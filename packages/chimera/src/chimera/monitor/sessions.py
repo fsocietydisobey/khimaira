@@ -37,7 +37,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any  # noqa: F401  (used in helper signatures)
 
 from chimera.log import get_logger
 
@@ -142,11 +142,99 @@ def set_status(session_id: str, status: str, detail: str = "") -> dict:
     """Update the agent's high-level state. Other sessions see this in
     session_state. Free-form string but conventional values: 'researching',
     'implementing', 'blocked', 'awaiting-review', 'idle'.
+
+    Preserves any existing `name` field — use `set_name()` to change that.
     """
     path = _session_dir(session_id) / "status.json"
-    record = {"status": status, "detail": detail, "updated_at": _now_iso()}
+    # Preserve name (and other future metadata) on status updates
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    record = {
+        **existing,
+        "status": status,
+        "detail": detail,
+        "updated_at": _now_iso(),
+    }
     path.write_text(json.dumps(record, indent=2))
     return record
+
+
+def set_name(session_id: str, name: str) -> dict:
+    """Set a friendly name for the session — surfaces in session_list and
+    enables name-based resolution from other sessions.
+
+    Names should be slug-shaped: lowercase, dashes, no spaces. Two sessions
+    can share a name; lookup prefers most-recently-active.
+    """
+    path = _session_dir(session_id) / "status.json"
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    record = {**existing, "name": name, "updated_at": _now_iso()}
+    record.setdefault("status", "idle")
+    record.setdefault("detail", "")
+    path.write_text(json.dumps(record, indent=2))
+    log.info("session %s: named %r", session_id, name)
+    return record
+
+
+def resolve_session_id(query: str) -> str:
+    """Map a user-friendly query → exact session_id (UUID).
+
+    Resolution order:
+      1. If query is an existing session_id (directory exists), return as-is.
+      2. Otherwise, search every session's status.json for a `name` match;
+         if multiple sessions share the name, return the most-recently-active.
+      3. Otherwise, raise ValueError with a helpful message.
+
+    Used by the read-side tools (state, pending_notes, post_answer) so users
+    can pass either UUIDs or names interchangeably.
+    """
+    safe = query.replace("/", "_").replace("..", "_")
+    if (_BASE_DIR / safe).is_dir():
+        return safe
+
+    # Name-based search
+    if not _BASE_DIR.exists():
+        raise ValueError(f"No session named or id'd {query!r} (no sessions exist yet).")
+
+    candidates: list[tuple[float, str]] = []
+    for d in _BASE_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        status_path = d / "status.json"
+        if not status_path.is_file():
+            continue
+        try:
+            s = json.loads(status_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if s.get("name") == query:
+            try:
+                mtime = max(
+                    (p.stat().st_mtime for p in d.iterdir() if p.is_file()),
+                    default=0.0,
+                )
+            except OSError:
+                mtime = 0.0
+            candidates.append((mtime, d.name))
+
+    if not candidates:
+        raise ValueError(
+            f"No session named or id'd {query!r}. "
+            f"Use session_list() to see available sessions."
+        )
+
+    # Most-recently-active wins on name collision
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +254,10 @@ def post_answer(
     Updates the question's record in-place (status → answered) AND drops a
     note in A's inbox. A's SessionStart hook calls session_pending_notes,
     which reads the inbox and surfaces unread answers.
+
+    `target_session_id` accepts either a UUID or a friendly name.
     """
+    target_session_id = resolve_session_id(target_session_id)
     qpath = _session_dir(target_session_id) / "questions.jsonl"
     questions = _read_jsonl(qpath)
     matched: dict | None = None
@@ -218,7 +309,11 @@ def post_answer(
 
 def state(session_id: str, recent: int = 10) -> dict:
     """Full digest of session_id's externalized state. The 'what is session A
-    up to right now' query."""
+    up to right now' query.
+
+    Accepts either a session UUID OR a friendly name (set via set_name).
+    """
+    session_id = resolve_session_id(session_id)
     d = _session_dir(session_id)
     decisions = _read_jsonl(d / "decisions.jsonl")
     files = _read_jsonl(d / "files_touched.jsonl")
@@ -260,7 +355,10 @@ def pending_notes(session_id: str, mark_read: bool = True) -> list[dict]:
     Called automatically by A's SessionStart hook so unread answers surface
     in A's system prompt without the user having to know to ask. Setting
     mark_read=False allows debug/inspect without consuming the note.
+
+    `session_id` accepts either a UUID or a friendly name.
     """
+    session_id = resolve_session_id(session_id)
     inbox_path = _session_dir(session_id) / "inbox.jsonl"
     notes = _read_jsonl(inbox_path)
     pending = [n for n in notes if not n.get("read")]
@@ -301,6 +399,7 @@ def list_sessions() -> list[dict]:
 
         out.append({
             "session_id": sd.name,
+            "name": (status.get("name") if isinstance(status, dict) else None),
             "last_active": last_mtime,
             "last_active_age_s": time.time() - last_mtime if last_mtime else None,
             "status": status,

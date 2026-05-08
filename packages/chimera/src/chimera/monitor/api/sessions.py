@@ -44,6 +44,10 @@ class StatusReq(BaseModel):
     detail: str = ""
 
 
+class NameReq(BaseModel):
+    name: str
+
+
 class AnswerReq(BaseModel):
     question_id: str
     answer: str
@@ -91,6 +95,17 @@ def build_router():
     @router.post("/sessions/{session_id}/status")
     async def post_status(session_id: str, req: StatusReq) -> dict:
         return sessions.set_status(session_id, req.status, req.detail)
+
+    @router.post("/sessions/{session_id}/name")
+    async def post_name(session_id: str, req: NameReq) -> dict:
+        return sessions.set_name(session_id, req.name)
+
+    @router.get("/sessions/resolve/{query}")
+    async def resolve(query: str) -> dict:
+        try:
+            return {"query": query, "session_id": sessions.resolve_session_id(query)}
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e))
 
     @router.post("/sessions/{session_id}/answer")
     async def post_answer(session_id: str, req: AnswerReq) -> dict:

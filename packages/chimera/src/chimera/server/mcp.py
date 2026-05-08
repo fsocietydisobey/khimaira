@@ -1620,6 +1620,27 @@ async def session_set_status(session_id: str, status: str, detail: str = "") -> 
 
 
 @mcp.tool()
+@logged_tool("session_set_name")
+async def session_set_name(session_id: str, name: str) -> str:
+    """Give this session a friendly name (e.g. 'chimera-monitor', 'jeevy-auth-fix').
+
+    After this, OTHER sessions can refer to it by name everywhere a
+    session_id is accepted — `session_state("chimera-monitor")` works
+    instead of needing the UUID. The lookup prefers most-recently-active
+    on name collisions.
+
+    Recommended: set this in the FIRST turn so other sessions can find
+    you. Convention: kebab-case slug describing the work
+    ('feature-x-rewrite', 'jeevy-monitor').
+
+    Args:
+        session_id: this session's id (the UUID — name yourself, not someone else).
+        name: friendly slug.
+    """
+    return await _monitor_tools.session_set_name(session_id, name)
+
+
+@mcp.tool()
 @logged_tool("session_post_answer")
 async def session_post_answer(
     target_session_id: str,

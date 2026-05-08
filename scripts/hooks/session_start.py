@@ -181,23 +181,29 @@ def _format_active_sessions(sessions: list[dict]) -> str:
     for s in sessions:
         sid = s.get("session_id", "?")
         status = s.get("status") or {}
-        status_label = status.get("status", "?")
-        detail = status.get("detail", "")
+        # Friendly name (set via session_set_name) — preferred handle
+        name = status.get("name") if isinstance(status, dict) else None
+        status_label = status.get("status", "?") if isinstance(status, dict) else "?"
+        detail = status.get("detail", "") if isinstance(status, dict) else ""
         age_s = s.get("last_active_age_s", 0)
         age_str = f"{age_s // 60}m ago" if age_s >= 60 else f"{age_s}s ago"
         decisions = s.get("decision_count", 0)
         touches = s.get("file_touch_count", 0)
         open_q = s.get("open_question_count", 0)
 
-        lines.append(
-            f"- `{sid}` (status: {status_label}{', ' + detail if detail else ''})"
-        )
+        # If named, prefer the name as the handle other sessions use
+        handle = f'"{name}"' if name else f'"{sid}"'
+        ident_line = (
+            f"- `{name}` (id: {sid})" if name else f"- `{sid}`"
+        ) + f" (status: {status_label}{', ' + detail if detail else ''})"
+
+        lines.append(ident_line)
         lines.append(
             f"  last active {age_str} · {decisions} decisions · "
             f"{touches} file touches · {open_q} open question(s)"
         )
         lines.append(
-            f"  → use session_state(\"{sid}\") to read details"
+            f"  → use session_state({handle}) to read details"
         )
         lines.append("")
     lines.append(

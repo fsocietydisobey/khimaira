@@ -732,6 +732,25 @@ async def session_set_status(session_id: str, status: str, detail: str = "") -> 
     return f"🟢 status updated: {status}{(' — ' + detail) if detail else ''}"
 
 
+async def session_set_name(session_id: str, name: str) -> str:
+    """Set a friendly name for the session. After this, other sessions can
+    refer to it by name in `session_state(name)`, `session_post_answer(name, ...)`,
+    etc. — no need to remember the UUID.
+
+    Names should be slug-shaped: lowercase, dashes ('chimera-monitor',
+    'jeevy-auth-fix'). Two sessions can share a name; lookup prefers
+    most-recently-active.
+    """
+    data = _post(
+        f"/api/sessions/{urllib.parse.quote(session_id)}/name",
+        {"name": name},
+        timeout=10.0,
+    )
+    if isinstance(data, str):
+        return data
+    return f"🏷️ session named `{name}` (id: {session_id})"
+
+
 async def session_post_answer(
     target_session_id: str,
     question_id: str,
@@ -881,8 +900,10 @@ async def session_list() -> str:
         status = s.get("status", {}) or {}
         age_s = s.get("last_active_age_s") or 0
         age_str = f"{age_s/60:.0f}m ago" if age_s < 3600 else f"{age_s/3600:.1f}h ago"
+        name = s.get("name")
+        ident = f"`{name}` (id: {s['session_id']})" if name else f"`{s['session_id']}`"
         parts.append(
-            f"- `{s['session_id']}` "
+            f"- {ident} "
             f"({status.get('status', '?')}) — "
             f"last active {age_str}, "
             f"decisions={s.get('decision_count', 0)}, "
