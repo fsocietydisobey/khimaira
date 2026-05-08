@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+wheels/
+develop-eggs/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# uv
+.uv/
+
+# Testing / linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Project state (ephemeral, machine-local)
+*.db
+*.db-wal
+*.db-shm
+*.log
+.chimera/cache/
+.chimera/local/
+
+# Frontend
+node_modules/
+apps/*/dist/
+apps/*/build/
+*.tsbuildinfo
+
+# Secrets
+.env
+.env.local
+.env.*.local
+!.env.example

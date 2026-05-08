@@ -1,0 +1,30 @@
+[project]
+name = "chimera"
+version = "0.1.0.dev0"
+description = "Multi-model AI orchestration — patterns, runtime, dispatcher"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "fsocietydisobey" }]
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "langgraph>=0.2",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "sse-starlette>=2.1",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2"]
+all = ["psycopg[binary]>=3.2"]
+
+[project.scripts]
+chimera = "chimera.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chimera"]
