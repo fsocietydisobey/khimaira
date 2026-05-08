@@ -213,9 +213,10 @@ need wiring in Phase 6+9.
 | **`mcp__chimera__session_pending_notes(session_id, mark_read)`** | ✅ | **A's inbox read — answers B has posted, auto-marks read** |
 | `/api/sessions/*` REST endpoints | ✅ | `monitor/api/sessions.py` | dashboard data |
 | Smoke test verified: bidirectional flow A ↔ B ↔ A | ✅ | | |
-| **PostToolUse hook → auto session_log_touch** | ⬜ | deferred | `~/.claude/hooks/` script — agent-side automation |
-| **Periodic `<chimera:reminder>` injection** | ⬜ | deferred | UserPromptSubmit hook for decisions/questions nudge |
-| **SessionStart hook → call session_pending_notes** | ⬜ | deferred | auto-surface unread answers in next turn's context |
+| **PostToolUse hook → auto session_log_touch** | ✅ | `scripts/hooks/post_tool_use.py` | stdlib Python, direct JSONL write, dedupes within MultiEdit, skips non-edit tools |
+| **Periodic `<chimera:reminder>` injection** | ✅ | `scripts/hooks/user_prompt_submit.py` | per-session counter at `~/.local/state/chimera/hook-counters/`, fires every 8th turn |
+| **SessionStart hook → call session_pending_notes** | ✅ | `scripts/hooks/session_start.py` | reads inbox.jsonl, atomic-rewrites with read=true, emits hookSpecificOutput JSON |
+| **`chimera install-hooks` installer** | ✅ | `cli/install_hooks.py` | idempotent merge into ~/.claude/settings.json, marker-based uninstall, --dry-run + auto-backup |
 | Dashboard panel: live sessions view | ⬜ | deferred | `apps/monitor-ui/src/components/sessions/` |
 
 **Critical design notes (incorporated from review):**
