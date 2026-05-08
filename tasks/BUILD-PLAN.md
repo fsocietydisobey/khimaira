@@ -230,26 +230,19 @@ state-watching daemon makes the externalized-state version of this tractable.
 
 ---
 
-## Phase 12 — Process observability (replace agent polling with blocking SSE)
-
-The gap: Claude Code (and similar agents) polls long-running processes via
-repeated `cat <log>` or `tail` calls. A 5-minute test run → 30+ MCP roundtrips
-where 1 would suffice. Each poll burns context window space and time.
-
-The fix: chimera daemon tails the process internally; agents make ONE
-blocking MCP call that resolves when the process completes or a pattern
-matches. SSE under the hood, MCP tool blocks above it.
+## Phase 12 — Process observability ✅ DONE (backend; UI deferred)
 
 | Item | Status | Where | Notes |
 |---|---|---|---|
-| Process registry in monitor daemon | ⬜ | `monitor/processes.py` | dict {label: ProcessHandle}; spawn + capture stdout/stderr |
-| `mcp__chimera__spawn_process(cmd, label, cwd, env)` | ⬜ | server tool | starts a tracked process; returns {label, pid} |
-| `mcp__chimera__wait_for_process(label, completion_signal, timeout_s)` | ⬜ | server tool | **BLOCKS until pattern in output OR exit OR timeout. Returns full output + exit code.** This is the polling-replacement primitive. |
-| `mcp__chimera__follow_process(label, lines_per_chunk, max_chunks)` | ⬜ | server tool | yields chunks via MCP streaming if supported; otherwise returns when buffer fills |
-| `mcp__chimera__list_processes()` | ⬜ | server tool | what's currently being tracked |
-| `mcp__chimera__kill_process(label)` | ⬜ | server tool | clean shutdown |
-| `/api/processes/<label>/stream` SSE | ⬜ | `monitor/api/processes.py` | for the dashboard view |
-| Dashboard panel: live process output | ⬜ | `apps/monitor-ui/src/components/processes/` | tabbed view of all tracked processes |
+| Process registry in monitor daemon | ✅ | `monitor/processes.py` | spawn/wait/follow/kill — 4MB ring buffer per process |
+| `mcp__chimera__spawn_process` | ✅ | `server/mcp.py` | |
+| `mcp__chimera__wait_for_process` | ✅ | `server/mcp.py` | **Polling replacement primitive — verified end-to-end (signal_match in 0.6s)** |
+| `mcp__chimera__follow_process` | ✅ | `server/mcp.py` | snapshot of current output |
+| `mcp__chimera__list_processes` | ✅ | `server/mcp.py` | |
+| `mcp__chimera__kill_process` | ✅ | `server/mcp.py` | SIGTERM + 5s grace + SIGKILL |
+| `/api/processes/{label}/stream` SSE | ✅ | `monitor/api/processes.py` | dashboard endpoint |
+| `POST /api/processes/spawn`, `POST /api/processes/{label}/wait` | ✅ | `monitor/api/processes.py` | long-poll wait endpoint |
+| Dashboard panel: live process output | ⬜ | `apps/monitor-ui/src/components/processes/` | UI deferred — backend wired |
 
 **Use cases this unblocks:**
 

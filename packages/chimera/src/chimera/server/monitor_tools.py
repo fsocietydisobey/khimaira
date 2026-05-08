@@ -49,6 +49,41 @@ def _get(path: str, *, base: str = _DEFAULT_BASE, timeout: float = 5.0) -> dict[
         return f"chimera-monitor query failed ({url}): {exc}"
 
 
+def _post(
+    path: str,
+    body: dict[str, Any],
+    *,
+    base: str = _DEFAULT_BASE,
+    timeout: float = 5.0,
+) -> dict[str, Any] | str:
+    """POST request → parsed JSON, or friendly error string. Long-poll friendly.
+
+    For `wait_for_process` the caller passes a timeout matching the daemon's
+    server-side wait timeout plus a small buffer.
+    """
+    url = f"{base}{path}"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            payload = e.read().decode("utf-8")
+            return f"chimera-monitor {url} → HTTP {e.code}: {payload[:300]}"
+        except Exception:
+            return f"chimera-monitor {url} → HTTP {e.code}"
+    except urllib.error.URLError:
+        return _DAEMON_DOWN_HINT.format(base=base)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return f"chimera-monitor returned non-JSON from {url}: {exc}"
+    except Exception as exc:
+        return f"chimera-monitor query failed ({url}): {exc}"
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations — kept thin so Claude reads the daemon's data
 # directly. Output is markdown-formatted for chat readability.
@@ -366,3 +401,146 @@ async def topology(project: str) -> str:
             + (f", invokes: {list(invokes.values())}" if invokes else "")
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Process observability — replaces agent polling with single-call SSE-backed
+# blocking primitives. See chimera/monitor/processes.py and the
+# /api/processes/* endpoints for the daemon-side implementation.
+# ---------------------------------------------------------------------------
+
+
+async def spawn_process(
+    cmd: list[str],
+    label: str,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    replace_existing: bool = False,
+) -> str:
+    """Start a tracked subprocess. Returns a handle dict; process runs in the
+    daemon. Use `wait_for_process` to block until completion or `follow_process`
+    to read recent output.
+    """
+    data = _post(
+        "/api/processes/spawn",
+        {
+            "cmd": cmd, "label": label, "cwd": cwd,
+            "env": env, "replace_existing": replace_existing,
+        },
+        timeout=10.0,
+    )
+    if isinstance(data, str):
+        return data
+    return (
+        f"✅ spawned `{data['label']}` (pid {data['pid']}) — "
+        f"{' '.join(data['cmd'][:3])}\n"
+        f"Use `wait_for_process('{label}')` or `follow_process('{label}')` to observe."
+    )
+
+
+async def wait_for_process(
+    label: str,
+    completion_signal: str | None = None,
+    timeout_s: float = 300.0,
+) -> str:
+    """**Blocking call** — wait for a process to finish OR for a regex match
+    in its output. Returns ONE response with full stdout/stderr + exit code.
+
+    This replaces the polling pattern of repeated `cat <log>` calls. Single
+    MCP roundtrip instead of dozens.
+
+    Args:
+        label: process label from `spawn_process`.
+        completion_signal: optional regex; returns as soon as it matches output.
+            Examples: r"\\d+ passed|\\d+ failed" for tests, r"Local: http" for dev server.
+        timeout_s: max wall time to wait. Returns reason="timeout" if exceeded.
+    """
+    client_timeout = timeout_s + 30.0
+    data = _post(
+        f"/api/processes/{urllib.parse.quote(label)}/wait",
+        {"completion_signal": completion_signal, "timeout_s": timeout_s},
+        timeout=client_timeout,
+    )
+    if isinstance(data, str):
+        return data
+
+    reason = data.get("reason", "?")
+    duration = data.get("duration_s", 0)
+    parts = [f"**`{label}`** — finished in {duration:.1f}s ({reason})"]
+    if reason == "signal_match":
+        parts.append(f"matched: {data.get('matched', '')!r}")
+    elif reason == "exit":
+        parts.append(f"exit code: {data.get('exit_code')}")
+    elif reason == "timeout":
+        parts.append(f"⚠️ timed out after {timeout_s}s — process still running")
+
+    stdout = (data.get("stdout_text") or "").strip()
+    stderr = (data.get("stderr_text") or "").strip()
+    if stdout:
+        parts.append(f"\n**stdout** ({len(stdout)} chars):\n```\n{_tail(stdout, 4000)}\n```")
+    if stderr:
+        parts.append(f"\n**stderr** ({len(stderr)} chars):\n```\n{_tail(stderr, 2000)}\n```")
+    return "\n".join(parts)
+
+
+async def follow_process(label: str, max_chunks: int = 100) -> str:
+    """Snapshot of a tracked process's output so far. Non-blocking.
+
+    For real-time streaming, the dashboard's SSE endpoint
+    (`/api/processes/{label}/stream`) is better; this is the single-call
+    snapshot variant for MCP usage.
+    """
+    data = _get(f"/api/processes/{urllib.parse.quote(label)}", timeout=10.0)
+    if isinstance(data, str):
+        return data
+
+    parts = [
+        f"**`{label}`** — pid={data['pid']} "
+        f"{'running' if data.get('is_running') else 'finished'} "
+        f"({data.get('duration_s', 0):.1f}s)",
+    ]
+    if data.get("exit_code") is not None:
+        parts.append(f"exit code: {data['exit_code']}")
+    stdout = (data.get("stdout_text") or "").strip()
+    stderr = (data.get("stderr_text") or "").strip()
+    if stdout:
+        parts.append(f"\n**stdout** ({len(stdout)} chars):\n```\n{_tail(stdout, 4000)}\n```")
+    if stderr:
+        parts.append(f"\n**stderr** ({len(stderr)} chars):\n```\n{_tail(stderr, 2000)}\n```")
+    return "\n".join(parts)
+
+
+async def list_processes() -> str:
+    """All tracked processes — running + recently-finished."""
+    data = _get("/api/processes")
+    if isinstance(data, str):
+        return data
+    procs = data.get("processes", [])
+    if not procs:
+        return "No tracked processes. Spawn one with `spawn_process`."
+
+    lines = [f"**{len(procs)} tracked process(es):**\n"]
+    for p in procs:
+        status = "🟢 running" if p["is_running"] else f"⚪ exit={p.get('exit_code')}"
+        lines.append(
+            f"- `{p['label']}` (pid {p['pid']}) {status} "
+            f"— {p['duration_s']:.1f}s — `{' '.join(p['cmd'][:3])}`"
+        )
+    return "\n".join(lines)
+
+
+async def kill_process(label: str) -> str:
+    """Send SIGTERM (then SIGKILL after 5s grace) to a tracked process."""
+    data = _post(f"/api/processes/{urllib.parse.quote(label)}/kill", {}, timeout=15.0)
+    if isinstance(data, str):
+        return data
+    if data.get("stopped"):
+        return f"✅ killed `{label}`"
+    return f"`{label}` was already finished — nothing to kill"
+
+
+def _tail(text: str, max_chars: int) -> str:
+    """Show the last `max_chars` of text — what an agent usually wants from logs."""
+    if len(text) <= max_chars:
+        return text
+    return f"... [{len(text) - max_chars} chars truncated] ...\n" + text[-max_chars:]

@@ -1410,6 +1410,98 @@ async def monitor_topology(project: str) -> str:
     return await _monitor_tools.topology(project)
 
 
+# ---------------------------------------------------------------------------
+# Process observability — replaces polling with single blocking calls.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def spawn_process(
+    cmd: list[str],
+    label: str,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    replace_existing: bool = False,
+) -> str:
+    """Start a tracked subprocess (test runner, dev server, build, migration).
+
+    Process runs in the chimera-monitor daemon — survives this MCP session.
+    Use `wait_for_process` to block until it finishes (single MCP call
+    instead of polling), or `follow_process` for a snapshot of output.
+
+    Args:
+        cmd: argv list — first element is the executable.
+        label: short identifier ('npm-test', 'dev-server', 'vite-build') —
+            used for subsequent wait/follow/kill calls.
+        cwd: working directory; default = daemon's cwd (chimera repo root).
+        env: extra env vars merged with the daemon's environment.
+        replace_existing: kill any existing process with this label before spawning.
+    """
+    return await _monitor_tools.spawn_process(cmd, label, cwd, env, replace_existing)
+
+
+@mcp.tool()
+async def wait_for_process(
+    label: str,
+    completion_signal: str | None = None,
+    timeout_s: float = 300.0,
+) -> str:
+    """Block until a tracked process completes, or until a regex matches output.
+
+    **This replaces the agent-polling pattern.** Instead of repeated
+    `cat <log>` calls every few seconds, make one call to this tool — it
+    blocks server-side and returns when the process is done OR a completion
+    signal is detected. ONE roundtrip instead of dozens.
+
+    Examples:
+        wait_for_process("npm-test", completion_signal=r"\\d+ passed|\\d+ failed", timeout_s=300)
+        wait_for_process("dev-server", completion_signal=r"Local: http", timeout_s=30)
+        wait_for_process("vite-build", completion_signal=r"built in", timeout_s=120)
+
+    Returns: stdout, stderr, exit code, reason ('signal_match'/'exit'/'timeout'),
+    duration. Process keeps running if reason='signal_match' (you matched on
+    output but the process hasn't exited yet) — useful for "wait until ready
+    then keep going" patterns like dev servers.
+
+    Args:
+        label: process label from `spawn_process`.
+        completion_signal: optional regex; returns when matched in stdout/stderr.
+        timeout_s: max wait time (1-3600 seconds).
+    """
+    return await _monitor_tools.wait_for_process(label, completion_signal, timeout_s)
+
+
+@mcp.tool()
+async def follow_process(label: str, max_chunks: int = 100) -> str:
+    """Snapshot of a tracked process's current output. Non-blocking.
+
+    Use this when you want to peek at a long-running process without
+    waiting for it to finish. For "wait until done" semantics, use
+    `wait_for_process` (single blocking call replaces polling).
+
+    Args:
+        label: process label from `spawn_process`.
+        max_chunks: cap on returned output chunks (default 100).
+    """
+    return await _monitor_tools.follow_process(label, max_chunks)
+
+
+@mcp.tool()
+async def list_processes() -> str:
+    """List all tracked subprocesses — running + recently-finished."""
+    return await _monitor_tools.list_processes()
+
+
+@mcp.tool()
+async def kill_process(label: str) -> str:
+    """Stop a tracked process (SIGTERM, then SIGKILL after 5s grace).
+
+    Args:
+        label: process label from `spawn_process`.
+    """
+    return await _monitor_tools.kill_process(label)
+
+
 def main():
     """Entry point — run the MCP server over stdio."""
     import atexit

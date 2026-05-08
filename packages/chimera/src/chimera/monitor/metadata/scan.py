@@ -278,8 +278,13 @@ async def _run_model(prompt: str, project_path: Path, project_name: str) -> str 
     Falls back to the alternate model on first-attempt failure so a
     transient outage on one provider doesn't block the scan.
     """
-    primary = (os.environ.get("CHIMERA_MONITOR_SCAN_MODEL") or "claude").lower()
-    fallback = "gemini" if primary == "claude" else "claude"
+    # Default to gemini (subscription-billed) over claude (per-call API billing).
+    # Reasoning: a fresh `chimera monitor start` against N projects spawns N
+    # Opus-on-94k-char-prompt scans = ~$1.40/project = surprise spend the user
+    # didn't authorize. Gemini CLI hits the user's Gemini subscription instead.
+    # Override via CHIMERA_MONITOR_SCAN_MODEL=claude when API billing is OK.
+    primary = (os.environ.get("CHIMERA_MONITOR_SCAN_MODEL") or "gemini").lower()
+    fallback = "claude" if primary == "gemini" else "gemini"
     # Pin Opus 4.7 for scans regardless of chimera's CLAUDE_MODEL default —
     # metadata classification benefits from the largest reasoning model.
     # Override via CHIMERA_MONITOR_SCAN_CLAUDE_MODEL.
