@@ -8,11 +8,22 @@ license = { text = "MIT" }
 authors = [{ name = "fsocietydisobey" }]
 dependencies = [
     "fastapi>=0.115",
-    "uvicorn>=0.30",
-    "langgraph>=0.2",
+    "uvicorn[standard]>=0.30",
+    "langgraph>=0.4",
+    "langgraph-checkpoint-sqlite>=2",
+    "langchain-core>=0.3",
+    "langchain-anthropic>=0.3",
+    "langchain-google-genai>=2",
+    "aiosqlite>=0.20",
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "sse-starlette>=2.1",
+    "python-dotenv>=1",
+    "psutil>=5",
+    "anthropic>=0.40",
+    "mcp[cli]>=1.0",
+    "tree-sitter>=0.21",
+    "tree-sitter-python>=0.21",
     "chimera-types",
     "chimera-transport",
 ]
@@ -22,8 +33,8 @@ chimera-types = { workspace = true }
 chimera-transport = { workspace = true }
 
 [project.optional-dependencies]
-postgres = ["psycopg[binary]>=3.2"]
-all = ["psycopg[binary]>=3.2"]
+postgres = ["psycopg[binary]>=3.1"]
+all = ["psycopg[binary]>=3.1"]
 
 [project.scripts]
 chimera = "chimera.cli:main"

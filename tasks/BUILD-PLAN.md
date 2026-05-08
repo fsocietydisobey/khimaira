@@ -9,7 +9,7 @@
 - ⏳ In progress — being built now
 - ⬜ Pending — not started
 
-**Last updated:** 2026-05-08 (session 1 — initial scaffold + core build)
+**Last updated:** 2026-05-08 (session 1 — phases 0-3, 6-8 done; session shared-state idea added as Phase 11)
 
 ---
 
@@ -46,43 +46,44 @@ Local model fills the gaps for free."*
 
 ---
 
-## Phase 1 — Shared types
+## Phase 1 — Shared types ✅ DONE
 
 | Item | Status | Where | Notes |
 |---|---|---|---|
-| `TaskClassification` | ⏳ | `shared/types/src/chimera_types/classification.py` | AMR classifier output |
-| `FileContext` + `ContextBundle` | ⏳ | `shared/types/src/chimera_types/context.py` | resolver output |
-| `UsageRecord` | ⏳ | `shared/types/src/chimera_types/usage.py` | tracker schema |
-| `RoutingDecision` | ⏳ | `shared/types/src/chimera_types/routing.py` | router output |
-| `RuntimeStatus` | ⏳ | `shared/types/src/chimera_types/runtime.py` | dev server / browser / DB status |
+| `TaskClassification` | ✅ | `shared/types/src/chimera_types/classification.py` | AMR classifier output |
+| `FileContext` + `ContextBundle` | ✅ | `shared/types/src/chimera_types/context.py` | resolver output |
+| `UsageRecord` | ✅ | `shared/types/src/chimera_types/usage.py` | now with `task_id` for per-task budgeting |
+| `RoutingDecision` | ✅ | `shared/types/src/chimera_types/routing.py` | router output |
+| `RuntimeStatus` | ✅ | `shared/types/src/chimera_types/runtime.py` | dev server / browser / DB status |
 
 ---
 
-## Phase 2 — CLI Runners (the pure-CLI substrate)
+## Phase 2 — CLI Runners (the pure-CLI substrate) ✅ DONE
 
 The only place chimera talks to LLMs. No API SDK calls anywhere else.
 
 | Runner | Status | File | Notes |
 |---|---|---|---|
-| `CLIRunner` protocol | ⏳ | `dispatch/runners/base.py` | |
-| `claude` runner | ⏳ | `dispatch/runners/claude.py` | migrated from legacy `cli/runners.py` |
-| `codex` runner | ⏳ | `dispatch/runners/codex.py` | NEW |
-| `gemini` runner | ⏳ | `dispatch/runners/gemini.py` | migrated from legacy |
-| `ollama` runner | ⏳ | `dispatch/runners/ollama.py` | NEW (local) |
-| `llm` runner | ⏳ | `dispatch/runners/llm.py` | NEW (Simon Willison's, covers OpenRouter+rest) |
-| `run_structured()` | ⏳ | `dispatch/structured.py` | prompt-engineered + parsed + retry-on-fail |
-| `cli_available()`, subprocess helpers | ⏳ | `dispatch/runners/base.py` | from legacy `cli/cli.py` |
+| `CLIRunner` protocol | ✅ | `dispatch/runners/base.py` | |
+| `claude` runner | ✅ | `dispatch/runners/claude.py` | + ClaudeAuthError hard-stop on credit-low/auth/rate-limit |
+| `codex` runner | ✅ | `dispatch/runners/codex.py` | NEW |
+| `gemini` runner | ✅ | `dispatch/runners/gemini.py` | |
+| `ollama` runner | ✅ | `dispatch/runners/ollama.py` | NEW (local, free-tier) |
+| `llm` runner | ✅ | `dispatch/runners/llm.py` | NEW (Simon Willison's, covers OpenRouter+rest) |
+| `run_structured()` | ✅ | `dispatch/structured.py` | prompt-engineered + JSON-extract + retry-on-fail |
+| `cli_available()`, subprocess helpers | ✅ | `dispatch/runners/base.py` | now permissive on non-zero exit (Claude needs JSON regardless) |
 
 ---
 
-## Phase 3 — AMR (Automatic Model Router)
+## Phase 3 — AMR (Automatic Model Router) ✅ DONE (core)
 
 | Item | Status | Where | Notes |
 |---|---|---|---|
-| `classifier.py` (cheap-model task classifier) | ⏳ | `dispatch/classifier.py` | uses Haiku-tier runner |
-| `router.py` (classification → runner+model) | ⏳ | `dispatch/router.py` | reads `routing_table.yaml` |
-| `routing_table.yaml` (default routing matrix) | ⏳ | `config/routing_table.yaml` | task_type × complexity → runner |
-| Validator-gated escalation | ⬜ | `dispatch/escalation.py` | |
+| `classifier.py` (cheap-model task classifier) | ✅ | `dispatch/classifier.py` | Ollama-preferred → Claude Haiku fallback |
+| `router.py` (classification → runner+model) | ✅ | `dispatch/router.py` | budget gate + privacy gate + availability fallback chain |
+| `routing_table.yaml` (default routing matrix) | ✅ | `config/routing_table.yaml` | 10 task_types × 5 complexity_tiers |
+| Config layered loader | ✅ | `config/__init__.py` | shipped → user → project deep-merge |
+| Validator-gated escalation | ⬜ | `dispatch/escalation.py` | retry on bigger model when validator fails |
 | `mcp__chimera__route` MCP tool | ⬜ | `server/tools/route.py` | classify-only, returns recommendation |
 | `mcp__chimera__chain_auto` MCP tool | ⬜ | `server/tools/chain_auto.py` | end-to-end auto-routed dispatch |
 
@@ -122,58 +123,63 @@ The only place chimera talks to LLMs. No API SDK calls anywhere else.
 
 | Command | Status | File | Notes |
 |---|---|---|---|
-| `chimera task <description>` | ⏳ | `cli/task.py` | end-to-end: context → AMR → dispatch |
+| `chimera task <description>` | ✅ | `cli/task.py` | end-to-end: classify → route → dispatch → record. Verified with --dry-run. |
+| `chimera route <description>` | ✅ | `cli/route.py` | classify-only, prints routing decision JSON |
+| `chimera doctor` | ✅ | `cli/doctor.py` | env diagnostic, lists available runners + modes |
+| `chimera monitor {start,stop,restart,status,rescan}` | ✅ | `cli/monitor.py` | thin wrapper over migrated monitor.cli |
+| Entry point (`chimera.cli:main`) | ✅ | `cli/__init__.py` | argparse dispatch |
 | `chimera dev <project>` | ⬜ | `cli/dev.py` | (Phase 5) |
 | `chimera init` | ⬜ | `cli/init.py` | first-run UX, detects + suggests Ollama |
-| `chimera doctor` | ⬜ | `cli/doctor.py` | env diagnostic, lists available runners |
 | `chimera install --target` | ⬜ | `cli/install.py` | configures Claude Code / Gemini / Codex MCP |
-| `chimera monitor {start,stop,restart}` | ⏳ | `cli/monitor.py` | migrate from legacy |
-| Entry point (`chimera.cli:main`) | ⏳ | `cli/__init__.py` | argparse / typer dispatch |
 
 ---
 
-## Phase 7 — Monitor migration (from chimera-legacy)
+## Phase 7 — Monitor migration (from chimera-legacy) ✅ DONE (core)
 
-The observability daemon already works in legacy. Mostly mechanical move.
+The observability daemon migrated cleanly — only 3 import patches needed
+(ROOTS, runners). Daemon starts in new repo, /api/projects responds, all
+endpoints accessible.
 
 | Item | Status | Notes |
 |---|---|---|
-| `monitor/server.py` | ⏳ | FastAPI on 127.0.0.1:8740 |
-| `monitor/api/projects.py` | ⏳ | |
-| `monitor/api/topology.py` | ⏳ | |
-| `monitor/api/threads.py` (incl SSE) | ⏳ | |
-| `monitor/api/usage.py` | ⏳ | |
-| `monitor/api/anomalies.py` | ⏳ | |
-| `monitor/api/api_routes.py` | ⏳ | FastAPI route extractor |
-| `monitor/api/frontend_components.py` | ⏳ | React component extractor |
-| `monitor/api/schema_drift.py` | ⏳ | |
-| `monitor/anomalies.py` (self-watch) | ⏳ | |
-| `monitor/watchdog.py` (zombie detector) | ⏳ | |
-| `monitor/usage.py` (LLM tracker) | ⏳ | |
-| `monitor/auto_fix.py` | ⏳ | |
-| `monitor/discovery/*` | ⏳ | project + connection + topology discovery |
-| `monitor/metadata/*` | ⏳ | observation collector + scan |
+| `monitor/server.py` | ✅ | FastAPI on 127.0.0.1:8740 |
+| `monitor/api/projects.py` | ✅ | |
+| `monitor/api/topology.py` | ✅ | |
+| `monitor/api/threads.py` (incl SSE) | ✅ | |
+| `monitor/api/usage.py` | ✅ | |
+| `monitor/api/anomalies.py` | ✅ | |
+| `monitor/api/api_routes.py` | ✅ | FastAPI route extractor |
+| `monitor/api/frontend_components.py` | ✅ | React component extractor |
+| `monitor/api/schema_drift.py` | ✅ | |
+| `monitor/anomalies.py` (self-watch) | ✅ | usage_rate + zombie checks active |
+| `monitor/watchdog.py` (zombie detector) | ✅ | |
+| `chimera.usage` module | ✅ | + `make_langchain_callback` for legacy node usage |
+| `monitor/auto_fix.py` | ✅ | |
+| `monitor/discovery/*` | ✅ | project + connection + topology discovery |
+| `monitor/metadata/*` | ✅ | observation collector + scan |
 | **NEW** `monitor/api/savings.py` | ⬜ | burn-down chart data |
 | **NEW** `monitor/api/runtime.py` | ⬜ | dev/browser/db status |
 | **NEW** `monitor/api/routing.py` | ⬜ | AMR decision log |
 
 ---
 
-## Phase 8 — Patterns migration (from chimera-legacy)
+## Phase 8 — Patterns migration (from chimera-legacy) ✅ DONE
 
-The existing 8 patterns (SPR-4, CLR, PDE, HVD, ACL, DCE, POB, plus AMR new). Mostly mechanical move.
+All 8 graph factories import cleanly. Server tools (MCP exposure) still
+need wiring in Phase 6+9.
 
 | Pattern | Designation | Status | Notes |
 |---|---|---|---|
-| SPR-4 | Sequential Phase Runner | ⬜ | `chain_pipeline` MCP tool |
-| TFB | Tri-Force Balancer (inside SPR-4) | ⬜ | 6 balanced force nodes |
-| CLR | Closed-Loop Refiner | ⬜ | `chain_refiner` |
-| PDE | Parallel Dispatch Engine | ⬜ | `swarm` |
-| HVD | Hypervisor Daemon | ⬜ | `chain_hypervisor` |
-| **AMR** | **Automatic Model Router** | ⏳ | **NEW — Phase 3** |
-| ACL | Atomic Component Library | ⬜ | `chain_components` |
-| DCE | Dead Code Eliminator | ⬜ | `chain_deadcode` |
-| POB | Proactive Observation Builder | ⬜ | `chain_toolbuilder` |
+| SPR-4 | Sequential Phase Runner | ✅ | `chain_pipeline` graph factory |
+| TFB | Tri-Force Balancer (inside SPR-4) | ✅ | 6 balanced force nodes |
+| CLR | Closed-Loop Refiner | ✅ | `chain_refiner` graph |
+| PDE | Parallel Dispatch Engine | ✅ | `swarm` graph |
+| HVD | Hypervisor Daemon | ✅ | `chain_hypervisor` graph |
+| **AMR** | **Automatic Model Router** | ✅ | **NEW — Phase 3 done** |
+| ACL | Atomic Component Library | ✅ | `chain_components` graph |
+| DCE | Dead Code Eliminator | ✅ | `chain_deadcode` graph |
+| POB | Proactive Observation Builder | ✅ | `chain_toolbuilder` graph |
+| `chimera.server.mcp` MCP entry point | ⬜ | exposes graph factories as MCP tools |
 
 ---
 
@@ -186,6 +192,41 @@ The existing 8 patterns (SPR-4, CLR, PDE, HVD, ACL, DCE, POB, plus AMR new). Mos
 | **NEW** Burn-down savings widget | ⬜ | shows "you saved X this week" |
 | **NEW** Runtime status panel | ⬜ | dev/browser/db |
 | **NEW** AMR routing decisions log | ⬜ | "this task routed to Y because Z" |
+
+---
+
+## Phase 11 — Multi-session shared state (Claude Code observability)
+
+The gap: when one Claude Code session is grinding on a task, you can't ask
+related questions in another window without losing the working session's
+context. Forks (Agent tool) solve "background work" but not "side conversation
+that sees what the working agent is doing." Chimera's already-existing
+state-watching daemon makes the externalized-state version of this tractable.
+
+| Item | Status | Where | Notes |
+|---|---|---|---|
+| `~/.local/state/chimera/sessions/<sid>/` JSONL store | ⬜ | new | decisions, files_touched, open_questions, status, **inbox** |
+| `mcp__chimera__session_log_decision(text, why)` | ⬜ | `server/tools/session_*.py` | A's write |
+| `mcp__chimera__session_log_question(text)` → returns question_id | ⬜ | | A's write — ID is the handle B uses to answer |
+| `mcp__chimera__session_status(state)` | ⬜ | | A's status update: researching/implementing/blocked |
+| **`mcp__chimera__session_post_answer(session_id, question_id, answer)`** | ⬜ | | **B → A write-back. Without this, B can only read A.** |
+| `mcp__chimera__session_state(session_id)` | ⬜ | | B's read — full digest |
+| `mcp__chimera__session_recent_decisions()` | ⬜ | | B's read across all sessions |
+| **`mcp__chimera__session_pending_notes(session_id)`** | ⬜ | | **A's inbox read — answers B has posted that A hasn't seen** |
+| **PostToolUse hook → auto session_log_touch** | ⬜ | `~/.claude/hooks/` | **Free file-touch logging. Highest-leverage automation: agent burden = 0, log is always-correct.** Diff-parses Edit/Write/MultiEdit tool params. |
+| **Periodic `<chimera:reminder>` injection** | ⬜ | UserPromptSubmit hook every N turns | Nudges agent to log decisions/questions. NOT auto-extracted from prose — extraction unreliable. |
+| **SessionStart hook → call session_pending_notes** | ⬜ | `~/.claude/hooks/` | When A wakes up, surfaces "B answered Q3 while you were running" without user having to ask. Closes the inbox-read loop. |
+| `/api/sessions` endpoint | ⬜ | `monitor/api/sessions.py` | dashboard view: all active sessions, their state, pending answers |
+
+**Critical design notes (incorporated from review):**
+
+1. **File-touch is automated; decisions/questions are nudged.** PostToolUse hook on Edit/Write/MultiEdit captures every file mutation with line ranges — zero agent burden, can't be forgotten. Decisions and questions require the agent to recognize "this is a decision" — extraction from prose is unreliable, so we inject a periodic reminder rather than auto-extract.
+
+2. **The write-back path is symmetric.** B → A communication is NOT optional. Without `session_post_answer` + `session_pending_notes` + the SessionStart auto-read, the design collapses to "B reads A, then human relays" — which only solves half the problem. Both directions plumbed from day 1.
+
+3. **Inbox-read should be automatic.** SessionStart hook calls `session_pending_notes` and surfaces unread answers in the system prompt. The agent sees "session B answered Q3" without the user having to know to ask.
+
+4. **Estimated scope:** ~300-400 LOC + 2-3 Claude Code hook scripts. Reuses existing chimera-monitor daemon, JSONL pattern, FastMCP server scaffolding.
 
 ---
 

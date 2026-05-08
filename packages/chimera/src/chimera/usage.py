@@ -141,3 +141,103 @@ def runner_to_provider(runner: str) -> str:
         "ollama": "local",
         "llm": "other",  # depends on model; "other" is least-wrong default
     }.get(runner, "other")
+
+
+# ---------------------------------------------------------------------------
+# LangChain callback — auto-attached to every model built via config/models.py.
+# Migrated from legacy chimera/usage.py to keep the patterns' usage tracking
+# working during the gradual API → CLI substrate migration. Once Phase 10
+# (API removal) is complete, this can be deleted.
+# ---------------------------------------------------------------------------
+
+
+def _record_sync(
+    *,
+    provider: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    latency_s: float,
+    role: str | None = None,
+    source: str = "langchain",
+) -> None:
+    """Synchronous append, used by LangChain callback handlers (which run
+    in the LLM call's thread, may or may not be the asyncio loop)."""
+    import time as _time
+
+    cost = estimate_cost(model, input_tokens, output_tokens)
+    record = UsageRecord(
+        ts=datetime.now(timezone.utc).isoformat(),
+        runner=provider,  # Best mapping when CLI runner unknown — provider name
+        provider=provider,  # type: ignore[arg-type]
+        model=model,
+        role=role,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_s=latency_s,
+        estimated_cost_usd=cost,
+        source=source,  # type: ignore[arg-type]
+    )
+    _ = _time  # silence noqa
+    try:
+        _Recorder._append(record)
+    except Exception as exc:
+        log.warning("usage: failed to record %s/%s: %s", provider, model, exc)
+
+
+def make_langchain_callback(provider: str, role: str | None = None):
+    """Return a BaseCallbackHandler that records every LangChain LLM call.
+
+    Lazy import — langchain_core is heavy and not all chimera entry paths
+    need it (e.g. `chimera doctor` shouldn't pay the import cost).
+    """
+    import time as _time
+
+    from langchain_core.callbacks import BaseCallbackHandler
+
+    class _UsageCallback(BaseCallbackHandler):
+        """Captures token usage from LangChain LLM responses.
+
+        Anthropic puts usage under llm_output['usage']; Google under
+        llm_output['usage_metadata']. Same shape, different parent key —
+        we probe both.
+        """
+
+        def on_llm_start(self, *args, **kwargs):
+            self._t0 = _time.monotonic()
+
+        def on_llm_end(self, response, **kwargs):
+            latency = _time.monotonic() - getattr(self, "_t0", _time.monotonic())
+            llm_output = getattr(response, "llm_output", None) or {}
+
+            usage = llm_output.get("usage") or llm_output.get("usage_metadata") or {}
+            model = (
+                llm_output.get("model_name")
+                or llm_output.get("model")
+                or "unknown"
+            )
+
+            input_tokens = (
+                usage.get("input_tokens")
+                or usage.get("prompt_tokens")
+                or usage.get("prompt_token_count")
+                or 0
+            )
+            output_tokens = (
+                usage.get("output_tokens")
+                or usage.get("completion_tokens")
+                or usage.get("candidates_token_count")
+                or 0
+            )
+
+            _record_sync(
+                provider=provider,
+                model=model,
+                input_tokens=int(input_tokens),
+                output_tokens=int(output_tokens),
+                latency_s=latency,
+                role=role,
+                source="langchain",
+            )
+
+    return _UsageCallback()

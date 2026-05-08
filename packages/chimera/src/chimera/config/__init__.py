@@ -70,3 +70,31 @@ def load_routing_table(project_path: str | None = None) -> dict[str, Any]:
 def is_local_only_mode() -> bool:
     """User opted in to privacy mode — only local runners are eligible."""
     return os.environ.get("CHIMERA_LOCAL_ONLY", "").lower() in ("1", "true", "yes")
+
+
+# Re-export ROOTS so monitor code can `from chimera.config import ROOTS`
+from .roots import ROOTS, ROOTS_FILE  # noqa: E402
+
+# Legacy config (OrchestratorConfig + RoleConfig + ProviderConfig) used by
+# the migrated graph nodes. Stays available until Phase 10 (API removal)
+# is complete and the patterns are rewritten to use AMR routing instead.
+from .loader import (  # noqa: E402
+    OrchestratorConfig,
+    ProviderConfig,
+    RoleConfig,
+    load_config,
+)
+from .models import get_classify_model  # noqa: E402
+
+__all__ = [
+    "load_routing_table",
+    "is_local_only_mode",
+    "ROOTS",
+    "ROOTS_FILE",
+    # legacy
+    "OrchestratorConfig",
+    "ProviderConfig",
+    "RoleConfig",
+    "load_config",
+    "get_classify_model",
+]

@@ -20,7 +20,7 @@ import sys
 
 from chimera import __version__
 
-from . import doctor, route, task
+from . import doctor, monitor, route, task
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     task.add_subparser(subparsers)
     route.add_subparser(subparsers)
     doctor.add_subparser(subparsers)
+    monitor.add_subparser(subparsers)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
