@@ -230,6 +230,43 @@ state-watching daemon makes the externalized-state version of this tractable.
 
 ---
 
+## Phase 12 — Process observability (replace agent polling with blocking SSE)
+
+The gap: Claude Code (and similar agents) polls long-running processes via
+repeated `cat <log>` or `tail` calls. A 5-minute test run → 30+ MCP roundtrips
+where 1 would suffice. Each poll burns context window space and time.
+
+The fix: chimera daemon tails the process internally; agents make ONE
+blocking MCP call that resolves when the process completes or a pattern
+matches. SSE under the hood, MCP tool blocks above it.
+
+| Item | Status | Where | Notes |
+|---|---|---|---|
+| Process registry in monitor daemon | ⬜ | `monitor/processes.py` | dict {label: ProcessHandle}; spawn + capture stdout/stderr |
+| `mcp__chimera__spawn_process(cmd, label, cwd, env)` | ⬜ | server tool | starts a tracked process; returns {label, pid} |
+| `mcp__chimera__wait_for_process(label, completion_signal, timeout_s)` | ⬜ | server tool | **BLOCKS until pattern in output OR exit OR timeout. Returns full output + exit code.** This is the polling-replacement primitive. |
+| `mcp__chimera__follow_process(label, lines_per_chunk, max_chunks)` | ⬜ | server tool | yields chunks via MCP streaming if supported; otherwise returns when buffer fills |
+| `mcp__chimera__list_processes()` | ⬜ | server tool | what's currently being tracked |
+| `mcp__chimera__kill_process(label)` | ⬜ | server tool | clean shutdown |
+| `/api/processes/<label>/stream` SSE | ⬜ | `monitor/api/processes.py` | for the dashboard view |
+| Dashboard panel: live process output | ⬜ | `apps/monitor-ui/src/components/processes/` | tabbed view of all tracked processes |
+
+**Use cases this unblocks:**
+
+1. **Wait for tests:** `wait_for_process("npm-test", completion_signal=r"\d+ passed|\d+ failed", timeout_s=300)` — single tool call replaces polling loop.
+2. **Wait for dev server ready:** `wait_for_process("dev-server", completion_signal=r"Local: http", timeout_s=30)` — agent kicks off `chimera dev`, waits one call for the server to be up before it interacts with the browser.
+3. **Wait for build:** `wait_for_process("vite-build", completion_signal=r"built in", timeout_s=120)`.
+4. **Long migrations:** `wait_for_process("alembic-upgrade", completion_signal=r"Done|Error", timeout_s=600)`.
+
+**Estimated scope:** ~250-350 LOC (process registry + 5 MCP tools + 1 API
+route + dashboard panel). Plumbs through the existing monitor daemon — no
+new long-running services.
+
+**Sequencing:** lands cleanly AFTER Phase 5 (Runtime manager), since
+`chimera dev` will be a heavy user of the process registry.
+
+---
+
 ## Phase 10 — API removal (the deprecation path)
 
 The dev-tool pitch requires "no API keys, no surprise bills." Migration sequence:
@@ -244,6 +281,30 @@ The dev-tool pitch requires "no API keys, no surprise bills." Migration sequence
 
 API-using nodes inventory (from legacy):
 - `validator`, `supervisor`, `critic`, `stress_tester`, `scope_analyzer`, `arbitrator`, `retry_controller`, `compliance`, `refiner/classifier`, `swarm/task_decomposer`, `hypervisor_dispatcher`, `toolbuilder/friction`, `toolbuilder/proposer`, `nodes/balanced/integration_gate`
+
+---
+
+## Known footguns (address before public release)
+
+### Monitor auto-scan kicks off Claude Opus on daemon startup
+
+When `chimera monitor start` runs, the metadata scanner queues every
+discovered project for an LLM-driven scan. Defaults to **Claude Opus 4.7
+on a ~94k-char prompt = ~$1.40 per project, per fresh start.**
+
+For a dev-tool that's pitching "no surprise bills," this is a problem.
+First-run experience burns ~$3 on chimera + 1 other project before the
+user has even queried anything.
+
+**Fix candidates (do one before public release):**
+1. Default `CHIMERA_MONITOR_SCAN_MODEL=gemini` — uses Gemini CLI (subscription) instead of Anthropic API (per-call billing).
+2. Make auto-scan opt-in: env var `CHIMERA_AUTO_SCAN=1` to enable; default off until user runs `chimera monitor scan` manually.
+3. Skip scan entirely under `CHIMERA_LOCAL_ONLY=1`.
+4. Use AMR routing (Phase 3) for the scan call instead of hardcoded Opus — let the auto-router pick a cheaper model.
+
+**Recommendation:** option 4 once AMR's escalation path is solid; option 2
+as the conservative interim default (better UX surprise: "no scan ran, run
+this command" vs "$3 vanished without consent").
 
 ---
 

@@ -12,7 +12,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-_MONITOR_UI = Path(__file__).resolve().parent.parent.parent.parent / "monitor_ui"
+# Workspace layout: packages/chimera/src/chimera/monitor/build.py
+# → parents[5] = workspace root → apps/monitor-ui
+_MONITOR_UI = Path(__file__).resolve().parents[5] / "apps" / "monitor-ui"
 
 
 def ui_root() -> Path:

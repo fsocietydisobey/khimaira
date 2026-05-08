@@ -37,3 +37,11 @@ def get_logger(name: str) -> logging.Logger:
     """Return a logger scoped to the given name, with chimera's stderr config applied."""
     _configure_root()
     return logging.getLogger(name)
+
+
+def setup_logging() -> None:
+    """Compatibility alias for legacy callers — no-op since `get_logger`
+    already configures the root once. Kept so MCP server's `setup_logging()`
+    call still works after migration.
+    """
+    _configure_root()
