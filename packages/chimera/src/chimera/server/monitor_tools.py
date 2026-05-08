@@ -465,7 +465,10 @@ async def wait_for_process(
         return data
 
     reason = data.get("reason", "?")
-    duration = data.get("duration_s", 0)
+    # Prefer process runtime over wait-elapsed time. They diverge when the
+    # process exited before the wait was called (then wait_duration_s ≈ 0
+    # but process_runtime_s reflects the actual work).
+    duration = data.get("process_runtime_s", data.get("duration_s", 0))
     parts = [f"**`{label}`** — finished in {duration:.1f}s ({reason})"]
     if reason == "signal_match":
         parts.append(f"matched: {data.get('matched', '')!r}")

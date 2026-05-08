@@ -465,6 +465,15 @@ def _result(
     duration_s: float,
     matched: str = "",
 ) -> dict:
+    """Build the wait_for_process response.
+
+    Two distinct timings — they look the same when wait blocks the whole
+    time, but diverge when the process exited before the wait was even
+    called (then `wait_duration_s` ≈ 0 but `process_runtime_s` is the real
+    work duration). MCP wrapper uses `process_runtime_s` for the
+    user-facing "finished in" message.
+    """
+    process_runtime_s = (h.ended_at or time.time()) - h.started_at
     return {
         "label": h.label,
         "pid": h.pid,
@@ -474,5 +483,9 @@ def _result(
         "stderr_text": h.stderr_text(),
         "exit_code": h.exit_code,
         "is_running": h.is_running(),
+        # Kept for backwards compat — the wait's own elapsed time
         "duration_s": round(duration_s, 3),
+        # The actual process wall-clock duration. Prefer this in UI/logs.
+        "process_runtime_s": round(process_runtime_s, 3),
+        "wait_duration_s": round(duration_s, 3),
     }

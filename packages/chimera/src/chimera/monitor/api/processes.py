@@ -12,27 +12,33 @@ this module is the dashboard view.
 
 from __future__ import annotations
 
+from pydantic import BaseModel, Field
+
 from chimera.monitor import processes
 
 from .._optional import require
 
 
+# Module-level — FastAPI's body-vs-query auto-detection only fires reliably
+# when the Pydantic class is defined at module scope. Closure-defined
+# classes get treated as query params (same bug pattern as the SSE endpoint).
+class SpawnRequest(BaseModel):
+    cmd: list[str] = Field(min_length=1)
+    label: str = Field(min_length=1, max_length=128)
+    cwd: str | None = None
+    env: dict[str, str] | None = None
+    replace_existing: bool = False
+
+
+class WaitRequest(BaseModel):
+    completion_signal: str | None = None
+    timeout_s: float = Field(default=300.0, ge=1.0, le=3600.0)
+
+
 def build_router():
     fastapi = require("fastapi")
-    from pydantic import BaseModel, Field
     from starlette.requests import Request
     from sse_starlette.sse import EventSourceResponse
-
-    class SpawnRequest(BaseModel):
-        cmd: list[str] = Field(min_length=1)
-        label: str = Field(min_length=1, max_length=128)
-        cwd: str | None = None
-        env: dict[str, str] | None = None
-        replace_existing: bool = False
-
-    class WaitRequest(BaseModel):
-        completion_signal: str | None = None
-        timeout_s: float = Field(default=300.0, ge=1.0, le=3600.0)
 
     router = fastapi.APIRouter()
 

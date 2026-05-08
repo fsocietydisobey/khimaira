@@ -14,36 +14,44 @@ Endpoints:
 
 from __future__ import annotations
 
+from pydantic import BaseModel
+
 from chimera.monitor import sessions
 
 from .._optional import require
 
 
+# Module-level — FastAPI body-detection requires the Pydantic class to be
+# defined at module scope, not in a closure.
+class DecisionReq(BaseModel):
+    text: str
+    why: str = ""
+
+
+class TouchReq(BaseModel):
+    file: str
+    summary: str = ""
+    line_start: int | None = None
+    line_end: int | None = None
+
+
+class QuestionReq(BaseModel):
+    text: str
+
+
+class StatusReq(BaseModel):
+    status: str
+    detail: str = ""
+
+
+class AnswerReq(BaseModel):
+    question_id: str
+    answer: str
+    from_session_id: str = "external"
+
+
 def build_router():
     fastapi = require("fastapi")
-    from pydantic import BaseModel
-
-    class DecisionReq(BaseModel):
-        text: str
-        why: str = ""
-
-    class TouchReq(BaseModel):
-        file: str
-        summary: str = ""
-        line_start: int | None = None
-        line_end: int | None = None
-
-    class QuestionReq(BaseModel):
-        text: str
-
-    class StatusReq(BaseModel):
-        status: str
-        detail: str = ""
-
-    class AnswerReq(BaseModel):
-        question_id: str
-        answer: str
-        from_session_id: str = "external"
 
     router = fastapi.APIRouter()
 
