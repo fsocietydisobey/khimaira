@@ -70,6 +70,7 @@ def build_app():
     from .api import anomalies as anomalies_api
     from .api import api_routes as api_routes_api
     from .api import frontend_components as fc_api
+    from .api import heartbeats as heartbeats_api
     from .api import mcp_calls as mcp_calls_api
     from .api import processes as processes_api
     from .api import projects as projects_api
@@ -90,6 +91,7 @@ def build_app():
     app.include_router(processes_api.build_router(), prefix="/api")
     app.include_router(sessions_api.build_router(), prefix="/api")
     app.include_router(mcp_calls_api.build_router(), prefix="/api")
+    app.include_router(heartbeats_api.build_router(), prefix="/api")
 
     # Auto-scan: kick off background metadata enrichment for any project
     # whose cache is missing or stale. The worker drains serially so we
@@ -164,6 +166,40 @@ def build_app():
                 await asyncio.sleep(300)  # 5 min between passes
 
         asyncio.create_task(_loop())
+
+    # Heartbeat store GC — drop runs idle longer than the TTL.
+    @app.on_event("startup")
+    async def _start_heartbeat_gc() -> None:
+        from . import heartbeats as heartbeats_module
+        asyncio.create_task(heartbeats_module.gc_loop())
+
+    # Attach supervisor — auto-reattach chimera_observer when target venvs
+    # rebuild. Two parts:
+    #   (1) startup pass: re-inject for any project where files vanished
+    #       while daemon was offline.
+    #   (2) live watch: inotify on every attached project's site-packages,
+    #       re-inject on rebuild detection.
+    @app.on_event("startup")
+    async def _start_attach_supervisor() -> None:
+        from . import attach_supervisor
+
+        async def _supervisor() -> None:
+            try:
+                await attach_supervisor.startup_reattach_pass()
+            except Exception as exc:
+                print(
+                    f"chimera monitor: attach supervisor startup pass failed: {exc}",
+                    file=sys.stderr,
+                )
+            try:
+                await attach_supervisor.watch_loop()
+            except Exception as exc:
+                print(
+                    f"chimera monitor: attach supervisor watch loop crashed: {exc}",
+                    file=sys.stderr,
+                )
+
+        asyncio.create_task(_supervisor())
 
     # Static frontend — only mount if dist/ exists; otherwise serve a placeholder
     dist = ui_build.dist_dir()
