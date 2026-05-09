@@ -107,6 +107,31 @@ def build_router():
         """
         return {"questions": sessions.incoming_questions(session_id)}
 
+    @router.get("/sessions/{session_id}/questions/{question_id}/wait")
+    async def wait_for_answer(
+        session_id: str, question_id: str, timeout: float = 300.0
+    ) -> dict:
+        """Long-poll: block until question_id is answered on session_id.
+
+        session_id is the OWNER of the question (the asking session).
+        Returns the answered question record on success. Returns 408
+        (Request Timeout) if no answer in `timeout` seconds. Returns 410
+        (Gone) if the question was withdrawn.
+
+        Caller's HTTP timeout MUST be greater than `timeout` parameter.
+        """
+        try:
+            answered = await sessions.wait_for_answer(
+                session_id, question_id, timeout=timeout
+            )
+            return {"answered": True, "question": answered}
+        except TimeoutError:
+            raise fastapi.HTTPException(
+                408, f"No answer to {question_id} within {timeout:.0f}s"
+            )
+        except ValueError as e:
+            raise fastapi.HTTPException(410, str(e))
+
     @router.post("/sessions/{session_id}/status")
     async def post_status(session_id: str, req: StatusReq) -> dict:
         return sessions.set_status(session_id, req.status, req.detail)

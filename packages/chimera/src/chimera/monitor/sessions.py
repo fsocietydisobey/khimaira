@@ -409,6 +409,56 @@ def pending_notes(session_id: str, mark_read: bool = True) -> list[dict]:
     return pending
 
 
+async def wait_for_answer(
+    target_session_id: str,
+    question_id: str,
+    timeout: float = 300.0,
+    poll_interval: float = 1.0,
+) -> dict:
+    """Block until a specific question is answered, or timeout.
+
+    Real-time-ish coordination primitive: session A logs a targeted
+    question on B, then awaits B's answer in the SAME TURN. Without this,
+    A's turn ends and A only sees B's answer on its next user prompt —
+    forcing the user to type "ok" twice (wake A again) just to relay
+    information that's already in the system.
+
+    Implementation: tail-poll questions.jsonl every poll_interval. The
+    target session may answer via session_post_answer (atomic rewrite),
+    so we always re-read from disk rather than caching.
+
+    `target_session_id` accepts UUID or friendly name; resolved once at
+    entry. `question_id` is the 12-char hex id returned by log_question.
+
+    Raises asyncio.TimeoutError if no answer arrives in time.
+    """
+    import asyncio
+
+    target_session_id = resolve_session_id(target_session_id)
+    qpath = _session_dir(target_session_id) / "questions.jsonl"
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        questions = _read_jsonl(qpath)
+        for q in questions:
+            if q.get("id") != question_id:
+                continue
+            status = q.get("status")
+            if status == "answered":
+                return q
+            if status == "withdrawn":
+                raise ValueError(
+                    f"Question {question_id} was withdrawn before being answered."
+                )
+            break  # found the question but not yet answered; keep polling
+        await asyncio.sleep(poll_interval)
+
+    raise asyncio.TimeoutError(
+        f"No answer to question {question_id} on session "
+        f"{target_session_id} within {timeout:.0f}s"
+    )
+
+
 def incoming_questions(session_id: str) -> list[dict]:
     """Open questions on OTHER sessions that target this session.
 

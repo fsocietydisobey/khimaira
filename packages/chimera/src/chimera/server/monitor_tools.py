@@ -741,6 +741,46 @@ async def session_log_question(
     )
 
 
+async def session_wait_for_answer(
+    session_id: str,
+    question_id: str,
+    timeout: float = 300.0,
+) -> str:
+    """Block until question_id is answered, or timeout.
+
+    Real-time coordination primitive. After logging a TARGETED question
+    on another session, call this to await the answer in the SAME TURN
+    instead of ending the turn and reading the answer next time. Saves
+    a turn-cycle of "wake the asking agent again to read the answer."
+
+    `session_id` is the asking session (where the question was logged).
+    `question_id` is the 12-char hex id returned by session_log_question.
+
+    Returns the answer text on success. Raises if the request errors,
+    times out, or the question was withdrawn.
+    """
+    # HTTP client timeout MUST exceed server-side wait timeout to give
+    # the long-poll a chance to return.
+    http_timeout = timeout + 30.0
+    url = (
+        f"/api/sessions/{urllib.parse.quote(session_id)}"
+        f"/questions/{urllib.parse.quote(question_id)}/wait"
+        f"?timeout={timeout}"
+    )
+    data = _get(url, timeout=http_timeout)
+    if isinstance(data, str):
+        return data
+    if not data.get("answered"):
+        return f"⏱️ no answer within {timeout:.0f}s for q={question_id}"
+    q = data.get("question", {})
+    answer = q.get("answer", "")
+    answered_by = (q.get("answered_by") or "")[:8]
+    return (
+        f"✅ answer received for q={question_id} "
+        f"(answered by {answered_by}):\n\n{answer}"
+    )
+
+
 async def session_incoming_questions(session_id: str) -> str:
     """Open questions from OTHER sessions targeted at this one.
 
