@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
-from chimera.config import OrchestratorConfig, get_classify_model
+from chimera.config import OrchestratorConfig
 from chimera.core.guards import require_plan_approved
 from chimera.core.memory import get_recent_context, save_run
 from chimera.core.state import OrchestratorState
@@ -244,14 +244,13 @@ async def build_pipeline_graph(config: OrchestratorConfig):
     log.info("SPR-4 checkpointer ready: %s", db_path)
 
     # Build the critic/validator model (Haiku — cheap and fast)
-    critic_model = get_classify_model(config)
 
     # Build phase subgraphs (no checkpointer — parent handles persistence)
     # Implementation subgraph gets a separate review_model for cross-model arbitration
-    research_phase = build_research_subgraph(critic_model)
-    planning_phase = build_planning_subgraph(critic_model)
-    implementation_phase = build_implementation_subgraph(critic_model, review_model=critic_model)
-    review_phase = build_review_subgraph(critic_model)
+    research_phase = build_research_subgraph()
+    planning_phase = build_planning_subgraph()
+    implementation_phase = build_implementation_subgraph()
+    review_phase = build_review_subgraph()
 
     # --- Wire the parent graph ---
     graph = StateGraph(OrchestratorState)

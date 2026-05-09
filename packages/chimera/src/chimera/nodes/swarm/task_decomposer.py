@@ -5,11 +5,10 @@ Supports two dispatch modes: flat (all at once) and PDE-F
 (graduated generations based on dependencies).
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from chimera.log import get_logger
+from chimera.dispatch.structured import StructuredCallError, run_structured
 from chimera.core.state import OrchestratorState
 
 log = get_logger("node.task_decomposer")
@@ -60,7 +59,7 @@ class TaskManifest(BaseModel):
     reasoning: str = Field(description="Why this decomposition was chosen")
 
 
-def build_swarm_decomposer_node(model: BaseChatModel):
+def build_swarm_decomposer_node(runner: str = "claude", model: str = "claude-haiku-4-5"):
     """Build a task decomposition node.
 
     Args:
@@ -69,7 +68,6 @@ def build_swarm_decomposer_node(model: BaseChatModel):
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(TaskManifest)
 
     async def task_decomposer_node(state: OrchestratorState) -> dict:
         """Decompose the goal into parallel tasks."""
@@ -85,13 +83,11 @@ def build_swarm_decomposer_node(model: BaseChatModel):
             prompt_parts.append(f"## Context\n\n{context}")
         prompt_parts.append(f"## Budget\n\nMaximum {max_agents} parallel tasks.")
 
-        messages = [
-            SystemMessage(content=DECOMPOSER_SYSTEM_PROMPT),
-            HumanMessage(content="\n\n".join(prompt_parts)),
-        ]
-
-        manifest = await structured_model.ainvoke(messages)
-        assert isinstance(manifest, TaskManifest)
+        prompt = DECOMPOSER_SYSTEM_PROMPT + "\n\n" + "\n\n".join(prompt_parts)
+        manifest, _ = await run_structured(
+            runner, prompt, TaskManifest,
+            model=model, max_retries=2,
+        )
 
         # Validate file ownership — no two tasks share a file
         file_owners: dict[str, str] = {}

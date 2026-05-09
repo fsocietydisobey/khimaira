@@ -9,11 +9,10 @@ to accept, and an overall rationale. The decision feeds back into the
 implementation loop.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from chimera.log import get_logger
+from chimera.dispatch.structured import StructuredCallError, run_structured
 from chimera.core.state import OrchestratorState
 
 log = get_logger("node.arbitrator")
@@ -61,7 +60,7 @@ class ArbitrationDecision(BaseModel):
     )
 
 
-def build_arbitrator_node(model: BaseChatModel):
+def build_arbitrator_node(runner: str = "claude", model: str = "claude-haiku-4-5"):
     """Build a cross-model arbitration node.
 
     IMPORTANT: This should use a DIFFERENT model from the one that produced
@@ -74,7 +73,6 @@ def build_arbitrator_node(model: BaseChatModel):
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(ArbitrationDecision)
 
     async def arbitrator_node(state: OrchestratorState) -> dict:
         """Arbitrate between Stress Tester's restrictions and ScopeAnalyzer's expansions."""
@@ -121,14 +119,11 @@ def build_arbitrator_node(model: BaseChatModel):
         if impl:
             prompt_parts.append(f"## Implementation output (for reference)\n\n{impl[:2000]}")
 
-        messages = [
-            SystemMessage(content=ARBITRATOR_SYSTEM_PROMPT),
-            HumanMessage(content="\n\n".join(prompt_parts)),
-        ]
-
-        decision_raw = await structured_model.ainvoke(messages)
-        assert isinstance(decision_raw, ArbitrationDecision)
-        decision = decision_raw
+        prompt = ARBITRATOR_SYSTEM_PROMPT + "\n\n" + "\n\n".join(prompt_parts)
+        decision, _ = await run_structured(
+            runner, prompt, ArbitrationDecision,
+            model=model, max_retries=2,
+        )
 
         log.info(
             "decision: %d accepted, %d rejected, needs_rework=%s",

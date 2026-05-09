@@ -7,11 +7,10 @@ ScopeAnalyzer does NOT implement. It proposes. Arbitrator decides which proposal
 Capped at 3 proposals per cycle to prevent infinite expansion.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from chimera.log import get_logger
+from chimera.dispatch.structured import StructuredCallError, run_structured
 from chimera.core.state import OrchestratorState
 
 log = get_logger("node.scope_analyzer")
@@ -55,7 +54,7 @@ class ScopeAnalyzerProposal(BaseModel):
     )
 
 
-def build_scope_analyzer_node(model: BaseChatModel):
+def build_scope_analyzer_node(runner: str = "claude", model: str = "claude-haiku-4-5"):
     """Build a scope expansion proposer node.
 
     Args:
@@ -64,7 +63,6 @@ def build_scope_analyzer_node(model: BaseChatModel):
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(ScopeAnalyzerProposal)
 
     async def scope_analyzer_node(state: OrchestratorState) -> dict:
         """Propose improvements beyond the plan."""
@@ -87,14 +85,11 @@ def build_scope_analyzer_node(model: BaseChatModel):
         if impl:
             prompt_parts.append(f"## Implementation output\n\n{impl}")
 
-        messages = [
-            SystemMessage(content=SCOPE_ANALYZER_SYSTEM_PROMPT),
-            HumanMessage(content="\n\n".join(prompt_parts)),
-        ]
-
-        result_raw = await structured_model.ainvoke(messages)
-        assert isinstance(result_raw, ScopeAnalyzerProposal)
-        result = result_raw
+        prompt = SCOPE_ANALYZER_SYSTEM_PROMPT + "\n\n" + "\n\n".join(prompt_parts)
+        result, _ = await run_structured(
+            runner, prompt, ScopeAnalyzerProposal,
+            model=model, max_retries=2,
+        )
 
         # Enforce max 3 proposals
         proposals = result.proposals[:3]

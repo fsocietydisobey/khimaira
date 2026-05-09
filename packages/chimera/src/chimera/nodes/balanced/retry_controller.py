@@ -7,11 +7,10 @@ retry approach: simple retry, model escalation, task decomposition, or graceful 
 Tracks retry history to avoid repeating the same failed approach.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from chimera.log import get_logger
+from chimera.dispatch.structured import StructuredCallError, run_structured
 from chimera.core.state import OrchestratorState
 
 log = get_logger("node.retry_controller")
@@ -61,7 +60,7 @@ class RetryStrategy(BaseModel):
     )
 
 
-def build_retry_controller_node(model: BaseChatModel):
+def build_retry_controller_node(runner: str = "claude", model: str = "claude-haiku-4-5"):
     """Build a strategic retry engine node.
 
     Args:
@@ -70,7 +69,6 @@ def build_retry_controller_node(model: BaseChatModel):
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(RetryStrategy)
 
     async def retry_controller_node(state: OrchestratorState) -> dict:
         """Analyze failure and choose retry strategy."""
@@ -108,12 +106,11 @@ def build_retry_controller_node(model: BaseChatModel):
         else:
             prompt += "No previous retries.\n"
 
-        messages = [
-            SystemMessage(content=RETRY_CONTROLLER_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-
-        strategy_raw = await structured_model.ainvoke(messages)
+        prompt = f"{RETRY_CONTROLLER_SYSTEM_PROMPT}\n\n{prompt}"
+        strategy_raw, _ = await run_structured(
+            runner, prompt, RetryStrategy,
+            model=model, max_retries=2,
+        )
         assert isinstance(strategy_raw, RetryStrategy)
         strategy = strategy_raw
 

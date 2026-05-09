@@ -13,7 +13,7 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from chimera.config import OrchestratorConfig, get_classify_model
+from chimera.config import OrchestratorConfig
 from chimera.core.state import OrchestratorState
 from chimera.log import get_logger
 from chimera.nodes.swarm.aggregator import build_swarm_aggregator_node
@@ -115,9 +115,7 @@ async def build_swarm_graph(config: OrchestratorConfig):
     checkpointer = AsyncSqliteSaver(conn)
     await checkpointer.setup()
     log.info("PDE checkpointer ready: %s", db_path)
-
-    model = get_classify_model(config)
-    task_decomposer_node = build_swarm_decomposer_node(model)
+    task_decomposer_node = build_swarm_decomposer_node()
     pde_worker_node = build_swarm_worker_node()
     merge_node = build_swarm_aggregator_node()
 

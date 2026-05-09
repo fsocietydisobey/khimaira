@@ -15,7 +15,7 @@ import asyncio
 
 from langgraph.graph import END, START, StateGraph
 
-from chimera.config import OrchestratorConfig, get_classify_model
+from chimera.config import OrchestratorConfig
 from chimera.core.directives import check_directives
 from chimera.core.resource_control import GlobalBudget
 from chimera.core.state import OrchestratorState
@@ -208,10 +208,8 @@ async def build_hypervisor_graph(config: OrchestratorConfig):
     checkpointer = AsyncSqliteSaver(conn)
     await checkpointer.setup()
     log.info("HVD checkpointer ready: %s", db_path)
-
-    model = get_classify_model(config)
     health_scanner_node = build_health_scanner_node()
-    hvd_dispatch_node = build_hypervisor_dispatcher_node(model)
+    hvd_dispatch_node = build_hypervisor_dispatcher_node()
 
     graph = StateGraph(OrchestratorState)
 

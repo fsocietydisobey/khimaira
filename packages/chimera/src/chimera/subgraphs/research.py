@@ -7,7 +7,6 @@ The critic scores research_findings and decides whether more research is
 needed. The loop runs until the critic passes or max steps are reached.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
 from chimera.nodes.pipeline.critic import build_critic_node
@@ -23,7 +22,7 @@ def _after_critic(state: OrchestratorState) -> str:
     return END
 
 
-def build_research_subgraph(critic_model: BaseChatModel):
+def build_research_subgraph():
     """Build the research phase subgraph.
 
     Args:
@@ -33,7 +32,7 @@ def build_research_subgraph(critic_model: BaseChatModel):
         Compiled StateGraph (no checkpointer — parent handles that).
     """
     research_node = build_research_node()
-    critic_node = build_critic_node(critic_model, "research")
+    critic_node = build_critic_node("research")
 
     graph = StateGraph(OrchestratorState)
 

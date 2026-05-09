@@ -1,18 +1,20 @@
 """Validator node — scores the most recent output for quality.
 
-Uses a cheap model (Haiku) to evaluate whether research findings or
-architecture plans are complete, specific, and actionable. The score
-and feedback are written to state so the supervisor can decide whether
-to retry or move forward.
+Phase 10 migrated: uses CLI runner via run_structured, NOT langchain.
+Default runner=claude, model=claude-haiku-4-5 (cheap+fast). Caller can
+override via build_validator_node(runner=..., model=...).
+
+The score and feedback are written to state so the supervisor can decide
+whether to retry or move forward.
 """
 
-import json
+from __future__ import annotations
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
-from chimera.log import get_logger
 from chimera.core.state import OrchestratorState
+from chimera.dispatch.structured import StructuredCallError, run_structured
+from chimera.log import get_logger
 
 log = get_logger("node.validator")
 
@@ -25,23 +27,26 @@ You are a quality validator. Score the most recent output on a 0.0-1.0 scale.
 - **Specificity** (0.25): Does it reference concrete details (file paths, function names, patterns)?
 - **Actionability** (0.25): Could someone act on this without asking follow-up questions?
 - **Accuracy** (0.25): Does it avoid hallucinations, vague hand-waving, or generic advice?
-
-## Response format
-
-Respond with ONLY a JSON object:
-
-{
-  "score": 0.0-1.0,
-  "feedback": "Brief, actionable feedback. What's missing or weak? Empty if score >= 0.7."
-}
 """
 
 
-def build_validator_node(model: BaseChatModel):
+class ValidationResult(BaseModel):
+    score: float = Field(ge=0.0, le=1.0, description="Quality score 0..1")
+    feedback: str = Field(
+        default="",
+        description="Brief, actionable feedback on what's missing or weak. Empty when score >= 0.7.",
+    )
+
+
+def build_validator_node(
+    runner: str = "claude",
+    model: str = "claude-haiku-4-5",
+):
     """Build a validator node that scores output quality.
 
     Args:
-        model: LangChain chat model (cheap/fast — Haiku recommended).
+        runner: CLI runner — 'claude' (default), 'codex', 'gemini', 'ollama', 'llm'.
+        model: model identifier passed to the runner. Default haiku 4.5 — cheap+fast.
 
     Returns:
         Async node function compatible with LangGraph StateGraph.
@@ -50,20 +55,16 @@ def build_validator_node(model: BaseChatModel):
     async def validator_node(state: OrchestratorState) -> dict:
         """Score the most recent output and provide feedback."""
         task = state.get("task", "")
-        history = state.get("history", [])
+        history = list(state.get("history", []))
 
-        # Determine what to validate — most recent substantial output
         plan = state.get("architecture_plan", "")
         findings = state.get("research_findings", "")
 
         if plan:
-            output_type = "architecture plan"
-            output_content = plan
+            output_type, output_content = "architecture plan", plan
         elif findings:
-            output_type = "research findings"
-            output_content = findings
+            output_type, output_content = "research findings", findings
         else:
-            # Nothing to validate
             return {
                 "validation_score": 1.0,
                 "validation_feedback": "",
@@ -71,29 +72,29 @@ def build_validator_node(model: BaseChatModel):
             }
 
         prompt = (
+            f"{VALIDATOR_SYSTEM_PROMPT}\n\n"
             f"## Task\n\n{task}\n\n"
             f"## Output to evaluate ({output_type})\n\n{output_content}"
         )
 
-        messages = [
-            SystemMessage(content=VALIDATOR_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-        response = await model.ainvoke(messages)
-        raw = response.content.strip()
-
-        # Parse JSON
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
         try:
-            result = json.loads(raw)
-            score = float(result.get("score", 0.5))
-            feedback = result.get("feedback", "")
-        except (json.JSONDecodeError, ValueError):
+            result, _ = await run_structured(
+                runner,
+                prompt,
+                ValidationResult,
+                model=model,
+                max_retries=2,
+            )
+            score = result.score
+            feedback = result.feedback
+        except StructuredCallError as exc:
+            log.warning("validator: structured call failed (%s) — defaulting to 0.5", exc)
             score = 0.5
-            feedback = "Failed to parse validator response."
-            log.warning("failed to parse response: %s", raw[:200])
+            feedback = "Validator call failed; defaulting to neutral."
+        except Exception as exc:
+            log.warning("validator: unexpected error (%s) — defaulting to 0.5", exc)
+            score = 0.5
+            feedback = f"Validator error: {exc}"
 
         log.info("scored %s: %.2f%s", output_type, score, f" — {feedback}" if feedback else "")
 

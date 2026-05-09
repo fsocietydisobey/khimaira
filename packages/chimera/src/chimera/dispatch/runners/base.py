@@ -112,16 +112,54 @@ def kill_all_subprocesses() -> None:
     _active_pids.clear()
 
 
+# Auth env vars chimera scrubs from spawned CLI subprocesses by default.
+# Why: when the user has ANTHROPIC_API_KEY (or equivalent) set in their
+# shell AND also has Claude Code / Codex / Gemini OAuth subscriptions,
+# the spawned `claude -p ...` subprocess inherits the env and prefers the
+# API key — billing API instead of subscription. This breaks chimera's
+# core "no API spend" pitch silently.
+#
+# Scrubbing these env vars forces the spawned CLI to fall back to its
+# OAuth subscription auth. Users who EXPLICITLY want API billing can set
+# CHIMERA_USE_API=true to disable scrubbing.
+_API_KEY_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "GOOGLE_AI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+)
+
+
+def _build_subprocess_env() -> dict[str, str]:
+    """Return os.environ minus API auth vars (unless user opted in via
+    CHIMERA_USE_API=true). Subprocesses inherit this so spawned CLIs use
+    their OAuth subscription auth, not API keys."""
+    env = dict(os.environ)
+    if env.get("CHIMERA_USE_API", "").lower() in ("1", "true", "yes"):
+        return env
+    for var in _API_KEY_ENV_VARS:
+        env.pop(var, None)
+    return env
+
+
 def _run_subprocess_sync(
     cmd: list[str],
     timeout: int,
     cwd: str | None,
     stdin: str | None = None,
 ) -> tuple[bytes, bytes, int]:
-    """Spawn a subprocess in the calling thread. Returns (stdout, stderr, code)."""
+    """Spawn a subprocess in the calling thread. Returns (stdout, stderr, code).
+
+    Env: API auth keys are scrubbed by default (see _build_subprocess_env)
+    so spawned CLIs use OAuth subscription, not API. Override with
+    CHIMERA_USE_API=true.
+    """
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
+        env=_build_subprocess_env(),
         stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

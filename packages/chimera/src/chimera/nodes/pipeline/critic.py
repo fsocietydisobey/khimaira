@@ -10,15 +10,18 @@ Phase-specific behavior:
     implementation: scores implementation_result → "tests_failing" or "ready_for_review"
 """
 
-import json
+from pydantic import BaseModel, Field
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from chimera.log import get_logger
 from chimera.core.state import OrchestratorState
+from chimera.dispatch.structured import StructuredCallError, run_structured
+from chimera.log import get_logger
 
 log = get_logger("node.critic")
+
+
+class CriticResult(BaseModel):
+    score: float = Field(ge=0.0, le=1.0)
+    feedback: str = Field(default="")
 
 CRITIC_SYSTEM_PROMPT = """\
 You are a quality critic evaluating the output of a {phase} phase.
@@ -51,16 +54,20 @@ _HANDOFF_MAP: dict[str, tuple[str, str]] = {
 QUALITY_THRESHOLD = 0.7
 
 
-def build_critic_node(model: BaseChatModel, phase: str):
+def build_critic_node(
+    phase: str,
+    runner: str = "claude",
+    model: str = "claude-haiku-4-5",
+):
     """Build a critic node for a specific SPR-4 phase.
 
-    The critic scores the phase's output and sets handoff_type to control
-    whether the subgraph loops (retry) or exits (proceed to next phase).
-    Also increments phase_step and enforces max step limits.
+    Phase 10 migrated: uses CLI runner via run_structured. Default
+    runner=claude, model=haiku-4-5 (cheap+fast).
 
     Args:
-        model: LangChain chat model (cheap/fast — Haiku recommended).
         phase: One of "research", "planning", "implementation".
+        runner: CLI runner.
+        model: model identifier for the runner.
 
     Returns:
         Async node function compatible with LangGraph StateGraph.
@@ -101,28 +108,22 @@ def build_critic_node(model: BaseChatModel, phase: str):
             f"## Output to evaluate ({field_label})\n\n{output_content}"
         )
 
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=prompt),
-        ]
-
-        response = await model.ainvoke(messages)
-        content = response.content
-        raw = content if isinstance(content, str) else str(content)
-        raw = raw.strip()
-
-        # Parse JSON
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
+        full_prompt = f"{system_prompt}\n\n{prompt}"
         try:
-            result = json.loads(raw)
-            score = float(result.get("score", 0.5))
-            feedback = result.get("feedback", "")
-        except (json.JSONDecodeError, ValueError):
+            critic_result, _ = await run_structured(
+                runner, full_prompt, CriticResult,
+                model=model, max_retries=2,
+            )
+            score = critic_result.score
+            feedback = critic_result.feedback
+        except StructuredCallError as exc:
+            log.warning("[%s] critic call failed (%s) — defaulting to 0.5", phase, exc)
             score = 0.5
-            feedback = "Failed to parse critic response."
-            log.warning("[%s] failed to parse response: %s", phase, raw[:200])
+            feedback = "Critic call failed; defaulting to neutral."
+        except Exception as exc:
+            log.warning("[%s] critic unexpected error (%s)", phase, exc)
+            score = 0.5
+            feedback = f"Critic error: {exc}"
 
         # Decide handoff
         if score >= QUALITY_THRESHOLD or phase_step >= max_steps:

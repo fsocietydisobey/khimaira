@@ -11,12 +11,11 @@ Uses Pydantic structured output for type-safe, validated decisions.
 
 from typing import Literal
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from chimera.log import get_logger
 from chimera.core.state import OrchestratorState
+from chimera.dispatch.structured import StructuredCallError, run_structured
+from chimera.log import get_logger
 
 log = get_logger("supervisor")
 
@@ -126,16 +125,22 @@ class RouterDecision(BaseModel):
     )
 
 
-def build_supervisor_node(model: BaseChatModel):
+def build_supervisor_node(
+    runner: str = "claude",
+    model: str = "claude-haiku-4-5",
+):
     """Build a supervisor node that uses structured output for routing decisions.
 
+    Phase 10 migrated: uses CLI runner via run_structured, NOT langchain.
+    Default haiku 4.5 — cheap+fast, fits supervisor's high-call-rate workload.
+
     Args:
-        model: LangChain chat model (cheap/fast — Haiku recommended).
+        runner: CLI runner — 'claude' / 'codex' / 'gemini' / 'ollama' / 'llm'.
+        model: model identifier passed to the runner.
 
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(RouterDecision)
 
     async def supervisor_node(state: OrchestratorState) -> dict:
         """Inspect state and decide the next step."""
@@ -224,12 +229,20 @@ def build_supervisor_node(model: BaseChatModel):
         _t1 = _time.monotonic()
         log.info("building state summary took %.1fs", _t1 - _t0)
 
-        messages = [
-            SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
-            HumanMessage(content=state_summary),
-        ]
+        prompt = f"{SUPERVISOR_SYSTEM_PROMPT}\n\n{state_summary}"
 
-        decision: RouterDecision = await structured_model.ainvoke(messages)
+        try:
+            decision, _ = await run_structured(
+                runner, prompt, RouterDecision,
+                model=model, max_retries=2,
+            )
+        except StructuredCallError as exc:
+            log.warning("supervisor: structured call failed (%s) — defaulting to finish", exc)
+            decision = RouterDecision(
+                next_step="finish",
+                rationale=f"Supervisor call failed: {exc}",
+                instructions="",
+            )
         _t2 = _time.monotonic()
         log.info("decision: %s — %s (LLM call: %.1fs, total: %.1fs)", decision.next_step, decision.rationale, _t2 - _t1, _t2 - _t0)
 

@@ -8,7 +8,6 @@ The guard node enforces the plan_approved invariant — implementation
 cannot proceed without an approved architecture plan.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
 from chimera.core.guards import require_plan_approved
@@ -72,27 +71,22 @@ def _after_arbitrator(state: OrchestratorState) -> str:
     return "compliance"  # Proceed to formatting
 
 
-def build_implementation_subgraph(
-    critic_model: BaseChatModel,
-    review_model: BaseChatModel | None = None,
-):
+def build_implementation_subgraph():
     """Build the implementation phase subgraph with TFB balanced forces.
 
     Flow: guard → implement → stress_tester → scope_analyzer → arbitrator → compliance → exit
     With loop: if arbitrator says needs_rework → back to implement
 
-    Args:
-        critic_model: LangChain model for Stress Tester and ScopeAnalyzer (Haiku).
-        review_model: LangChain model for Arbitrator (should be different from
-            the builder for cross-model review). Falls back to critic_model.
+    Phase 10 migrated: child nodes use CLI runners with Haiku defaults
+    (no model arg needed). Override per-node via their explicit args.
 
     Returns:
         Compiled StateGraph (no checkpointer — parent handles that).
     """
     implement_node = build_implement_node()
-    stress_tester_node = build_stress_tester_node(critic_model)
-    scope_analyzer_node = build_scope_analyzer_node(critic_model)
-    arbitrator_node = build_arbitrator_node(review_model or critic_model)
+    stress_tester_node = build_stress_tester_node()
+    scope_analyzer_node = build_scope_analyzer_node()
+    arbitrator_node = build_arbitrator_node()
     compliance_node = build_compliance_node()
 
     graph = StateGraph(OrchestratorState)

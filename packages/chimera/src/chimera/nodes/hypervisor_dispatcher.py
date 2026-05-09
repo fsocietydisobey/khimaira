@@ -4,11 +4,10 @@ Reads the health report and spec progress, decides whether to spawn
 CLR (refinement), PDE (parallel dispatch), or SPR-4 (single task).
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from chimera.log import get_logger
+from chimera.dispatch.structured import StructuredCallError, run_structured
 from chimera.core.state import OrchestratorState
 
 log = get_logger("node.hvd_dispatcher")
@@ -49,7 +48,7 @@ class DispatchDecision(BaseModel):
     )
 
 
-def build_hypervisor_dispatcher_node(model: BaseChatModel):
+def build_hypervisor_dispatcher_node(runner: str = "claude", model: str = "claude-haiku-4-5"):
     """Build HVD's pattern dispatch node.
 
     Args:
@@ -58,7 +57,6 @@ def build_hypervisor_dispatcher_node(model: BaseChatModel):
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(DispatchDecision)
 
     async def dispatch_node(state: OrchestratorState) -> dict:
         """Decide which pattern to spawn."""
@@ -103,12 +101,11 @@ def build_hypervisor_dispatcher_node(model: BaseChatModel):
             f"- Budget remaining: ${remaining:.2f}\n"
         )
 
-        messages = [
-            SystemMessage(content=DISPATCH_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-
-        decision = await structured_model.ainvoke(messages)
+        prompt = f"{DISPATCH_SYSTEM_PROMPT}\n\n{prompt}"
+        decision, _ = await run_structured(
+            runner, prompt, DispatchDecision,
+            model=model, max_retries=2,
+        )
         assert isinstance(decision, DispatchDecision)
 
         log.info("dispatch: %s — %s", decision.pattern, decision.reasoning)

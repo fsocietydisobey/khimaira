@@ -4,11 +4,10 @@ Reads the health report and decides: fix (defects), refactor (code smells),
 feature (next spec item), or idle (converged). Uses Haiku for fast classification.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from chimera.log import get_logger
+from chimera.dispatch.structured import StructuredCallError, run_structured
 from chimera.core.state import OrchestratorState
 
 log = get_logger("node.triage")
@@ -44,7 +43,7 @@ class TriageDecision(BaseModel):
     spec_item: str = Field(default="", description="Which SPEC.md item (if action is feature)")
 
 
-def build_classifier_node(model: BaseChatModel):
+def build_classifier_node(runner: str = "claude", model: str = "claude-haiku-4-5"):
     """Build a triage node for CLR's refinement loop.
 
     Args:
@@ -53,7 +52,6 @@ def build_classifier_node(model: BaseChatModel):
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(TriageDecision)
 
     async def classifier_node(state: OrchestratorState) -> dict:
         """Classify the highest-priority action."""
@@ -98,12 +96,11 @@ def build_classifier_node(model: BaseChatModel):
             recent = history[-5:]
             prompt += "\n## Recent history\n\n" + "\n".join(f"- {h}" for h in recent)
 
-        messages = [
-            SystemMessage(content=TRIAGE_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-
-        decision = await structured_model.ainvoke(messages)
+        prompt = f"{TRIAGE_SYSTEM_PROMPT}\n\n{prompt}"
+        decision, _ = await run_structured(
+            runner, prompt, TriageDecision,
+            model=model, max_retries=2,
+        )
         assert isinstance(decision, TriageDecision)
 
         log.info("cycle %d: %s — %s", cycle, decision.action, decision.reasoning)

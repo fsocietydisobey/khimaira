@@ -5,12 +5,11 @@ what kind of tool would eliminate each friction point.
 Uses Haiku for classification.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from chimera.core.state import OrchestratorState
 from chimera.log import get_logger
+from chimera.dispatch.structured import StructuredCallError, run_structured
 
 log = get_logger("node.toolbuilder_friction")
 
@@ -56,7 +55,7 @@ class FrictionAnalysis(BaseModel):
     total_signals_analyzed: int = Field(description="Number of signals that were analyzed")
 
 
-def build_toolbuilder_friction_node(model: BaseChatModel):
+def build_toolbuilder_friction_node(runner: str = "claude", model: str = "claude-haiku-4-5"):
     """Build a friction analyzer node.
 
     Args:
@@ -65,7 +64,6 @@ def build_toolbuilder_friction_node(model: BaseChatModel):
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(FrictionAnalysis)
 
     async def toolbuilder_friction_node(state: OrchestratorState) -> dict:
         """Analyze behavioral signals and identify friction points."""
@@ -91,12 +89,11 @@ def build_toolbuilder_friction_node(model: BaseChatModel):
             + "\n".join(signal_lines)
         )
 
-        messages = [
-            SystemMessage(content=FRICTION_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-
-        analysis = await structured_model.ainvoke(messages)
+        prompt = f"{FRICTION_SYSTEM_PROMPT}\n\n{prompt}"
+        analysis, _ = await run_structured(
+            runner, prompt, FrictionAnalysis,
+            model=model, max_retries=2,
+        )
         assert isinstance(analysis, FrictionAnalysis)
 
         friction_dicts = [

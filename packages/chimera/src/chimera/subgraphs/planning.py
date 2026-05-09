@@ -7,7 +7,6 @@ Stress Tester replaces the passive critic — it actively tries to find flaws in
 architecture plan. If blockers are found, the architect revises.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
 from chimera.core.state import OrchestratorState
@@ -31,7 +30,7 @@ def _after_stress_tester(state: OrchestratorState) -> str:
     return "critic"  # Pass to critic for final scoring + handoff decision
 
 
-def build_planning_subgraph(critic_model: BaseChatModel):
+def build_planning_subgraph():
     """Build the planning phase subgraph with Stress Tester adversarial review.
 
     Flow: architect → stress_tester (adversarial) → critic (score + handoff) → loop/exit
@@ -47,8 +46,8 @@ def build_planning_subgraph(critic_model: BaseChatModel):
         Compiled StateGraph (no checkpointer — parent handles that).
     """
     architect_node = build_architect_node()
-    stress_tester_node = build_stress_tester_node(critic_model)
-    critic_node = build_critic_node(critic_model, "planning")
+    stress_tester_node = build_stress_tester_node()
+    critic_node = build_critic_node("planning")
 
     graph = StateGraph(OrchestratorState)
 

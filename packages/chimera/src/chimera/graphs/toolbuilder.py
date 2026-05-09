@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
-from chimera.config import OrchestratorConfig, get_classify_model
+from chimera.config import OrchestratorConfig
 from chimera.core.state import OrchestratorState
 from chimera.log import get_logger
 from chimera.nodes.toolbuilder.forge import build_toolbuilder_forge_node
@@ -57,11 +57,9 @@ async def build_toolbuilder_graph(config: OrchestratorConfig):
     checkpointer = AsyncSqliteSaver(conn)
     await checkpointer.setup()
     log.info("POB checkpointer ready: %s", db_path)
-
-    model = get_classify_model(config)
     watcher_node = build_toolbuilder_watcher_node()
-    friction_node = build_toolbuilder_friction_node(model)
-    proposer_node = build_toolbuilder_proposer_node(model)
+    friction_node = build_toolbuilder_friction_node()
+    proposer_node = build_toolbuilder_proposer_node()
     forge_node = build_toolbuilder_forge_node()
     pr_creator_node = build_toolbuilder_pr_creator_node()
 

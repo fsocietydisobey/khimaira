@@ -7,11 +7,10 @@ Produces a structured verdict with categorized issues at blocker/warning/note se
 Any blocker forces a rework. Warnings are passed to Arbitrator for arbitration.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from chimera.log import get_logger
+from chimera.dispatch.structured import StructuredCallError, run_structured
 from chimera.core.state import OrchestratorState
 
 log = get_logger("node.stress_tester")
@@ -58,7 +57,7 @@ class StressTestVerdict(BaseModel):
     summary: str = Field(description="One-sentence summary of the verdict")
 
 
-def build_stress_tester_node(model: BaseChatModel):
+def build_stress_tester_node(runner: str = "claude", model: str = "claude-haiku-4-5"):
     """Build an adversarial validator node.
 
     Args:
@@ -67,7 +66,6 @@ def build_stress_tester_node(model: BaseChatModel):
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(StressTestVerdict)
 
     async def stress_tester_node(state: OrchestratorState) -> dict:
         """Adversarially review the most recent output."""
@@ -104,12 +102,11 @@ def build_stress_tester_node(model: BaseChatModel):
         if target_type == "implementation" and plan:
             prompt += f"\n\n## Architecture plan (for scope comparison)\n\n{plan}"
 
-        messages = [
-            SystemMessage(content=STRESS_TESTER_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-
-        verdict_raw = await structured_model.ainvoke(messages)
+        prompt = f"{STRESS_TESTER_SYSTEM_PROMPT}\n\n{prompt}"
+        verdict_raw, _ = await run_structured(
+            runner, prompt, StressTestVerdict,
+            model=model, max_retries=2,
+        )
         assert isinstance(verdict_raw, StressTestVerdict)
         verdict = verdict_raw
 

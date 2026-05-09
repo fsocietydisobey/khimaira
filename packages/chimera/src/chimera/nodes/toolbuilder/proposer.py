@@ -6,13 +6,12 @@ Uses Haiku for spec generation.
 
 import time
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from chimera.core.state import OrchestratorState
 from chimera.core.toolbuilder_memory import get_rejected_types, last_proposal_time
 from chimera.log import get_logger
+from chimera.dispatch.structured import StructuredCallError, run_structured
 
 log = get_logger("node.toolbuilder_proposer")
 
@@ -44,7 +43,7 @@ class ToolSpec(BaseModel):
     usage: str = Field(description="How to use the tool")
 
 
-def build_toolbuilder_proposer_node(model: BaseChatModel):
+def build_toolbuilder_proposer_node(runner: str = "claude", model: str = "claude-haiku-4-5"):
     """Build a proposer node that selects and specs a tool to build.
 
     Args:
@@ -53,7 +52,6 @@ def build_toolbuilder_proposer_node(model: BaseChatModel):
     Returns:
         Async node function compatible with LangGraph StateGraph.
     """
-    structured_model = model.with_structured_output(ToolSpec)
 
     async def toolbuilder_proposer_node(state: OrchestratorState) -> dict:
         """Select a friction point and generate a tool spec."""
@@ -102,12 +100,11 @@ def build_toolbuilder_proposer_node(model: BaseChatModel):
             f"**Estimated time saved:** {selected['estimated_time_saved']}\n"
         )
 
-        messages = [
-            SystemMessage(content=PROPOSER_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-
-        spec = await structured_model.ainvoke(messages)
+        prompt = f"{PROPOSER_SYSTEM_PROMPT}\n\n{prompt}"
+        spec, _ = await run_structured(
+            runner, prompt, ToolSpec,
+            model=model, max_retries=2,
+        )
         assert isinstance(spec, ToolSpec)
 
         # Validate paths

@@ -8,7 +8,6 @@ then pauses for human approval via the existing human_review node.
 The human sets human_approved on approval or provides feedback on rejection.
 """
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
 from chimera.core.state import OrchestratorState
@@ -35,7 +34,7 @@ async def _set_review_handoff(state: OrchestratorState) -> dict:
         }
 
 
-def build_review_subgraph(validator_model: BaseChatModel):
+def build_review_subgraph():
     """Build the review phase subgraph with Integration Gate integration gate.
 
     Flow: integration_gate → human_review (HITL) → set_handoff → exit

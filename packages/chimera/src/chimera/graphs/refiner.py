@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
-from chimera.config import OrchestratorConfig, get_classify_model
+from chimera.config import OrchestratorConfig
 from chimera.core.fitness import assess_health
 from chimera.core.refiner_memory import get_last_cycle_number, get_recent_cycles, log_cycle
 from chimera.core.state import OrchestratorState
@@ -234,10 +234,8 @@ async def build_refiner_graph(config: OrchestratorConfig):
     checkpointer = AsyncSqliteSaver(conn)
     await checkpointer.setup()
     log.info("CLR checkpointer ready: %s", db_path)
-
-    model = get_classify_model(config)
     health_scanner_node = build_health_scanner_node()
-    classifier_node = build_classifier_node(model)
+    classifier_node = build_classifier_node()
 
     graph = StateGraph(OrchestratorState)
 

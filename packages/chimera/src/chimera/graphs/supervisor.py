@@ -166,11 +166,10 @@ async def build_orchestrator_graph(config: OrchestratorConfig):
     await checkpointer.setup()
     log.info("checkpointer ready: %s", db_path)
 
-    # Supervisor and validator use a cheap/fast API model
-    supervisor_model = get_classify_model(config)
-
-    supervisor_node = build_supervisor_node(supervisor_model)
-    validator_node = build_validator_node(supervisor_model)
+    # Supervisor and validator use a cheap/fast CLI runner — defaults to
+    # Claude Haiku via subscription (no API spend). Phase 10 migrated.
+    supervisor_node = build_supervisor_node()
+    validator_node = build_validator_node()
     research_node = build_research_node()
     architect_node = build_architect_node()
     implement_node = build_implement_node()
