@@ -741,6 +741,31 @@ async def session_log_question(
     )
 
 
+async def session_ack_notes(
+    session_id: str,
+    note_ids: list[str] | None = None,
+) -> str:
+    """Mark inbox notes as read after surfacing their content to the user.
+
+    The auto-inject hook re-surfaces unread notes every turn until acked
+    or until 3 surfaces (auto-expire safety net). Call this after you've
+    relayed the notice content in your response so the same note doesn't
+    re-loop into context next turn.
+
+    `note_ids=None` acks all currently-unread notes — fine when you've
+    surfaced everything in this turn's `📬 chimera inbox` block.
+    """
+    body: dict[str, Any] = {"note_ids": note_ids}
+    data = _post(
+        f"/api/sessions/{urllib.parse.quote(session_id)}/inbox/ack",
+        body,
+        timeout=10.0,
+    )
+    if isinstance(data, str):
+        return data
+    return f"📭 acked {data.get('acked', 0)} note(s)"
+
+
 async def session_post_notice(
     target_session_id: str,
     text: str,

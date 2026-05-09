@@ -62,12 +62,20 @@ def _write_count(path: Path, n: int) -> None:
 
 
 def _fetch_pending_notes(session_id: str) -> list[dict]:
-    """Hit /api/sessions/{sid}/pending; return notes list or [] on any failure.
+    """Hit /api/sessions/{sid}/inbox/surface; return notes or [] on failure.
 
-    mark_read=true so notes don't re-surface on subsequent turns. The agent
-    sees each note exactly once unless another session re-posts.
+    Uses the surface endpoint (NOT /pending) so notes are NOT marked read
+    on first fetch. Notes re-surface every turn until either:
+      • The agent calls session_ack_notes after surfacing the content
+      • surface_count exceeds the auto-expire threshold (3 surfaces)
+
+    This is symmetric with the incoming-questions behavior: unread/
+    unanswered cross-session info stays in context until handled, rather
+    than being silently consumed by the hook (which was the v1 design's
+    flaw — agents could ignore the injected block and the user would
+    never see the message).
     """
-    url = f"{_ENDPOINT}/api/sessions/{session_id}/pending?mark_read=true"
+    url = f"{_ENDPOINT}/api/sessions/{session_id}/inbox/surface"
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=_INBOX_TIMEOUT_S) as resp:
@@ -98,25 +106,46 @@ def _fetch_incoming_questions(session_id: str) -> list[dict]:
         return []
 
 
-def _format_inbox(notes: list[dict]) -> str:
-    """Render notes as compact context block. Truncates long bodies."""
-    lines = [f"📬 chimera inbox: {len(notes)} new note(s) from other sessions:"]
+def _format_inbox(notes: list[dict], session_id: str) -> str:
+    """Render notes as compact context block.
+
+    Each note carries a `_remaining_surfaces` field — how many more turns
+    this note will keep re-injecting before auto-expiring. The agent is
+    expected to surface the content to the user AND call session_ack_notes
+    to clear the unread flag immediately (not wait for auto-expire).
+    """
+    lines = [
+        f"📬 chimera inbox: {len(notes)} unread note(s) from other sessions.",
+        "**ACTION REQUIRED:** surface these to the user in your response,",
+        f"then call `session_ack_notes(session_id=\"{session_id}\")` to",
+        "clear them. Without ack, they re-surface each turn (up to 3) then",
+        "auto-expire — you risk the user never seeing them.",
+        "",
+    ]
     for n in notes:
         kind = n.get("kind") or "note"
         from_sid = (n.get("from_session_id") or "")[:8] or "external"
+        nid = n.get("id", "?")
+        remaining = n.get("_remaining_surfaces")
         # 'answer' notes have answer text in `answer` field, not `text`.
-        # Decisions/touches (future) would use `text`.
         body = (n.get("answer") or n.get("text") or "").strip()
         if len(body) > 600:
             body = body[:600] + "…"
         question_text = (n.get("question_text") or "").strip()
         if question_text and len(question_text) > 200:
             question_text = question_text[:200] + "…"
-        lines.append(f"  • [{kind} from {from_sid}]")
+        urgency = ""
+        if remaining is not None:
+            if remaining <= 0:
+                urgency = " — LAST SURFACE before auto-expire"
+            elif remaining == 1:
+                urgency = f" — {remaining} more surface remaining"
+            else:
+                urgency = f" — {remaining} more surfaces remaining"
+        lines.append(f"  • [{kind} from {from_sid} | id={nid}{urgency}]")
         if question_text:
             lines.append(f"    re Q: {question_text}")
         lines.append(f"    {body}")
-    lines.append("(auto-read; no need to call session_pending_notes for these)")
     return "\n".join(lines)
 
 
@@ -160,7 +189,7 @@ def main() -> int:
     inbox_block = ""
     notes = _fetch_pending_notes(session_id)
     if notes:
-        inbox_block = _format_inbox(notes)
+        inbox_block = _format_inbox(notes, session_id)
 
     # --- Incoming questions targeting this session (every turn) -----------
     # Re-fetched each turn (no mark-read concept) — open questions stay

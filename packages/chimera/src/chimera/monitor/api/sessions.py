@@ -60,6 +60,10 @@ class NoticeReq(BaseModel):
     from_session_id: str = "external"
 
 
+class AckNotesReq(BaseModel):
+    note_ids: list[str] | None = None  # None = ack all unread
+
+
 def build_router():
     fastapi = require("fastapi")
 
@@ -173,5 +177,22 @@ def build_router():
             req.text,
             from_session_id=req.from_session_id,
         )
+
+    @router.get("/sessions/{session_id}/inbox/surface")
+    async def surface_inbox(session_id: str) -> dict:
+        """Hook-only fetch path. Returns unread notes + increments
+        surface_count. Notes auto-mark read after 3 surfaces (safety net).
+
+        Distinct from /pending: doesn't drain on first fetch — caller is
+        expected to surface the content to the user, then call /ack to
+        explicitly clear.
+        """
+        return {"notes": sessions.surface_inbox_for_hook(session_id)}
+
+    @router.post("/sessions/{session_id}/inbox/ack")
+    async def ack_inbox_notes(session_id: str, req: AckNotesReq) -> dict:
+        """Mark inbox notes as read. note_ids=None acks all unread."""
+        count = sessions.ack_notes(session_id, req.note_ids)
+        return {"acked": count}
 
     return router

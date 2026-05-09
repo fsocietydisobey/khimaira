@@ -317,6 +317,7 @@ def post_answer(
 
     # Drop a note in the inbox so A surfaces it on next read
     note = {
+        "id": uuid.uuid4().hex[:12],
         "ts": _now_iso(),
         "kind": "answer",
         "question_id": question_id,
@@ -324,6 +325,7 @@ def post_answer(
         "answer": answer,
         "from_session_id": from_session_id,
         "read": False,
+        "surface_count": 0,
     }
     _append_jsonl(_session_dir(target_session_id) / "inbox.jsonl", note)
     log.info(
@@ -424,29 +426,124 @@ def post_notice(
     that the other session benefits from seeing but shouldn't have to
     respond to.
 
-    The note appears in target's inbox alongside answers. The hook auto-
-    inject renders it as `[notice from X]` and marks it read on first
-    surface so it doesn't re-loop. No question_id is set — notices are
-    standalone.
+    The note re-surfaces on the target's UserPromptSubmit hook every
+    turn until either:
+      • The agent explicitly calls `session_ack_notes` after surfacing
+        the notice content to the user, OR
+      • surface_count exceeds the auto-expire threshold (3 surfaces)
+        as a safety net so an unresponsive agent doesn't loop forever.
 
     `target_session_id` accepts UUID or friendly name. `from_session_id`
-    is for attribution; defaults to "external" if the caller doesn't
-    know its own id (rare — usually you'd pass your session_id).
+    is for attribution.
     """
     target_session_id = resolve_session_id(target_session_id)
     note = {
+        "id": uuid.uuid4().hex[:12],
         "ts": _now_iso(),
         "kind": "notice",
         "text": text,
         "from_session_id": from_session_id,
         "read": False,
+        "surface_count": 0,
     }
     _append_jsonl(_session_dir(target_session_id) / "inbox.jsonl", note)
     log.info(
-        "session %s: notice posted by %s — %s",
-        target_session_id, from_session_id, text[:80],
+        "session %s: notice posted by %s (id=%s) — %s",
+        target_session_id, from_session_id, note["id"], text[:80],
     )
     return note
+
+
+_HOOK_AUTO_EXPIRE_AFTER = 3
+"""Max times an inbox note re-surfaces on the hook before auto-marking read.
+
+Safety net so an unresponsive agent (one that ignores notices in its
+context block instead of surfacing them to the user) doesn't loop the
+same notice into context forever. Agents SHOULD ack via session_ack_notes
+when they've surfaced the content; this is the fallback.
+"""
+
+
+def surface_inbox_for_hook(session_id: str) -> list[dict]:
+    """Hook-only fetch path. Returns unread notes, increments surface_count.
+
+    Differs from pending_notes: doesn't mark read on first fetch. Notes
+    re-surface each turn until the agent explicitly acks (via
+    session_ack_notes) OR surface_count hits the auto-expire threshold.
+
+    Each returned note carries a `_remaining_surfaces` field so the hook
+    can render urgency info ("[2/3 surfaces remaining — call ack]").
+    """
+    session_id = resolve_session_id(session_id)
+    inbox_path = _session_dir(session_id) / "inbox.jsonl"
+    notes = _read_jsonl(inbox_path)
+    surfaced: list[dict] = []
+    modified = False
+
+    for n in notes:
+        if n.get("read"):
+            continue
+        n["surface_count"] = int(n.get("surface_count") or 0) + 1
+        modified = True
+
+        if n["surface_count"] >= _HOOK_AUTO_EXPIRE_AFTER:
+            n["read"] = True
+            n["read_at"] = _now_iso()
+            n["read_reason"] = "auto_after_surfaces"
+
+        copy = dict(n)
+        copy["_remaining_surfaces"] = max(
+            0, _HOOK_AUTO_EXPIRE_AFTER - n["surface_count"]
+        )
+        surfaced.append(copy)
+
+    if modified:
+        tmp = inbox_path.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            for n in notes:
+                f.write(json.dumps(n, separators=(",", ":")) + "\n")
+        tmp.replace(inbox_path)
+
+    return surfaced
+
+
+def ack_notes(
+    session_id: str,
+    note_ids: list[str] | None = None,
+) -> int:
+    """Explicitly mark inbox notes as read.
+
+    Called by the agent after surfacing notice content to the user, so
+    the same notice doesn't re-loop into context next turn. Pass
+    `note_ids=None` to ack all currently-unread notes.
+
+    Returns the count of notes newly marked read.
+    """
+    session_id = resolve_session_id(session_id)
+    inbox_path = _session_dir(session_id) / "inbox.jsonl"
+    notes = _read_jsonl(inbox_path)
+    count = 0
+
+    target_set = set(note_ids) if note_ids else None
+
+    for n in notes:
+        if n.get("read"):
+            continue
+        if target_set is not None and n.get("id") not in target_set:
+            continue
+        n["read"] = True
+        n["read_at"] = _now_iso()
+        n["read_reason"] = "agent_ack"
+        count += 1
+
+    if count > 0:
+        tmp = inbox_path.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            for n in notes:
+                f.write(json.dumps(n, separators=(",", ":")) + "\n")
+        tmp.replace(inbox_path)
+
+    return count
 
 
 async def wait_for_answer(

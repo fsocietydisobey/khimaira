@@ -1640,6 +1640,35 @@ async def session_log_question(
 
 
 @mcp.tool()
+@logged_tool("session_ack_notes")
+async def session_ack_notes(
+    session_id: str,
+    note_ids: list[str] | None = None,
+) -> str:
+    """**Acknowledge inbox notes** after surfacing their content to the user.
+
+    The UserPromptSubmit hook re-surfaces unread inbox notes every turn
+    (with a 3-surface auto-expire safety net) until you ack. The pattern:
+
+      1. Hook injects `📬 chimera inbox` into your context
+      2. You surface the notice content to the user in your response
+      3. You call session_ack_notes(session_id) to clear the unread flag
+      4. Next turn, that same notice doesn't reappear
+
+    Without step 3, the notice keeps surfacing for up to 3 turns total
+    before auto-expiring — costs context. With step 3, it clears
+    immediately.
+
+    Args:
+        session_id: this session's id.
+        note_ids: list of note ids to ack. If None (default), acks ALL
+            currently-unread notes — usually what you want after
+            surfacing the contents of a 📬 chimera inbox block.
+    """
+    return await _monitor_tools.session_ack_notes(session_id, note_ids)
+
+
+@mcp.tool()
 @logged_tool("session_post_notice")
 async def session_post_notice(
     target_session_id: str,
