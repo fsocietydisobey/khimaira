@@ -1693,6 +1693,47 @@ async def session_ack_notes(
 
 
 @mcp.tool()
+@logged_tool("session_post_handoff")
+async def session_post_handoff(
+    from_session_id: str,
+    text: str,
+    scope_cwd: str | None = None,
+    expires_in_hours: float = 168.0,
+) -> str:
+    """**Handoff to a future session** that doesn't exist yet.
+
+    Use case: you've finished a piece of work and the next chat to open
+    in this project will need context — what you just did, why, where
+    to pick up, gotchas. Handoffs are scoped by working directory: any
+    new session whose cwd is == or under `scope_cwd` will see this on
+    its SessionStart hook automatically.
+
+    Distinct from session_post_notice (which needs a target_session_id
+    that already exists). Distinct from session_log_decision (which is
+    session-private state, not surfaced anywhere automatically).
+
+    Each new session sees a given handoff exactly once (read tracking
+    by session_id; resumes don't re-surface). Handoffs auto-expire
+    after expires_in_hours (default 7 days) so stale notes don't pile
+    up.
+
+    Args:
+        from_session_id: your session id (for attribution).
+        text: the handoff note. Be specific — file paths, commits,
+            gotchas, where the work picked back up. The receiving
+            agent will surface this verbatim.
+        scope_cwd: directory the handoff applies to. None = inferred
+            from your most-recent file_touched directory. Override
+            when you've been working across multiple project roots.
+        expires_in_hours: TTL. Default 168 (7 days). Use larger for
+            permanent context, smaller for time-bounded asks.
+    """
+    return await _monitor_tools.session_post_handoff(
+        from_session_id, text, scope_cwd, expires_in_hours,
+    )
+
+
+@mcp.tool()
 @logged_tool("session_post_notice")
 async def session_post_notice(
     target_session_id: str,

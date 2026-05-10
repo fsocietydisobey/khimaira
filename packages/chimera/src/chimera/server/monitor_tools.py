@@ -794,6 +794,34 @@ async def session_ack_notes(
     return f"📭 acked {data.get('acked', 0)} note(s)"
 
 
+async def session_post_handoff(
+    from_session_id: str,
+    text: str,
+    scope_cwd: str | None = None,
+    expires_in_hours: float = 168.0,
+) -> str:
+    """Drop a handoff note any future session whose cwd matches will read.
+
+    For cross-session handoffs to sessions that DON'T EXIST YET. Use this
+    instead of session_post_notice when you don't know the target session
+    id (because the handoff is for whoever picks up this work next).
+    """
+    body: dict[str, Any] = {
+        "from_session_id": from_session_id,
+        "text": text,
+        "expires_in_hours": expires_in_hours,
+    }
+    if scope_cwd:
+        body["scope_cwd"] = scope_cwd
+    data = _post("/api/handoffs", body, timeout=10.0)
+    if isinstance(data, str):
+        return data
+    return (
+        f"📦 handoff posted (id={data.get('id')}, scope_cwd={data.get('scope_cwd')}, "
+        f"expires_in_hours={expires_in_hours})"
+    )
+
+
 async def session_post_notice(
     target_session_id: str,
     text: str,

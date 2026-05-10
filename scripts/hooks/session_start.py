@@ -25,9 +25,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-_BASE_DIR = Path(
+_STATE_ROOT = Path(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
-) / "chimera" / "sessions"
+) / "chimera"
+_BASE_DIR = _STATE_ROOT / "sessions"
+_HANDOFFS_PATH = _STATE_ROOT / "handoffs.jsonl"
 
 
 def _now_iso() -> str:
@@ -172,6 +174,75 @@ def _discover_other_active_sessions(
     return out
 
 
+def _consume_handoffs(session_id: str, cwd: str) -> list[dict]:
+    """Read handoffs whose scope_cwd matches `cwd`; mark this session_id
+    as having read them; return the matched set.
+
+    Cwd-scoped handoffs are how prior sessions leave notes for FUTURE
+    sessions ("here's where I left off; pick up at file X commit Y").
+    Without this, the only fallback was naming the prior session +
+    relying on the user to type a bootstrap prompt referencing it.
+    """
+    import time
+
+    if not _HANDOFFS_PATH.exists():
+        return []
+    cwd_abs = os.path.abspath(cwd)
+    handoffs = _read_jsonl(_HANDOFFS_PATH)
+    now = time.time()
+    matched: list[dict] = []
+    modified = False
+
+    for h in handoffs:
+        if h.get("expires_at", 0) < now:
+            continue
+        scope = h.get("scope_cwd") or ""
+        if not scope:
+            continue
+        # Match: cwd is the scope OR a child of scope
+        if cwd_abs != scope and not cwd_abs.startswith(scope.rstrip("/") + "/"):
+            continue
+        read_by = h.get("read_by") or []
+        if session_id in read_by:
+            continue
+        matched.append(h)
+        h["read_by"] = read_by + [session_id]
+        modified = True
+
+    if modified:
+        tmp = _HANDOFFS_PATH.with_suffix(".jsonl.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                for h in handoffs:
+                    if h.get("expires_at", 0) < now:
+                        continue
+                    f.write(json.dumps(h, separators=(",", ":")) + "\n")
+            tmp.replace(_HANDOFFS_PATH)
+        except OSError:
+            pass
+
+    return matched
+
+
+def _format_handoffs(handoffs: list[dict], cwd: str) -> str:
+    lines = [
+        f"📦 chimera handoffs — {len(handoffs)} note(s) from prior sessions in this project ({cwd}):",
+        "",
+    ]
+    for h in handoffs:
+        from_id = (h.get("from_session_id") or "?")[:8]
+        ts = (h.get("ts") or "")[:19]
+        text = (h.get("text") or "").strip()
+        lines.append(f"- [{ts} from {from_id}]")
+        lines.append(f"  {text}")
+        lines.append("")
+    lines.append(
+        "These are forward-looking notes from prior work. Each handoff was "
+        "marked read by this session — they won't re-surface on resume."
+    )
+    return "\n".join(lines).rstrip()
+
+
 def _format_active_sessions(sessions: list[dict]) -> str:
     """Render the 'other sessions currently active' block."""
     lines = [
@@ -249,9 +320,13 @@ def main() -> int:
 
     notes = _consume_inbox(session_id)
     others = _discover_other_active_sessions(session_id, within_minutes=30)
+    cwd = data.get("cwd") or os.getcwd()
+    handoffs = _consume_handoffs(session_id, cwd)
 
     if notes:
         blocks.append(_format_inbox(notes))
+    if handoffs:
+        blocks.append(_format_handoffs(handoffs, cwd))
     if others:
         blocks.append(_format_active_sessions(others))
 

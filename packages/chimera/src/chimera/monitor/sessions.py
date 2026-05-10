@@ -426,6 +426,123 @@ def pending_notes(session_id: str, mark_read: bool = True) -> list[dict]:
     return pending
 
 
+_HANDOFFS_PATH = _BASE_DIR.parent / "handoffs.jsonl"
+
+
+def post_handoff(
+    from_session_id: str,
+    text: str,
+    *,
+    scope_cwd: str | None = None,
+    expires_in_hours: float = 168.0,
+) -> dict:
+    """Drop a handoff note any FUTURE session in this project will read.
+
+    Closes the gap that post_notice left open: post_notice requires a
+    target_session_id, but cross-session handoffs to sessions that
+    don't exist yet (e.g. "next chat that picks up this work") have
+    no target. Workaround was naming yourself + logging a HANDOFF
+    decision, then having the user relay a bootstrap prompt to the
+    new chat — manual + lossy.
+
+    Handoffs are scoped by working directory. When a new session
+    starts via SessionStart hook, it reads handoffs.jsonl and surfaces
+    any whose `scope_cwd` is == or a prefix of the new session's cwd
+    (and that the new session hasn't already read).
+
+    `scope_cwd=None` infers from the asker's most-recent file_touched
+    parent directory — the dir that session was working in. Override
+    when the asker has been touching files across multiple project
+    roots and wants to disambiguate.
+
+    Default `expires_in_hours=168` (7 days) — work moves on; stale
+    handoffs become noise. Pass a larger value for "permanent context"
+    notes, smaller for time-bounded asks.
+    """
+    inferred = scope_cwd
+    if inferred is None:
+        # Infer from session's most-recent file touch — that's the
+        # directory they were working in. Fallback: process cwd.
+        files = _read_jsonl(_session_dir(from_session_id) / "files_touched.jsonl")
+        if files:
+            most_recent = files[-1].get("file") or ""
+            if most_recent:
+                inferred = os.path.dirname(most_recent)
+        if not inferred:
+            inferred = os.getcwd()
+
+    inferred = os.path.abspath(inferred)
+    expires_at = time.time() + expires_in_hours * 3600.0
+
+    handoff = {
+        "id": uuid.uuid4().hex[:12],
+        "ts": _now_iso(),
+        "from_session_id": from_session_id,
+        "text": text,
+        "scope_cwd": inferred,
+        "expires_at": expires_at,
+        "read_by": [],
+    }
+    _HANDOFFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _append_jsonl(_HANDOFFS_PATH, handoff)
+    log.info(
+        "handoff posted by %s for cwd=%s — %s",
+        from_session_id, inferred, text[:80],
+    )
+    return handoff
+
+
+def consume_handoffs(session_id: str, cwd: str) -> list[dict]:
+    """Return handoffs matching this session's cwd; mark this session as
+    having read them (no double-surface on session resume).
+
+    Match: handoff.scope_cwd is == cwd OR cwd is a child of scope_cwd
+    (so a handoff scoped at /repo/root surfaces in any session working
+    in /repo/root/sub/path/...).
+
+    Excluded: handoffs already in this session's read_by, or expired.
+    """
+    if not _HANDOFFS_PATH.exists():
+        return []
+    cwd_abs = os.path.abspath(cwd)
+    handoffs = _read_jsonl(_HANDOFFS_PATH)
+    now = time.time()
+    matched: list[dict] = []
+    modified = False
+
+    for h in handoffs:
+        if h.get("expires_at", 0) < now:
+            continue
+        scope = h.get("scope_cwd") or ""
+        if not scope:
+            continue
+        # Match: cwd is the scope, or starts with scope + os.sep
+        if cwd_abs != scope and not cwd_abs.startswith(scope.rstrip("/") + "/"):
+            continue
+        read_by = h.get("read_by") or []
+        if session_id in read_by:
+            continue
+        matched.append(h)
+        h["read_by"] = read_by + [session_id]
+        modified = True
+
+    if modified:
+        tmp = _HANDOFFS_PATH.with_suffix(".jsonl.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                # Drop expired entries while we're rewriting — keeps the
+                # file from growing unboundedly.
+                for h in handoffs:
+                    if h.get("expires_at", 0) < now:
+                        continue
+                    f.write(json.dumps(h, separators=(",", ":")) + "\n")
+            tmp.replace(_HANDOFFS_PATH)
+        except OSError:
+            log.warning("failed to rewrite handoffs.jsonl; read state may double-surface")
+
+    return matched
+
+
 def post_notice(
     target_session_id: str,
     text: str,

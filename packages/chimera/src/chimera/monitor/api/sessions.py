@@ -64,6 +64,13 @@ class AckNotesReq(BaseModel):
     note_ids: list[str] | None = None  # None = ack all unread
 
 
+class HandoffReq(BaseModel):
+    text: str
+    from_session_id: str
+    scope_cwd: str | None = None
+    expires_in_hours: float = 168.0
+
+
 def build_router():
     fastapi = require("fastapi")
 
@@ -194,6 +201,26 @@ def build_router():
         """Mark inbox notes as read. note_ids=None acks all unread."""
         count = sessions.ack_notes(session_id, req.note_ids)
         return {"acked": count}
+
+    @router.post("/handoffs")
+    async def post_handoff(req: HandoffReq) -> dict:
+        """Drop a handoff note any future session in matching cwd will read.
+
+        Closes the gap that post_notice left: notices need a target_session_id
+        but cross-session handoffs to future sessions had no target. Handoffs
+        are scoped by cwd and surface on the next matching SessionStart.
+        """
+        return sessions.post_handoff(
+            req.from_session_id,
+            req.text,
+            scope_cwd=req.scope_cwd,
+            expires_in_hours=req.expires_in_hours,
+        )
+
+    @router.get("/handoffs/consume")
+    async def consume_handoffs(session_id: str, cwd: str) -> dict:
+        """Return handoffs matching cwd; mark this session_id as having read."""
+        return {"handoffs": sessions.consume_handoffs(session_id, cwd)}
 
     @router.get("/sessions/{session_id}/inbox/archive")
     async def search_inbox_archive(
