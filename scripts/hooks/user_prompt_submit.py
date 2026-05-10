@@ -86,6 +86,101 @@ def _fetch_pending_notes(session_id: str) -> list[dict]:
         return []
 
 
+def _sync_rename_to_chimera(session_id: str) -> None:
+    """Auto-sync Claude Code's /rename to chimera's session_set_name.
+
+    Closes the gap that makes addressing fresh sessions painful:
+      1. User runs /rename my-new-session in a fresh Claude Code chat
+      2. Claude Code writes a {type: "custom-title"} entry to the
+         session's transcript JSONL
+      3. But chimera daemon's session_set_name is never called, so
+         other sessions can't address by the renamed handle
+
+    This hook walks the session's own transcript (~/.claude/projects/
+    <encoded-cwd>/<session-uuid>.jsonl), finds the most recent custom-
+    title, and compares against the chimera-stored name. If they
+    differ, POST to /api/sessions/{id}/name to sync.
+
+    Silent on every failure path — hooks must not block the user.
+    Cheap: bounded reverse-iteration over the JSONL file (most recent
+    title is usually within the last ~50 lines).
+    """
+    try:
+        # Find the transcript: scan ~/.claude/projects/*/{session_id}.jsonl
+        claude_projects = Path(os.path.expanduser("~/.claude/projects"))
+        if not claude_projects.exists():
+            return
+        target_filename = f"{session_id}.jsonl"
+        transcript: Path | None = None
+        for project_dir in claude_projects.iterdir():
+            if not project_dir.is_dir():
+                continue
+            candidate = project_dir / target_filename
+            if candidate.is_file():
+                transcript = candidate
+                break
+        if transcript is None:
+            return
+
+        # Read transcript, find most recent custom-title entry
+        latest_title: str | None = None
+        with transcript.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or '"custom-title"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # Possible shapes:
+                #   {"type": "custom-title", "title": "...", ...}
+                #   {"type": "custom-title", "customTitle": "...", ...}
+                if rec.get("type") != "custom-title":
+                    continue
+                title = rec.get("title") or rec.get("customTitle") or rec.get("name") or ""
+                if title:
+                    latest_title = title  # keep the last one (most recent)
+
+        if not latest_title:
+            return
+
+        # ONLY sync when chimera has no name yet — don't clobber explicit
+        # session_set_name calls. If a user wants to change the chimera
+        # name later, they can do it via `session_set_name` directly
+        # (which is what the user would expect — explicit > inferred).
+        try:
+            url = f"{_ENDPOINT}/api/sessions/{session_id}"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=_INBOX_TIMEOUT_S) as resp:
+                state = json.loads(resp.read())
+            current_name = (state.get("status") or {}).get("name") or ""
+            if current_name:
+                # Already named — don't overwrite (even if Claude Code's
+                # /rename differs from chimera's name). Explicit wins.
+                return
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            # Couldn't read current name — bail rather than risk
+            # overwriting. Will retry on next prompt.
+            return
+
+        # POST the new name
+        try:
+            url = f"{_ENDPOINT}/api/sessions/{session_id}/name"
+            data = json.dumps({"name": latest_title}).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=_INBOX_TIMEOUT_S) as _:
+                pass
+        except (urllib.error.URLError, OSError, TimeoutError):
+            pass  # Best-effort; will retry on next prompt
+    except Exception:
+        pass  # Silent — never break the user's flow over a sync error
+
+
 def _fetch_incoming_questions(session_id: str) -> list[dict]:
     """Hit /api/sessions/{sid}/incoming; return questions or [] on failure.
 
@@ -190,6 +285,13 @@ def main() -> int:
     session_id = data.get("session_id") or ""
     if not session_id:
         return 0
+
+    # --- Sync Claude Code's /rename → chimera's session name (every turn) ---
+    # Cheap idempotent check; only POSTs when the names differ. Closes the
+    # gap where /rename in Claude Code is UI-only and other sessions can't
+    # address by the new name until the agent in the renamed session
+    # manually calls session_set_name.
+    _sync_rename_to_chimera(session_id)
 
     # --- Inbox auto-read (every turn) -------------------------------------
     inbox_block = ""
