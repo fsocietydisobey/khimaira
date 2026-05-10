@@ -16,13 +16,14 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 
 import { useGetTopologyQuery, useListThreadsQuery, type NodeMeta, type ThreadStatus, type ThreadSummary, type TopologyResponse } from "@/api";
 import { ActiveNodeCard } from "@/components/project/ActiveNodeCard";
 import { FlowCanvas } from "@/components/project/FlowCanvas";
 import { LiveRunsCard } from "@/components/project/LiveRunsCard";
 import { NodeInspector } from "@/components/project/NodeInspector";
+import { ProjectNavTabs } from "@/components/project/ProjectNavTabs";
 import { ReplayController, type ReplayState } from "@/components/project/ReplayController";
 import { RunsDrawer } from "@/components/project/RunsDrawer";
 import { RunStepsCard } from "@/components/project/RunStepsCard";
@@ -329,22 +330,7 @@ export function ProjectView() {
       <header className="flex shrink-0 items-center justify-between border-b border-border bg-card/40 px-4 py-2">
         <div className="flex items-center gap-3">
           <h2 className="text-sm font-semibold">{projectName}</h2>
-          <nav className="flex items-center gap-2 text-[11px]">
-            <Link
-              to={`/${projectName}/cost`}
-              className="text-muted-foreground hover:text-foreground"
-              title="Estimated USD spend + token usage by model"
-            >
-              cost
-            </Link>
-            <span className="text-muted-foreground/50">·</span>
-            <span
-              className="text-muted-foreground/60"
-              title="Trace waterfall — open via /<project>/trace/<correlation_id>. Tag your app run with chimera_observer.tag_run(cid) to populate."
-            >
-              trace
-            </span>
-          </nav>
+          <ProjectNavTabs projectName={projectName} />
           {noCheckpointer ? (
             <span className="text-[11px] text-muted-foreground">topology only · no checkpointer</span>
           ) : (

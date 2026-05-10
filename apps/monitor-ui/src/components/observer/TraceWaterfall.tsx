@@ -32,6 +32,7 @@ import { useMemo } from "react";
 import { useParams } from "react-router-dom";
 
 import { useGetEventsByCorrelationQuery, type ObserverEvent } from "@/api";
+import { ProjectNavTabs } from "@/components/project/ProjectNavTabs";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
@@ -235,6 +236,7 @@ function Header({
             correlation_id: {cid}
           </p>
         </div>
+        <ProjectNavTabs projectName={projectName} currentCorrelationId={cid} />
         {totalDurationMs !== undefined ? (
           <div className="text-right text-[11px] text-muted-foreground space-y-0.5">
             <div>

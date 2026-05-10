@@ -21,6 +21,7 @@
 import { useParams } from "react-router-dom";
 
 import { useGetCostSummaryQuery, type CostByModel } from "@/api";
+import { ProjectNavTabs } from "@/components/project/ProjectNavTabs";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
@@ -72,11 +73,16 @@ export function CostDashboard() {
   return (
     <div className="flex h-full flex-col overflow-auto">
       <header className="shrink-0 border-b border-border bg-card/40 px-4 py-3">
-        <h2 className="text-sm font-semibold">cost summary — {projectName}</h2>
-        <p className="text-[11px] text-muted-foreground mt-0.5">
-          {data.note} · refreshes every 5s · only reflects runs still in the
-          observer's 1h heartbeat buffer
-        </p>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold">cost summary — {projectName}</h2>
+            <p className="text-[11px] text-muted-foreground mt-0.5">
+              {data.note} · refreshes every 5s · only reflects runs still in the
+              observer's 1h heartbeat buffer
+            </p>
+          </div>
+          <ProjectNavTabs projectName={projectName} />
+        </div>
       </header>
 
       <div className="grid gap-4 p-4 md:grid-cols-3">
