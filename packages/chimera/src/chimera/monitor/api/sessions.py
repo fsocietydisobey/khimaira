@@ -179,11 +179,16 @@ def build_router():
     async def post_notice(session_id: str, req: NoticeReq) -> dict:
         """Drop a FYI/ack note in target session's inbox. No question/answer
         coupling — for "you don't need to reply, just want you to know" info."""
-        return sessions.post_notice(
-            session_id,
-            req.text,
-            from_session_id=req.from_session_id,
-        )
+        try:
+            return sessions.post_notice(
+                session_id,
+                req.text,
+                from_session_id=req.from_session_id,
+            )
+        except ValueError as e:
+            # Unknown session name/id — return 404 with the helpful message
+            # (sessions.resolve_session_id already includes "use session_list").
+            raise fastapi.HTTPException(404, str(e))
 
     @router.get("/sessions/{session_id}/inbox/surface")
     async def surface_inbox(session_id: str) -> dict:
