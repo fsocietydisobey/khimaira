@@ -44,6 +44,12 @@ _CLAUDE_PROJECTS_DIR = Path(
 # but custom-title changes are rare. Don't re-scan unchanged files.
 _last_synced: dict[str, str] = {}
 
+# Per-session byte offset — only scan transcript bytes written AFTER
+# the offset for new custom-title entries. Catches fresh /rename events
+# without re-syncing historical ones that were already overridden by
+# explicit session_set_name calls.
+_last_offset: dict[str, int] = {}
+
 
 async def watch_loop() -> None:
     """Long-running: watch Claude Code project dirs; sync rename events.
@@ -101,13 +107,17 @@ async def watch_loop() -> None:
 
 
 def _initial_pass() -> None:
-    """One-shot scan at startup — sync any pre-existing /rename events.
+    """One-shot scan at startup.
 
-    Bounded to recently-modified transcripts (last 24h) so we don't
-    re-scan every transcript ever on every daemon start.
+    Records the current EOF byte offset for each recently-active transcript,
+    so subsequent live-watch fires only consider bytes written AFTER startup.
+    Historical custom-title entries (which may conflict with explicit
+    session_set_name calls made later) are intentionally skipped.
+
+    Bounded to last 24h to keep startup cheap.
     """
     import time
-    cutoff = time.time() - 86400  # last 24h
+    cutoff = time.time() - 86400
     for project_dir in _CLAUDE_PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
             continue
@@ -115,41 +125,40 @@ def _initial_pass() -> None:
             try:
                 if transcript.stat().st_mtime < cutoff:
                     continue
-                _maybe_sync_name(transcript.stem, transcript)
+                session_id = transcript.stem
+                # Mark current EOF as the start point — historical content
+                # is NOT clobbered. Only NEW custom-title entries (written
+                # after daemon boot) will trigger sync.
+                _last_offset[session_id] = transcript.stat().st_size
             except OSError:
                 continue
 
 
 def _maybe_sync_name(session_id: str, transcript: Path) -> None:
-    """Read transcript for latest /rename; call set_name if different.
+    """Read transcript for latest /rename (only bytes written since last
+    scan via _last_offset). Sync to chimera if different from current name.
 
-    Only syncs if chimera DOESN'T already have a name for this session.
-    Explicit `session_set_name` calls win over Claude Code's /rename;
-    the watcher only fills in defaults.
+    "Only new entries" semantics matter: historical custom-title entries
+    may conflict with later explicit session_set_name calls. By only
+    looking at bytes written AFTER our last scan (recorded in
+    _last_offset), we catch FRESH /rename events without clobbering
+    explicit names.
     """
-    latest_title = _find_latest_custom_title(transcript)
+    latest_title = _find_latest_custom_title(transcript, session_id)
     if not latest_title:
         return
 
-    # Debounce — skip if we already synced this exact title for this session
+    # Debounce — skip if we already synced this exact title for this session.
+    # This is the only "don't re-sync" guard; once a NEW title appears, we
+    # always sync it (no chimera-side name check).
     if _last_synced.get(session_id) == latest_title:
         return
 
-    # Check current chimera state. If session already has a name, don't
-    # clobber it. If it doesn't exist in chimera yet, we'll create it
-    # via set_name (which writes status.json).
-    try:
-        state = sessions.state(session_id)
-        current_name = (state.get("status") or {}).get("name") or ""
-        if current_name:
-            # Already named explicitly — record so we don't re-check
-            _last_synced[session_id] = current_name
-            return
-    except ValueError:
-        # Session doesn't exist in chimera yet — that's fine, set_name
-        # will create the status.json.
-        pass
-
+    # ALWAYS SYNC: /rename in Claude Code is the user's most direct rename
+    # intent. It wins over any prior name set via session_set_name (which
+    # is the agent's inference). The earlier "don't clobber explicit names"
+    # rule was wrong — it caused fresh /rename events to be silently
+    # ignored when chimera had a stale agent-set name.
     try:
         sessions.set_name(session_id, latest_title)
         _last_synced[session_id] = latest_title
@@ -164,20 +173,23 @@ def _maybe_sync_name(session_id: str, transcript: Path) -> None:
         )
 
 
-def _find_latest_custom_title(transcript: Path) -> str | None:
-    """Scan transcript JSONL for the most-recent {type: 'custom-title'} entry.
+def _find_latest_custom_title(transcript: Path, session_id: str) -> str | None:
+    """Scan transcript JSONL starting at `_last_offset[session_id]` for the
+    most-recent {type: 'custom-title'} entry written AFTER the offset.
 
-    Reads the whole file because:
-      - Most transcripts are <100MB
-      - custom-title entries are rare (~1-5 per session typically)
-      - Reverse-iteration is more complex than a single forward pass
-      - We don't run this on the hot path — only on file changes
+    Updates `_last_offset` to current EOF after the scan, so subsequent
+    calls only consider newer bytes. Without this, historical
+    custom-title entries (which may have been overridden by later
+    session_set_name calls) would keep getting re-synced and clobber
+    explicit names.
 
-    Returns the title string, or None if no custom-title entry found.
+    Returns the title string, or None if no NEW custom-title since last scan.
     """
     try:
         latest: str | None = None
+        start_offset = _last_offset.get(session_id, 0)
         with transcript.open("r", encoding="utf-8") as f:
+            f.seek(start_offset)
             for line in f:
                 if '"custom-title"' not in line:
                     continue
@@ -190,9 +202,6 @@ def _find_latest_custom_title(transcript: Path) -> str | None:
                     continue
                 if rec.get("type") != "custom-title":
                     continue
-                # Possible shapes seen in Claude Code transcripts:
-                #   {"type": "custom-title", "title": "..."}
-                #   {"type": "custom-title", "customTitle": "..."}
                 title = (
                     rec.get("title")
                     or rec.get("customTitle")
@@ -201,6 +210,8 @@ def _find_latest_custom_title(transcript: Path) -> str | None:
                 )
                 if title:
                     latest = title
+            # Update offset to current EOF so we don't re-process this region
+            _last_offset[session_id] = f.tell()
         return latest
     except OSError:
         return None

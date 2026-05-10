@@ -145,24 +145,23 @@ def _sync_rename_to_chimera(session_id: str) -> None:
         if not latest_title:
             return
 
-        # ONLY sync when chimera has no name yet — don't clobber explicit
-        # session_set_name calls. If a user wants to change the chimera
-        # name later, they can do it via `session_set_name` directly
-        # (which is what the user would expect — explicit > inferred).
+        # ALWAYS SYNC: /rename is the user's most direct rename intent.
+        # It wins over any prior name set via session_set_name (agent's
+        # inference). Previous "don't clobber" rule caused fresh /rename
+        # events to be silently ignored when chimera had a stale name.
+        # Skip if it would be a no-op (same name) to avoid wasted POSTs.
         try:
             url = f"{_ENDPOINT}/api/sessions/{session_id}"
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=_INBOX_TIMEOUT_S) as resp:
                 state = json.loads(resp.read())
             current_name = (state.get("status") or {}).get("name") or ""
-            if current_name:
-                # Already named — don't overwrite (even if Claude Code's
-                # /rename differs from chimera's name). Explicit wins.
+            if current_name == latest_title:
+                # Already synced — no-op
                 return
         except (urllib.error.URLError, OSError, ValueError, TimeoutError):
-            # Couldn't read current name — bail rather than risk
-            # overwriting. Will retry on next prompt.
-            return
+            # Couldn't read current name — push the sync anyway; idempotent
+            pass
 
         # POST the new name
         try:
@@ -206,15 +205,27 @@ def _format_inbox(notes: list[dict], session_id: str) -> str:
 
     Each note carries a `_remaining_surfaces` field — how many more turns
     this note will keep re-injecting before auto-expiring. The agent is
-    expected to surface the content to the user AND call session_ack_notes
-    to clear the unread flag immediately (not wait for auto-expire).
+    expected to surface the content + actively engage with it, not just
+    ack and continue.
     """
     lines = [
         f"📬 chimera inbox: {len(notes)} unread note(s) from other sessions.",
-        "**ACTION REQUIRED:** surface these to the user in your response,",
-        f"then call `session_ack_notes(session_id=\"{session_id}\")` to",
-        "clear them. Without ack, they re-surface each turn (up to 3) then",
-        "auto-expire — you risk the user never seeing them.",
+        "**ACTION REQUIRED — handle each note:**",
+        "  1. Surface the content to the user (don't just say 'got a note', show it).",
+        "  2. **Engage actively** — for each note:",
+        "     • If it conveys NEW information that warrants a substantive reply",
+        "       (questions, observations needing acknowledgment, decisions",
+        "       requiring confirmation, follow-ups to your earlier message):",
+        "       draft a response. If the response is clear, send it via",
+        "       `/tell <sender_session> '...'`. If uncertain whether to",
+        "       respond or HOW to respond, ASK the user: \"<sender> said X.",
+        "       Should I reply with Y, or do you want to handle?\"",
+        "     • If it's pure FYI (no implicit ask), surface + ack is enough.",
+        "  3. Call `session_ack_notes(session_id=\"" + session_id + "\")` to clear.",
+        "",
+        "**Don't ack-and-continue silently.** The user posted the message",
+        "expecting engagement, not a passive read. Even if you're mid-task,",
+        "pause briefly to handle the note properly.",
         "",
     ]
     for n in notes:
