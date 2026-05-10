@@ -1,0 +1,113 @@
+"""HTTP-layer tests for /api/sessions/* — regression for today's 500-vs-404 bugs.
+
+The two bugs this file pins:
+  - POST /api/sessions/{name}/notice with unknown name → was 500, now 404
+  - GET /api/sessions/{name} with unknown name → was 500, now 404
+
+Tests use FastAPI's TestClient so no real daemon is needed.
+"""
+
+from __future__ import annotations
+
+
+def test_post_notice_unknown_session_returns_404(api_client):
+    """Regression: was raising 500 from unhandled ValueError."""
+    r = api_client.post(
+        "/api/sessions/no-such-session/notice",
+        json={"text": "hi", "from_session_id": "me"},
+    )
+    assert r.status_code == 404
+    body = r.json()
+    # Error message varies depending on whether any sessions exist (empty
+    # state vs name-mismatch) — assert on the stable substring rather than
+    # the recommendation tail.
+    assert "no session" in body["detail"].lower()
+    assert "no-such-session" in body["detail"]
+
+
+def test_get_state_unknown_session_returns_404(api_client):
+    """Regression: was 500. Now 404 with helpful 'use session_list' message."""
+    r = api_client.get("/api/sessions/087234eb17d2")  # 12-char hex (a question id)
+    assert r.status_code == 404
+    body = r.json()
+    assert "no session" in body["detail"].lower()
+
+
+def test_get_state_known_session_returns_state(api_client, isolated_state):
+    """Happy path — confirm the test setup works end-to-end."""
+    isolated_state.log_decision("known-session", "test decision", "because")
+    r = api_client.get("/api/sessions/known-session")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["decision_count"] == 1
+    assert body["recent_decisions"][0]["text"] == "test decision"
+
+
+def test_post_notice_to_known_session_returns_200(api_client, isolated_state):
+    """Happy path counterpart to the 404 regression test."""
+    # Materialize the target session
+    isolated_state.log_decision("target", "init", "")
+
+    r = api_client.post(
+        "/api/sessions/target/notice",
+        json={"text": "hello", "from_session_id": "asker"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["kind"] == "notice"
+    assert body["text"] == "hello"
+
+
+def test_post_handoff_returns_record(api_client, tmp_path):
+    """Handoffs API end-to-end: POST then GET consume."""
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    r = api_client.post(
+        "/api/handoffs",
+        json={
+            "from_session_id": "asker",
+            "text": "pickup pointers",
+            "scope_cwd": str(project),
+            "expires_in_hours": 24,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["text"] == "pickup pointers"
+    assert body["scope_cwd"] == str(project)
+    assert body["read_by"] == []
+
+    # Consume from a new session in the same cwd
+    r2 = api_client.get(
+        "/api/handoffs/consume",
+        params={"session_id": "new-session", "cwd": str(project)},
+    )
+    assert r2.status_code == 200
+    assert len(r2.json()["handoffs"]) == 1
+
+
+def test_inbox_archive_search(api_client, isolated_state):
+    """search_archive returns past read notes by substring."""
+    isolated_state.log_decision("s", "init", "")
+    isolated_state.post_notice("s", text="Roboflow latency notes", from_session_id="x")
+    isolated_state.pending_notes("s", mark_read=True)  # drain → archive
+
+    r = api_client.get(
+        "/api/sessions/s/inbox/archive",
+        params={"q": "roboflow"},
+    )
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert "Roboflow" in results[0]["text"]
+
+
+def test_inbox_archive_search_no_match(api_client, isolated_state):
+    isolated_state.log_decision("s", "init", "")
+    r = api_client.get(
+        "/api/sessions/s/inbox/archive",
+        params={"q": "nothing-here"},
+    )
+    assert r.status_code == 200
+    assert r.json()["results"] == []

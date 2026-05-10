@@ -770,10 +770,12 @@ def consume_handoffs(session_id: str, cwd: str) -> list[dict]:
     handoffs = _read_jsonl(_HANDOFFS_PATH)
     now = time.time()
     matched: list[dict] = []
-    modified = False
+    needs_rewrite = False
+    has_expired = False
 
     for h in handoffs:
         if h.get("expires_at", 0) < now:
+            has_expired = True
             continue
         scope = h.get("scope_cwd") or ""
         if not scope:
@@ -786,14 +788,16 @@ def consume_handoffs(session_id: str, cwd: str) -> list[dict]:
             continue
         matched.append(h)
         h["read_by"] = read_by + [session_id]
-        modified = True
+        needs_rewrite = True
 
-    if modified:
+    # Rewrite if EITHER we marked something read OR there are expired
+    # entries to drop. Without the second condition, an all-expired file
+    # accumulates forever — the gc only runs when something else happens
+    # to fire, which may never.
+    if needs_rewrite or has_expired:
         tmp = _HANDOFFS_PATH.with_suffix(".jsonl.tmp")
         try:
             with tmp.open("w", encoding="utf-8") as f:
-                # Drop expired entries while we're rewriting — keeps the
-                # file from growing unboundedly.
                 for h in handoffs:
                     if h.get("expires_at", 0) < now:
                         continue
