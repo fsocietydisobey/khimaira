@@ -1,8 +1,14 @@
 # chimera
 
-> Multi-model AI orchestration for the terminal AI era.
+> Multi-model AI orchestration + LangGraph observability + multi-session collaboration for the terminal AI era.
 
-chimera is a dev framework that makes your terminal AI tool — Claude Code, Codex CLI, Gemini CLI, or local Ollama — 5–10× more efficient. It pre-resolves task-relevant context, manages your dev stack with a debugger-attached browser, and routes every prompt to the cheapest competent model. **No API keys required to start; bring your own when you want premium models.**
+chimera is a dev framework that makes your terminal AI tool — Claude Code, Codex CLI, Gemini CLI, or local Ollama — 5–10× more efficient. Three things in one:
+
+1. **Orchestrator** — pre-resolves task-relevant context, manages your dev stack with a debugger-attached browser, and routes every prompt to the cheapest competent model.
+2. **LangGraph observer** — zero-touch venv-injected tracing for any LangGraph app. Auto-correlates runs, captures external HTTP (Roboflow, OpenAI, Anthropic), surfaces cost + slow calls + waterfall traces in a local dashboard.
+3. **Multi-session shared state** — externalize session decisions, file touches, questions; coordinate parallel Claude/Codex/Gemini windows via targeted questions, real-time blocking calls, FYI notices, and forward-looking handoffs that survive across sessions.
+
+**No API keys required to start; bring your own when you want premium models.**
 
 ---
 
@@ -262,27 +268,212 @@ The router picks among installed runners using a YAML routing table that ships w
 
 ---
 
-## Multi-session shared state
+## LangGraph observability
 
-When one Claude Code session is grinding on a task, you can't ask related questions in another window without losing context. Chimera externalizes session state so parallel sessions can collaborate.
+`chimera attach <app-path>` injects a zero-touch observer into any Python project's venv. No source changes, no env vars, no installed deps in the app's manifest. Restart the app and every LangGraph node, every LLM call, every external HTTP request streams to chimera-monitor in real time.
+
+```mermaid
+flowchart LR
+    App["your LangGraph app<br/>(jeevy, etc.)"] -->|venv-injected<br/>chimera_observer.pth| Obs["observer v0.4.1<br/>BaseCallbackHandler<br/>+ httpx/requests<br/>monkey-patches"]
+    Obs -->|POST /api/heartbeat| Daemon["chimera-monitor<br/>daemon"]
+    Daemon -->|in-memory<br/>buffer + SSE| UI["monitor-ui<br/>(localhost:8740)"]
+    Daemon -->|REST endpoints| CLI["chimera observer<br/>trace · compare · slow"]
+
+    style Obs fill:#1f6feb,color:#fff
+    style Daemon fill:#1f6feb,color:#fff
+```
+
+### What you get out-of-box
+
+| Surface | What it shows |
+|---|---|
+| `/{project}/topology` | Live LangGraph node-by-node execution + replay |
+| `/{project}/cost` | Estimated USD spend by model, token counts, telemetry-overhead callout (LangSmith calls — opt out via `CHIMERA_DISABLE_LANGSMITH=true`) |
+| `/{project}/trace/{cid}` | Waterfall view of one app run — chain/llm/tool/external bars on a time axis. The *exact* visualization that proves your `asyncio.gather` is actually concurrent (3 starts within ~10ms = textbook parallel) |
+| `chimera observer trace <p> <cid>` | Full event timeline as text |
+| `chimera observer compare <p> <cid-a> <cid-b>` | A/B per-node wall-time deltas with regression markers |
+| `chimera observer slow <p> --llm 5 --external 30` | Recent calls past per-kind threshold + in-flight stuck detection |
+
+### Auto-correlation (zero app code changes)
+
+Every event the observer emits gets auto-tagged with the LangGraph run's top-level `correlation_id`:
 
 ```mermaid
 sequenceDiagram
-    participant A as Session A<br/>(working)
-    participant Ch as chimera
-    participant B as Session B<br/>(side conversation)
+    autonumber
+    participant App as Your App
+    participant LC as LangChain
+    participant Obs as ChimeraTracer
+    participant CV as ContextVar
+    participant HX as httpx (patched)
+    participant D as chimera-monitor
 
-    A->>Ch: session_log_decision("use Postgres read-only")
-    A->>Ch: session_log_question("bcrypt or argon2?") → q_id
-    Note right of A: A keeps working...
-    B->>Ch: session_state(A) — reads digest
-    B->>Ch: session_post_answer(A, q_id, "argon2id")
-    Note left of A: A finishes its task
-    A->>Ch: session_pending_notes(A) — auto on SessionStart
-    Ch-->>A: "Session B answered Q3"
+    App->>LC: graph.invoke(state)
+    LC->>Obs: on_chain_start(run_id=A, parent=None)
+    Note over Obs,CV: parent=None → top-level<br/>set _correlation_id = A
+    Obs->>D: chain_start, cid=A
+    LC->>Obs: on_llm_start(run_id=B, parent=A)
+    Obs->>CV: read cid (= A)
+    Obs->>D: llm_start, cid=A
+    Note over App,HX: app makes httpx.get() inside chain
+    HX->>CV: read cid (= A — propagates via ContextVar)
+    HX->>D: external_start, cid=A
+    HX->>D: external_end, cid=A
+    LC->>Obs: on_chain_end(run_id=A)
+    Note over Obs,CV: top-level done → clear cid
+
+    Note over D: GET /by-correlation/A returns ALL above events
 ```
 
-The bidirectional inbox closes the loop — without write-back, the design collapses to "B reads A, human relays."
+```python
+# Your app — UNCHANGED:
+result = graph.invoke(state)
+# Now queryable: GET /api/heartbeats/<project>/by-correlation/<run_id>
+# returns every chain/llm/tool/external event for this run
+```
+
+The observer reads LangChain's `parent_run_id=None` signal on `on_chain_start`, sets a `ContextVar`, and `_enqueue` propagates it through async + thread boundaries to every downstream event including the HTTP monkey-patch interceptors. Override with `chimera_observer.tag_run(my_id)` only when you want a domain-specific identifier (deliverable_id, business txn id) instead of the auto UUID.
+
+### attach / detach
+
+```bash
+chimera attach /path/to/your/langgraph/app
+# drops chimera_observer.pth + chimera_observer/ into the venv's site-packages
+# (gitignored — production builds don't include them)
+
+chimera attached
+# list all attached projects + observer version per venv
+
+chimera detach /path/to/your/langgraph/app
+```
+
+The observer fails silent on every error path — apps must not break because of telemetry setup.
+
+---
+
+## Multi-session shared state
+
+When one Claude Code session is grinding on a task, you can't ask related questions in another window without losing context. Chimera externalizes session state so parallel sessions can collaborate — and so future sessions can pick up where stopped ones left off.
+
+### Cross-session messaging — five primitives
+
+```mermaid
+flowchart TB
+    subgraph Now["live coordination (sessions running NOW)"]
+        Q["session_log_question<br/>(broadcast or targeted)"]
+        W["session_wait_for_answer<br/>(blocking — same turn)"]
+        N["session_post_notice<br/>(FYI, no reply expected)"]
+        I["session_post_answer<br/>(B → A inbox)"]
+    end
+
+    subgraph Future["across-time coordination"]
+        H["session_post_handoff<br/>(scoped by cwd —<br/>any future session sees it)"]
+        T["session_query_transcript<br/>session_summarize_transcript<br/>(read what stopped sessions said)"]
+    end
+
+    style Now fill:#1f6feb,color:#fff
+    style Future fill:#2da44e,color:#fff
+```
+
+| When you want to... | Use |
+|---|---|
+| Ask another *active* session a question, get answer in the same turn | `session_log_question(target_session_id=B)` + `session_wait_for_answer(qid)` |
+| Tell another session "FYI, no reply needed" | `session_post_notice(target_session_id=B, text=...)` |
+| Leave a note for **whoever opens the next chat in this project** | `session_post_handoff(text=..., scope_cwd=...)` — auto-surfaces on any future session's SessionStart hook in matching cwd |
+| Read what a stopped session discussed about topic X | `session_query_transcript(session_id, query="X")` |
+| Get the lay of the land of a stopped session before drilling in | `session_summarize_transcript(session_id, focus="X")` — heuristic, no LLM cost |
+| Search past inbox notes (drained / acked / auto-expired) | `session_search_archive(session_id, query)` |
+
+### Hooks (auto-surfacing — no manual polling required)
+
+Two hooks ship with chimera and install via `chimera install-hooks`:
+
+- **SessionStart** — auto-reads inbox + matched handoffs + lists other active sessions
+- **UserPromptSubmit** — auto-fetches inbox notes (with surface-count + 3-turn auto-expire) AND incoming questions targeting this session, injects both into context every turn
+
+You never manually call `session_pending_notes` mid-conversation; the loop is closed structurally.
+
+### Example — real-time cross-session ask
+
+```python
+# Session A, mid-turn:
+qid = session_log_question(
+    session_id=ME,
+    text="Roboflow per-page parallelization look right?",
+    target_session_id="llm-piping-extension",  # routes to B's hook
+)
+answer = session_wait_for_answer(ME, qid, timeout=300)
+# → A blocks. B's UserPromptSubmit hook surfaces the question on B's
+#   next turn. B answers via session_post_answer. A unblocks instantly
+#   and continues processing in the SAME turn.
+```
+
+### Example — real-time wait_for_answer flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as You
+    participant A as Session A<br/>(running)
+    participant Ch as chimera daemon
+    participant B as Session B<br/>(running)
+    participant Bh as B's hook
+
+    A->>Ch: log_question(target=B, "approach 1 or 2?")
+    A->>Ch: wait_for_answer(qid, timeout=300)
+    Note right of A: A blocks (long-poll)
+    U->>B: types anything in B's window
+    Bh->>Ch: GET /sessions/B/incoming
+    Ch-->>Bh: 1 question targeting B
+    Note over B: agent sees `📨 chimera incoming`
+    B->>Ch: post_answer(target=A, qid, "approach 2 because...")
+    Ch-->>A: wait_for_answer returns
+    Note left of A: A continues in SAME turn
+```
+
+User effort: 1 prompt to A (kicks off ask + wait), 1 prompt to B (B answers), A continues automatically. **No copy-paste relay, no cross-window context juggling.**
+
+### Example — handoff to a future session
+
+```python
+session_post_handoff(
+    from_session_id=ME,
+    text="HANDOFF: shipped tasks #58-#65 + observer v0.4.1. Pickup
+          tasks/workspaces/IMPLEMENTATION.md if you want workspace
+          isolation. Restart jeevy backend to get auto-correlation.",
+    scope_cwd="/home/_3ntropy/dev/chimera",
+)
+```
+
+```mermaid
+flowchart LR
+    A["session A<br/>(today, 5pm)"] -->|post_handoff| Disk[("~/.local/state/<br/>chimera/handoffs.jsonl<br/>scope_cwd, expires_in=7d")]
+    Disk -.->|3 days later| Boot[SessionStart hook<br/>in new session]
+    Boot -->|cwd matches scope?| Match{match?}
+    Match -->|yes + not in read_by| Inject["📦 chimera handoffs<br/>injected into new agent's<br/>first context block"]
+    Match -->|no| Skip[skip]
+
+    style Disk fill:#1f6feb,color:#fff
+    style Inject fill:#2da44e,color:#fff
+```
+
+### Reading what stopped sessions said
+
+Claude can't be programmatically resumed — but the conversation transcripts are on disk at `~/.claude/projects/<project>/<uuid>.jsonl`. Two tools turn that into queryable knowledge:
+
+```mermaid
+flowchart LR
+    Past["session A<br/>(now stopped)"] -.->|transcript<br/>on disk| File[("uuid.jsonl<br/>~42MB, 11K turns")]
+    Now["session B<br/>(today)"] -->|session_summarize_transcript| Heur["heuristic digest<br/>(no LLM cost)<br/>tools used, files,<br/>recent prompts"]
+    Now -->|session_query_transcript<br/>q='roboflow'| Grep["matched turns<br/>+ context lines"]
+    File --> Heur
+    File --> Grep
+
+    style Heur fill:#2da44e,color:#fff
+    style Grep fill:#2da44e,color:#fff
+```
+
+No new LLM API calls from chimera daemon — the agent calling the tool can summarize via its own context if it wants to.
 
 ---
 
@@ -317,11 +508,18 @@ See [`tasks/BUILD-PLAN.md`](tasks/BUILD-PLAN.md) for full status. Cliff-notes:
 | 7 — Monitor daemon migration | ✅ |
 | 8 — All 8 LangGraph patterns migrated | ✅ |
 | 9 — Frontend (`apps/monitor-ui`) | ✅ |
-| 11 — Multi-session shared state | ✅ (backend) |
-| 12 — Process observability | ✅ (backend) |
+| 10 — API removal (langchain_anthropic deprecated) | ✅ |
+| 11 — Multi-session shared state | ✅ |
+| 12 — Process observability | ✅ |
+| 13 — MCP call telemetry | ✅ |
+| 14 — Venv-injected observer (zero-touch LangGraph tracing) | ✅ v0.4.1 |
+| 14b — Observer dashboards (cost / trace waterfall / slow alerts) | ✅ |
+| 14c — Hooks for cross-session inbox + incoming + handoffs auto-surface | ✅ |
+| 14d — Cross-session primitives (targeted Q, wait_for_answer, post_notice, post_handoff, archive, transcript query/summary) | ✅ |
 | 4½ — Séance/Scarlet library APIs | ⬜ |
-| 10 — API removal (deprecate langchain_anthropic) | ⬜ |
-| Hooks for Phase 11 (PostToolUse, SessionStart) | ⬜ |
+| Workspaces (multi-project session isolation) | ⬜ spec'd at `tasks/workspaces/` |
+| Desktop notifications (libnotify push for cross-session events) | ⬜ spec'd at `tasks/desktop-notifications/` |
+| React DevTools replacement (Vue-DevTools-quality UI for React) | ⬜ spec'd at `tasks/react-devtools/` |
 | Burn-down savings dashboard widget | ⬜ |
 
 ---
