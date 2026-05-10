@@ -44,6 +44,38 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     p_rescan.add_argument("project", nargs="?", help="Project name to rescan; omit for all")
     p_rescan.set_defaults(func=_run_rescan)
 
+    p_watch = sub.add_parser(
+        "watch",
+        help="Supervise the daemon — restart on non-zero exit (cross-platform fallback)",
+        description=(
+            "Run the monitor daemon in foreground with auto-restart on "
+            "non-zero exit. Exponential backoff (1s → 60s) with a 5-min "
+            "healthy-uptime reset. Cross-platform fallback to "
+            "`install-service` for users without systemd."
+        ),
+    )
+    p_watch.set_defaults(func=_run_watch)
+
+    p_install = sub.add_parser(
+        "install-service",
+        help="Install a systemd user unit (Linux) so the daemon auto-restarts on failure",
+        description=(
+            "Writes ~/.config/systemd/user/chimera-monitor.service. After "
+            "install, view logs with `journalctl --user -u chimera-monitor -f`."
+        ),
+    )
+    p_install.add_argument("--enable", action="store_true",
+                           help="Also enable + start the service immediately")
+    p_install.add_argument("--force", action="store_true",
+                           help="Overwrite an existing unit file with different contents")
+    p_install.set_defaults(func=_run_install_service)
+
+    p_uninstall = sub.add_parser(
+        "uninstall-service",
+        help="Stop, disable, and remove the systemd user unit",
+    )
+    p_uninstall.set_defaults(func=_run_uninstall_service)
+
 
 def _run_start(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_start, _load_env
@@ -71,3 +103,19 @@ def _run_rescan(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_rescan, _load_env
     _load_env()
     return _cmd_rescan(args)
+
+
+def _run_watch(args: argparse.Namespace) -> int:
+    from chimera.monitor.cli import _cmd_watch, _load_env
+    _load_env()
+    return _cmd_watch(args)
+
+
+def _run_install_service(args: argparse.Namespace) -> int:
+    from chimera.monitor.cli import _cmd_install_service
+    return _cmd_install_service(args)
+
+
+def _run_uninstall_service(args: argparse.Namespace) -> int:
+    from chimera.monitor.cli import _cmd_uninstall_service
+    return _cmd_uninstall_service(args)

@@ -86,7 +86,12 @@ def build_router():
 
     @router.get("/sessions/{session_id}")
     async def get_state(session_id: str, recent: int = 10) -> dict:
-        return sessions.state(session_id, recent=recent)
+        try:
+            return sessions.state(session_id, recent=recent)
+        except ValueError as e:
+            # Unknown session name/id — clean 404 with helpful message
+            # rather than a 500 stack trace.
+            raise fastapi.HTTPException(404, str(e))
 
     @router.get("/sessions/{session_id}/pending")
     async def get_pending(session_id: str, mark_read: bool = True) -> dict:

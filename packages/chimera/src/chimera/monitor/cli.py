@@ -7,6 +7,7 @@ import socket
 import sys
 import time
 import webbrowser
+from pathlib import Path
 
 from .paths import LOG_FILE, PID_FILE, ensure_dirs
 
@@ -199,6 +200,259 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"chimera monitor: running (PID {pid}) — http://127.0.0.1:{_port()}")
     print(f"logs: {LOG_FILE}")
     return 0
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    """Supervisor — run the daemon in foreground, restart on non-zero exit.
+
+    For environments without systemd (or for users who don't want to
+    install a system service). Use `chimera monitor install-service`
+    for the long-running production answer; this is the cross-platform
+    fallback.
+
+    Exponential backoff between restarts: 1s, 2s, 4s, 8s, ..., capped
+    at 60s. Resets to 1s after the daemon stays up for >5 minutes
+    (healthy run signal — flapping doesn't masquerade as stable).
+
+    Ctrl-C exits cleanly; daemon receives SIGTERM, watcher waits for
+    graceful exit, then returns.
+    """
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    backoff = 1.0
+    max_backoff = 60.0
+    healthy_threshold = 300.0  # 5 min uptime = reset backoff
+    cmd = [
+        sys.executable, "-m", "chimera.cli", "monitor", "start",
+        "--foreground", "--no-browser",
+    ]
+
+    print(f"chimera monitor watch: supervising — Ctrl-C to stop")
+    print(f"  command: {' '.join(cmd)}")
+    print(f"  logs: {LOG_FILE}")
+
+    child: subprocess.Popen | None = None
+    interrupted = {"flag": False}
+
+    def _sigint_handler(signum, frame):  # noqa: ARG001
+        interrupted["flag"] = True
+        if child and child.poll() is None:
+            try:
+                child.send_signal(signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+    signal.signal(signal.SIGTERM, _sigint_handler)
+
+    while not interrupted["flag"]:
+        start_ts = time.time()
+        try:
+            child = subprocess.Popen(cmd)
+        except OSError as e:
+            print(f"chimera monitor watch: spawn failed ({e}); retrying in {backoff:.0f}s",
+                  file=sys.stderr)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+            continue
+
+        rc = child.wait()
+        uptime = time.time() - start_ts
+
+        if interrupted["flag"]:
+            print(f"chimera monitor watch: interrupted; daemon exited with rc={rc}")
+            return 0
+
+        if rc == 0:
+            print(f"chimera monitor watch: daemon exited cleanly (rc=0); not restarting")
+            return 0
+
+        # Reset backoff if the daemon ran healthy for a while
+        if uptime >= healthy_threshold:
+            backoff = 1.0
+
+        print(
+            f"chimera monitor watch: daemon died (rc={rc}, uptime={uptime:.0f}s); "
+            f"restarting in {backoff:.0f}s — see {LOG_FILE} for cause",
+            file=sys.stderr,
+        )
+        time.sleep(backoff)
+        backoff = min(backoff * 2, max_backoff)
+
+    return 0
+
+
+def _systemd_unit_path() -> Path:
+    """User-scoped systemd unit file path."""
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(xdg) / "systemd" / "user" / "chimera-monitor.service"
+
+
+def _systemd_unit_content() -> str:
+    """Render the systemd user unit. Uses the current Python interpreter
+    + chimera installation discovered at write time. Re-run install-service
+    if you reinstall chimera in a different venv."""
+    import shutil
+    import sys
+
+    # Prefer `uv run` if available (handles workspace + lockfile resolution
+    # transparently); fall back to direct python -m if not.
+    uv = shutil.which("uv")
+    # __file__ = .../chimera/packages/chimera/src/chimera/monitor/cli.py
+    # parents[5] = chimera/ (workspace root, where pyproject.toml lives)
+    workspace_root = str(Path(__file__).resolve().parents[5])
+    if uv:
+        exec_start = (
+            f"{uv} --directory {workspace_root} run chimera monitor start "
+            f"--foreground --no-browser"
+        )
+    else:
+        exec_start = (
+            f"{sys.executable} -m chimera.cli monitor start --foreground --no-browser"
+        )
+
+    return f"""[Unit]
+Description=chimera-monitor — local LangGraph observability daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={exec_start}
+Restart=on-failure
+RestartSec=5
+# Restart even on clean exits (rc=0) — chimera daemon's normal exit
+# path is shutdown, so seeing rc=0 mid-day means something killed it.
+# Override to "on-failure" if you want the daemon to STAY stopped on
+# clean exits.
+# Environment=CHIMERA_MONITOR_PORT=8740
+
+# Resource limits (optional; uncomment if you see OOM-related failures)
+# MemoryMax=2G
+# CPUQuota=200%
+
+# Log to systemd journal — view with `journalctl --user -u chimera-monitor -f`
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _cmd_install_service(args: argparse.Namespace) -> int:
+    """Install a systemd user unit so the daemon auto-starts on login +
+    auto-restarts on failure. Linux-only; macOS users should use
+    `chimera monitor watch` (foreground supervisor).
+    """
+    import subprocess
+    import sys
+
+    if sys.platform != "linux":
+        print(
+            f"chimera monitor install-service: systemd is Linux-only "
+            f"(detected {sys.platform}). Use `chimera monitor watch` instead "
+            f"as a cross-platform fallback supervisor.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not shutil_which("systemctl"):
+        print(
+            "chimera monitor install-service: systemctl not found on PATH. "
+            "Use `chimera monitor watch` instead.",
+            file=sys.stderr,
+        )
+        return 1
+
+    unit_path = _systemd_unit_path()
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    content = _systemd_unit_content()
+
+    if unit_path.exists() and not args.force:
+        existing = unit_path.read_text(encoding="utf-8")
+        if existing == content:
+            print(f"chimera monitor: unit already installed and current — {unit_path}")
+        else:
+            print(
+                f"chimera monitor: unit exists at {unit_path} but contents differ. "
+                f"Re-run with --force to overwrite.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        unit_path.write_text(content, encoding="utf-8")
+        print(f"chimera monitor: wrote unit → {unit_path}")
+
+    # Reload + enable + start
+    try:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"chimera monitor: systemctl daemon-reload failed: {e}", file=sys.stderr)
+        return 1
+
+    if args.enable:
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "enable", "--now", "chimera-monitor"],
+                check=True,
+            )
+            print("chimera monitor: enabled + started — `journalctl --user -u chimera-monitor -f` to follow")
+        except subprocess.CalledProcessError as e:
+            print(f"chimera monitor: enable failed: {e}", file=sys.stderr)
+            return 1
+    else:
+        print(
+            "chimera monitor: unit installed but not enabled. To start now:\n"
+            "  systemctl --user enable --now chimera-monitor\n"
+            "Or re-run with --enable."
+        )
+    return 0
+
+
+def _cmd_uninstall_service(args: argparse.Namespace) -> int:
+    """Remove the systemd user unit (does not stop a currently-running daemon
+    started outside systemd; use `chimera monitor stop` for that)."""
+    import subprocess
+    import sys
+
+    if sys.platform != "linux":
+        print(f"chimera monitor uninstall-service: systemd is Linux-only.", file=sys.stderr)
+        return 1
+
+    unit_path = _systemd_unit_path()
+    if not unit_path.exists():
+        print(f"chimera monitor: no unit at {unit_path} — nothing to uninstall")
+        return 0
+
+    # Best-effort: stop + disable before removing the unit file
+    if shutil_which("systemctl"):
+        for action in (("disable",), ("stop",)):
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", *action, "chimera-monitor"],
+                    check=False,
+                )
+            except FileNotFoundError:
+                pass
+
+    unit_path.unlink(missing_ok=True)
+    print(f"chimera monitor: removed {unit_path}")
+
+    if shutil_which("systemctl"):
+        try:
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        except FileNotFoundError:
+            pass
+    return 0
+
+
+def shutil_which(cmd: str) -> str | None:
+    import shutil
+    return shutil.which(cmd)
 
 
 def _load_env() -> None:
