@@ -102,7 +102,10 @@ def build_router():
 
     @router.get("/sessions/{session_id}/pending")
     async def get_pending(session_id: str, mark_read: bool = True) -> dict:
-        return {"notes": sessions.pending_notes(session_id, mark_read=mark_read)}
+        try:
+            return {"notes": sessions.pending_notes(session_id, mark_read=mark_read)}
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e))
 
     @router.post("/sessions/{session_id}/decision")
     async def post_decision(session_id: str, req: DecisionReq) -> dict:
@@ -133,7 +136,10 @@ def build_router():
         questions THIS session asked; /incoming shows questions OTHER
         sessions asked targeting THIS session.
         """
-        return {"questions": sessions.incoming_questions(session_id)}
+        try:
+            return {"questions": sessions.incoming_questions(session_id)}
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e))
 
     @router.get("/sessions/{session_id}/questions/{question_id}/wait")
     async def wait_for_answer(
@@ -211,13 +217,19 @@ def build_router():
         expected to surface the content to the user, then call /ack to
         explicitly clear.
         """
-        return {"notes": sessions.surface_inbox_for_hook(session_id)}
+        try:
+            return {"notes": sessions.surface_inbox_for_hook(session_id)}
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e))
 
     @router.post("/sessions/{session_id}/inbox/ack")
     async def ack_inbox_notes(session_id: str, req: AckNotesReq) -> dict:
         """Mark inbox notes as read. note_ids=None acks all unread."""
-        count = sessions.ack_notes(session_id, req.note_ids)
-        return {"acked": count}
+        try:
+            count = sessions.ack_notes(session_id, req.note_ids)
+            return {"acked": count}
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e))
 
     @router.post("/handoffs")
     async def post_handoff(req: HandoffReq) -> dict:
@@ -301,9 +313,12 @@ def build_router():
         you can query "what did session X say about topic Y" without
         losing past cross-session context.
         """
-        return {
-            "query": q,
-            "results": sessions.search_archive(session_id, q, limit),
-        }
+        try:
+            return {
+                "query": q,
+                "results": sessions.search_archive(session_id, q, limit),
+            }
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e))
 
     return router

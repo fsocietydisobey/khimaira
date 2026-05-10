@@ -36,13 +36,45 @@ _DAEMON_DOWN_HINT = (
 
 
 def _get(path: str, *, base: str = _DEFAULT_BASE, timeout: float = 5.0) -> dict[str, Any] | str:
-    """GET request → parsed JSON, or a friendly error string on failure."""
+    """GET request → parsed JSON, or a friendly error string on failure.
+
+    Error mapping (matches _post's pattern — earlier this was a bug:
+    HTTPError is a subclass of URLError, so catching URLError first
+    swallowed 4xx/5xx responses as "daemon down". 2026-05-10 fix: catch
+    HTTPError BEFORE URLError so the agent sees the real status):
+
+      HTTPError (e.g. 404 unknown session, 500 server bug) →
+        "HTTP <code>: <detail>"
+      URLError with ConnectionRefusedError reason → daemon truly down
+      URLError other (timeout, dns) → transient; suggest retry
+    """
     url = f"{base}{path}"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError:
-        return _DAEMON_DOWN_HINT.format(base=base)
+    except urllib.error.HTTPError as e:
+        try:
+            payload = e.read().decode("utf-8")
+            # FastAPI returns {"detail": "..."} for HTTPException; surface
+            # just the detail when present rather than the full JSON envelope.
+            try:
+                detail = json.loads(payload).get("detail", payload)
+            except (json.JSONDecodeError, AttributeError):
+                detail = payload
+            return f"chimera-monitor {url} → HTTP {e.code}: {detail[:400]}"
+        except Exception:
+            return f"chimera-monitor {url} → HTTP {e.code}"
+    except urllib.error.URLError as e:
+        # Differentiate truly-down from transient. ConnectionRefusedError
+        # means the daemon socket isn't bound; timeouts/dns/etc are
+        # usually transient and benefit from a retry suggestion.
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, ConnectionRefusedError):
+            return _DAEMON_DOWN_HINT.format(base=base)
+        return (
+            f"chimera-monitor {url} → transient connection error: {reason or e}. "
+            f"Retry once; if it persists, check `chimera monitor status`."
+        )
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return f"chimera-monitor returned non-JSON from {url}: {exc}"
     except Exception as exc:
@@ -1128,11 +1160,30 @@ async def session_pending_notes(session_id: str, mark_read: bool = True) -> str:
 
     parts = [f"📬 **{len(notes)} pending note(s):**\n"]
     for n in notes:
-        parts.append(
-            f"- ({n.get('kind')}) Q={n.get('question_text', '')[:120]}\n"
-            f"  ➜ {n.get('answer', '')[:300]}\n"
-            f"  from: {n.get('from_session_id')}, ts: {n.get('ts')}"
-        )
+        kind = n.get("kind") or "note"
+        from_sid = (n.get("from_session_id") or "")[:8] or "external"
+        ts = (n.get("ts") or "")[:19]
+        # Render body based on kind:
+        #   answer  → has answer + question_text (re Q: ... ➜ ...)
+        #   notice  → has text only, no question coupling
+        # Previous version assumed all notes were answers and rendered
+        # notices with empty Q + empty ➜ fields. Body was in `text`
+        # but never accessed.
+        if kind == "answer":
+            q_text = (n.get("question_text") or "").strip()
+            a_text = (n.get("answer") or n.get("text") or "").strip()
+            if q_text:
+                parts.append(
+                    f"- [answer from {from_sid} · {ts}]\n"
+                    f"  re Q: {q_text[:200]}\n"
+                    f"  ➜ {a_text[:600]}"
+                )
+            else:
+                parts.append(f"- [answer from {from_sid} · {ts}]\n  {a_text[:600]}")
+        else:
+            # notice (or any future non-answer kind) — body lives in `text`
+            body = (n.get("text") or n.get("answer") or "").strip()
+            parts.append(f"- [{kind} from {from_sid} · {ts}]\n  {body[:600]}")
     return "\n".join(parts)
 
 

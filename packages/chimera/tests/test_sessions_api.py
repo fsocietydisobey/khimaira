@@ -111,3 +111,52 @@ def test_inbox_archive_search_no_match(api_client, isolated_state):
     )
     assert r.status_code == 200
     assert r.json()["results"] == []
+
+
+# ----------------------------------------------------------------------------
+# Regression: every endpoint that resolves a session name must return 404
+# (not 500) when the name doesn't match. The bug class: ValueError from
+# resolve_session_id unwrapped at the FastAPI route boundary.
+#
+# Found 2026-05-10 when a fresh chat's session_id wasn't yet registered;
+# MCP tool reported "daemon unreachable" but daemon was up — the actual
+# response was 500 (which urllib.error.HTTPError surfaces as URLError,
+# which _get caught and mapped to "daemon down"). Fixing all the
+# endpoints + the _get pattern is the holistic fix.
+# ----------------------------------------------------------------------------
+
+
+def test_get_pending_unknown_session_returns_404(api_client):
+    r = api_client.get("/api/sessions/no-such-session/pending")
+    assert r.status_code == 404
+    assert "no session" in r.json()["detail"].lower()
+
+
+def test_get_incoming_unknown_session_returns_404(api_client):
+    r = api_client.get("/api/sessions/no-such-session/incoming")
+    assert r.status_code == 404
+    assert "no session" in r.json()["detail"].lower()
+
+
+def test_surface_inbox_unknown_session_returns_404(api_client):
+    r = api_client.get("/api/sessions/no-such-session/inbox/surface")
+    assert r.status_code == 404
+    assert "no session" in r.json()["detail"].lower()
+
+
+def test_ack_inbox_unknown_session_returns_404(api_client):
+    r = api_client.post(
+        "/api/sessions/no-such-session/inbox/ack",
+        json={"note_ids": None},
+    )
+    assert r.status_code == 404
+    assert "no session" in r.json()["detail"].lower()
+
+
+def test_archive_search_unknown_session_returns_404(api_client):
+    r = api_client.get(
+        "/api/sessions/no-such-session/inbox/archive",
+        params={"q": "anything"},
+    )
+    assert r.status_code == 404
+    assert "no session" in r.json()["detail"].lower()
