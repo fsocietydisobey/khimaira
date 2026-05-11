@@ -61,28 +61,48 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 def _consume_inbox(session_id: str) -> list[dict]:
-    """Read unread notes; mark them all read; return the unread set.
+    """Read unread notes, mark them read, MOVE TO archive.jsonl, return the
+    drained set.
 
-    Same logic as chimera.monitor.sessions.pending_notes(mark_read=True).
+    Mirrors chimera.monitor.sessions.pending_notes(mark_read=True): drained
+    notes move from inbox.jsonl → archive.jsonl atomically. Earlier version
+    of this hook marked-read in-place but never archived, so notes appeared
+    "missing" — present in inbox.jsonl as read=true records but invisible
+    to session_search_archive. 2026-05-11 bug: fixed to match daemon's
+    semantics.
+
     Hook runs as a separate process from the daemon; both use atomic
-    rename for the rewrite, so concurrent writes don't corrupt the file.
+    rename for the rewrite so concurrent writes don't corrupt the file.
     """
     inbox = _session_dir(session_id) / "inbox.jsonl"
+    archive = _session_dir(session_id) / "archive.jsonl"
     notes = _read_jsonl(inbox)
     pending = [n for n in notes if not n.get("read")]
     if not pending:
         return []
 
-    # Mark all unread → read, atomic rewrite
+    # Partition: notes that were already read OR are being drained now →
+    # archived; nothing remains in inbox after this pass (since pending was
+    # everything unread, and we're also archiving any previously-read
+    # entries that may have been left behind by older code paths).
+    archived: list[dict] = []
     for n in notes:
         if not n.get("read"):
             n["read"] = True
             n["read_at"] = _now_iso()
-    tmp = inbox.with_suffix(".jsonl.tmp")
+            n["read_reason"] = "session_start_drain"
+        archived.append(n)
+
     try:
-        with tmp.open("w", encoding="utf-8") as f:
-            for n in notes:
+        # Append-only write to archive.jsonl (preserves history across
+        # multiple drains)
+        with archive.open("a", encoding="utf-8") as f:
+            for n in archived:
                 f.write(json.dumps(n, separators=(",", ":")) + "\n")
+        # Atomic rewrite of inbox to empty (everything moved)
+        tmp = inbox.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            pass  # empty file
         tmp.replace(inbox)
     except OSError:
         # Couldn't rewrite — return empty so we don't lose the notes by
