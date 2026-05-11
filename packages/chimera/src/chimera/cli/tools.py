@@ -25,7 +25,6 @@ import re
 import sys
 from pathlib import Path
 
-
 _HERE = Path(__file__).resolve().parent
 _PACKAGE_ROOT = _HERE.parent  # chimera/
 _REPO_ROOT = _PACKAGE_ROOT.parent.parent.parent.parent  # chimera/ (workspace)
@@ -38,8 +37,16 @@ def _collect_cli_subcommands() -> list[dict]:
     """
     from chimera.cli import main as _main_fn  # noqa: F401  (import side-effects)
     from chimera.cli import (
-        attach as attach_cmd, dev, doctor, install_hooks, mcp_serve,
-        monitor, observer as observer_cli, route, task, tools as tools_cmd,
+        attach as attach_cmd,
+        dev,
+        doctor,
+        install_hooks,
+        mcp_serve,
+        monitor,
+        observer as observer_cli,
+        route,
+        task,
+        tools as tools_cmd,
     )
 
     out: list[dict] = []
@@ -75,23 +82,48 @@ def _collect_cli_subcommands() -> list[dict]:
             # Strip leading whitespace from multi-line descriptions
             help_text = re.split(r"\n\n", help_text.strip(), maxsplit=1)[0]
             help_text = " ".join(help_text.split())
-            out.append({
-                "category": "cli",
-                "name": f"chimera {name}",
-                "description": help_text[:140] if help_text else "(no help)",
-                "source": f"chimera.cli.{name.replace('-', '_')}",
-            })
+            out.append(
+                {
+                    "category": "cli",
+                    "name": f"chimera {name}",
+                    "description": help_text[:140] if help_text else "(no help)",
+                    "source": f"chimera.cli.{name.replace('-', '_')}",
+                }
+            )
     out.sort(key=lambda r: r["name"])
     return out
+
+
+def _mcp_call_counts(window_minutes: int = 60 * 24 * 7) -> dict[str, int]:
+    """Per-tool call count over the window (default: 7 days), from the
+    local mcp-calls.jsonl. Returns {} if telemetry log missing/unreadable.
+
+    Local file read — no daemon dependency, safe to call even when
+    chimera-monitor is down.
+    """
+    try:
+        from chimera.monitor import mcp_calls
+    except ImportError:
+        return {}
+    try:
+        digest = mcp_calls.summarize(window_minutes=window_minutes)
+    except Exception:
+        return {}
+    return {entry["tool"]: entry.get("calls", 0) for entry in digest.get("by_tool", [])}
 
 
 def _collect_mcp_tools() -> list[dict]:
     """Introspect chimera.server.mcp module for @mcp.tool() decorated functions.
 
     Pulls each tool's docstring (first line) as the description, plus
-    the function signature so users can see the args inline.
+    the function signature so users can see the args inline. Attaches a
+    `call_count` field from the local 7-day call telemetry so the rendered
+    listing can sort by usage — the most-used tools surface first, which
+    is what an agent scanning the catalog actually wants.
     """
     from chimera.server import mcp as mcp_mod
+
+    call_counts = _mcp_call_counts()
 
     out: list[dict] = []
     for name in dir(mcp_mod):
@@ -109,10 +141,25 @@ def _collect_mcp_tools() -> list[dict]:
         # health/status/approve/research/architect/brainstorm/classify/
         # history/rewind/swarm).
         prefixes = (
-            "session_", "monitor_", "chain", "follow_", "spawn_",
-            "list_", "kill_", "wait_", "usage_", "research", "architect",
-            "brainstorm", "classify", "approve", "history", "rewind",
-            "swarm", "health", "status",
+            "session_",
+            "monitor_",
+            "chain",
+            "follow_",
+            "spawn_",
+            "list_",
+            "kill_",
+            "wait_",
+            "usage_",
+            "research",
+            "architect",
+            "brainstorm",
+            "classify",
+            "approve",
+            "history",
+            "rewind",
+            "swarm",
+            "health",
+            "status",
         )
         if not any(name.startswith(p) for p in prefixes):
             continue
@@ -130,14 +177,21 @@ def _collect_mcp_tools() -> list[dict]:
             if line:
                 desc = line
                 break
-        out.append({
-            "category": "mcp",
-            "name": f"mcp__chimera__{name}",
-            "description": desc[:200] if desc else "(no docstring)",
-            "signature": sig,
-            "source": "chimera.server.mcp",
-        })
-    out.sort(key=lambda r: r["name"])
+        out.append(
+            {
+                "category": "mcp",
+                "name": f"mcp__chimera__{name}",
+                "description": desc[:200] if desc else "(no docstring)",
+                "signature": sig,
+                "source": "chimera.server.mcp",
+                "call_count": call_counts.get(name, 0),
+            }
+        )
+    # Rank by 7-day call count desc, alphabetic tiebreaker. The most-
+    # used tools surface first — which is what an agent scanning the
+    # catalog actually wants. When no telemetry exists (fresh install),
+    # all counts are 0 and the sort degenerates cleanly to alphabetic.
+    out.sort(key=lambda r: (-r["call_count"], r["name"]))
     return out
 
 
@@ -159,7 +213,11 @@ def _collect_slash_commands() -> list[dict]:
                     continue
                 if line.startswith("# /"):
                     # Header like "# /inbox — read pending answers..."
-                    desc = line.lstrip("#").strip().split(" — ", 1)[-1] if " — " in line else line.lstrip("#").strip()
+                    desc = (
+                        line.lstrip("#").strip().split(" — ", 1)[-1]
+                        if " — " in line
+                        else line.lstrip("#").strip()
+                    )
                     break
                 if line.startswith("# ") or line.startswith("## "):
                     continue
@@ -167,12 +225,14 @@ def _collect_slash_commands() -> list[dict]:
                 break
         except OSError:
             pass
-        out.append({
-            "category": "slash",
-            "name": f"/{name}",
-            "description": desc[:200] if desc else "(no description)",
-            "source": str(path),
-        })
+        out.append(
+            {
+                "category": "slash",
+                "name": f"/{name}",
+                "description": desc[:200] if desc else "(no description)",
+                "source": str(path),
+            }
+        )
     return out
 
 
@@ -212,30 +272,54 @@ def _collect_web_routes() -> list[dict]:
 def _collect_observer_endpoints() -> list[dict]:
     """REST API endpoints worth knowing about (for scripting / debugging)."""
     return [
-        {"category": "api", "name": "POST /api/heartbeat",
-         "description": "Receive one event from chimera_observer (called by app, not user)",
-         "source": ""},
-        {"category": "api", "name": "GET /api/heartbeats/{project}",
-         "description": "List active runs in project",
-         "source": ""},
-        {"category": "api", "name": "GET /api/heartbeats/{project}/cost",
-         "description": "Per-model token usage + estimated USD",
-         "source": ""},
-        {"category": "api", "name": "GET /api/heartbeats/{project}/slow",
-         "description": "Recent slow chain/llm/tool/external calls",
-         "source": ""},
-        {"category": "api", "name": "GET /api/heartbeats/{project}/by-correlation/{cid}",
-         "description": "All events for one app-level run (auto-correlation)",
-         "source": ""},
-        {"category": "api", "name": "POST /api/handoffs",
-         "description": "Drop a handoff for any future session in matching cwd",
-         "source": ""},
-        {"category": "api", "name": "GET /api/sessions/{sid}/transcript/summary",
-         "description": "Heuristic summary of a session's transcript (no LLM)",
-         "source": ""},
-        {"category": "api", "name": "GET /api/sessions/{sid}/transcript/query?q=",
-         "description": "Grep a session's transcript for a substring",
-         "source": ""},
+        {
+            "category": "api",
+            "name": "POST /api/heartbeat",
+            "description": "Receive one event from chimera_observer (called by app, not user)",
+            "source": "",
+        },
+        {
+            "category": "api",
+            "name": "GET /api/heartbeats/{project}",
+            "description": "List active runs in project",
+            "source": "",
+        },
+        {
+            "category": "api",
+            "name": "GET /api/heartbeats/{project}/cost",
+            "description": "Per-model token usage + estimated USD",
+            "source": "",
+        },
+        {
+            "category": "api",
+            "name": "GET /api/heartbeats/{project}/slow",
+            "description": "Recent slow chain/llm/tool/external calls",
+            "source": "",
+        },
+        {
+            "category": "api",
+            "name": "GET /api/heartbeats/{project}/by-correlation/{cid}",
+            "description": "All events for one app-level run (auto-correlation)",
+            "source": "",
+        },
+        {
+            "category": "api",
+            "name": "POST /api/handoffs",
+            "description": "Drop a handoff for any future session in matching cwd",
+            "source": "",
+        },
+        {
+            "category": "api",
+            "name": "GET /api/sessions/{sid}/transcript/summary",
+            "description": "Heuristic summary of a session's transcript (no LLM)",
+            "source": "",
+        },
+        {
+            "category": "api",
+            "name": "GET /api/sessions/{sid}/transcript/query?q=",
+            "description": "Grep a session's transcript for a substring",
+            "source": "",
+        },
     ]
 
 
@@ -252,12 +336,14 @@ def _collect_all() -> list[dict]:
         try:
             out.extend(fn())
         except Exception as e:
-            out.append({
-                "category": "_error",
-                "name": fn.__name__,
-                "description": f"failed to collect: {e}",
-                "source": "",
-            })
+            out.append(
+                {
+                    "category": "_error",
+                    "name": fn.__name__,
+                    "description": f"failed to collect: {e}",
+                    "source": "",
+                }
+            )
     return out
 
 
@@ -280,13 +366,21 @@ def _print_text(items: list[dict]) -> None:
         rows = by_cat.get(cat) or []
         if not rows:
             continue
-        print(f"\n{_CATEGORY_LABELS.get(cat, cat)}  ({len(rows)})")
+        suffix = ""
+        if cat == "mcp":
+            # Flag the ordering so users don't think the list is alphabetic.
+            total_calls = sum(r.get("call_count", 0) for r in rows)
+            if total_calls > 0:
+                suffix = "  — ranked by 7-day call count"
+        print(f"\n{_CATEGORY_LABELS.get(cat, cat)}  ({len(rows)}){suffix}")
         print("─" * 80)
         for it in rows:
             name = it["name"]
             desc = it["description"]
             if cat == "mcp" and it.get("signature"):
-                print(f"  {name}{it['signature']}")
+                count = it.get("call_count", 0)
+                count_tag = f"  [{count}×/7d]" if count else ""
+                print(f"  {name}{it['signature']}{count_tag}")
                 print(f"      {desc}")
             else:
                 # Pad name to a column then description
@@ -300,9 +394,7 @@ def _filter(items: list[dict], q: str | None, category: str | None) -> list[dict
     if q:
         ql = q.lower()
         out = [
-            i for i in out
-            if ql in i["name"].lower()
-            or ql in i["description"].lower()
+            i for i in out if ql in i["name"].lower() or ql in i["description"].lower()
         ]
     return out
 
@@ -318,8 +410,10 @@ def _cmd_tools(args: argparse.Namespace) -> int:
         print(f"no tools matching query={args.query!r} category={args.category!r}")
         return 1
     _print_text(items)
-    print(f"\n{len(items)} item(s). Use --json for machine-readable output, "
-          f"or `chimera tools <substring>` to filter.")
+    print(
+        f"\n{len(items)} item(s). Use --json for machine-readable output, "
+        f"or `chimera tools <substring>` to filter."
+    )
     return 0
 
 

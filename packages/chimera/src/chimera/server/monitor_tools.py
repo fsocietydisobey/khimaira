@@ -1442,4 +1442,9 @@ async def session_list() -> str:
             f"decisions={s.get('decision_count', 0)}, "
             f"open_q={s.get('open_question_count', 0)}"
         )
+    parts.append(
+        "\n_💡 Pass any name/id above directly to `session_state`, "
+        "`session_summary`, `session_post_notice`, etc. — they resolve "
+        "names internally, no need to list-then-filter._"
+    )
     return "\n".join(parts)

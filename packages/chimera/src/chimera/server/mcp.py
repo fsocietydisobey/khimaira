@@ -2234,7 +2234,18 @@ async def session_recent_decisions(recent_per_session: int = 5) -> str:
 @mcp.tool()
 @logged_tool("session_list")
 async def session_list() -> str:
-    """List all tracked sessions — last activity, status, counts."""
+    """List all tracked sessions — last activity, status, counts.
+
+    Use for DISCOVERY ("what sessions exist?", "what's been active
+    recently?"). NOT a lookup-by-name helper.
+
+    🛑 If you already know the session's name or id, skip the list:
+    every read tool (`session_state`, `session_summary`,
+    `session_pending_notes`) and every write tool (`session_post_notice`,
+    `session_post_handoff`, `session_invite_handoff`, `session_log_*`)
+    accepts a NAME directly and resolves it internally — list-then-filter
+    is wasted work.
+    """
     return await _monitor_tools.session_list()
 
 
