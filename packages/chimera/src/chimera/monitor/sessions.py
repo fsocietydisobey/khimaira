@@ -98,7 +98,9 @@ def log_decision(session_id: str, text: str, why: str = "") -> dict:
         "why": why,
     }
     _append_jsonl(_session_dir(session_id) / "decisions.jsonl", record)
+    _invalidate_list_sessions_cache()  # decision count is part of the cached digest
     # Fan out to handoff subscribers — best-effort, non-blocking
+    # (broadcast itself is now async; this try/except is a final safety net)
     try:
         _broadcast_to_handoff_subscribers(session_id, "decision", text)
     except Exception:
@@ -197,6 +199,7 @@ def set_status(session_id: str, status: str, detail: str = "") -> dict:
         "updated_at": _now_iso(),
     }
     path.write_text(json.dumps(record, indent=2))
+    _invalidate_list_sessions_cache()
     return record
 
 
@@ -218,6 +221,7 @@ def set_name(session_id: str, name: str) -> dict:
     record.setdefault("status", "idle")
     record.setdefault("detail", "")
     path.write_text(json.dumps(record, indent=2))
+    _invalidate_list_sessions_cache()
     log.info("session %s: named %r", session_id, name)
     return record
 
@@ -971,38 +975,60 @@ def _broadcast_to_handoff_subscribers(
 ) -> None:
     """Drop a notice into every subscriber of every handoff this session owns.
 
-    Called by log_decision/log_touch/set_status so subscribers see owner's
-    progress in their inboxes automatically. Subscribers can unsubscribe if
-    they want to mute. Silent on every failure path — never block the
-    owner's work on a broadcast issue.
+    Runs in a background daemon thread so the caller (log_decision /
+    log_touch / set_status) returns immediately. Previously synchronous
+    — measured 344ms outlier on log_decision because N subscribers
+    meant N sequential file appends on the caller's hot path.
+
+    The owner doesn't need to know whether subscribers actually received
+    notices; eventual delivery is the contract. If the broadcast thread
+    crashes, the owner's decision is still logged.
+
+    Silent on every failure path — never block the owner's work on a
+    broadcast issue, never propagate broadcast errors to the caller.
     """
     if not _HANDOFFS_PATH.exists():
         return
+
+    # Cheap pre-check on the sync path: if we have no handoffs at all,
+    # don't even spin up a thread. Eliminates overhead for the 95%+ of
+    # log_decision calls where no broadcast is needed.
     try:
-        handoffs = _read_jsonl(_HANDOFFS_PATH)
+        handoffs_snapshot = _read_jsonl(_HANDOFFS_PATH)
     except OSError:
         return
-
-    owned = [h for h in handoffs if h.get("owner_session_id") == owner_session_id]
+    owned = [h for h in handoffs_snapshot if h.get("owner_session_id") == owner_session_id]
     if not owned:
         return
 
+    # Capture the data the thread needs so we don't re-read the file
+    # (which might race with concurrent writes).
+    work: list[tuple[str, str, dict]] = []
     for h in owned:
-        subscribers = h.get("subscribers") or []
-        for sub_id in subscribers:
+        for sub_id in (h.get("subscribers") or []):
+            note = {
+                "id": uuid.uuid4().hex[:12],
+                "ts": _now_iso(),
+                "kind": "notice",
+                "text": f"[handoff {h['id'][:8]} progress] {kind}: {text[:300]}",
+                "from_session_id": owner_session_id,
+                "read": False,
+                "surface_count": 0,
+            }
+            work.append((h["id"], sub_id, note))
+
+    if not work:
+        return
+
+    def _do_fanout() -> None:
+        for _handoff_id, sub_id, note in work:
             try:
-                note = {
-                    "id": uuid.uuid4().hex[:12],
-                    "ts": _now_iso(),
-                    "kind": "notice",
-                    "text": f"[handoff {h['id'][:8]} progress] {kind}: {text[:300]}",
-                    "from_session_id": owner_session_id,
-                    "read": False,
-                    "surface_count": 0,
-                }
                 _append_jsonl(_session_dir(sub_id) / "inbox.jsonl", note)
             except Exception:
                 pass  # subscriber may have been deleted; skip
+
+    import threading
+    threading.Thread(target=_do_fanout, daemon=True).start()
 
 
 def list_handoffs_in_scope(session_id: str, cwd: str) -> list[dict]:
@@ -1392,34 +1418,80 @@ def incoming_questions(session_id: str) -> list[dict]:
     return out
 
 
-def list_sessions() -> list[dict]:
-    """All sessions with their last-modified timestamp + summary counts."""
-    if not _BASE_DIR.exists():
-        return []
-    out: list[dict] = []
-    for sd in _BASE_DIR.iterdir():
-        if not sd.is_dir():
-            continue
-        last_mtime = max(
-            (p.stat().st_mtime for p in sd.iterdir() if p.is_file()),
-            default=0.0,
-        )
-        decisions = sum(1 for _ in (sd / "decisions.jsonl").open() if _.strip()) if (sd / "decisions.jsonl").exists() else 0
-        files = sum(1 for _ in (sd / "files_touched.jsonl").open() if _.strip()) if (sd / "files_touched.jsonl").exists() else 0
-        questions = _read_jsonl(sd / "questions.jsonl")
-        open_q = sum(1 for q in questions if q.get("status") == "open")
-        status_path = sd / "status.json"
-        status = json.loads(status_path.read_text()) if status_path.exists() else None
+# list_sessions is hot — called 9+ times per day in measured usage, with
+# p95=172ms (one outlier hit 776ms) when sessions accumulate. The work
+# is per-session: open every session dir, stat every file, count lines
+# in jsonl files, read status.json. Scales linearly with session count.
+#
+# Cache result for _LIST_SESSIONS_TTL seconds. 2s is short enough that
+# stale-data risk is negligible (sessions update infrequently) and long
+# enough that bursts of UI/MCP calls hit cache.
+_LIST_SESSIONS_TTL = 2.0
+_list_sessions_cache: tuple[float, list[dict]] | None = None
+_list_sessions_lock = None  # lazy init to avoid threading import on cold path
 
-        out.append({
-            "session_id": sd.name,
-            "name": (status.get("name") if isinstance(status, dict) else None),
-            "last_active": last_mtime,
-            "last_active_age_s": time.time() - last_mtime if last_mtime else None,
-            "status": status,
-            "decision_count": decisions,
-            "file_touch_count": files,
-            "open_question_count": open_q,
-        })
-    out.sort(key=lambda r: r.get("last_active", 0), reverse=True)
-    return out
+
+def list_sessions(use_cache: bool = True) -> list[dict]:
+    """All sessions with their last-modified timestamp + summary counts.
+
+    Cached for 2s. Pass use_cache=False to force a fresh scan (rare —
+    most callers prefer the cache because sessions don't move fast).
+    """
+    global _list_sessions_cache, _list_sessions_lock
+
+    if use_cache and _list_sessions_cache is not None:
+        cached_at, cached_data = _list_sessions_cache
+        if time.time() - cached_at < _LIST_SESSIONS_TTL:
+            return cached_data
+
+    if _list_sessions_lock is None:
+        import threading
+        _list_sessions_lock = threading.Lock()
+
+    with _list_sessions_lock:
+        # Double-check after acquiring lock — another thread may have
+        # already refreshed while we were waiting.
+        if use_cache and _list_sessions_cache is not None:
+            cached_at, cached_data = _list_sessions_cache
+            if time.time() - cached_at < _LIST_SESSIONS_TTL:
+                return cached_data
+
+        if not _BASE_DIR.exists():
+            _list_sessions_cache = (time.time(), [])
+            return []
+
+        out: list[dict] = []
+        for sd in _BASE_DIR.iterdir():
+            if not sd.is_dir():
+                continue
+            last_mtime = max(
+                (p.stat().st_mtime for p in sd.iterdir() if p.is_file()),
+                default=0.0,
+            )
+            decisions = sum(1 for _ in (sd / "decisions.jsonl").open() if _.strip()) if (sd / "decisions.jsonl").exists() else 0
+            files = sum(1 for _ in (sd / "files_touched.jsonl").open() if _.strip()) if (sd / "files_touched.jsonl").exists() else 0
+            questions = _read_jsonl(sd / "questions.jsonl")
+            open_q = sum(1 for q in questions if q.get("status") == "open")
+            status_path = sd / "status.json"
+            status = json.loads(status_path.read_text()) if status_path.exists() else None
+
+            out.append({
+                "session_id": sd.name,
+                "name": (status.get("name") if isinstance(status, dict) else None),
+                "last_active": last_mtime,
+                "last_active_age_s": time.time() - last_mtime if last_mtime else None,
+                "status": status,
+                "decision_count": decisions,
+                "file_touch_count": files,
+                "open_question_count": open_q,
+            })
+        out.sort(key=lambda r: r.get("last_active", 0), reverse=True)
+        _list_sessions_cache = (time.time(), out)
+        return out
+
+
+def _invalidate_list_sessions_cache() -> None:
+    """Bust the cache. Called by write paths (set_name, set_status) so
+    UI updates feel instant even though most reads are cached."""
+    global _list_sessions_cache
+    _list_sessions_cache = None

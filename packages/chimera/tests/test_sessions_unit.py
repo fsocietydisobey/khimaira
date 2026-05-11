@@ -148,6 +148,74 @@ def test_consume_handoffs_unrelated_cwd_no_match(isolated_state, tmp_path):
     assert matched == []
 
 
+def test_list_sessions_caches_within_ttl(isolated_state, monkeypatch):
+    """list_sessions should return cached result within 2s TTL."""
+    isolated_state.log_decision("s1", "init", "")
+    isolated_state.log_decision("s2", "init", "")
+
+    first = isolated_state.list_sessions()
+    assert len(first) == 2
+
+    # Now mutate state by adding a new session, but don't invalidate cache
+    # (simulating: write happened without going through chimera write path)
+    sd = isolated_state._BASE_DIR / "s3-fake"
+    sd.mkdir()
+    (sd / "status.json").write_text('{"name":"x","status":"idle","detail":""}')
+
+    # Cache should still return 2 sessions
+    cached = isolated_state.list_sessions()
+    assert len(cached) == 2
+
+    # Force fresh scan → sees 3
+    fresh = isolated_state.list_sessions(use_cache=False)
+    assert len(fresh) == 3
+
+
+def test_list_sessions_cache_invalidated_on_log_decision(isolated_state):
+    """log_decision should bust the cache so next list sees the new session."""
+    isolated_state.log_decision("s1", "init", "")
+    first = isolated_state.list_sessions()
+    assert len(first) == 1
+
+    # New session via log_decision → cache should be busted
+    isolated_state.log_decision("s2", "new session", "")
+    second = isolated_state.list_sessions()
+    assert len(second) == 2
+
+
+def test_list_sessions_cache_invalidated_on_set_name(isolated_state):
+    """set_name should bust the cache so renames appear immediately."""
+    isolated_state.log_decision("s1", "init", "")
+    isolated_state.list_sessions()  # warm cache
+
+    isolated_state.set_name("s1", "renamed")
+    after_rename = isolated_state.list_sessions()
+    assert after_rename[0]["name"] == "renamed"
+
+
+def test_broadcast_returns_immediately_when_no_subscribers(isolated_state, tmp_path):
+    """log_decision shouldn't spawn a thread if no subscribers exist."""
+    import time
+    asker = "asker"
+    project = tmp_path / "p"
+    project.mkdir()
+    # Handoff without subscribers
+    h = isolated_state.post_handoff(
+        asker, text="t", scope_cwd=str(project), expires_in_hours=24,
+    )
+    isolated_state.consume_handoffs("owner", str(project))  # claim ownership
+    isolated_state.log_decision("subscriber-1", "init", "")  # materialize but DON'T subscribe
+
+    # Time log_decision — should be fast (no broadcast work)
+    t0 = time.perf_counter()
+    for _ in range(10):
+        isolated_state.log_decision("owner", "decision text", "why")
+    elapsed = time.perf_counter() - t0
+
+    # 10 decisions, no broadcast → should be well under 100ms total
+    assert elapsed < 0.5, f"10 unsubscribed broadcasts took {elapsed:.2f}s (too slow)"
+
+
 def test_consume_handoffs_auto_claims_first_consumer_as_owner(isolated_state, tmp_path):
     """First session in scope auto-claims as owner; subsequent sessions are
     observers. Closes the collision pattern where multiple sessions in the
@@ -190,7 +258,11 @@ def test_subscribe_handoff_idempotent(isolated_state, tmp_path):
 
 
 def test_log_decision_broadcasts_to_handoff_subscribers(isolated_state, tmp_path):
-    """When owner logs a decision, subscribers' inboxes receive a notice."""
+    """When owner logs a decision, subscribers' inboxes receive a notice
+    (eventually — broadcast runs in a background thread, so we poll).
+    """
+    import time
+
     asker = "asker"
     project = tmp_path / "p"
     project.mkdir()
@@ -203,15 +275,19 @@ def test_log_decision_broadcasts_to_handoff_subscribers(isolated_state, tmp_path
     isolated_state.log_decision("subscriber-session", "init", "")
     isolated_state.subscribe_handoff(h["id"], "subscriber-session")
 
-    # Owner logs a decision — should fan out to subscriber's inbox
+    # Owner logs a decision — fanout is async; poll up to 2s for delivery
     isolated_state.log_decision("owner-session", "starting bug fix in foo.py", "step 1")
 
-    pending = isolated_state.pending_notes("subscriber-session", mark_read=False)
-    assert len(pending) >= 1
-    # Match the broadcast notice (filter out the asker's earlier log_decision
-    # which doesn't broadcast because asker doesn't own this handoff)
-    broadcasts = [n for n in pending if "handoff" in (n.get("text") or "")]
-    assert len(broadcasts) == 1
+    deadline = time.time() + 2.0
+    broadcasts: list[dict] = []
+    while time.time() < deadline:
+        pending = isolated_state.pending_notes("subscriber-session", mark_read=False)
+        broadcasts = [n for n in pending if "handoff" in (n.get("text") or "")]
+        if broadcasts:
+            break
+        time.sleep(0.05)
+
+    assert len(broadcasts) == 1, f"broadcast didn't arrive in 2s: {broadcasts}"
     assert "decision" in broadcasts[0]["text"]
     assert "starting bug fix" in broadcasts[0]["text"]
 
