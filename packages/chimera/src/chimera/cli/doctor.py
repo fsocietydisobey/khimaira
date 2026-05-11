@@ -53,11 +53,16 @@ def run(_args: argparse.Namespace) -> int:
 
     # Env vars worth surfacing
     relevant_env = [
-        "CHIMERA_CLAUDE_CMD", "CHIMERA_CLAUDE_MODEL",
-        "CHIMERA_CODEX_CMD", "CHIMERA_CODEX_MODEL",
-        "CHIMERA_GEMINI_CMD", "CHIMERA_GEMINI_MODEL",
-        "CHIMERA_OLLAMA_CMD", "CHIMERA_OLLAMA_MODEL",
-        "CHIMERA_LLM_CMD", "CHIMERA_LLM_MODEL",
+        "CHIMERA_CLAUDE_CMD",
+        "CHIMERA_CLAUDE_MODEL",
+        "CHIMERA_CODEX_CMD",
+        "CHIMERA_CODEX_MODEL",
+        "CHIMERA_GEMINI_CMD",
+        "CHIMERA_GEMINI_MODEL",
+        "CHIMERA_OLLAMA_CMD",
+        "CHIMERA_OLLAMA_MODEL",
+        "CHIMERA_LLM_CMD",
+        "CHIMERA_LLM_MODEL",
         "CHIMERA_LOCAL_ONLY",
     ]
     set_vars = [(k, os.environ[k]) for k in relevant_env if k in os.environ]
@@ -70,7 +75,9 @@ def run(_args: argparse.Namespace) -> int:
     any_available = any(avail.values())
     print()
     if any_available:
-        print(f"✅ chimera is operational ({sum(avail.values())}/{len(avail)} runners installed).")
+        print(
+            f"✅ chimera is operational ({sum(avail.values())}/{len(avail)} runners installed)."
+        )
         if not avail.get("ollama"):
             print(
                 "   Tip: install Ollama for free local fallback — "
@@ -116,34 +123,58 @@ def _check_monitor_status() -> None:
         print("  ❌ chimera-monitor daemon NOT running on 127.0.0.1:8740")
         print("     Start with: `chimera monitor start`")
         print("     For auto-start + auto-restart on crash:")
-        print("       `chimera monitor install-service --enable` (systemd, Linux)")
-        print("       `chimera monitor watch` (cross-platform fallback)")
+        print(
+            "       `chimera monitor install-service --enable` (systemd on Linux, launchd on macOS)"
+        )
+        print("       `chimera monitor watch` (cross-platform foreground fallback)")
         return
 
     # 2. Is there a supervisor watching it?
-    has_systemd_unit = False
-    systemd_active = False
+    supervisor_active = False
+    supervisor_name = ""
     if sys.platform == "linux" and shutil.which("systemctl"):
         try:
             result = subprocess.run(
                 ["systemctl", "--user", "is-active", "chimera-monitor"],
-                capture_output=True, text=True, timeout=2.0,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
             )
-            systemd_active = result.stdout.strip() == "active"
-            has_systemd_unit = result.returncode in (0, 3)  # 3 = inactive but unit exists
+            supervisor_active = result.stdout.strip() == "active"
+            supervisor_name = "systemd"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    elif sys.platform == "darwin" and shutil.which("launchctl"):
+        # `launchctl list <label>` exits 0 and prints the dict when loaded,
+        # nonzero otherwise. Cheaper than `print` (which can return blocks).
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", "com.chimera.monitor"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            supervisor_active = result.returncode == 0
+            supervisor_name = "launchd"
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
 
-    if systemd_active:
-        print("  ✅ daemon up, supervised by systemd (auto-restart enabled)")
-        print("     logs: `journalctl --user -u chimera-monitor -f`")
+    if supervisor_active:
+        print(f"  ✅ daemon up, supervised by {supervisor_name} (auto-restart enabled)")
+        if supervisor_name == "systemd":
+            print("     logs: `journalctl --user -u chimera-monitor -f`")
+        elif supervisor_name == "launchd":
+            print("     logs: ~/Library/Logs/chimera-monitor.{out,err}.log")
         return
 
     # Daemon up but no supervisor — the failure class users hit most
     print("  ⚠️  daemon up but NOT supervised — silent death class still possible")
-    if sys.platform == "linux":
+    if sys.platform in ("linux", "darwin"):
+        backend = (
+            "systemd user unit" if sys.platform == "linux" else "launchd LaunchAgent"
+        )
         print("     Recommended: `chimera monitor install-service --enable`")
-        print("     (writes a systemd user unit; daemon auto-restarts on crash + boot)")
+        print(f"     (writes a {backend}; daemon auto-restarts on crash + boot)")
     else:
         print("     Recommended: `chimera monitor watch` in a tmux/screen pane")
-        print("     (cross-platform fallback; systemd is Linux-only)")
+        print("     (cross-platform fallback; no native supervisor for this OS)")

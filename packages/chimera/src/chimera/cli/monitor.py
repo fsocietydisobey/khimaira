@@ -25,23 +25,35 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
 
     # Lazy imports — keep import time fast; monitor pulls heavy deps (FastAPI etc.)
     p_start = sub.add_parser("start", help="Daemonize the monitor server")
-    p_start.add_argument("--foreground", action="store_true", help="Run in foreground (no fork)")
-    p_start.add_argument("--no-browser", action="store_true", help="Don't open the browser")
+    p_start.add_argument(
+        "--foreground", action="store_true", help="Run in foreground (no fork)"
+    )
+    p_start.add_argument(
+        "--no-browser", action="store_true", help="Don't open the browser"
+    )
     p_start.set_defaults(func=_run_start)
 
     p_stop = sub.add_parser("stop", help="Stop the monitor daemon")
     p_stop.set_defaults(func=_run_stop)
 
     p_restart = sub.add_parser("restart", help="Stop then start the monitor daemon")
-    p_restart.add_argument("--foreground", action="store_true", help="Run in foreground")
-    p_restart.add_argument("--no-browser", action="store_true", help="Don't open the browser")
+    p_restart.add_argument(
+        "--foreground", action="store_true", help="Run in foreground"
+    )
+    p_restart.add_argument(
+        "--no-browser", action="store_true", help="Don't open the browser"
+    )
     p_restart.set_defaults(func=_run_restart)
 
     p_status = sub.add_parser("status", help="Report daemon status")
     p_status.set_defaults(func=_run_status)
 
-    p_rescan = sub.add_parser("rescan", help="Force a metadata rescan for one project (or all)")
-    p_rescan.add_argument("project", nargs="?", help="Project name to rescan; omit for all")
+    p_rescan = sub.add_parser(
+        "rescan", help="Force a metadata rescan for one project (or all)"
+    )
+    p_rescan.add_argument(
+        "project", nargs="?", help="Project name to rescan; omit for all"
+    )
     p_rescan.set_defaults(func=_run_rescan)
 
     p_watch = sub.add_parser(
@@ -58,64 +70,122 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
 
     p_install = sub.add_parser(
         "install-service",
-        help="Install a systemd user unit (Linux) so the daemon auto-restarts on failure",
+        help="Install a host-native supervisor (systemd on Linux, launchd on macOS)",
         description=(
-            "Writes ~/.config/systemd/user/chimera-monitor.service. After "
-            "install, view logs with `journalctl --user -u chimera-monitor -f`."
+            "Dispatches by platform. Linux: writes "
+            "~/.config/systemd/user/chimera-monitor.service (view logs with "
+            "`journalctl --user -u chimera-monitor -f`). macOS: writes "
+            "~/Library/LaunchAgents/com.chimera.monitor.plist (logs in "
+            "~/Library/Logs/chimera-monitor.{out,err}.log)."
         ),
     )
-    p_install.add_argument("--enable", action="store_true",
-                           help="Also enable + start the service immediately")
-    p_install.add_argument("--force", action="store_true",
-                           help="Overwrite an existing unit file with different contents")
+    p_install.add_argument(
+        "--enable",
+        action="store_true",
+        help="Also enable + start the service immediately",
+    )
+    p_install.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing unit file with different contents",
+    )
     p_install.set_defaults(func=_run_install_service)
 
     p_uninstall = sub.add_parser(
         "uninstall-service",
-        help="Stop, disable, and remove the systemd user unit",
+        help="Stop and remove the host-native supervisor",
     )
     p_uninstall.set_defaults(func=_run_uninstall_service)
+
+    # Explicit per-platform commands for users who want the specific
+    # backend without going through the dispatcher.
+    p_install_launchd = sub.add_parser(
+        "install-launchd",
+        help="Install a launchd LaunchAgent plist (macOS) — explicit form of install-service",
+        description=(
+            "Writes ~/Library/LaunchAgents/com.chimera.monitor.plist. "
+            "Logs land at ~/Library/Logs/chimera-monitor.{out,err}.log. "
+            "On Linux/other platforms, use `install-service` instead."
+        ),
+    )
+    p_install_launchd.add_argument(
+        "--enable",
+        action="store_true",
+        help="Also launchctl load -w the plist immediately",
+    )
+    p_install_launchd.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing plist with different contents",
+    )
+    p_install_launchd.set_defaults(func=_run_install_launchd)
+
+    p_uninstall_launchd = sub.add_parser(
+        "uninstall-launchd",
+        help="Unload + remove the launchd LaunchAgent plist (macOS)",
+    )
+    p_uninstall_launchd.set_defaults(func=_run_uninstall_launchd)
 
 
 def _run_start(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_start, _load_env
+
     _load_env()
     return _cmd_start(args)
 
 
 def _run_stop(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_stop
+
     return _cmd_stop(args)
 
 
 def _run_restart(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_restart, _load_env
+
     _load_env()
     return _cmd_restart(args)
 
 
 def _run_status(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_status
+
     return _cmd_status(args)
 
 
 def _run_rescan(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_rescan, _load_env
+
     _load_env()
     return _cmd_rescan(args)
 
 
 def _run_watch(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_watch, _load_env
+
     _load_env()
     return _cmd_watch(args)
 
 
 def _run_install_service(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_install_service
+
     return _cmd_install_service(args)
 
 
 def _run_uninstall_service(args: argparse.Namespace) -> int:
     from chimera.monitor.cli import _cmd_uninstall_service
+
     return _cmd_uninstall_service(args)
+
+
+def _run_install_launchd(args: argparse.Namespace) -> int:
+    from chimera.monitor.cli import _cmd_install_launchd
+
+    return _cmd_install_launchd(args)
+
+
+def _run_uninstall_launchd(args: argparse.Namespace) -> int:
+    from chimera.monitor.cli import _cmd_uninstall_launchd
+
+    return _cmd_uninstall_launchd(args)

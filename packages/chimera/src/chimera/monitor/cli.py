@@ -56,7 +56,9 @@ def _port() -> int:
 def _cmd_start(args: argparse.Namespace) -> int:
     existing = _read_pid()
     if existing and _alive(existing):
-        print(f"chimera monitor already running (PID {existing}) — http://127.0.0.1:{_port()}")
+        print(
+            f"chimera monitor already running (PID {existing}) — http://127.0.0.1:{_port()}"
+        )
         if not args.no_browser:
             webbrowser.open(f"http://127.0.0.1:{_port()}")
         return 0
@@ -123,26 +125,45 @@ def _maybe_nudge_about_supervisor() -> None:
     """
     if os.environ.get("CHIMERA_QUIET_NUDGE"):
         return
-    if sys.platform != "linux":
-        # On macOS, the analog is launchd — we don't ship a launchd
-        # template yet, so the nudge would point at the cross-platform
-        # `chimera monitor watch` instead.
-        print("tip: `chimera monitor watch` in a tmux/screen pane for auto-restart")
-        return
     import shutil
     import subprocess
-    if not shutil.which("systemctl"):
-        return  # systemd not available — skip nudge
-    try:
-        result = subprocess.run(
-            ["systemctl", "--user", "is-active", "chimera-monitor"],
-            capture_output=True, text=True, timeout=1.5,
-        )
-        if result.stdout.strip() == "active":
-            return  # supervised already; no nudge needed
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return  # If we can't tell, don't nudge — might be misleading
-    print("tip: `chimera monitor install-service --enable` to auto-restart on crash + boot")
+
+    if sys.platform == "linux":
+        if not shutil.which("systemctl"):
+            return  # systemd not available — skip nudge
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", "chimera-monitor"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+            )
+            if result.stdout.strip() == "active":
+                return  # supervised already; no nudge needed
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return  # If we can't tell, don't nudge — might be misleading
+    elif sys.platform == "darwin":
+        if not shutil.which("launchctl"):
+            return
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", "com.chimera.monitor"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+            )
+            if result.returncode == 0:
+                return  # already loaded — no nudge needed
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return
+    else:
+        # Other platforms: no native supervisor, point at the foreground watcher.
+        print("tip: `chimera monitor watch` in a tmux/screen pane for auto-restart")
+        return
+
+    print(
+        "tip: `chimera monitor install-service --enable` to auto-restart on crash + boot"
+    )
 
 
 def _cmd_restart(args: argparse.Namespace) -> int:
@@ -178,7 +199,10 @@ def _cmd_stop(args: argparse.Namespace) -> int:
             return 0
         time.sleep(0.1)
 
-    print(f"chimera monitor: PID {pid} did not exit on SIGTERM, sending SIGKILL", file=sys.stderr)
+    print(
+        f"chimera monitor: PID {pid} did not exit on SIGTERM, sending SIGKILL",
+        file=sys.stderr,
+    )
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -202,7 +226,10 @@ def _cmd_rescan(args: argparse.Namespace) -> int:
     if args.project:
         projects = [p for p in projects if p.name == args.project]
         if not projects:
-            print(f"chimera monitor: no project named {args.project!r} in roots", file=sys.stderr)
+            print(
+                f"chimera monitor: no project named {args.project!r} in roots",
+                file=sys.stderr,
+            )
             return 1
 
     if not projects:
@@ -262,8 +289,13 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     max_backoff = 60.0
     healthy_threshold = 300.0  # 5 min uptime = reset backoff
     cmd = [
-        sys.executable, "-m", "chimera.cli", "monitor", "start",
-        "--foreground", "--no-browser",
+        sys.executable,
+        "-m",
+        "chimera.cli",
+        "monitor",
+        "start",
+        "--foreground",
+        "--no-browser",
     ]
 
     print(f"chimera monitor watch: supervising — Ctrl-C to stop")
@@ -289,8 +321,10 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         try:
             child = subprocess.Popen(cmd)
         except OSError as e:
-            print(f"chimera monitor watch: spawn failed ({e}); retrying in {backoff:.0f}s",
-                  file=sys.stderr)
+            print(
+                f"chimera monitor watch: spawn failed ({e}); retrying in {backoff:.0f}s",
+                file=sys.stderr,
+            )
             time.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
             continue
@@ -303,7 +337,9 @@ def _cmd_watch(args: argparse.Namespace) -> int:
             return 0
 
         if rc == 0:
-            print(f"chimera monitor watch: daemon exited cleanly (rc=0); not restarting")
+            print(
+                f"chimera monitor watch: daemon exited cleanly (rc=0); not restarting"
+            )
             return 0
 
         # Reset backoff if the daemon ran healthy for a while
@@ -321,10 +357,211 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+_LAUNCHD_LABEL = "com.chimera.monitor"
+
+
 def _systemd_unit_path() -> Path:
     """User-scoped systemd unit file path."""
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return Path(xdg) / "systemd" / "user" / "chimera-monitor.service"
+
+
+def _launchd_plist_path() -> Path:
+    """User-scoped launchd LaunchAgent plist path (macOS)."""
+    return Path(os.path.expanduser(f"~/Library/LaunchAgents/{_LAUNCHD_LABEL}.plist"))
+
+
+def _launchd_plist_content() -> str:
+    """Render the launchd LaunchAgent plist.
+
+    Mirrors the systemd unit's behavior:
+      - Restart on failure (KeepAlive with SuccessfulExit=false so we
+        treat both crashes AND clean exits as restart-worthy, matching
+        the systemd unit's intent).
+      - Run at user login (RunAtLoad).
+      - Log stdout/stderr to ~/Library/Logs/chimera-monitor.{out,err}.log.
+
+    ProgramArguments uses `uv --directory <workspace> run chimera monitor
+    start --foreground --no-browser` when uv is available, mirroring the
+    systemd path. Falls back to the current Python interpreter.
+    """
+    import shutil
+    import sys
+
+    uv = shutil.which("uv")
+    # __file__ = .../chimera/packages/chimera/src/chimera/monitor/cli.py
+    # parents[5] = chimera/ workspace root
+    workspace_root = str(Path(__file__).resolve().parents[5])
+    if uv:
+        program_args = [
+            uv,
+            "--directory",
+            workspace_root,
+            "run",
+            "chimera",
+            "monitor",
+            "start",
+            "--foreground",
+            "--no-browser",
+        ]
+    else:
+        program_args = [
+            sys.executable,
+            "-m",
+            "chimera.cli",
+            "monitor",
+            "start",
+            "--foreground",
+            "--no-browser",
+        ]
+
+    log_dir = os.path.expanduser("~/Library/Logs")
+    args_xml = "\n".join(f"        <string>{a}</string>" for a in program_args)
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{_LAUNCHD_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+{args_xml}
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on both crash AND clean exit — chimera daemon's normal
+         exit path is shutdown, so rc=0 mid-day means something killed
+         it. Throttle so a stuck-loop crash doesn't spin. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>{log_dir}/chimera-monitor.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/chimera-monitor.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+"""
+
+
+def _cmd_install_launchd(args: argparse.Namespace) -> int:
+    """Install a launchd LaunchAgent plist (macOS) so the daemon auto-
+    starts on login + auto-restarts on failure. macOS-only analog of
+    `install-service` on Linux.
+    """
+    import subprocess
+    import sys
+
+    if sys.platform != "darwin":
+        print(
+            f"chimera monitor install-launchd: launchd is macOS-only "
+            f"(detected {sys.platform}). On Linux use `install-service`; "
+            f"elsewhere use `chimera monitor watch`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not shutil_which("launchctl"):
+        print(
+            "chimera monitor install-launchd: launchctl not found on PATH. "
+            "Use `chimera monitor watch` instead.",
+            file=sys.stderr,
+        )
+        return 1
+
+    plist_path = _launchd_plist_path()
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    content = _launchd_plist_content()
+
+    if plist_path.exists() and not args.force:
+        existing = plist_path.read_text(encoding="utf-8")
+        if existing == content:
+            print(
+                f"chimera monitor: plist already installed and current — {plist_path}"
+            )
+        else:
+            print(
+                f"chimera monitor: plist exists at {plist_path} but contents differ. "
+                f"Re-run with --force to overwrite.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        plist_path.write_text(content, encoding="utf-8")
+        print(f"chimera monitor: wrote plist → {plist_path}")
+
+    if args.enable:
+        # Unload any prior version first — bootstrap fails if already loaded.
+        # `2>/dev/null` not available via subprocess.run, so swallow stderr
+        # by capturing it; we don't care about errors here.
+        subprocess.run(
+            ["launchctl", "unload", str(plist_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        try:
+            subprocess.run(
+                ["launchctl", "load", "-w", str(plist_path)],
+                check=True,
+            )
+            print(
+                f"chimera monitor: loaded + started — "
+                f"logs in ~/Library/Logs/chimera-monitor.{{out,err}}.log"
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"chimera monitor: launchctl load failed: {e}", file=sys.stderr)
+            return 1
+    else:
+        print(
+            "chimera monitor: plist installed but not loaded. To start now:\n"
+            f"  launchctl load -w {plist_path}\n"
+            "Or re-run with --enable."
+        )
+    return 0
+
+
+def _cmd_uninstall_launchd(args: argparse.Namespace) -> int:
+    """Unload + remove the launchd LaunchAgent plist (macOS)."""
+    import subprocess
+    import sys
+
+    if sys.platform != "darwin":
+        print(
+            f"chimera monitor uninstall-launchd: launchd is macOS-only.",
+            file=sys.stderr,
+        )
+        return 1
+
+    plist_path = _launchd_plist_path()
+    if not plist_path.exists():
+        print(f"chimera monitor: no plist at {plist_path} — nothing to uninstall")
+        return 0
+
+    # Best-effort unload; suppress errors if it wasn't loaded.
+    if shutil_which("launchctl"):
+        subprocess.run(
+            ["launchctl", "unload", str(plist_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    plist_path.unlink(missing_ok=True)
+    print(f"chimera monitor: removed {plist_path}")
+    return 0
 
 
 def _systemd_unit_content() -> str:
@@ -379,17 +616,24 @@ WantedBy=default.target
 
 
 def _cmd_install_service(args: argparse.Namespace) -> int:
-    """Install a systemd user unit so the daemon auto-starts on login +
-    auto-restarts on failure. Linux-only; macOS users should use
-    `chimera monitor watch` (foreground supervisor).
+    """Install a host-native service so the daemon auto-starts on login
+    + auto-restarts on failure.
+
+    Dispatches by platform:
+      - Linux → systemd user unit
+      - macOS → launchd LaunchAgent plist (via install-launchd)
+      - Other → suggest `chimera monitor watch` (foreground supervisor)
     """
     import subprocess
     import sys
 
+    if sys.platform == "darwin":
+        return _cmd_install_launchd(args)
+
     if sys.platform != "linux":
         print(
-            f"chimera monitor install-service: systemd is Linux-only "
-            f"(detected {sys.platform}). Use `chimera monitor watch` instead "
+            f"chimera monitor install-service: no native supervisor "
+            f"available for {sys.platform}. Use `chimera monitor watch` "
             f"as a cross-platform fallback supervisor.",
             file=sys.stderr,
         )
@@ -435,7 +679,9 @@ def _cmd_install_service(args: argparse.Namespace) -> int:
                 ["systemctl", "--user", "enable", "--now", "chimera-monitor"],
                 check=True,
             )
-            print("chimera monitor: enabled + started — `journalctl --user -u chimera-monitor -f` to follow")
+            print(
+                "chimera monitor: enabled + started — `journalctl --user -u chimera-monitor -f` to follow"
+            )
         except subprocess.CalledProcessError as e:
             print(f"chimera monitor: enable failed: {e}", file=sys.stderr)
             return 1
@@ -449,13 +695,21 @@ def _cmd_install_service(args: argparse.Namespace) -> int:
 
 
 def _cmd_uninstall_service(args: argparse.Namespace) -> int:
-    """Remove the systemd user unit (does not stop a currently-running daemon
-    started outside systemd; use `chimera monitor stop` for that)."""
+    """Remove the host-native service (systemd unit on Linux, launchd
+    plist on macOS). Does not stop a currently-running daemon started
+    outside the supervisor; use `chimera monitor stop` for that."""
     import subprocess
     import sys
 
+    if sys.platform == "darwin":
+        return _cmd_uninstall_launchd(args)
+
     if sys.platform != "linux":
-        print(f"chimera monitor uninstall-service: systemd is Linux-only.", file=sys.stderr)
+        print(
+            f"chimera monitor uninstall-service: no native supervisor "
+            f"to uninstall on {sys.platform}.",
+            file=sys.stderr,
+        )
         return 1
 
     unit_path = _systemd_unit_path()
@@ -487,6 +741,7 @@ def _cmd_uninstall_service(args: argparse.Namespace) -> int:
 
 def shutil_which(cmd: str) -> str | None:
     import shutil
+
     return shutil.which(cmd)
 
 
@@ -508,8 +763,12 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_start = sub.add_parser("start", help="Daemonize the monitor server")
-    p_start.add_argument("--foreground", action="store_true", help="Run in foreground (no fork)")
-    p_start.add_argument("--no-browser", action="store_true", help="Don't open the browser")
+    p_start.add_argument(
+        "--foreground", action="store_true", help="Run in foreground (no fork)"
+    )
+    p_start.add_argument(
+        "--no-browser", action="store_true", help="Don't open the browser"
+    )
     p_start.set_defaults(func=_cmd_start)
 
     p_stop = sub.add_parser("stop", help="Stop the monitor daemon")
@@ -519,8 +778,12 @@ def main() -> None:
     # development when monitor backend changes need a fresh daemon
     # to take effect (e.g. after a `git pull`).
     p_restart = sub.add_parser("restart", help="Stop then start the monitor daemon")
-    p_restart.add_argument("--foreground", action="store_true", help="Run in foreground (no fork)")
-    p_restart.add_argument("--no-browser", action="store_true", help="Don't open the browser")
+    p_restart.add_argument(
+        "--foreground", action="store_true", help="Run in foreground (no fork)"
+    )
+    p_restart.add_argument(
+        "--no-browser", action="store_true", help="Don't open the browser"
+    )
     p_restart.set_defaults(func=_cmd_restart)
 
     p_status = sub.add_parser("status", help="Report daemon status")
@@ -530,7 +793,9 @@ def main() -> None:
         "rescan",
         help="Force a metadata rescan for one project (or all). Manual override.",
     )
-    p_rescan.add_argument("project", nargs="?", help="Project name to rescan; omit for all")
+    p_rescan.add_argument(
+        "project", nargs="?", help="Project name to rescan; omit for all"
+    )
     p_rescan.set_defaults(func=_cmd_rescan)
 
     args = parser.parse_args()
