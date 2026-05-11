@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any  # noqa: F401  (used in helper signatures)
 
 from chimera.log import get_logger
+from chimera.monitor import desktop_notify
 
 log = get_logger("monitor.sessions")
 
@@ -338,6 +339,9 @@ def post_answer(
         "surface_count": 0,
     }
     _append_jsonl(_session_dir(target_session_id) / "inbox.jsonl", note)
+    desktop_notify.notify_answer(
+        target_session_id, from_session_id, matched.get("text", "")
+    )
     log.info(
         "session %s: answer posted by %s for q=%s",
         target_session_id, from_session_id, question_id,
@@ -880,6 +884,7 @@ def post_handoff(
     }
     _HANDOFFS_PATH.parent.mkdir(parents=True, exist_ok=True)
     _append_jsonl(_HANDOFFS_PATH, handoff)
+    desktop_notify.notify_handoff(from_session_id, inferred, text)
     log.info(
         "handoff posted by %s for cwd=%s — %s",
         from_session_id, inferred, text[:80],
@@ -1066,6 +1071,15 @@ def _broadcast_to_handoff_subscribers(
                 _append_jsonl(_session_dir(sub_id) / "inbox.jsonl", note)
             except Exception:
                 pass  # subscriber may have been deleted; skip
+            # Desktop notification is gated separately — broadcasts are
+            # high-volume so the env var defaults OFF. Opt in via
+            # CHIMERA_DESKTOP_NOTIFY_BROADCAST=1.
+            try:
+                desktop_notify.notify_broadcast(
+                    owner_session_id, sub_id, kind, text
+                )
+            except Exception:
+                pass
 
     import threading
     threading.Thread(target=_do_fanout, daemon=True).start()
@@ -1169,6 +1183,7 @@ def post_notice(
     text: str,
     *,
     from_session_id: str = "external",
+    fire_desktop_notify: bool = True,
 ) -> dict:
     """Drop a "FYI" / "ack" note in another session's inbox. No question
     required, no answer expected.
@@ -1187,7 +1202,9 @@ def post_notice(
         as a safety net so an unresponsive agent doesn't loop forever.
 
     `target_session_id` accepts UUID or friendly name. `from_session_id`
-    is for attribution.
+    is for attribution. `fire_desktop_notify=False` suppresses the
+    desktop popup — used when a caller has already fired its own
+    purpose-built notification.
     """
     target_session_id = resolve_session_id(target_session_id)
     note = {
@@ -1200,6 +1217,8 @@ def post_notice(
         "surface_count": 0,
     }
     _append_jsonl(_session_dir(target_session_id) / "inbox.jsonl", note)
+    if fire_desktop_notify:
+        desktop_notify.notify_notice(target_session_id, from_session_id, text)
     log.info(
         "session %s: notice posted by %s (id=%s) — %s",
         target_session_id, from_session_id, note["id"], text[:80],

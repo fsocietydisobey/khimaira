@@ -14,6 +14,23 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _suppress_desktop_notifications(monkeypatch: pytest.MonkeyPatch):
+    """Block real desktop popups from firing during the test suite.
+
+    Several tests exercise code paths (post_handoff, invite_handoff,
+    post_notice, post_answer) that now fire desktop notifications. If
+    we don't disable them globally, every test run blasts the developer
+    with dozens of system popups. CHIMERA_DESKTOP_NOTIFY=0 is the same
+    opt-out users have in production.
+
+    Tests that need to verify notification behavior explicitly opt
+    back in via their own monkeypatch.setenv.
+    """
+    monkeypatch.setenv("CHIMERA_DESKTOP_NOTIFY", "0")
+    yield
+
+
 @pytest.fixture
 def isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Re-root chimera's state dir at a tmp_path for the test's lifetime.
