@@ -61,3 +61,10 @@ supervisor:
   auto_install: true
 
 spa_build: true
+
+# Re-write ~/.claude/settings.json with chimera's hooks on every
+# bootstrap/sync. Lives outside dotfiles symlinks because hook command
+# paths embed the local chimera install path — symlinking from a
+# fixed-path dotfiles copy would write wrong paths on machines whose
+# username or install location differs.
+install_claude_hooks: true

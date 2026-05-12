@@ -2328,6 +2328,66 @@ async def list_mcp_calls(
     return await _monitor_tools.list_calls(window_minutes, tool, only_failures, limit)
 
 
+@mcp.tool()
+@logged_tool("chimera_configure")
+async def chimera_configure(profile: str | None = None, force: bool = False) -> str:
+    """**Re-sync this machine to your chimera profile** (dotfiles, MCP
+    servers, hooks). Invoke from any Claude Code session via the
+    `/chimera-configure` slash command — does the same thing as running
+    `chimera sync` from a terminal but without leaving chat.
+
+    Pulls your dotfiles repo, re-applies the symlinks declared in the
+    profile, re-registers MCP servers with Claude Code (idempotent),
+    and re-writes settings.json hooks if the profile asks for it.
+
+    First-run setup on a brand-new machine still needs the CLI
+    one-liner — this MCP tool requires chimera to already be installed
+    locally. See `chimera bootstrap` for first-run.
+
+    Args:
+        profile: optional path or http(s) URL to a profile YAML. If
+            None, uses CHIMERA_PROFILE env, then ~/.config/chimera/profile.yaml,
+            then the chimera-shipped default.
+        force: re-register MCP servers even if Claude Code lists them already.
+    """
+    from chimera.bootstrap import load_profile, ProfileError
+    from chimera.bootstrap.runner import run_sync
+
+    try:
+        prof, source = load_profile(profile)
+    except ProfileError as e:
+        return f"❌ failed to load profile: {e}"
+
+    report = run_sync(prof, force=force)
+
+    # Render the report inline so the agent can surface meaningful
+    # detail to the user. Tail-summary mirrors the CLI's output.
+    glyph = {
+        "created": "✨",
+        "updated": "🔄",
+        "unchanged": "·",
+        "skipped": "—",
+        "failed": "✗",
+    }
+    lines = [f"**chimera-configure** — profile `{prof.name}` (from {source})"]
+    for r in report.results:
+        g = glyph.get(r.status, "?")
+        line = f"  {g} `{r.op}` {r.target}"
+        if r.status in ("failed", "created", "updated") and r.detail:
+            line += f" — {r.detail}"
+        lines.append(line)
+    summary = report.summary
+    counts = ", ".join(
+        f"{summary[k]} {k}"
+        for k in ("created", "updated", "unchanged", "skipped", "failed")
+        if k in summary
+    )
+    lines.append(f"\n{counts or 'no operations'}")
+    if report.had_failures:
+        lines.append("\n⚠️ at least one operation failed — see entries marked ✗ above.")
+    return "\n".join(lines)
+
+
 def main():
     """Entry point — run the MCP server over stdio."""
     import atexit

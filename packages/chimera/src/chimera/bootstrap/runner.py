@@ -6,8 +6,9 @@ two top-level workflows.
   2. apply symlinks
   3. repo clones + installs
   4. MCP server registrations
-  5. supervisor install
-  6. SPA build
+  5. Claude Code hooks (re-writes settings.json with local hook paths)
+  6. supervisor install
+  7. SPA build
 
 `run_sync(profile)` — ongoing across machines. Order:
   1. dotfiles git pull
@@ -104,7 +105,11 @@ def run_bootstrap(profile: Profile, *, force: bool = False) -> RunReport:
     for mcp in profile.mcp_servers:
         report.results.append(ops.register_mcp(mcp, force=force))
 
-    # --- 5. supervisor ---
+    # --- 5. Claude Code hooks (settings.json) ---
+    if profile.install_claude_hooks:
+        report.results.append(ops.install_claude_hooks())
+
+    # --- 6. supervisor ---
     if profile.supervisor.auto_install:
         report.results.append(ops.install_supervisor())
 
@@ -160,5 +165,11 @@ def run_sync(profile: Profile, *, force: bool = False) -> RunReport:
     # Re-register MCP servers (idempotent — skips already-registered).
     for mcp in profile.mcp_servers:
         report.results.append(ops.register_mcp(mcp, force=force))
+
+    # Re-apply Claude Code hooks. Idempotent at the install-hooks layer
+    # — and necessary on sync because the dotfiles pull may have shipped
+    # new hook scripts that need re-pointing.
+    if profile.install_claude_hooks:
+        report.results.append(ops.install_claude_hooks())
 
     return report

@@ -119,6 +119,13 @@ class Profile:
     mcp_servers: list[McpServerSpec] = field(default_factory=list)
     supervisor: SupervisorSpec = field(default_factory=SupervisorSpec)
     spa_build: bool = False
+    # Whether to (re-)write ~/.claude/settings.json with chimera's hooks.
+    # Lives outside the symlink list because hook command paths embed the
+    # local chimera install path, which differs per machine — symlinking
+    # settings.json across machines with different usernames or install
+    # locations would write the wrong paths. install-hooks generates the
+    # correct paths from THIS machine's chimera location.
+    install_claude_hooks: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """For diagnostics / JSON output. Mirrors the YAML schema."""
@@ -143,6 +150,7 @@ class Profile:
         ]
         out["supervisor"] = {"auto_install": self.supervisor.auto_install}
         out["spa_build"] = self.spa_build
+        out["install_claude_hooks"] = self.install_claude_hooks
         return out
 
 
@@ -169,6 +177,7 @@ def _parse_dict(raw: dict[str, Any]) -> Profile:
         "mcp_servers",
         "supervisor",
         "spa_build",
+        "install_claude_hooks",
     }
     unknown = set(raw.keys()) - known_top
     if unknown:
@@ -236,6 +245,7 @@ def _parse_dict(raw: dict[str, Any]) -> Profile:
         mcp_servers=mcp_servers,
         supervisor=supervisor,
         spa_build=bool(raw.get("spa_build", False)),
+        install_claude_hooks=bool(raw.get("install_claude_hooks", False)),
     )
 
 

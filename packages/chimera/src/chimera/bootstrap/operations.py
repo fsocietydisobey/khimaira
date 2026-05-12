@@ -388,6 +388,37 @@ def register_mcp(spec: McpServerSpec, *, force: bool = False) -> OpResult:
 # ---------------------------------------------------------------------------
 
 
+def install_claude_hooks() -> OpResult:
+    """Run `chimera install-hooks` to (re-)write ~/.claude/settings.json
+    with chimera's SessionStart / UserPromptSubmit / PostToolUse hooks.
+
+    Idempotent (install-hooks is itself idempotent). The hook commands
+    embed the LOCAL chimera install path, so they always point at the
+    machine's own `~/dev/chimera/scripts/hooks/*.py` — that's why we
+    re-run this on every bootstrap/sync rather than symlinking
+    settings.json from a fixed-path dotfiles copy.
+    """
+    proc = _run(["chimera", "install-hooks"])
+    if proc.returncode != 0:
+        return OpResult(
+            op="claude-hooks",
+            target="settings.json",
+            status="failed",
+            detail=f"install-hooks failed: {(proc.stderr or proc.stdout).strip()[:300]}",
+        )
+    out = (proc.stdout or "").strip()
+    # install-hooks prints a one-line summary; surface it as the detail
+    # so the bootstrap report shows "hooks already current" vs
+    # "rewrote 3 entries" without re-implementing the detection here.
+    status: OpStatus = "unchanged" if "no changes" in out.lower() else "updated"
+    return OpResult(
+        op="claude-hooks",
+        target="settings.json",
+        status=status,
+        detail=out.split("\n")[-1] if out else "hooks command completed",
+    )
+
+
 def install_supervisor() -> OpResult:
     """Run `chimera monitor install-service --enable` — dispatches per-OS
     (systemd on Linux, launchd on macOS, no-op elsewhere). Idempotent
