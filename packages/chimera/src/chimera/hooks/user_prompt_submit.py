@@ -344,11 +344,37 @@ def main() -> int:
             "Skip if nothing to log."
         )
 
-    if not inbox_block and not incoming_block and not reminder_block:
+    # --- Auto-delegate nudge (opt-in; saves tokens on trivial prompts) ---
+    # Heuristic — no API call from this hot path; if the user's prompt
+    # looks trivial, surface a strong "consider delegating" nudge so
+    # Opus routes it to mcp__chimera__delegate (haiku-class model)
+    # instead of burning thinking budget. Set
+    # CHIMERA_AUTO_DELEGATE_NUDGE=1 to enable; off by default because
+    # the heuristic can trigger false positives that feel naggy.
+    delegate_block = ""
+    if os.environ.get("CHIMERA_AUTO_DELEGATE_NUDGE") in ("1", "true", "yes"):
+        prompt_text = (data.get("prompt") or "").strip()
+        if _looks_trivial(prompt_text):
+            delegate_block = (
+                "💡 chimera auto-delegate: this prompt looks low-effort "
+                "(short, factual / lookup-style, no code blocks). Strong "
+                "suggestion: call "
+                '`mcp__chimera__delegate(prompt=<user\'s question>, tier="auto")` '
+                "to route it to a cheaper model. Skip the delegate ONLY if "
+                "you genuinely need Opus's depth (multi-step reasoning, "
+                "architectural decisions, debugging that needs full context)."
+            )
+
+    if (
+        not inbox_block
+        and not incoming_block
+        and not reminder_block
+        and not delegate_block
+    ):
         return 0
 
     additional_context = "\n\n".join(
-        b for b in (inbox_block, incoming_block, reminder_block) if b
+        b for b in (delegate_block, inbox_block, incoming_block, reminder_block) if b
     )
 
     output = {
@@ -359,6 +385,97 @@ def main() -> int:
     }
     sys.stdout.write(json.dumps(output))
     return 0
+
+
+def _looks_trivial(prompt: str) -> bool:
+    """Heuristic: does this prompt look like a question that doesn't
+    need Opus thinking budget?
+
+    Pure-stdlib, no API call — runs in the hot UserPromptSubmit path
+    where latency matters. False-positive rate is intentionally low
+    (better to miss delegating than to nag on every prompt). Signals:
+
+      - Short (≤ 20 words) → simple lookup vs multi-step task.
+      - Starts with a question word or is interrogative.
+      - No code blocks, no file paths, no diff indicators — those
+        usually need full context.
+      - No imperative work verbs ('implement', 'refactor', 'debug',
+        'write a', 'add a') — those want Opus.
+
+    Returns True only when ALL trivial signals fire. Conservative on
+    purpose.
+    """
+    if not prompt:
+        return False
+    p = prompt.strip()
+
+    # Length gate — long prompts almost always carry context Opus needs.
+    word_count = len(p.split())
+    if word_count > 20:
+        return False
+
+    # Code/diff/path indicators → not trivial.
+    if (
+        "```" in p
+        or "/" in p
+        and any(p_seg.endswith(".py") or p_seg.endswith(".ts") for p_seg in p.split())
+    ):
+        return False
+    if any(marker in p for marker in ("$ ", "@@", "diff --git", "<file>", "<path>")):
+        return False
+
+    lower = p.lower()
+
+    # Heavy work verbs — these want Opus reasoning.
+    heavy_verbs = (
+        "implement",
+        "refactor",
+        "debug",
+        "design",
+        "architect",
+        "review",
+        "audit",
+        "rewrite",
+        "write a function",
+        "write a class",
+        "write a test",
+        "add a feature",
+        "add a method",
+        "fix the bug",
+    )
+    if any(v in lower for v in heavy_verbs):
+        return False
+
+    # Interrogative / lookup markers — these are good delegate candidates.
+    light_markers = (
+        "what is",
+        "what's",
+        "what does",
+        "how do i",
+        "how does",
+        "how to",
+        "is this",
+        "is the",
+        "is it",
+        "why is",
+        "why does",
+        "when should",
+        "where is",
+        "where does",
+        "explain",
+        "define",
+        "summarize",
+        "list",
+        "show me",
+    )
+    if any(p.lower().startswith(m) or m in lower[:30] for m in light_markers):
+        return True
+
+    # Short and ends with a question mark — likely a lookup.
+    if word_count <= 10 and p.endswith("?"):
+        return True
+
+    return False
 
 
 if __name__ == "__main__":

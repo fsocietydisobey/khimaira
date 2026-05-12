@@ -394,6 +394,112 @@ async def classify(task_description: str) -> str:
 
 
 @mcp.tool()
+@logged_tool("delegate")
+async def delegate(
+    prompt: str,
+    tier: str = "auto",
+    timeout_s: int = 120,
+) -> str:
+    """**Lower-token-cost answer.** Delegate a prompt to the cheapest
+    competent model and return its answer text.
+
+    Use when the user's question (or a sub-question you're about to
+    think about) is trivial-to-moderate: factual lookup, syntax check,
+    one-line refactor, "what does this function do?", "is this safe?",
+    boilerplate generation. Avoids burning Opus thinking budget on
+    work a haiku-class model handles fine.
+
+    Use `tier="auto"` (default) to let chimera's classifier pick.
+    Override with an explicit tier when you know the question's shape:
+
+      - `tier="haiku"` / `tier="flash"` — cheap and fast, factual/simple
+      - `tier="sonnet"` / `tier="gemini-pro"` — mid-complexity reasoning
+      - `tier="local"` — Ollama, free, slowest
+
+    The auto path runs a fast classifier (~50ms via haiku) then routes.
+    For repeat calls on similar questions, prefer the explicit tier —
+    skips the classifier hop.
+
+    Args:
+        prompt: the prompt to delegate. Pass the full question + any
+            context the cheap model needs; it has no memory of YOUR
+            conversation.
+        tier: "auto" | "haiku" | "flash" | "sonnet" | "gemini-pro" | "local".
+        timeout_s: max wall time. Default 120s; raise for long generations.
+    """
+    from chimera.dispatch import router as dispatch_router
+    from chimera.dispatch.classifier import classify_task
+    from chimera.dispatch.runners import get_runner
+
+    # tier="auto" → run the classifier. Otherwise build a synthetic
+    # classification with the user's chosen tier mapped to a runner+model.
+    if tier == "auto":
+        classification = await classify_task(prompt)
+    else:
+        # Manual tier-to-runner mapping. Keep these stable across
+        # routing-table revisions — the user's tier hint should yield
+        # the same dispatch regardless of which CLI they have installed.
+        tier_map = {
+            "haiku": ("claude", "claude-haiku-4-5"),
+            "flash": ("gemini", "gemini-2.5-flash"),
+            "sonnet": ("claude", "claude-sonnet-4-6"),
+            "gemini-pro": ("gemini", "gemini-2.5-pro"),
+            "local": ("ollama", ""),
+        }
+        if tier not in tier_map:
+            return (
+                f"❌ unknown tier {tier!r}. "
+                f"Valid: auto, {', '.join(sorted(tier_map))}."
+            )
+        runner_name, model = tier_map[tier]
+        from chimera_types import TaskClassification
+
+        # task_type "classify" + complexity_tier "trivial" so the
+        # downstream router treats this as a cheap one-shot, not as
+        # a multi-step pipeline.
+        classification = TaskClassification(
+            task_type="classify",
+            complexity_tier="trivial",
+            thinking_level="none",
+            recommended_runner=runner_name,
+            recommended_model=model,
+            thinking_budget_tokens=0,
+            estimated_cost_usd_max=0.05,
+            reasoning=f"explicit tier={tier!r} via mcp__chimera__delegate",
+            confidence=1.0,
+            forced_by=f"delegate(tier={tier!r})",
+        )
+
+    decision = dispatch_router.route(classification)
+    if decision.refused:
+        return f"❌ delegate refused: {decision.refusal_reason}"
+
+    runner = get_runner(decision.chosen_runner)
+    if not runner.is_available():
+        return (
+            f"❌ runner {decision.chosen_runner!r} not available on this machine. "
+            f"Install Claude Code / Codex / Gemini / Ollama, or change tier."
+        )
+
+    try:
+        result = await runner.run(
+            prompt,
+            model=decision.chosen_model or None,
+            timeout=timeout_s,
+        )
+    except Exception as e:
+        return f"❌ delegate dispatch failed: {e}"
+
+    out = result.text.strip()
+    header = (
+        f"_(via {decision.chosen_runner}/{result.model or decision.chosen_model} · "
+        f"{result.input_tokens}→{result.output_tokens} tokens · "
+        f"{result.latency_s:.1f}s)_\n\n"
+    )
+    return header + out
+
+
+@mcp.tool()
 @logged_tool("chain")
 async def chain(task_description: str, context: str = "", thread_id: str = "") -> str:
     """Start a LangGraph pipeline in the background and return immediately.
