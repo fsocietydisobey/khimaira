@@ -193,17 +193,17 @@ def run(args: argparse.Namespace) -> int:
         )
         print(
             f"  • PostToolUse on Edit|Write|MultiEdit|NotebookEdit → "
-            f"{scripts_dir / 'post_tool_use.py'}",
+            f"{_build_hook_command('post_tool_use')}",
             flush=True,
         )
         print(
-            f"  • SessionStart → {scripts_dir / 'session_start.py'} "
+            f"  • SessionStart → {_build_hook_command('session_start')} "
             "(auto-reads inbox from other sessions)",
             flush=True,
         )
         print(
             f"  • UserPromptSubmit (every 8 turns) → "
-            f"{scripts_dir / 'user_prompt_submit.py'} "
+            f"{_build_hook_command('user_prompt_submit')} "
             "(reminder to log decisions/questions)",
             flush=True,
         )
