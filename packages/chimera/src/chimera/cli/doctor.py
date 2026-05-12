@@ -22,12 +22,28 @@ from chimera.dispatch.runners import RUNNERS, available_runners
 def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "doctor",
-        help="Diagnose your chimera environment — which runners, which mode.",
+        help="Diagnose your chimera environment — runners, daemon, profile drift.",
+    )
+    p.add_argument(
+        "--profile",
+        default=None,
+        help=(
+            "Path or http(s) URL to a chimera profile YAML to check "
+            "drift against. Defaults to the standard resolution: "
+            "CHIMERA_PROFILE env, ~/.config/chimera/profile.yaml, "
+            "or the shipped chimera-only baseline. Skip the profile "
+            "section by passing --no-profile."
+        ),
+    )
+    p.add_argument(
+        "--no-profile",
+        action="store_true",
+        help="Skip the profile-drift check (runs faster, only checks runners + daemon).",
     )
     p.set_defaults(func=run)
 
 
-def run(_args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace) -> int:
     print("chimera doctor")
     print("=" * 60)
 
@@ -50,6 +66,13 @@ def run(_args: argparse.Namespace) -> int:
     # Monitor daemon + supervisor status
     print("\nObservability daemon:")
     _check_monitor_status()
+
+    # Profile drift — what would `chimera bootstrap` need to do?
+    if not getattr(args, "no_profile", False):
+        print("\nProfile drift:")
+        profile_drift_failures = _check_profile_drift(getattr(args, "profile", None))
+    else:
+        profile_drift_failures = False
 
     # Env vars worth surfacing
     relevant_env = [
@@ -82,6 +105,15 @@ def run(_args: argparse.Namespace) -> int:
             print(
                 "   Tip: install Ollama for free local fallback — "
                 "https://ollama.com/download"
+            )
+        # Non-fatal note about drift so the doctor return code stays
+        # 0 when runners are healthy. Drift surfaces as a hint, not
+        # a failure — drift is normal mid-iteration; users opt into
+        # fixing it with `chimera bootstrap`.
+        if profile_drift_failures:
+            print(
+                "   ⚠️  Profile drift detected above — run `chimera bootstrap` "
+                "to apply, or `chimera bootstrap --check` for the full diff."
             )
         return 0
     print("❌ NO runners installed. chimera cannot dispatch any tasks.")
@@ -178,3 +210,75 @@ def _check_monitor_status() -> None:
     else:
         print("     Recommended: `chimera monitor watch` in a tmux/screen pane")
         print("     (cross-platform fallback; no native supervisor for this OS)")
+
+
+def _check_profile_drift(profile_arg: str | None) -> bool:
+    """Run a check_bootstrap and surface a compact summary.
+
+    Returns True if drift was detected (would-create / would-update
+    rows present, or any failures). Doctor uses the bool to decide
+    whether to nudge the user at the bottom.
+
+    Output is intentionally terse — just counts per status + the first
+    few drift rows. For the full diff the user runs
+    `chimera bootstrap --check`.
+    """
+    try:
+        from chimera.bootstrap import ProfileError, load_profile
+        from chimera.bootstrap.runner import check_bootstrap
+    except ImportError as e:
+        print(f"  ⚠️  can't import chimera.bootstrap ({e}) — skipping profile check")
+        return False
+
+    try:
+        profile, source = load_profile(profile_arg)
+    except ProfileError as e:
+        print(f"  ❌ profile failed to load: {e}")
+        return True  # this IS drift the user should know about
+    except Exception as e:
+        print(f"  ⚠️  unexpected error loading profile: {e}")
+        return False
+
+    print(f"  profile: {profile.name}  (from {source})")
+    report = check_bootstrap(profile)
+    summary = report.summary
+
+    drift_count = summary.get("created", 0) + summary.get("updated", 0)
+    current_count = summary.get("unchanged", 0)
+    failed_count = summary.get("failed", 0)
+    skipped_count = summary.get("skipped", 0)
+
+    if failed_count:
+        print(
+            f"  ❌ {failed_count} failed — drift is unrecoverable without intervention"
+        )
+        # Surface the failed rows
+        for r in report.results:
+            if r.status == "failed":
+                print(f"      ✗ {r.op:<16}  {r.target}  — {r.detail}")
+    if drift_count == 0 and failed_count == 0:
+        print(
+            f"  ✅ no drift — {current_count} ops match profile (+ {skipped_count} skipped)"
+        )
+        return False
+
+    if drift_count:
+        creates = summary.get("created", 0)
+        updates = summary.get("updated", 0)
+        print(
+            f"  🔄 {drift_count} drift item(s): "
+            f"{creates} would-create, {updates} would-update "
+            f"({current_count} current, {skipped_count} skipped)"
+        )
+        # Show first 3 drift rows for context
+        drift_rows = [r for r in report.results if r.status in ("created", "updated")][
+            :3
+        ]
+        for r in drift_rows:
+            label = "would-create" if r.status == "created" else "would-update"
+            print(f"      • {r.op:<16}  {r.target}  [{label}]")
+        if drift_count > 3:
+            print(
+                f"      … and {drift_count - 3} more — run `chimera bootstrap --check` for full diff"
+            )
+    return drift_count > 0 or failed_count > 0
