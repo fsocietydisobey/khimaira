@@ -29,7 +29,10 @@ dotfiles:
 repos:
   - name: chimera
     url: git@github.com:fsocietydisobey/chimera.git
-    install: uv sync
+    # `--all-packages` is load-bearing: chimera is a uv workspace and a
+    # plain `uv sync` only installs the root project's deps, which drops
+    # member-package entry-point scripts (notably `.venv/bin/chimera`).
+    install: uv sync --all-packages
   - name: seance
     url: git@github.com:fsocietydisobey/seance.git
     install: uv sync
@@ -45,7 +48,9 @@ repos:
 
 mcp_servers:
   - name: chimera
-    command: uv --directory ~/dev/chimera run chimera mcp 2>>/tmp/chimera.log
+    # `python -m chimera.cli mcp` (not bare `chimera mcp`) survives the
+    # workspace-sync churn that can drop .venv/bin/chimera.
+    command: uv --directory ~/dev/chimera run python -m chimera.cli mcp 2>>/tmp/chimera.log
   - name: seance
     command: uv --directory ~/dev/seance run seance serve
   - name: specter
