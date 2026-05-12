@@ -139,7 +139,7 @@ def run_bootstrap(profile: Profile, *, force: bool = False) -> RunReport:
 
     # --- 6. supervisor ---
     if profile.supervisor.auto_install:
-        report.results.append(ops.install_supervisor())
+        report.results.append(ops.install_supervisor(force=force))
 
     # --- 6. SPA build ---
     if profile.spa_build:

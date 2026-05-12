@@ -508,10 +508,16 @@ def install_claude_hooks(*, scripts_dir: str | None = None) -> OpResult:
     )
 
 
-def install_supervisor() -> OpResult:
+def install_supervisor(*, force: bool = False) -> OpResult:
     """Install the host-native supervisor (systemd user unit on Linux,
     launchd LaunchAgent on macOS, no-op elsewhere) via direct in-process
-    call to `_cmd_install_service`. Idempotent."""
+    call to `_cmd_install_service`. Idempotent on matching content.
+
+    `force=True` rewrites the unit file even when contents differ from
+    the existing one — needed when bumping chimera's unit template
+    across machines, or recovering from a partial install. Plumbed
+    through from `chimera bootstrap --force`.
+    """
     import argparse
 
     try:
@@ -524,7 +530,7 @@ def install_supervisor() -> OpResult:
             detail=f"chimera.monitor.cli import failed: {e}",
         )
 
-    args = argparse.Namespace(enable=True, force=False)
+    args = argparse.Namespace(enable=True, force=force)
     rc, out = _capture_stdout(_cmd_install_service, args)
     if rc != 0:
         return OpResult(
