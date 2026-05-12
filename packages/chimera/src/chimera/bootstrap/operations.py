@@ -16,9 +16,19 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+# Self-referential chimera invocation that works regardless of how the
+# binary was installed (uv tool install, uv run from workspace,
+# system pip, bootstrap during a uv-run-only setup). Always uses the
+# CURRENT Python interpreter — guaranteed to have the chimera package
+# importable since we're executing inside it. Avoids the PATH-dependency
+# trap where `["chimera", ...]` fails on fresh machines that haven't
+# put the binary on PATH yet.
+_CHIMERA_INVOKE = [sys.executable, "-m", "chimera.cli"]
 
 from chimera.log import get_logger
 from chimera.bootstrap.schema import (
@@ -398,7 +408,7 @@ def install_claude_hooks() -> OpResult:
     re-run this on every bootstrap/sync rather than symlinking
     settings.json from a fixed-path dotfiles copy.
     """
-    proc = _run(["chimera", "install-hooks"])
+    proc = _run([*_CHIMERA_INVOKE, "install-hooks"])
     if proc.returncode != 0:
         return OpResult(
             op="claude-hooks",
@@ -426,7 +436,7 @@ def install_supervisor() -> OpResult:
     matching unit → skipped silently."""
     # Defer to the actual install-service command (already handles
     # systemd vs launchd vs unsupported-OS dispatch + idempotency).
-    proc = _run(["chimera", "monitor", "install-service", "--enable"])
+    proc = _run([*_CHIMERA_INVOKE, "monitor", "install-service", "--enable"])
     if proc.returncode != 0:
         return OpResult(
             op="supervisor",
