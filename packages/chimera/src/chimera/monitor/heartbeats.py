@@ -199,10 +199,15 @@ def cost_summary(project: str) -> dict:
                 total_in += in_tok
                 total_out += out_tok
                 total_cost += cost
-                bm = by_model.setdefault(model, {
-                    "input_tokens": 0, "output_tokens": 0,
-                    "cost_usd": 0.0, "calls": 0,
-                })
+                bm = by_model.setdefault(
+                    model,
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_usd": 0.0,
+                        "calls": 0,
+                    },
+                )
                 bm["input_tokens"] += in_tok
                 bm["output_tokens"] += out_tok
                 bm["cost_usd"] += cost
@@ -223,6 +228,88 @@ def cost_summary(project: str) -> dict:
         },
         "telemetry_calls_langsmith": telemetry_calls,
         "note": "estimate based on public list prices; not invoice-accurate",
+    }
+
+
+def cost_timeseries(
+    project: str,
+    *,
+    bucket_minutes: int = 5,
+    window_minutes: int = 60,
+) -> dict:
+    """Cost binned into time buckets — backs the sparkline chart in the UI.
+
+    Iterates the same llm_end events as `cost_summary`, but groups by
+    bucket instead of by model. Returns one entry per bucket within the
+    window, ALWAYS including empty buckets (cost=0, calls=0) so the
+    sparkline's x-axis is uniform.
+
+    Defaults match the dashboard's "what's happened recently" framing:
+    60-minute window in 5-minute buckets = 12 points. Buckets are
+    aligned to wall-clock boundaries (e.g. :00, :05, :10) so two
+    polls a moment apart show the same buckets.
+
+    Returns:
+        {
+            project, bucket_minutes, window_minutes,
+            buckets: [{ts_start, ts_end, cost_usd, llm_calls}, ...],
+        }
+        Bucket order: oldest → newest (left to right on the chart).
+    """
+    bucket_seconds = max(60, bucket_minutes * 60)
+    window_seconds = max(bucket_seconds, window_minutes * 60)
+    now = time.time()
+    # Align the latest bucket to the wall-clock boundary so consecutive
+    # polls produce the same x-axis (avoids the "sparkline jitters"
+    # bug where every refresh shifts the bars by a few seconds).
+    latest_bucket_start = (int(now) // bucket_seconds) * bucket_seconds
+    oldest_bucket_start = latest_bucket_start - (window_seconds - bucket_seconds)
+
+    n_buckets = ((latest_bucket_start - oldest_bucket_start) // bucket_seconds) + 1
+    buckets: list[dict[str, Any]] = [
+        {
+            "ts_start": oldest_bucket_start + i * bucket_seconds,
+            "ts_end": oldest_bucket_start + (i + 1) * bucket_seconds,
+            "cost_usd": 0.0,
+            "llm_calls": 0,
+        }
+        for i in range(int(n_buckets))
+    ]
+
+    for entry in _runs.values():
+        if entry.project != project:
+            continue
+        for ev in entry.events:
+            if ev.get("event") != "llm_end":
+                continue
+            ts = ev.get("ts")
+            if not isinstance(ts, (int, float)):
+                continue
+            if ts < oldest_bucket_start or ts >= latest_bucket_start + bucket_seconds:
+                continue
+            idx = int((ts - oldest_bucket_start) // bucket_seconds)
+            if idx < 0 or idx >= len(buckets):
+                continue
+            extra = ev.get("extra") or {}
+            if not isinstance(extra, dict):
+                continue
+            in_tok = int(extra.get("input_tokens") or 0)
+            out_tok = int(extra.get("output_tokens") or 0)
+            model = extra.get("model") or "unknown"
+            in_rate, out_rate = _model_cost_per_mtok(model)
+            buckets[idx]["cost_usd"] += (
+                in_tok * in_rate + out_tok * out_rate
+            ) / 1_000_000.0
+            buckets[idx]["llm_calls"] += 1
+
+    for b in buckets:
+        b["cost_usd"] = round(b["cost_usd"], 6)
+
+    return {
+        "project": project,
+        "bucket_minutes": bucket_minutes,
+        "window_minutes": window_minutes,
+        "buckets": buckets,
     }
 
 
@@ -272,7 +359,7 @@ def find_slow_calls(
             for k in ("chain", "llm", "tool", "external"):
                 if ekind.startswith(k):
                     rid = ev.get("run_id") or ""
-                    suffix = ekind[len(k) + 1:]  # 'start', 'end', 'error'
+                    suffix = ekind[len(k) + 1 :]  # 'start', 'end', 'error'
                     if suffix == "start":
                         starts[(k, rid)] = ev
                     elif suffix in ("end", "error"):
@@ -292,19 +379,21 @@ def find_slow_calls(
             t = thresh.get(kind, float("inf"))
             if duration_s < t:
                 continue
-            out.append({
-                "kind": kind,
-                "run_id": rid,
-                "name": start.get("name"),
-                "started_ts": started_ts,
-                "ended_ts": ended_ts,
-                "in_flight": end is None,
-                "duration_ms": int(duration_s * 1000),
-                "threshold_ms": int(t * 1000),
-                "project": project,
-                "correlation_id": start.get("correlation_id"),
-                "extra": (end or {}).get("extra"),
-            })
+            out.append(
+                {
+                    "kind": kind,
+                    "run_id": rid,
+                    "name": start.get("name"),
+                    "started_ts": started_ts,
+                    "ended_ts": ended_ts,
+                    "in_flight": end is None,
+                    "duration_ms": int(duration_s * 1000),
+                    "threshold_ms": int(t * 1000),
+                    "project": project,
+                    "correlation_id": start.get("correlation_id"),
+                    "extra": (end or {}).get("extra"),
+                }
+            )
 
     out.sort(key=lambda r: r["duration_ms"], reverse=True)
     return out

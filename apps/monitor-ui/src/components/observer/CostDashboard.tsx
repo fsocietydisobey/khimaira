@@ -20,7 +20,12 @@
 
 import { useParams } from "react-router-dom";
 
-import { useGetCostSummaryQuery, type CostByModel } from "@/api";
+import {
+  useGetCostSummaryQuery,
+  useGetCostTimeseriesQuery,
+  type CostBucket,
+  type CostByModel,
+} from "@/api";
 import { ProjectNavTabs } from "@/components/project/ProjectNavTabs";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
@@ -46,6 +51,13 @@ export function CostDashboard() {
     pollingInterval: 5000,
     skip: !projectName,
   });
+  // Sparkline: 60min window in 5min buckets = 12 points. Same 5s polling
+  // cadence as the summary so the chart drifts in lock-step with the
+  // totals cards.
+  const { data: tsData } = useGetCostTimeseriesQuery(
+    { project: projectName, bucketMinutes: 5, windowMinutes: 60 },
+    { pollingInterval: 5000, skip: !projectName },
+  );
 
   if (!projectName) {
     return (
@@ -69,6 +81,8 @@ export function CostDashboard() {
   const models = Object.entries(data.by_model);
   const grandCost = data.total_cost_usd;
   const hasData = data.total_input_tokens + data.total_output_tokens > 0;
+  const buckets = tsData?.buckets ?? [];
+  const sparkHasData = buckets.some((b) => b.cost_usd > 0);
 
   return (
     <div className="flex h-full flex-col overflow-auto">
@@ -93,10 +107,19 @@ export function CostDashboard() {
             </CardDescription>
             <CardTitle className="text-2xl font-mono">{formatUsd(grandCost)}</CardTitle>
           </CardHeader>
-          <CardContent className="text-[11px] text-muted-foreground pt-0">
-            across {data.run_count} run{data.run_count === 1 ? "" : "s"} ·{" "}
-            {formatTokens(data.total_input_tokens)} in /{" "}
-            {formatTokens(data.total_output_tokens)} out
+          <CardContent className="text-[11px] text-muted-foreground pt-0 space-y-2">
+            <div>
+              across {data.run_count} run{data.run_count === 1 ? "" : "s"} ·{" "}
+              {formatTokens(data.total_input_tokens)} in /{" "}
+              {formatTokens(data.total_output_tokens)} out
+            </div>
+            {sparkHasData ? (
+              <CostSparkline buckets={buckets} />
+            ) : (
+              <div className="text-[10px] text-muted-foreground/60">
+                no llm activity in the last hour
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -220,5 +243,65 @@ function ModelTable({
         </tbody>
       </table>
     </div>
+  );
+}
+
+
+/**
+ * CostSparkline — pure-SVG bar chart of $/bucket for the last N buckets.
+ *
+ * Deliberately minimal: no axes, no grid, no tooltip library. The card's
+ * "estimated total" number does the heavy lifting; the sparkline answers
+ * "is spend constant or spiking?" at a glance. Bars share a fixed
+ * baseline so empty buckets render as gaps (zero height), and the tallest
+ * bar sets the y-scale — relative trend > absolute height.
+ *
+ * Title attribute on each bar gives hover-discoverable detail without
+ * pulling in a tooltip dependency.
+ */
+function CostSparkline({ buckets }: { buckets: CostBucket[] }) {
+  const max = buckets.reduce((m, b) => (b.cost_usd > m ? b.cost_usd : m), 0);
+  if (max === 0) return null;
+
+  const width = 200;
+  const height = 28;
+  const gap = 1;
+  const barW = (width - gap * (buckets.length - 1)) / buckets.length;
+
+  return (
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label="cost over last 60 minutes, 5-minute buckets"
+      className="block"
+    >
+      {buckets.map((b, i) => {
+        const h = max > 0 ? (b.cost_usd / max) * height : 0;
+        const x = i * (barW + gap);
+        const y = height - h;
+        const tsLabel = new Date(b.ts_start * 1000).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+        return (
+          <rect
+            key={b.ts_start}
+            x={x}
+            y={y}
+            width={barW}
+            height={Math.max(h, b.cost_usd > 0 ? 1 : 0)}
+            className="fill-foreground/70"
+          >
+            <title>
+              {tsLabel}: {b.cost_usd > 0 ? `$${b.cost_usd.toFixed(4)}` : "$0"}
+              {" · "}
+              {b.llm_calls} call{b.llm_calls === 1 ? "" : "s"}
+            </title>
+          </rect>
+        );
+      })}
+    </svg>
   );
 }

@@ -148,6 +148,20 @@ export interface CostSummary {
   note: string;
 }
 
+export interface CostBucket {
+  ts_start: number;     // unix seconds, inclusive
+  ts_end: number;       // unix seconds, exclusive
+  cost_usd: number;
+  llm_calls: number;
+}
+
+export interface CostTimeseries {
+  project: string;
+  bucket_minutes: number;
+  window_minutes: number;
+  buckets: CostBucket[];
+}
+
 export interface SlowCall {
   kind: "chain" | "llm" | "tool" | "external";
   run_id: string;
@@ -223,6 +237,14 @@ export const monitorApi = createApi({
     getCostSummary: build.query<CostSummary, string>({
       query: (project) => `/heartbeats/${encodeURIComponent(project)}/cost`,
     }),
+    getCostTimeseries: build.query<
+      CostTimeseries,
+      { project: string; bucketMinutes?: number; windowMinutes?: number }
+    >({
+      query: ({ project, bucketMinutes = 5, windowMinutes = 60 }) =>
+        `/heartbeats/${encodeURIComponent(project)}/cost/timeseries` +
+        `?bucket_minutes=${bucketMinutes}&window_minutes=${windowMinutes}`,
+    }),
     getSlowCalls: build.query<
       SlowCallsResponse,
       { project: string; chain?: number; llm?: number; tool?: number; external?: number }
@@ -253,6 +275,7 @@ export const {
   useListThreadsQuery,
   useGetThreadDetailQuery,
   useGetCostSummaryQuery,
+  useGetCostTimeseriesQuery,
   useGetSlowCallsQuery,
   useGetEventsByCorrelationQuery,
 } = monitorApi;

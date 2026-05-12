@@ -69,6 +69,25 @@ def build_router():
         """
         return heartbeats.cost_summary(project)
 
+    @router.get("/heartbeats/{project}/cost/timeseries")
+    async def get_cost_timeseries(
+        project: str,
+        bucket_minutes: int = 5,
+        window_minutes: int = 60,
+    ) -> dict[str, Any]:
+        """Cost binned into time buckets — backs the dashboard sparkline.
+
+        Defaults to a 60-minute window in 5-minute buckets (12 points).
+        Bucket boundaries are wall-clock aligned so consecutive polls
+        produce a stable x-axis. Empty buckets are included (cost=0)
+        so the sparkline doesn't render with gaps.
+        """
+        return heartbeats.cost_timeseries(
+            project,
+            bucket_minutes=bucket_minutes,
+            window_minutes=window_minutes,
+        )
+
     @router.get("/heartbeats/{project}/slow")
     async def get_slow_calls(
         project: str,
@@ -144,12 +163,14 @@ def build_router():
         if entry is None:
             # Don't 404 — the run might not have started yet. Create an empty
             # placeholder; the consumer can wait for the first real event.
-            await heartbeats.record({
-                "project": project,
-                "run_id": run_id,
-                "event": "stream_subscribe",
-                "ts": 0.0,
-            })
+            await heartbeats.record(
+                {
+                    "project": project,
+                    "run_id": run_id,
+                    "event": "stream_subscribe",
+                    "ts": 0.0,
+                }
+            )
             entry = heartbeats.get(project, run_id)
 
         async def _gen():
@@ -181,6 +202,7 @@ def build_router():
                 # Wait for new event OR timeout
                 try:
                     import asyncio
+
                     await asyncio.wait_for(entry.new_event.wait(), timeout=15.0)
                 except asyncio.TimeoutError:
                     pass
