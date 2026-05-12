@@ -1,4 +1,4 @@
-"""Tests for scripts/hooks/session_start.py — HTTP-primary, file fallback.
+"""Tests for chimera.hooks.session_start — HTTP-primary, file fallback.
 
 The hook used to maintain file-direct duplicates of daemon logic
 (_consume_inbox, _consume_handoffs, _discover_other_active_sessions).
@@ -10,30 +10,27 @@ These tests verify both paths:
   - HTTP path: with the daemon responding, hook calls the daemon, period
   - Fallback: when daemon is unreachable, the file-direct path still
     archives inbox correctly + applies the target-session filter on
-    handoffs (the two bugs we shipped in the last day).
+    handoffs.
+
+The hook now lives inside the chimera package (chimera.hooks.session_start)
+rather than as a top-level script at workspace root, so tests can do a
+plain `import` — no path hackery — and the module ships in wheel
+installs without separate file copying.
 """
 
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import os
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-# The hook is a top-level script outside the package; load it by path so
-# tests don't have to set up a sys.path shim.
-_HOOK_PATH = (
-    Path(__file__).resolve().parents[3] / "scripts" / "hooks" / "session_start.py"
-)
-
 
 @pytest.fixture
 def hook_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Load session_start.py as a module with XDG_STATE_HOME isolated.
+    """Import chimera.hooks.session_start with XDG_STATE_HOME isolated.
 
     Reloaded per-test so module-level path constants pick up the env var.
     """
@@ -41,13 +38,14 @@ def hook_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     state_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("XDG_STATE_HOME", str(state_root))
 
-    spec = importlib.util.spec_from_file_location("session_start_hook", _HOOK_PATH)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["session_start_hook"] = mod
-    spec.loader.exec_module(mod)
+    from chimera.hooks import session_start as mod
+
+    importlib.reload(mod)
     yield mod
-    sys.modules.pop("session_start_hook", None)
+    # Reload one more time post-test so the module's path constants
+    # don't carry the tmp_path state into other tests in the suite.
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    importlib.reload(mod)
 
 
 def test_consume_inbox_uses_http_when_available(hook_module):

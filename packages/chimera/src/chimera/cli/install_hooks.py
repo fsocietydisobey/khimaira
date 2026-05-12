@@ -8,6 +8,14 @@ Idempotent merge into ~/.claude/settings.json:
 Doesn't clobber existing hooks. Adds chimera entries alongside whatever's
 already configured. Re-running is safe (replaces by command match).
 
+Hook commands take the form `<python> -m chimera.hooks.<name>` rather
+than embedding a filesystem path to a hook script. This works
+identically for source-checkout installs and wheel installs — the
+hook modules live in the chimera package itself (chimera/hooks/*.py),
+so importlib resolves them either way. Previous design embedded a path
+to `scripts/hooks/<name>.py` at workspace root, which crashed under
+`pip install` because wheels strip workspace-level files.
+
 Removal: `chimera install-hooks --uninstall` strips chimera entries cleanly.
 """
 
@@ -16,7 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
+import sys
+from importlib import resources
 from pathlib import Path
 
 from chimera.log import get_logger
@@ -24,8 +35,51 @@ from chimera.log import get_logger
 log = get_logger("cli.install_hooks")
 
 
-SETTINGS_PATH = Path(os.environ.get("CLAUDE_SETTINGS_PATH", str(Path.home() / ".claude" / "settings.json")))
-SCRIPTS_DIR = Path(__file__).resolve().parents[5] / "scripts" / "hooks"
+SETTINGS_PATH = Path(
+    os.environ.get(
+        "CLAUDE_SETTINGS_PATH", str(Path.home() / ".claude" / "settings.json")
+    )
+)
+
+# Legacy: the workspace-root scripts dir we used pre-chimera.hooks-package.
+# Retained for the --scripts-dir CLI flag's default so users on old
+# settings.json files can still uninstall by matching the legacy command.
+# New writes always use the python -m form (see _build_hook_command).
+LEGACY_SCRIPTS_DIR = Path(__file__).resolve().parents[5] / "scripts" / "hooks"
+
+
+def _build_hook_command(module_basename: str) -> str:
+    """Construct the shell command Claude Code will execute for a hook.
+
+    Form: `<python interpreter> -m chimera.hooks.<module>`. The interpreter
+    is captured from sys.executable at install time — that's the
+    interpreter the user invoked chimera with, so it's the one that has
+    chimera importable. Stays stable until they reinstall chimera elsewhere.
+
+    Each piece is shell-quoted so spaces in paths (e.g. macOS
+    "/Users/Joe Smith/...") survive. shlex.quote on a single token is
+    a no-op when not needed, so this is safe to apply unconditionally.
+    """
+    return f"{shlex.quote(sys.executable)} -m chimera.hooks.{module_basename}"
+
+
+def _hooks_package_dir() -> Path | None:
+    """Path to chimera/hooks/ on the local filesystem, or None if the
+    package isn't on importable file paths (rare — e.g. a zipped wheel).
+
+    Used by the `--scripts-dir` legacy flag for compatibility with
+    older settings.json files that referenced filesystem paths
+    directly. New installs don't depend on this.
+    """
+    try:
+        from chimera import hooks as hooks_pkg
+
+        traversable = resources.files(hooks_pkg)
+        # importlib.resources.files() returns MultiplexedPath/Path-like.
+        # str() gives us the on-disk location for normal installs.
+        return Path(str(traversable))
+    except (ImportError, ModuleNotFoundError):
+        return None
 
 
 def add_subparser(subparsers: argparse._SubParsersAction) -> None:
@@ -40,19 +94,28 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     p.add_argument(
-        "--uninstall", action="store_true",
+        "--uninstall",
+        action="store_true",
         help="Remove chimera hooks from settings.json instead of adding them.",
     )
     p.add_argument(
-        "--settings-path", default=str(SETTINGS_PATH),
+        "--settings-path",
+        default=str(SETTINGS_PATH),
         help=f"Path to settings.json (default: {SETTINGS_PATH}).",
     )
     p.add_argument(
-        "--scripts-dir", default=str(SCRIPTS_DIR),
-        help=f"Path to chimera hook scripts (default: {SCRIPTS_DIR}).",
+        "--scripts-dir",
+        default=None,
+        help=(
+            "(Deprecated) Path to a directory of hook .py scripts. "
+            "New installs use `python -m chimera.hooks.<name>` and don't "
+            "need this. Kept for back-compat / non-standard chimera "
+            "layouts."
+        ),
     )
     p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Print the resulting settings.json without writing.",
     )
     p.set_defaults(func=run)
@@ -60,11 +123,20 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     settings_path = Path(args.settings_path)
-    scripts_dir = Path(args.scripts_dir).resolve()
 
-    if not scripts_dir.is_dir():
-        print(f"[chimera install-hooks] scripts dir not found: {scripts_dir}", flush=True)
-        return 2
+    # scripts_dir is deprecated — only matters for explicit overrides or
+    # uninstall-on-legacy-settings. New writes go through the package
+    # form via _add_chimera_hooks, which doesn't touch scripts_dir.
+    legacy_scripts_dir: Path | None = None
+    if args.scripts_dir:
+        legacy_scripts_dir = Path(args.scripts_dir).resolve()
+        if not legacy_scripts_dir.is_dir():
+            print(
+                f"[chimera install-hooks] --scripts-dir {legacy_scripts_dir} "
+                f"not a directory (ignoring; using package hooks instead)",
+                flush=True,
+            )
+            legacy_scripts_dir = None
 
     # Load existing settings (or start empty)
     if settings_path.is_file():
@@ -91,7 +163,7 @@ def run(args: argparse.Namespace) -> int:
         new_settings = _strip_chimera_hooks(settings)
         action = "removed"
     else:
-        new_settings = _add_chimera_hooks(settings, scripts_dir)
+        new_settings = _add_chimera_hooks(settings)
         action = "installed"
 
     if args.dry_run:
@@ -111,7 +183,9 @@ def run(args: argparse.Namespace) -> int:
     tmp.write_text(json.dumps(new_settings, indent=2) + "\n", encoding="utf-8")
     tmp.replace(settings_path)
 
-    print(f"[chimera install-hooks] {action} chimera hooks at {settings_path}", flush=True)
+    print(
+        f"[chimera install-hooks] {action} chimera hooks at {settings_path}", flush=True
+    )
     if not args.uninstall:
         print(
             "\nWhat's now active for new Claude Code sessions:",
@@ -148,34 +222,58 @@ def run(args: argparse.Namespace) -> int:
 _CHIMERA_MARKER = "_chimera_hook"
 
 
-def _add_chimera_hooks(settings: dict, scripts_dir: Path) -> dict:
+def _add_chimera_hooks(settings: dict) -> dict:
     """Merge chimera hooks into existing settings, replacing prior chimera
-    entries by their marker but preserving non-chimera hooks."""
+    entries by their marker but preserving non-chimera hooks.
+
+    Command form: `<python> -m chimera.hooks.<module>`. The python is
+    whatever interpreter the user invoked chimera with at install time;
+    it's the one that has chimera importable. See module-level
+    _build_hook_command for details.
+    """
     out = dict(settings)
-    hooks = out.setdefault("hooks", {}) if isinstance(out.get("hooks"), dict) or "hooks" not in out else out["hooks"]
+    hooks = (
+        out.setdefault("hooks", {})
+        if isinstance(out.get("hooks"), dict) or "hooks" not in out
+        else out["hooks"]
+    )
     if not isinstance(hooks, dict):
         # Won't merge cleanly; preserve original under a side key + start fresh
-        log.warning("settings.hooks wasn't a dict — preserving as 'hooks_invalid' and starting fresh")
+        log.warning(
+            "settings.hooks wasn't a dict — preserving as 'hooks_invalid' and starting fresh"
+        )
         out["hooks_invalid"] = hooks
         hooks = {}
         out["hooks"] = hooks
 
-    pt = scripts_dir / "post_tool_use.py"
-    ss = scripts_dir / "session_start.py"
-    ups = scripts_dir / "user_prompt_submit.py"
+    pt_cmd = _build_hook_command("post_tool_use")
+    ss_cmd = _build_hook_command("session_start")
+    ups_cmd = _build_hook_command("user_prompt_submit")
 
     # Each hook event accepts a list of matchers. We append the chimera entry
     # if not already present (matched by marker).
-    _upsert_hook(hooks, "PostToolUse", {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [{"type": "command", "command": str(pt), _CHIMERA_MARKER: True}],
-    })
-    _upsert_hook(hooks, "SessionStart", {
-        "hooks": [{"type": "command", "command": str(ss), _CHIMERA_MARKER: True}],
-    })
-    _upsert_hook(hooks, "UserPromptSubmit", {
-        "hooks": [{"type": "command", "command": str(ups), _CHIMERA_MARKER: True}],
-    })
+    _upsert_hook(
+        hooks,
+        "PostToolUse",
+        {
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [{"type": "command", "command": pt_cmd, _CHIMERA_MARKER: True}],
+        },
+    )
+    _upsert_hook(
+        hooks,
+        "SessionStart",
+        {
+            "hooks": [{"type": "command", "command": ss_cmd, _CHIMERA_MARKER: True}],
+        },
+    )
+    _upsert_hook(
+        hooks,
+        "UserPromptSubmit",
+        {
+            "hooks": [{"type": "command", "command": ups_cmd, _CHIMERA_MARKER: True}],
+        },
+    )
 
     return out
 
@@ -189,7 +287,8 @@ def _upsert_hook(hooks: dict, event: str, entry: dict) -> None:
 
     # Remove any prior chimera entries
     matchers[:] = [
-        m for m in matchers
+        m
+        for m in matchers
         if not (
             isinstance(m, dict)
             and any(
@@ -213,7 +312,8 @@ def _strip_chimera_hooks(settings: dict) -> dict:
             new_hooks[event] = matchers
             continue
         kept = [
-            m for m in matchers
+            m
+            for m in matchers
             if not (
                 isinstance(m, dict)
                 and any(
