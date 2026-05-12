@@ -16,19 +16,10 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-# Self-referential chimera invocation that works regardless of how the
-# binary was installed (uv tool install, uv run from workspace,
-# system pip, bootstrap during a uv-run-only setup). Always uses the
-# CURRENT Python interpreter — guaranteed to have the chimera package
-# importable since we're executing inside it. Avoids the PATH-dependency
-# trap where `["chimera", ...]` fails on fresh machines that haven't
-# put the binary on PATH yet.
-_CHIMERA_INVOKE = [sys.executable, "-m", "chimera.cli"]
 
 from chimera.log import get_logger
 from chimera.bootstrap.schema import (
@@ -398,28 +389,74 @@ def register_mcp(spec: McpServerSpec, *, force: bool = False) -> OpResult:
 # ---------------------------------------------------------------------------
 
 
-def install_claude_hooks() -> OpResult:
-    """Run `chimera install-hooks` to (re-)write ~/.claude/settings.json
-    with chimera's SessionStart / UserPromptSubmit / PostToolUse hooks.
+def _capture_stdout(fn, *args, **kwargs) -> tuple[int, str]:
+    """Run `fn(...)` and capture its stdout. Used to call chimera's
+    install-hooks / install-service in-process instead of shelling out.
 
-    Idempotent (install-hooks is itself idempotent). The hook commands
-    embed the LOCAL chimera install path, so they always point at the
-    machine's own `~/dev/chimera/scripts/hooks/*.py` — that's why we
-    re-run this on every bootstrap/sync rather than symlinking
-    settings.json from a fixed-path dotfiles copy.
+    Subprocess approach was brittle: it required `chimera` (or `python
+    -m chimera.cli`) to be locatable, which depends on PATH and venv
+    install state. On uv workspaces, the chimera package can be
+    importable inside `uv run` but invisible to a fresh subprocess
+    Python because the workspace member isn't installed as a
+    site-packages entry — it's loaded via the .pth uv-run sets up.
+
+    We're already inside the chimera package — just call the function.
+
+    Returns (return_code, captured_stdout). SystemExit gets caught and
+    mapped to rc so an `argparse` parse-error inside the called command
+    doesn't tear the bootstrap process down.
     """
-    proc = _run([*_CHIMERA_INVOKE, "install-hooks"])
-    if proc.returncode != 0:
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            rc = fn(*args, **kwargs) or 0
+    except SystemExit as e:
+        rc = int(e.code) if isinstance(e.code, int) else 1
+    return rc, buf.getvalue().strip()
+
+
+def install_claude_hooks() -> OpResult:
+    """(Re-)write ~/.claude/settings.json with chimera's SessionStart /
+    UserPromptSubmit / PostToolUse hooks via direct in-process call.
+
+    Idempotent. Hook commands embed the LOCAL chimera install path
+    (resolved at call-time from this module's __file__), so paths are
+    always correct for THIS machine. That's why settings.json is
+    regenerated per-machine rather than symlinked from dotfiles.
+    """
+    import argparse
+
+    try:
+        from chimera.cli.install_hooks import (
+            SCRIPTS_DIR,
+            SETTINGS_PATH,
+            run as run_install_hooks,
+        )
+    except ImportError as e:
         return OpResult(
             op="claude-hooks",
             target="settings.json",
             status="failed",
-            detail=f"install-hooks failed: {(proc.stderr or proc.stdout).strip()[:300]}",
+            detail=f"chimera.cli.install_hooks import failed: {e}",
         )
-    out = (proc.stdout or "").strip()
-    # install-hooks prints a one-line summary; surface it as the detail
-    # so the bootstrap report shows "hooks already current" vs
-    # "rewrote 3 entries" without re-implementing the detection here.
+
+    args = argparse.Namespace(
+        uninstall=False,
+        settings_path=str(SETTINGS_PATH),
+        scripts_dir=str(SCRIPTS_DIR),
+        dry_run=False,
+    )
+    rc, out = _capture_stdout(run_install_hooks, args)
+    if rc != 0:
+        return OpResult(
+            op="claude-hooks",
+            target="settings.json",
+            status="failed",
+            detail=f"install-hooks rc={rc}: {out[:300]}",
+        )
     status: OpStatus = "unchanged" if "no changes" in out.lower() else "updated"
     return OpResult(
         op="claude-hooks",
@@ -430,21 +467,30 @@ def install_claude_hooks() -> OpResult:
 
 
 def install_supervisor() -> OpResult:
-    """Run `chimera monitor install-service --enable` — dispatches per-OS
-    (systemd on Linux, launchd on macOS, no-op elsewhere). Idempotent
-    by virtue of install-service's own --force handling: existing
-    matching unit → skipped silently."""
-    # Defer to the actual install-service command (already handles
-    # systemd vs launchd vs unsupported-OS dispatch + idempotency).
-    proc = _run([*_CHIMERA_INVOKE, "monitor", "install-service", "--enable"])
-    if proc.returncode != 0:
+    """Install the host-native supervisor (systemd user unit on Linux,
+    launchd LaunchAgent on macOS, no-op elsewhere) via direct in-process
+    call to `_cmd_install_service`. Idempotent."""
+    import argparse
+
+    try:
+        from chimera.monitor.cli import _cmd_install_service
+    except ImportError as e:
         return OpResult(
             op="supervisor",
             target="chimera-monitor",
             status="failed",
-            detail=f"install-service failed: {(proc.stderr or proc.stdout).strip()[:300]}",
+            detail=f"chimera.monitor.cli import failed: {e}",
         )
-    out = (proc.stdout or "").strip()
+
+    args = argparse.Namespace(enable=True, force=False)
+    rc, out = _capture_stdout(_cmd_install_service, args)
+    if rc != 0:
+        return OpResult(
+            op="supervisor",
+            target="chimera-monitor",
+            status="failed",
+            detail=f"install-service rc={rc}: {out[:300]}",
+        )
     status: OpStatus = "unchanged" if "already installed" in out else "updated"
     return OpResult(
         op="supervisor",
