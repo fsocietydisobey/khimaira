@@ -152,42 +152,101 @@ Same logic, two transports — like an SDK and a SQL interface to the same datab
 
 ## Quick start
 
+### Three install paths, pick what matches you
+
+**1. You have a chimera "profile" YAML (you or another maintainer wrote one in dotfiles).** Fastest fresh-machine setup — one command brings the whole agent stack online (chimera + sibling MCP servers + Claude rules/commands symlinks + supervisor + dashboard SPA):
+
 ```bash
-# clone + install (uv handles the workspace)
-git clone https://github.com/fsocietydisobey/chimera.git
-cd chimera
-uv sync --package chimera
+git clone git@github.com:<you>/dotfiles.git ~/dotfiles
+~/dotfiles/bootstrap.sh
+```
 
-# diagnose your environment
-uv run chimera doctor
+See [Profile-driven setup](#profile-driven-setup) below for what the YAML declares. New devs can clone the example profile from this repo and adapt.
 
-# auto-routed dispatch (dry-run first to see what it'd do)
-uv run chimera task --dry-run "rename this variable"
+**2. You want chimera and that's it.** No personal config, no sibling tools — just the chimera CLI + MCP server on this box:
 
-# start the observability daemon
-uv run chimera monitor start
+```bash
+git clone https://github.com/fsocietydisobey/chimera.git ~/dev/chimera
+cd ~/dev/chimera
+uv sync
+uv run chimera bootstrap   # uses chimera-shipped default profile
+```
+
+`chimera bootstrap` with no `--profile` arg runs the built-in baseline: registers chimera as an MCP server with Claude Code, writes the chimera SessionStart / UserPromptSubmit / PostToolUse hooks into `~/.claude/settings.json`, installs the host-native supervisor (systemd on Linux, launchd on macOS), builds the dashboard SPA.
+
+**3. You're trying chimera before committing.** Skip bootstrap, just register the MCP server manually:
+
+```bash
+# After uv sync above:
+claude mcp add chimera -s user -- bash -lc \
+  'uv --directory ~/dev/chimera run python -m chimera.cli mcp'
+```
+
+Then `claude` and chimera's MCP tools (`mcp__chimera__*`) are available.
+
+### Day-to-day commands
+
+```bash
+# Diagnose your environment (daemon up? supervisor active? hooks current?)
+chimera doctor
+
+# Auto-routed dispatch (dry-run first to see what it'd do)
+chimera task --dry-run "rename this variable"
+
+# Start the observability daemon (or use the installed supervisor)
+chimera monitor start
 # → http://127.0.0.1:8740 (loopback only — that IS the auth layer)
 
-# spin up a project's full dev stack with one command
-uv run chimera dev /path/to/project
+# Spin up a project's full dev stack with one command
+chimera dev /path/to/project
+
+# List every chimera surface (CLI commands, MCP tools, slash commands, web routes)
+chimera tools
 ```
 
-To use chimera as an MCP server from Claude Code / Codex CLI / Gemini CLI:
+### Profile-driven setup
 
-```jsonc
-// in .claude.json or equivalent
-{
-  "mcpServers": {
-    "chimera": {
-      "type": "stdio",
-      "command": "bash",
-      "args": ["-lc", "uv --directory /path/to/chimera run chimera mcp"]
-    }
-  }
-}
+Profiles let you declare your portable agent setup in one YAML file checked into your dotfiles repo. Same profile applied on N machines yields N matching environments. Bootstrap reads the profile and:
+
+- clones your dotfiles repo
+- creates symlinks (`~/.claude/CLAUDE.md` → your dotfiles, etc.)
+- clones declared sibling repos (e.g. seance, specter, scarlet) under `~/dev/`
+- runs each repo's install command (`uv sync`)
+- registers MCP servers with Claude Code
+- writes chimera hooks into `~/.claude/settings.json`
+- installs the supervisor
+- builds the dashboard SPA
+
+```yaml
+# chimera-profile.yaml (in your dotfiles repo)
+name: my-setup
+dotfiles:
+  repo: git@github.com:me/dotfiles.git
+  path: ~/dotfiles
+  symlinks:
+    - { src: claude/CLAUDE.md, dest: ~/.claude/CLAUDE.md }
+    - { src: claude/rules, dest: ~/.claude/rules }
+    - { src: claude/commands, dest: ~/.claude/commands }
+repos:
+  - { name: chimera, url: git@github.com:fsocietydisobey/chimera.git, install: uv sync --all-packages }
+mcp_servers:
+  - name: chimera
+    command: uv --directory ~/dev/chimera run python -m chimera.cli mcp
+supervisor:
+  auto_install: true
+install_claude_hooks: true
+spa_build: true
 ```
 
-42+ MCP tools available: orchestration, monitor, process observability, multi-session shared state.
+Then on any machine: `chimera bootstrap --profile <local-path-or-url>`. Idempotent — safe to re-run.
+
+For ongoing cross-machine sync (after profile changes): `chimera sync` from a terminal, or `/chimera-configure` from inside any Claude Code session.
+
+A complete example profile that does all of the above lives at [`tasks/bootstrap-profile/EXAMPLE-PROFILE.yaml`](tasks/bootstrap-profile/EXAMPLE-PROFILE.yaml).
+
+### MCP tools
+
+42+ MCP tools available across orchestration, monitor, process observability, and multi-session shared state. Discoverable via `chimera tools --category mcp` — ranked by 7-day call count so the most-used tools surface first.
 
 ---
 
