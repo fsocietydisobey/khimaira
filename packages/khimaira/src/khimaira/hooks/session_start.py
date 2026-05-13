@@ -343,6 +343,73 @@ def _consume_handoffs(session_id: str, cwd: str) -> list[dict]:
     return matched
 
 
+def _fetch_hook_safe_tasks() -> list[dict]:
+    """Fetch tasks from every enabled task source that's hook-safe.
+
+    Hook-safe = can be called from a stdlib-only subprocess with no
+    MCP / network. The JSONL adapter (default) qualifies; Linear /
+    GitHub adapters would not (they need daemon-side dispatch — see
+    `tasks/task-sources/IMPLEMENTATION.md`).
+
+    Returns a list of dicts (Task.__dict__-shape) so this stays
+    JSON-renderable without pulling in dataclass-asdict machinery.
+    Never raises — a broken source returns [] cleanly via the
+    adapter's contract.
+    """
+    try:
+        # Lazy import: avoid the cost on every SessionStart if the user
+        # has no task sources configured. khimaira package is importable
+        # from the hook (see install_hooks.py), so this is fine.
+        import asyncio
+
+        from khimaira.task_sources.config import fetch_all_open_tasks
+
+        tasks = asyncio.run(fetch_all_open_tasks(hook_safe_only=True))
+    except Exception:  # noqa: BLE001 — hook must not break SessionStart
+        return []
+
+    return [
+        {
+            "id": t.id,
+            "title": t.title,
+            "state": t.state,
+            "source": t.source,
+            "project": t.project,
+            "url": t.url,
+        }
+        for t in tasks
+    ]
+
+
+def _format_tasks(tasks: list[dict]) -> str:
+    """Render the task list as the SessionStart task block.
+
+    Format mirrors the handoff / inbox blocks — bullet list with state
+    + title, source noted if non-trivial.
+    """
+    if not tasks:
+        return ""
+    # Sort: by source first (group source-wise), then by state
+    # (in-progress / in-review surface above todo).
+    state_order = {"in progress": 0, "in-progress": 0, "in review": 1, "in-review": 1, "todo": 2}
+
+    def _sort_key(t: dict) -> tuple:
+        state = (t.get("state") or "").lower()
+        return (t.get("source", ""), state_order.get(state, 9), t.get("id", ""))
+
+    sorted_tasks = sorted(tasks, key=_sort_key)
+    lines = [f"📋 khimaira tasks — {len(sorted_tasks)} open assignment(s):", ""]
+    for t in sorted_tasks:
+        state = (t.get("state") or "").strip()
+        state_label = f" ({state})" if state else ""
+        source_label = f" [{t['source']}]" if t.get("source") else ""
+        line = f"  • {t['id']}{state_label} — {t['title']}{source_label}"
+        if len(line) > 110:
+            line = line[:107] + "..."
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _format_handoffs(handoffs: list[dict], cwd: str) -> str:
     # Split by role assigned during consume: this session may have
     # auto-claimed ownership of fresh handoffs OR be an observer on
@@ -527,11 +594,14 @@ def main() -> int:
     others = _discover_other_active_sessions(session_id, within_minutes=30)
     cwd = data.get("cwd") or os.getcwd()
     handoffs = _consume_handoffs(session_id, cwd)
+    tasks = _fetch_hook_safe_tasks()
 
     if notes:
         blocks.append(_format_inbox(notes))
     if handoffs:
         blocks.append(_format_handoffs(handoffs, cwd))
+    if tasks:
+        blocks.append(_format_tasks(tasks))
     if others:
         blocks.append(_format_active_sessions(others))
 

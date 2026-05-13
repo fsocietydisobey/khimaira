@@ -157,66 +157,61 @@ once heuristic is calibrated.
 **Done when**: After a week of real traffic, we have data on leakage
 rate and mis-route rate. Decision on v2 is informed by data, not vibes.
 
-### Phase 1.5 — Linear-surfacing hook  (1-2 days)
+### Phase 1.5 — External task source integration  ✅ (MVP shipped)
 
-> **Scope-corrected 2026-05-13 (third reframe in one day).** Original
-> spike: full state replication (9-10d). First reframe: cross-machine
-> task dispatch (3-5d). **Final answer: just surface Linear issues in
-> SessionStart (~1d).** Joseph already uses Linear MCP for task
-> tracking — building khimaira's own task-dispatch system is
-> parallel-system syndrome. Linear stays canonical for tasks;
-> khimaira only needs to close the auto-surface UX gap.
-> See spec: `tasks/linear-surfacing-hook/IMPLEMENTATION.md`.
+> **Vendor-neutral by design.** khimaira surfaces "what's assigned to
+> you" at session boot — but does NOT name any specific task tracker
+> in the public roadmap. Plug in your own via the `TaskSource`
+> Protocol. Reference adapter: plain JSONL (no deps). Community /
+> follow-up adapters: Linear, GitHub Issues, etc.
+> See spec: `tasks/task-sources/IMPLEMENTATION.md`.
 
-**The use case**: Joseph assigns himself an issue in Linear (or
-someone else assigns it to him). Today he has to *remember* to query
-Linear from a Claude Code session; he'd rather it land automatically
-when he boots, alongside khimaira handoffs.
+**Scope evolution** (three reframes, one final answer):
+- ~~Original (9-10d): full state replication~~
+- ~~Second (3-5d): cross-machine task-dispatch primitive~~
+- ~~Third (1d): Linear-surfacing hook~~ — too vendor-specific
+- **Final (shipped)**: generic external-task-source integration
 
-```
-📋 Linear issues assigned to you (3, cached 2m ago):
-  • KHI-12 (in progress) — "Add per-project budget for mcp__khimaira__auto"
-  • KHI-15 (todo)        — "Investigate Claude Agent SDK"
-  • LL-7  (in review)    — "Wire pricing into checkout flow"
-```
+**What shipped (MVP, 2026-05-13)**:
 
-**Implementation** (1d for the core, 0.5d for the optional savings
-aggregation — see spec for details):
+- `Task` dataclass + `TaskSource` Protocol in
+  `khimaira/task_sources/__init__.py`. Every adapter normalizes its
+  source-specific fields into the unified `Task` shape.
+- `JsonlTaskSource` — no-deps reference adapter reading
+  `~/.khimaira/todo.jsonl` (configurable). Closed states excluded.
+  Hook-safe.
+- `load_configured_sources()` reads `~/.khimaira/task_sources.yaml`
+  (or defaults to one JSONL source if no config exists).
+- `fetch_all_open_tasks()` fans out across enabled sources concurrently
+  with exception isolation (one bad source doesn't poison others).
+- SessionStart hook integration: renders a 📋 block alongside the
+  inbox / handoffs / active-sessions blocks. Skipped when empty.
+- 13 unit tests.
 
-1. Thin Linear MCP client wrapper with 5-min file cache at
-   `~/.local/state/khimaira/linear-cache.json`.
-2. Extend `session_start.py` to fetch + render Linear issues inline.
-3. Optional `/linear` slash command that bypasses the cache.
-4. Tests: happy path, empty list, Linear unreachable, cache hit,
-   stale-cache-plus-unreachable.
+**What's deliberately NOT in the core**:
 
-Decisions baked in (per spec):
-- Filter: `assignee=me + status≠done`. Not cwd-scoped (cross-project
-  assignments are common and shouldn't get hidden).
-- Render: inline in SessionStart (matches handoff pattern).
-- Cache: 5 min, file-based, bypassed by `/linear`.
-- Linear unreachable → silent skip, log warning. Don't break boot.
+- Vendor adapters (Linear, GitHub Issues, Jira, ...). They live as
+  follow-up work — see the spec's "Follow-ups" section. The reason
+  is the genericness principle: khimaira's roadmap names no vendor.
+  Linear-specific work IS valuable, but as a community / contrib
+  adapter on top of the Protocol, not as core khimaira.
+- Daemon-side MCP dispatch (required for non-hook-safe adapters like
+  Linear). The Protocol's `hook_safe()` method exists as the
+  forward-compatible escape hatch — adapters can opt out of the hook
+  surface and be reached via slash command from agent context, or
+  via a future daemon-side dispatch layer.
 
-**Done when**: A fresh Claude Code SessionStart shows assigned Linear
-issues alongside handoffs. Cache hit <50ms; cache miss + Linear
-reachable <500ms; cache miss + Linear unreachable <100ms (skip).
+**Why this reframe matters**
 
-**Optional add-on**: aggregated `khimaira usage savings --across-machines`
-(~0.5d). Fetch usage.jsonl from configured remote khimaira instances
-via SSH; sum the spend. Skip unless Joseph asks — today's per-machine
-view is sufficient for the savings value-prop.
+NORTH_STAR principle #1: "Editor-agnostic via MCP." The same logic
+applies to task trackers: tracker-agnostic via Protocol. Naming any
+one vendor in the public roadmap quietly limits khimaira's audience.
+Generic Protocol + community-extensible adapters is the posture that
+lets khimaira land in any user's workflow.
 
-**What was killed**: full state replication AND cross-machine
-task-dispatch. The handoffs schema extension, `khimaira assign` CLI,
-context-bundle resolver, pull+claim endpoints — none of it gets
-built. `tasks/cross-machine-backend/IMPLEMENTATION.md` is kept as a
-superseded reference doc.
-
-**Strategic position**: Phase 1.5 is now small enough (1-2 days)
-that it doesn't fight Phase 2 (cross-editor) for sequencing at all.
-Either can ship first. The original "Phase 1.5 vs Phase 2" debate
-was based on the much-larger task-dispatch scope; with 1.5 collapsed,
-the question is moot.
+**Strategic position**: With the MVP shipped and adapters relegated
+to follow-up / community work, Phase 1.5 doesn't fight Phase 2
+(cross-editor) for sequencing. Phase 2 is now next.
 
 ### Phase 2 — Cross-editor adapter configs  (1-2 weeks)
 
