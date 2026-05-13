@@ -328,7 +328,6 @@ wheels = [
 
 [[package]]
 name = "chimera"
-version = "0.1.0.dev0"
 source = { editable = "packages/chimera" }
 dependencies = [
     { name = "aiosqlite" },
@@ -408,6 +407,14 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.7" }]
 name = "chimera-workspace"
 version = "0.0.0"
 source = { virtual = "." }
+dependencies = [
+    { name = "chimera" },
+    { name = "chimera-transport" },
+    { name = "chimera-types" },
+    { name = "scarlet" },
+    { name = "seance" },
+    { name = "specter" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -418,6 +425,14 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [
+    { name = "chimera", editable = "packages/chimera" },
+    { name = "chimera-transport", editable = "shared/transport" },
+    { name = "chimera-types", editable = "shared/types" },
+    { name = "scarlet", editable = "packages/scarlet" },
+    { name = "seance", editable = "packages/seance" },
+    { name = "specter", editable = "packages/specter" },
+]
 
 [package.metadata.requires-dev]
 dev = [
