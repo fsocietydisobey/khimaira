@@ -169,6 +169,62 @@ async def health() -> str:
 
 
 @mcp.tool()
+@logged_tool("list_tasks")
+async def list_tasks(hook_safe_only: bool = False) -> str:
+    """List open tasks across every configured external task source.
+
+    Phase 1.5 task-source integration — the agent-context counterpart
+    to the SessionStart hook's task block. Calls every configured
+    adapter (JSONL, GitHub Issues, future Linear, …), merges their
+    results, and renders a compact list.
+
+    Use this when the user asks "what's on my plate?" or runs `/tasks`,
+    OR when the SessionStart hook surfaced only hook-safe sources and
+    you want the full picture (Linear-style adapters that need MCP /
+    network are reached from agent context, not from the hook).
+
+    Args:
+        hook_safe_only: if True, skip adapters that report
+            `hook_safe()` is False. Defaults to False — agent context
+            can reach any adapter. Pass True only when reproducing
+            the SessionStart hook's view.
+
+    Returns:
+        Human-readable bullet list (📋 header + one line per task) or
+        a "📭 no open tasks" message when every adapter returned [].
+    """
+    from khimaira.task_sources.config import fetch_all_open_tasks
+
+    tasks = await fetch_all_open_tasks(hook_safe_only=hook_safe_only)
+    if not tasks:
+        scope = " (hook-safe sources only)" if hook_safe_only else ""
+        return f"📭 no open tasks across configured sources{scope}."
+
+    state_order = {
+        "in progress": 0,
+        "in-progress": 0,
+        "in review": 1,
+        "in-review": 1,
+        "todo": 2,
+    }
+
+    def _sort_key(t):
+        state = (t.state or "").lower()
+        return (t.source or "", state_order.get(state, 9), t.id or "")
+
+    sorted_tasks = sorted(tasks, key=_sort_key)
+    lines = [f"📋 khimaira tasks — {len(sorted_tasks)} open assignment(s):", ""]
+    for t in sorted_tasks:
+        state = (t.state or "").strip()
+        state_label = f" ({state})" if state else ""
+        source_label = f" [{t.source}]" if t.source else ""
+        url_label = f"\n    {t.url}" if t.url else ""
+        line = f"  • {t.id}{state_label} — {t.title}{source_label}{url_label}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+@mcp.tool()
 @logged_tool("research")
 async def research(question: str, context: str = "", cwd: str = "") -> str:
     """Deep research using Gemini CLI. Use for domain exploration, technology

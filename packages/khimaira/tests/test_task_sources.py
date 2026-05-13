@@ -247,6 +247,83 @@ async def test_fetch_all_open_tasks_hook_safe_filter(isolated_home):
     assert {t.id for t in all_sources} == {"A-1", "MCP-1"}
 
 
+# -------------------- list_tasks MCP tool -------------------- #
+
+
+async def test_list_tasks_mcp_renders_tasks(isolated_home, monkeypatch):
+    """The `list_tasks` MCP tool returns a human-readable bullet list."""
+    home, _ = isolated_home
+    todo = home / ".khimaira" / "todo.jsonl"
+    todo.parent.mkdir(parents=True)
+    todo.write_text(
+        '{"id":"local-1","title":"Wire up the thing","state":"in progress"}\n'
+        '{"id":"local-2","title":"Document it","state":"todo"}\n'
+    )
+
+    # Force a JSONL-only configuration pointing at our fixture file so
+    # we don't depend on whatever happens to be on the developer's box.
+    from khimaira.task_sources.jsonl import JsonlTaskSource
+    from khimaira.task_sources import config as cfg_mod
+
+    monkeypatch.setattr(
+        cfg_mod, "load_configured_sources", lambda: [JsonlTaskSource(path=todo)]
+    )
+
+    from khimaira.server import mcp as mcp_mod
+
+    out = await mcp_mod.list_tasks()
+    assert "📋 khimaira tasks — 2 open assignment(s):" in out
+    assert "local-1" in out
+    assert "Wire up the thing" in out
+    # in-progress sorts above todo
+    assert out.index("local-1") < out.index("local-2")
+
+
+async def test_list_tasks_mcp_empty(isolated_home, monkeypatch):
+    """`📭 no open tasks` when every configured source returns []."""
+    from khimaira.task_sources import config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "load_configured_sources", lambda: [])
+
+    from khimaira.server import mcp as mcp_mod
+
+    out = await mcp_mod.list_tasks()
+    assert "📭 no open tasks" in out
+
+
+async def test_list_tasks_mcp_hook_safe_only_filters_non_hook_safe(
+    isolated_home, monkeypatch
+):
+    """`hook_safe_only=True` excludes adapters that report hook_safe()=False."""
+    from dataclasses import dataclass
+
+    from khimaira.task_sources import Task
+    from khimaira.task_sources import config as cfg_mod
+
+    @dataclass
+    class _MockMcpSource:
+        name: str = "mcp-only"
+
+        def hook_safe(self) -> bool:
+            return False
+
+        async def fetch_open_tasks(self):
+            return [Task(id="MCP-1", title="agent-only task", source="mcp-only")]
+
+    monkeypatch.setattr(cfg_mod, "load_configured_sources", lambda: [_MockMcpSource()])
+
+    from khimaira.server import mcp as mcp_mod
+
+    # Default: include non-hook-safe → MCP-1 appears
+    out_all = await mcp_mod.list_tasks()
+    assert "MCP-1" in out_all
+
+    # hook_safe_only=True: MCP-1 filtered out → empty
+    out_safe = await mcp_mod.list_tasks(hook_safe_only=True)
+    assert "📭 no open tasks" in out_safe
+    assert "(hook-safe sources only)" in out_safe
+
+
 async def test_fetch_all_open_tasks_exception_isolation(isolated_home):
     """One source raising doesn't kill the others."""
     home, _ = isolated_home
