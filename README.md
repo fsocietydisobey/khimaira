@@ -118,6 +118,104 @@ flowchart LR
 
 ---
 
+## Real savings, real numbers
+
+khimaira tracks every dispatch in `~/.local/state/khimaira/usage.jsonl` and computes the counterfactual: *what would this have cost if everything had run on Opus?* The delta is your savings.
+
+```bash
+khimaira usage savings           # last 30 days
+khimaira usage savings --days 7  # last week
+khimaira usage savings --by runner   # group by claude/codex/gemini/ollama
+```
+
+Example output:
+
+```
+Window: last 30 days  (243 records)
+  auto-mode records:     187
+  subagent records:      31
+  baseline model:        claude-opus-4-7
+
+Total actual spend:                  $  3.4210
+If everything had been baseline:     $ 47.8920
+  → savings (auto + subagent):       $ 38.7531
+  → routing efficiency:                  87.4%  (vs claude-opus-4-7)
+```
+
+**Two routes earn savings credit**, both visible in the breakdown:
+
+- **`mode=auto`** — you (or an agent) called `mcp__khimaira__auto(prompt)`. The classifier + pool router picked the cheapest competent model from your enabled pool. Audit trail in `~/.local/state/khimaira/khimaira.log` shows the pool size, top-2 candidates, and rejected reasons per dispatch.
+- **`mode=subagent`** — Claude Code's auto-delegation routed a prompt to one of the `khimaira-*` subagents in `~/.claude/agents/`. Native model-swap; recorded by the `SubagentStop` hook.
+
+Override the baseline model (e.g. compare against Sonnet instead of Opus):
+
+```bash
+KHIMAIRA_USAGE_BASELINE_MODEL=claude-sonnet-4-6 khimaira usage savings
+# or set baseline_model: <id> in ~/.khimaira/models.yaml for a persistent default
+```
+
+### The auto-router MCP tool
+
+Agents call `mcp__khimaira__auto(prompt=...)` directly when they recognize their own work as trivial-to-moderate. The classifier (~$0.0004) runs first, then the pool router picks the cheapest model covering the required capabilities. Same call path as `delegate(tier="auto")`; the alias just makes "auto-routed" the obvious default.
+
+```python
+# Inside any Claude Code session — agent realizes the question is shallow:
+answer = mcp__khimaira__auto("What's the difference between useMemo and useCallback?")
+# → routes to Haiku, returns answer, records mode=auto in usage.jsonl
+```
+
+### The model registry — `~/.khimaira/models.yaml`
+
+Which models are enabled for `mcp__khimaira__auto`'s pool, and at what cost-per-million-token? User-editable YAML. Sensible defaults ship; override per-machine without forking khimaira.
+
+```yaml
+# ~/.khimaira/models.yaml
+baseline_model: claude-opus-4-7   # for savings counterfactual
+
+models:
+  - id: claude-haiku-4-5
+    runner: claude
+    input_per_m: 0.8
+    output_per_m: 4.0
+    enabled_for_auto: true
+    capabilities: [factual, syntax, simple-code, classification]
+
+  - id: gemini-2.5-flash
+    runner: gemini
+    input_per_m: 0.075
+    output_per_m: 0.30
+    enabled_for_auto: true
+    capabilities: [factual, syntax, simple-code, large-context]
+
+  - id: claude-sonnet-4-6
+    runner: claude
+    input_per_m: 3.0
+    output_per_m: 15.0
+    enabled_for_auto: true
+    capabilities: [multi-file-reasoning, code-review, refactor]
+```
+
+The pool router picks the cheapest model whose capabilities cover the classifier's output.
+
+---
+
+## Subagents — thinking-token interception
+
+`~/.claude/agents/khimaira-*.md` ships a curated set of Claude Code subagents, each pinned to the right model for its role. When Claude Code's auto-delegation matches a subagent's `description`, it routes the work to that subagent and **swaps the model for that turn**. Opus delegates trivial work to Haiku without you (or the parent agent) doing anything.
+
+| Agent | Model | When it auto-routes |
+|---|---|---|
+| `khimaira-factual` | haiku | definitional + syntax-lookup questions, no codebase reads |
+| `khimaira-code-fast` | haiku | mechanical edits (renames, formatting, one-line fixes) |
+| `khimaira-research` | sonnet | multi-file tracing, cross-file context for refactors |
+| `khimaira-deep-debug` | opus | hypothesis-driven escalation when cheaper attempts got stuck |
+
+Shipped via the bootstrap framework's symlink path — `khimaira bootstrap` / `khimaira sync` creates `~/.claude/agents/` pointing at your dotfiles. The `SubagentStop` hook records each dispatch to `usage.jsonl` so `khimaira usage savings` credits the savings.
+
+Verified savings: a `khimaira-factual` dispatch on Haiku produces a usage row showing **~94.7% savings** vs the Opus baseline for the same tokens.
+
+---
+
 ## Repository layout
 
 ```mermaid
@@ -575,6 +673,10 @@ See [`tasks/BUILD-PLAN.md`](tasks/BUILD-PLAN.md) for full status. Cliff-notes:
 | 14b — Observer dashboards (cost / trace waterfall / slow alerts) | ✅ |
 | 14c — Hooks for cross-session inbox + incoming + handoffs auto-surface | ✅ |
 | 14d — Cross-session primitives (targeted Q, wait_for_answer, post_notice, post_handoff, archive, transcript query/summary) | ✅ |
+| 15 — Auto-mode (`mcp__khimaira__auto` + pool router + savings command) | ✅ |
+| 16 — Subagent library Phase 1.2a (4 `khimaira-*` agents in `~/.claude/agents/`) | ✅ |
+| 16b — SubagentStop hook → `usage.jsonl` (Phase 1.2b) | ✅ |
+| 17 — Cross-machine backend (Phase 1.5) | ⬜ scope-locked at `tasks/cross-machine-backend/` |
 | 4½ — Séance/Scarlet library APIs | ⬜ |
 | Workspaces (multi-project session isolation) | ⬜ spec'd at `tasks/workspaces/` |
 | Desktop notifications (libnotify push for cross-session events) | ⬜ spec'd at `tasks/desktop-notifications/` |

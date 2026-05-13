@@ -143,9 +143,10 @@ a `mode="subagent"` row. ✅ (verified 2026-05-13 — one khimaira-factual
 dispatch produced a haiku record showing 94.7% savings vs the Opus
 baseline.)
 
-**Deferred to 1.2c (after first-set usage data exists)**: khimaira-grep,
-khimaira-code-deep, khimaira-architect, khimaira-debug (as distinct
-from deep-debug).
+**1.2c — full subagent set** (done 2026-05-13): khimaira-grep (haiku),
+khimaira-code-deep (sonnet), khimaira-architect (opus), khimaira-debug
+(sonnet, distinct from deep-debug — first-pass before escalation).
+Shipped same path as 1.2a (dotfiles symlink). ✅
 
 ### Phase 1.3 — PreToolUse interceptor v1  (3-4 days)
 
@@ -156,38 +157,85 @@ once heuristic is calibrated.
 **Done when**: After a week of real traffic, we have data on leakage
 rate and mis-route rate. Decision on v2 is informed by data, not vibes.
 
-### Phase 1.5 — Cross-machine backend  (2-3 weeks; pending scope-lock)
+### Phase 1.5 — Cross-machine backend  (9-10 days, scope-locked)
 
 > Inserted between Phase 1 (foundation) and Phase 2 (cross-editor) so
 > the `StateClient` abstraction lands before cross-editor adapters
 > consume it. See spike: `tasks/cross-machine-backend/IMPLEMENTATION.md`.
+> Latency + project-identity decisions resolved via chimera-extension
+> follow-up answer (q=5a9b30df9c3e, 2026-05-13).
 
 Today every khimaira install is an island — local `~/.local/state/khimaira/`,
 local daemon at `localhost:8740`, local MCP registration. Joseph
 bootstrapped a second machine on 2026-05-13; the cross-machine friction
 (handoffs don't flow, `usage savings` only sees local, `/ask` can't
-cross hosts) is now a daily pain point.
+cross hosts) is a daily pain point.
 
 **Phase 1.5a — MVP (Option E: SSH-tunneled single backend)**:
 
-- Add `KHIMAIRA_BACKEND_URL` env var. When set, every state operation
-  in the MCP server + CLI routes through HTTP to that URL instead of
-  local files.
-- Introduce a `StateClient` abstraction that picks local-file vs HTTP
-  based on env (future-proof for Phase 1.5b's Postgres backend).
-- Refactor the direct-Python call sites in `server/mcp.py` to go
-  through `StateClient` (~30-60 sites per the spike).
-- Document the SSH tunnel pattern as the auth story (sidesteps
-  designing a token/mTLS scheme).
-- Project identity primitive (resolve "same project across worktrees"
-  — cwd-literal keying breaks when `~/dev/khimaira` and `~/code/khimaira`
-  are the same logical project). Pending answer to spike's open
-  question #3.
+Concrete implementation order (9-10 days total — write-queue included
+so WAN/exit-relay dogfooding stays usable from day one):
+
+1. **Consolidated read endpoint** (1d) — `GET /api/sessions/{id}/hook-state`
+   returns inbox + handoffs + incoming + active-sessions in one payload.
+   Cuts the 3-5 separate GETs the existing hooks make down to one
+   roundtrip. ~30 LOC endpoint.
+
+2. **Hook refactor** (1d) — `UserPromptSubmit` + `SessionStart` use the
+   new consolidated endpoint. ~50 LOC.
+
+3. **Local write-queue + background flusher** (2d) — high-frequency
+   writes (`PostToolUse` file_touches, `session_log_touch`) append to
+   `~/.local/state/khimaira/pending-writes.jsonl` synchronously, a
+   daemon-thread or systemd timer POSTs the queue to the remote
+   backend every 1-2s. Lose at most 2s of in-flight on crash; per-touch
+   granularity makes this acceptable. ~100 LOC.
+
+4. **Project-label primitive wiring** (1d) — teach
+   `consume_handoffs(cwd)` to resolve cwd → project labels via
+   `attached.json`, match where `scope_project ∈ labels OR
+   scope_cwd == cwd`. The primitive already exists: `attached.json`
+   stores `project_path` + `label`; `post_handoff` already accepts
+   `scope_project` (currently dead code). This task wires it through
+   the consume side.
+
+5. **Backward-compat shim** (0.5d) — `consume_handoffs` accepts both
+   the new project-label scope and existing cwd-literal entries; old
+   handoffs keep flowing until their 7-day TTL expires.
+
+6. **`KHIMAIRA_BACKEND_URL` plumbing + `StateClient` abstraction**
+   (3-5d) — the bulk. Refactor the ~30-60 direct-Python call sites in
+   `server/mcp.py` to go through `StateClient`, which picks local-file
+   vs HTTP based on env. User-intent writes (`session_log_decision`,
+   `session_post_handoff`, `session_post_answer`) stay synchronous —
+   low volume, agent expects them to land. File-touch / status writes
+   flow through the write-queue from step 3.
+
+Decision rationale (from chimera-extension's dig):
+- **Reads can't buffer** (need authoritative-at-the-moment) but can
+  be consolidated 5→1.
+- **High-frequency writes can buffer** (1-2s loss tolerance is fine for
+  file-touch granularity).
+- **User-intent writes stay sync** (low volume, agent contract requires
+  them to land before next read).
+- **Project label > git-remote-origin** — codebase already made this
+  call (`bootstrap/checks.py:32`). Monorepos / forks / remote-less
+  projects break the remote assumption. Label is explicit, declared at
+  `khimaira attach` time.
+
+Auth: SSH tunnel sidesteps token/mTLS design entirely.
+```bash
+# On laptop, expose desktop's khimaira locally:
+ssh -L 8740:127.0.0.1:8740 desktop
+```
+Daemon stays bound to `127.0.0.1`; SSH already authenticated the user.
 
 **Done when (1.5a)**: A handoff posted from desktop's khimaira surfaces
 in laptop's SessionStart hook on next boot. `khimaira usage savings`
 on either machine reflects the aggregate. `/ask laptop-session "..."`
-from desktop session unblocks when laptop wakes.
+from desktop session unblocks when laptop wakes. Latency budget:
+LAN/Tailscale-local adds 30-100ms/turn; WAN Tailscale adds 100-400ms.
+Tailscale exit-relay (1.6-4s) is documented as a known degraded mode.
 
 **Phase 1.5b — Optional Postgres backend** (deferred until 1.5a in use):
 
@@ -197,20 +245,16 @@ JSONL primitives → Pydantic-derived SQL tables. Buys query power
 (`khimaira usage savings --aggregate` becomes one GROUP BY) and
 operational story (backups, replication).
 
-**Scope-lock blockers** (gated on chimera-extension's follow-up dig):
+**Risks (documented as known issues)**:
 
-- Latency budget for the hot-path write operations (PostToolUse +
-  UserPromptSubmit + decision logging) under each transport tier
-  (LAN ~1ms, Tailscale WAN 30-100ms, exit-relay 100-300ms). Drives
-  whether 1.5a ships with sync HTTP or write-buffer-then-flush.
-- Project identity decision: git-remote-origin vs explicit label.
-
-**Risks**:
-
-- SPOF if backend machine is asleep/closed — needs documented
-  degraded-mode (read-only-cache? offline-queue-then-replay?).
-- Latency regression if naive sync HTTP for hot-path writes —
-  see scope-lock blockers above.
+- **SPOF**: if the designated backend machine is asleep/closed, all
+  other machines' khimaira is offline. v1 mitigation: the write-queue
+  keeps queueing locally; the read side fails fast with a clear error
+  that names the backend host. Offline-tolerant read cache is a Phase
+  3 stretch from the spike.
+- **Exit-relay latency** (Tailscale routing through a far-away relay):
+  documented as a known issue. Mitigation is on the user's side
+  (prefer LAN / direct-Tailscale routes when possible).
 
 **Strategic rationale for inserting before Phase 2**: the
 `StateClient` abstraction the cross-machine refactor needs is also
