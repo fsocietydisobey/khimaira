@@ -1,4 +1,4 @@
-# chimera — engineering rules for AI agents
+# khimaira — engineering rules for AI agents
 
 > Patterns captured from real bugs that hit prod (or the dev loop)
 > in this repo. Each rule is here because we shipped a bug it would
@@ -8,7 +8,7 @@
 
 ### Every endpoint that resolves a session name needs unknown-name coverage
 
-**Why:** `chimera.monitor.sessions.resolve_session_id` raises
+**Why:** `khimaira.monitor.sessions.resolve_session_id` raises
 `ValueError` on unknown names/UUIDs. FastAPI lets unhandled exceptions
 become HTTP 500 with a stack trace. The right shape is HTTP 404 with
 the helpful "use session_list()" message.
@@ -32,12 +32,12 @@ async def something(session_id: str, req: ...) -> dict:
 - happy path → 200 + assert response shape
 - unknown session name → 404 + assert error message contains "no session"
 
-See `packages/chimera/tests/test_sessions_api.py` for examples.
+See `packages/khimaira/tests/test_sessions_api.py` for examples.
 
 ### Every primitive that mutates JSONL needs round-trip coverage
 
 The `read → modify → atomic-rename` pattern is everywhere in
-`chimera.monitor.sessions`. A subtle off-by-one in the rewrite (e.g.
+`khimaira.monitor.sessions`. A subtle off-by-one in the rewrite (e.g.
 "only rewrite when modified" failing to drop expired entries when no
 modify happens) creates state-bloat bugs that don't surface until
 the file is large.
@@ -77,18 +77,18 @@ SIGTERM mid-flight (graceful shutdown).
 
 ### Every long-lived daemon needs a supervisor
 
-`chimera monitor` runs as a forked daemon. If it dies (OOM, manual
+`khimaira monitor` runs as a forked daemon. If it dies (OOM, manual
 SIGKILL, parent shell HUP), nothing restarts it. The whole stack
 (observer, dashboard, MCP tools that depend on the daemon) silently
 breaks.
 
 **Two paths shipped:**
-- `chimera monitor watch` — cross-platform foreground supervisor with
+- `khimaira monitor watch` — cross-platform foreground supervisor with
   exponential backoff
-- `chimera monitor install-service` — systemd user unit on Linux
+- `khimaira monitor install-service` — systemd user unit on Linux
   (the right answer; macOS users use `watch`)
 
-**Rule:** any future long-lived chimera daemon should ship
+**Rule:** any future long-lived khimaira daemon should ship
 foreground + supervisor patterns from day one, not as a follow-up.
 
 ### Error paths must include the correct primitive name in messages
@@ -96,7 +96,7 @@ foreground + supervisor patterns from day one, not as a follow-up.
 When `/inbox 087234eb17d2` returns "📭 inbox empty", that's correct
 output but unhelpful — the user passed a question ID, not a session
 ID. The right message is "12-char hex looks like a question ID; try
-`/notes <session>` or `mcp__chimera__session_state(<session>)`."
+`/notes <session>` or `mcp__khimaira__session_state(<session>)`."
 
 **Rule:** when a tool gets a clearly-wrong-shape input (12-char hex
 where a UUID was expected, etc.), the error/empty path should suggest
@@ -113,12 +113,12 @@ the closest correct primitive by name. Saves the next layer of
 | FYI / ack, no reply expected | `session_post_notice` | Re-surfaces up to 3 turns then auto-expires |
 | **Task for the next session in this project** | `session_post_handoff(scope_project=...)` | **Directive, not informational.** Auto-surfaces on any future session's SessionStart hook. The receiving agent is expected to START on it, not wait for user confirmation. |
 | **Delegate a slice of your handoff to a specific session** | `session_invite_handoff(parent_id, me, invitee, text)` | Owner-only. Child handoff targets the named session; cwd-peers skip. Invitee gets immediate inbox notice + SessionStart-hook surface on next boot. |
-| Read what a stopped session said | `session_query_transcript` / `session_summarize_transcript` | Heuristic — no LLM call from chimera |
+| Read what a stopped session said | `session_query_transcript` / `session_summarize_transcript` | Heuristic — no LLM call from khimaira |
 | State a commitment, no audience | `session_log_decision` | Pull-only via `session_state` |
 
 ### Handoffs are directives, not FYIs
 
-When you boot and see a `📦 chimera handoffs` block:
+When you boot and see a `📦 khimaira handoffs` block:
 
 1. **Treat it as your task list.** The prior session left it specifically for whoever picks up here. The user posted it; they don't need to re-authorize each step.
 2. **Read the linked files / specs first.** Don't summarize until you've read.
@@ -151,21 +151,21 @@ which is fine but less discoverable than a slug.
 
 ### Observer changes need both venvs redeployed
 
-`chimera_observer` is venv-injected via `chimera attach`. If you change
-the observer code in `packages/chimera/src/chimera/attach/observer_template/`,
+`khimaira_observer` is venv-injected via `khimaira attach`. If you change
+the observer code in `packages/khimaira/src/khimaira/attach/observer_template/`,
 running apps don't pick up the change automatically. They need:
 
-1. `chimera detach <project>`
-2. `chimera attach <project>`
+1. `khimaira detach <project>`
+2. `khimaira attach <project>`
 3. App restart (the running process has the OLD code in memory)
 
-**Rule:** when you bump `chimera_observer.__version__`, redeploy to
-all attached projects (`chimera attached` lists them) and remind the
+**Rule:** when you bump `khimaira_observer.__version__`, redeploy to
+all attached projects (`khimaira attached` lists them) and remind the
 user the apps need restart for the new code to take effect.
 
 ### Daemon restart wipes the in-memory heartbeat buffer
 
-`chimera-monitor` keeps heartbeats in-memory (`_runs: dict[(project,
+`khimaira-monitor` keeps heartbeats in-memory (`_runs: dict[(project,
 run_id), RunEntry]`). Restarting the daemon flushes the buffer.
 LangGraph runs that completed pre-restart are gone from observer
 queries (they're still in the LangGraph checkpointer DB; just not in
@@ -181,7 +181,7 @@ from the same in-memory store; all are affected the same way.
 ### Test files are docs
 
 The fastest way to learn what `consume_handoffs` does is read
-`test_consume_handoffs_*` in `packages/chimera/tests/test_sessions_unit.py`.
+`test_consume_handoffs_*` in `packages/khimaira/tests/test_sessions_unit.py`.
 Tests exercise corner cases the docstrings don't mention.
 
 **Rule:** when adding a new function to the sessions module, add a
@@ -199,8 +199,8 @@ how today's "it worked yesterday" bugs got into main.
 |---|---|
 | Open task specs | `tasks/<name>/IMPLEMENTATION.md` |
 | Phase status | `tasks/BUILD-PLAN.md` |
-| Test conventions | `packages/chimera/tests/conftest.py` |
+| Test conventions | `packages/khimaira/tests/conftest.py` |
 | Hook scripts | `scripts/hooks/` |
-| Observer template | `packages/chimera/src/chimera/attach/observer_template/` |
+| Observer template | `packages/khimaira/src/khimaira/attach/observer_template/` |
 | Slash commands | `~/.claude/commands/*.md` (symlinked from dotfiles) |
-| Discoverability | `chimera tools` or `/tools` |
+| Discoverability | `khimaira tools` or `/tools` |

@@ -1,34 +1,34 @@
 [project]
-name = "chimera-workspace"
+name = "khimaira-workspace"
 version = "0.0.0"
-description = "chimera — AI dev framework (workspace root)"
+description = "khimaira — AI dev framework (workspace root)"
 requires-python = ">=3.12"
 # Listing workspace members as dependencies is load-bearing: it makes
 # `uv sync` (from the workspace root) install every member's entry-point
 # script into .venv/bin/. Without this, a plain `uv sync` only resolves
 # the root project's deps and drops member bins — most painfully,
-# `.venv/bin/chimera` disappears, breaking the chimera MCP launcher and
+# `.venv/bin/khimaira` disappears, breaking the khimaira MCP launcher and
 # the bootstrap script's PATH-resolution layer. Use `tool.uv.sources`
 # below to redirect each name to the workspace member rather than PyPI.
 dependencies = [
-    "chimera",
+    "khimaira",
     "scarlet",
     "seance",
     "specter",
-    "chimera-transport",
-    "chimera-types",
+    "khimaira-transport",
+    "khimaira-types",
 ]
 
 [tool.uv.workspace]
 members = ["packages/*", "shared/*"]
 
 [tool.uv.sources]
-chimera = { workspace = true }
+khimaira = { workspace = true }
 scarlet = { workspace = true }
 seance = { workspace = true }
 specter = { workspace = true }
-chimera-transport = { workspace = true }
-chimera-types = { workspace = true }
+khimaira-transport = { workspace = true }
+khimaira-types = { workspace = true }
 
 [dependency-groups]
 dev = [

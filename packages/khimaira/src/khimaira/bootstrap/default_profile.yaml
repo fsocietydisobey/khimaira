@@ -1,0 +1,34 @@
+# Default khimaira profile — applied when no --profile is passed and no
+# KHIMAIRA_PROFILE / ~/.config/khimaira/profile.yaml exists.
+#
+# Minimal: registers khimaira's own MCP server + installs the supervisor.
+# No dotfiles, no sibling repos. Devs with their own setup author a
+# profile in their dotfiles repo and pass --profile or set KHIMAIRA_PROFILE.
+
+name: khimaira-default
+description: |
+  Khimaira-only baseline. Installs the khimaira-monitor daemon as a
+  host-native supervised service and registers mcp__khimaira__* with
+  Claude Code. No personal config, no sibling MCP servers.
+
+# khimaira-monitor needs the SPA built so the web dashboard works.
+# Cheap-ish (~4s npm build) and the daemon is supervised so it survives
+# a missing build by serving JSON API only — but the dashboard is part
+# of the value, so build by default.
+spa_build: true
+
+supervisor:
+  # Installs systemd user unit (Linux) / launchd LaunchAgent (macOS).
+  # No-op on other platforms; khimaira doctor will nudge toward `watch`.
+  auto_install: true
+
+mcp_servers:
+  - name: khimaira
+    # bash -lc so the user's PATH (uv, etc.) is in scope; 2>>log so a
+    # crashed launch leaves a breadcrumb the user can find via doctor.
+    command: bash -lc 'uv --directory ~/dev/khimaira run khimaira mcp 2>>/tmp/khimaira.log'
+
+# No repos block: the default assumes khimaira itself is already cloned
+# (bootstrap is being run from inside it). Profiles that want sibling
+# MCP servers (seance/specter/scarlet/etc.) declare them under `repos`
+# AND `mcp_servers` in their own manifest.

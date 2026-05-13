@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# chimera PostToolUse hook — auto-log file touches to chimera's session store.
+# khimaira PostToolUse hook — auto-log file touches to khimaira's session store.
 #
 # Triggered after Edit / Write / MultiEdit / NotebookEdit. Reads the hook
 # JSON from stdin, extracts file path + tool name, fires session_log_touch
-# against the chimera-monitor daemon's REST API.
+# against the khimaira-monitor daemon's REST API.
 #
 # Design constraints:
 #   - Must NOT block Claude Code. Silent-fail on every error (daemon down,
@@ -15,8 +15,8 @@
 set -u
 
 # Tunables — overridable via env
-CHIMERA_HOOK_BASE_URL="${CHIMERA_HOOK_BASE_URL:-http://127.0.0.1:8740}"
-CHIMERA_HOOK_TIMEOUT="${CHIMERA_HOOK_TIMEOUT:-2}"
+KHIMAIRA_HOOK_BASE_URL="${KHIMAIRA_HOOK_BASE_URL:-http://127.0.0.1:8740}"
+KHIMAIRA_HOOK_TIMEOUT="${KHIMAIRA_HOOK_TIMEOUT:-2}"
 
 # Need jq + curl. If either is missing, silent-skip — don't block.
 command -v jq >/dev/null 2>&1 || exit 0
@@ -48,8 +48,8 @@ if [ -z "$FILE_PATH" ]; then
     while IFS= read -r f; do
         [ -z "$f" ] && continue
         _post_touch() {
-            curl -s --max-time "$CHIMERA_HOOK_TIMEOUT" -X POST \
-                "$CHIMERA_HOOK_BASE_URL/api/sessions/$SESSION_ID/touch" \
+            curl -s --max-time "$KHIMAIRA_HOOK_TIMEOUT" -X POST \
+                "$KHIMAIRA_HOOK_BASE_URL/api/sessions/$SESSION_ID/touch" \
                 -H "Content-Type: application/json" \
                 -d "$(jq -n --arg f "$1" --arg t "$TOOL_NAME" '{file: $f, summary: ("auto-logged from " + $t + " hook")}')" \
                 >/dev/null 2>&1 || true
@@ -65,8 +65,8 @@ PAYLOAD="$(jq -n \
     --arg t "$TOOL_NAME" \
     '{file: $f, summary: ("auto-logged from " + $t + " hook")}')"
 
-curl -s --max-time "$CHIMERA_HOOK_TIMEOUT" -X POST \
-    "$CHIMERA_HOOK_BASE_URL/api/sessions/$SESSION_ID/touch" \
+curl -s --max-time "$KHIMAIRA_HOOK_TIMEOUT" -X POST \
+    "$KHIMAIRA_HOOK_BASE_URL/api/sessions/$SESSION_ID/touch" \
     -H "Content-Type: application/json" \
     -d "$PAYLOAD" \
     >/dev/null 2>&1 || true

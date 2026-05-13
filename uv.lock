@@ -8,10 +8,10 @@ resolution-markers = [
 
 [manifest]
 members = [
-    "chimera",
-    "chimera-transport",
-    "chimera-types",
-    "chimera-workspace",
+    "khimaira",
+    "khimaira-transport",
+    "khimaira-types",
+    "khimaira-workspace",
     "scarlet",
     "seance",
     "specter",
@@ -324,122 +324,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/7a/1d/29d32e0fb40864b1f878c7f5a0b343ae676c6e2b271a2d55cc3a152391da/charset_normalizer-3.4.7-cp314-cp314t-win_amd64.whl", hash = "sha256:03853ed82eeebbce3c2abfdbc98c96dc205f32a79627688ac9a27370ea61a49c", size = 174168, upload-time = "2026-04-02T09:27:49.795Z" },
     { url = "https://files.pythonhosted.org/packages/de/32/d92444ad05c7a6e41fb2036749777c163baf7a0301a040cb672d6b2b1ae9/charset_normalizer-3.4.7-cp314-cp314t-win_arm64.whl", hash = "sha256:c35abb8bfff0185efac5878da64c45dafd2b37fb0383add1be155a763c1f083d", size = 153018, upload-time = "2026-04-02T09:27:51.116Z" },
     { url = "https://files.pythonhosted.org/packages/db/8f/61959034484a4a7c527811f4721e75d02d653a35afb0b6054474d8185d4c/charset_normalizer-3.4.7-py3-none-any.whl", hash = "sha256:3dce51d0f5e7951f8bb4900c257dad282f49190fdbebecd4ba99bcc41fef404d", size = 61958, upload-time = "2026-04-02T09:28:37.794Z" },
-]
-
-[[package]]
-name = "chimera"
-source = { editable = "packages/chimera" }
-dependencies = [
-    { name = "aiosqlite" },
-    { name = "anthropic" },
-    { name = "chimera-transport" },
-    { name = "chimera-types" },
-    { name = "fastapi" },
-    { name = "langchain-anthropic" },
-    { name = "langchain-core" },
-    { name = "langchain-google-genai" },
-    { name = "langgraph" },
-    { name = "langgraph-checkpoint-sqlite" },
-    { name = "mcp", extra = ["cli"] },
-    { name = "psutil" },
-    { name = "psycopg", extra = ["binary"] },
-    { name = "pydantic" },
-    { name = "python-dotenv" },
-    { name = "pyyaml" },
-    { name = "sse-starlette" },
-    { name = "tree-sitter" },
-    { name = "tree-sitter-python" },
-    { name = "uvicorn", extra = ["standard"] },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiosqlite", specifier = ">=0.20" },
-    { name = "anthropic", specifier = ">=0.40" },
-    { name = "chimera-transport", editable = "shared/transport" },
-    { name = "chimera-types", editable = "shared/types" },
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "langchain-anthropic", specifier = ">=0.3" },
-    { name = "langchain-core", specifier = ">=0.3" },
-    { name = "langchain-google-genai", specifier = ">=2" },
-    { name = "langgraph", specifier = ">=0.4" },
-    { name = "langgraph-checkpoint-sqlite", specifier = ">=2" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.0" },
-    { name = "psutil", specifier = ">=5" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
-    { name = "pydantic", specifier = ">=2.7" },
-    { name = "python-dotenv", specifier = ">=1" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "sse-starlette", specifier = ">=2.1" },
-    { name = "tree-sitter", specifier = ">=0.21" },
-    { name = "tree-sitter-python", specifier = ">=0.21" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
-]
-provides-extras = ["all"]
-
-[[package]]
-name = "chimera-transport"
-version = "0.1.0.dev0"
-source = { editable = "shared/transport" }
-dependencies = [
-    { name = "fastmcp" },
-    { name = "sse-starlette" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "fastmcp", specifier = ">=2.0" },
-    { name = "sse-starlette", specifier = ">=2.1" },
-]
-
-[[package]]
-name = "chimera-types"
-version = "0.1.0.dev0"
-source = { editable = "shared/types" }
-dependencies = [
-    { name = "pydantic" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.7" }]
-
-[[package]]
-name = "chimera-workspace"
-version = "0.0.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "chimera" },
-    { name = "chimera-transport" },
-    { name = "chimera-types" },
-    { name = "scarlet" },
-    { name = "seance" },
-    { name = "specter" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "chimera", editable = "packages/chimera" },
-    { name = "chimera-transport", editable = "shared/transport" },
-    { name = "chimera-types", editable = "shared/types" },
-    { name = "scarlet", editable = "packages/scarlet" },
-    { name = "seance", editable = "packages/seance" },
-    { name = "specter", editable = "packages/specter" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.10" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-    { name = "ruff", specifier = ">=0.6" },
 ]
 
 [[package]]
@@ -1187,6 +1071,122 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/43/4b/674af6ef2f97d56f0ab5153bf0bfa28ccb6c3ed4d1babf4305449668807b/keyring-25.7.0.tar.gz", hash = "sha256:fe01bd85eb3f8fb3dd0405defdeac9a5b4f6f0439edbb3149577f244a2e8245b", size = 63516, upload-time = "2025-11-16T16:26:09.482Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/81/db/e655086b7f3a705df045bf0933bdd9c2f79bb3c97bfef1384598bb79a217/keyring-25.7.0-py3-none-any.whl", hash = "sha256:be4a0b195f149690c166e850609a477c532ddbfbaed96a404d4e43f8d5e2689f", size = 39160, upload-time = "2025-11-16T16:26:08.402Z" },
+]
+
+[[package]]
+name = "khimaira"
+source = { editable = "packages/khimaira" }
+dependencies = [
+    { name = "aiosqlite" },
+    { name = "anthropic" },
+    { name = "fastapi" },
+    { name = "khimaira-transport" },
+    { name = "khimaira-types" },
+    { name = "langchain-anthropic" },
+    { name = "langchain-core" },
+    { name = "langchain-google-genai" },
+    { name = "langgraph" },
+    { name = "langgraph-checkpoint-sqlite" },
+    { name = "mcp", extra = ["cli"] },
+    { name = "psutil" },
+    { name = "psycopg", extra = ["binary"] },
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
+    { name = "sse-starlette" },
+    { name = "tree-sitter" },
+    { name = "tree-sitter-python" },
+    { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiosqlite", specifier = ">=0.20" },
+    { name = "anthropic", specifier = ">=0.40" },
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "khimaira-transport", editable = "shared/transport" },
+    { name = "khimaira-types", editable = "shared/types" },
+    { name = "langchain-anthropic", specifier = ">=0.3" },
+    { name = "langchain-core", specifier = ">=0.3" },
+    { name = "langchain-google-genai", specifier = ">=2" },
+    { name = "langgraph", specifier = ">=0.4" },
+    { name = "langgraph-checkpoint-sqlite", specifier = ">=2" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.0" },
+    { name = "psutil", specifier = ">=5" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
+    { name = "pydantic", specifier = ">=2.7" },
+    { name = "python-dotenv", specifier = ">=1" },
+    { name = "pyyaml", specifier = ">=6.0" },
+    { name = "sse-starlette", specifier = ">=2.1" },
+    { name = "tree-sitter", specifier = ">=0.21" },
+    { name = "tree-sitter-python", specifier = ">=0.21" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+]
+provides-extras = ["all"]
+
+[[package]]
+name = "khimaira-transport"
+version = "0.1.0.dev0"
+source = { editable = "shared/transport" }
+dependencies = [
+    { name = "fastmcp" },
+    { name = "sse-starlette" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastmcp", specifier = ">=2.0" },
+    { name = "sse-starlette", specifier = ">=2.1" },
+]
+
+[[package]]
+name = "khimaira-types"
+version = "0.1.0.dev0"
+source = { editable = "shared/types" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.7" }]
+
+[[package]]
+name = "khimaira-workspace"
+version = "0.0.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "khimaira" },
+    { name = "khimaira-transport" },
+    { name = "khimaira-types" },
+    { name = "scarlet" },
+    { name = "seance" },
+    { name = "specter" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "khimaira", editable = "packages/khimaira" },
+    { name = "khimaira-transport", editable = "shared/transport" },
+    { name = "khimaira-types", editable = "shared/types" },
+    { name = "scarlet", editable = "packages/scarlet" },
+    { name = "seance", editable = "packages/seance" },
+    { name = "specter", editable = "packages/specter" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = ">=1.10" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "ruff", specifier = ">=0.6" },
 ]
 
 [[package]]

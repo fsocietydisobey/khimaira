@@ -1,8 +1,8 @@
-# chimera
+# khimaira
 
 > Multi-model AI orchestration + LangGraph observability + multi-session collaboration for the terminal AI era.
 
-chimera is a dev framework that makes your terminal AI tool — Claude Code, Codex CLI, Gemini CLI, or local Ollama — 5–10× more efficient. Three things in one:
+khimaira is a dev framework that makes your terminal AI tool — Claude Code, Codex CLI, Gemini CLI, or local Ollama — 5–10× more efficient. Three things in one:
 
 1. **Orchestrator** — pre-resolves task-relevant context, manages your dev stack with a debugger-attached browser, and routes every prompt to the cheapest competent model.
 2. **LangGraph observer** — zero-touch venv-injected tracing for any LangGraph app. Auto-correlates runs, captures external HTTP (Roboflow, OpenAI, Anthropic), surfaces cost + slow calls + waterfall traces in a local dashboard.
@@ -17,21 +17,21 @@ chimera is a dev framework that makes your terminal AI tool — Claude Code, Cod
 ```mermaid
 flowchart LR
     User([You]) -->|terminal| Shell["Claude Code · Codex CLI · Gemini CLI<br/>(any AI shell)"]
-    Shell -->|MCP| Chimera["⬢ chimera<br/>orchestrator"]
-    Chimera -->|subprocess| Claude["claude"]
-    Chimera -->|subprocess| Codex["codex"]
-    Chimera -->|subprocess| Gemini["gemini"]
-    Chimera -->|subprocess| Ollama["ollama (local)"]
-    Chimera -->|subprocess| LLM["llm (Simon Willison's<br/>+ OpenRouter)"]
-    Chimera -.->|library| Scarlet["Scarlet<br/>cartography"]
-    Chimera -.->|library| Seance["Séance<br/>semantic search"]
-    Chimera -.->|MCP| Specter["Specter<br/>browser debug"]
+    Shell -->|MCP| Khimaira["⬢ khimaira<br/>orchestrator"]
+    Khimaira -->|subprocess| Claude["claude"]
+    Khimaira -->|subprocess| Codex["codex"]
+    Khimaira -->|subprocess| Gemini["gemini"]
+    Khimaira -->|subprocess| Ollama["ollama (local)"]
+    Khimaira -->|subprocess| LLM["llm (Simon Willison's<br/>+ OpenRouter)"]
+    Khimaira -.->|library| Scarlet["Scarlet<br/>cartography"]
+    Khimaira -.->|library| Seance["Séance<br/>semantic search"]
+    Khimaira -.->|MCP| Specter["Specter<br/>browser debug"]
 
-    style Chimera fill:#1f6feb,stroke:#0d419d,color:#fff
+    style Khimaira fill:#1f6feb,stroke:#0d419d,color:#fff
     style Ollama fill:#2da44e,stroke:#1a7f37,color:#fff
 ```
 
-You drive your AI shell as usual. Chimera is the layer that picks the right tool for each task and shrinks the prompt before it goes out.
+You drive your AI shell as usual. Khimaira is the layer that picks the right tool for each task and shrinks the prompt before it goes out.
 
 ---
 
@@ -39,10 +39,10 @@ You drive your AI shell as usual. Chimera is the layer that picks the right tool
 
 ```mermaid
 flowchart TB
-    subgraph Chimera["chimera orchestrator"]
+    subgraph Khimaira["khimaira orchestrator"]
         direction LR
         P1["⓵ Context resolver<br/><sub>What files matter for THIS task?</sub>"]
-        P2["⓶ Runtime manager<br/><sub>chimera dev — full stack + Chrome + DB</sub>"]
+        P2["⓶ Runtime manager<br/><sub>khimaira dev — full stack + Chrome + DB</sub>"]
         P3["⓷ AI dispatcher<br/><sub>Auto-route to cheapest competent CLI</sub>"]
     end
 
@@ -52,33 +52,33 @@ flowchart TB
     P2 --> Server["dev server (vite/next/uvicorn)"]
     P3 --> Routing["route → CLI runner<br/>+ usage tracker + budget"]
 
-    style Chimera fill:#0d1117,stroke:#1f6feb,color:#fff
+    style Khimaira fill:#0d1117,stroke:#1f6feb,color:#fff
     style P1 fill:#1f6feb,color:#fff
     style P2 fill:#1f6feb,color:#fff
     style P3 fill:#1f6feb,color:#fff
 ```
 
 1. **Context resolver** — Séance (semantic search) + Scarlet (codebase cartography) + grep + filesystem heuristics. Answers *"what files actually matter?"* before anything hits the LLM. Where the 5-10× token reduction lives.
-2. **Runtime manager** — `chimera dev` starts your dev server, launches Chrome with `--remote-debugging-port` for Specter, ensures chimera-monitor is up. One Ctrl-C tears it all down.
+2. **Runtime manager** — `khimaira dev` starts your dev server, launches Chrome with `--remote-debugging-port` for Specter, ensures khimaira-monitor is up. One Ctrl-C tears it all down.
 3. **AI dispatcher** — auto-router (AMR pattern) classifies each task and dispatches to the cheapest competent CLI runner: Claude Code, Codex, Gemini, Ollama, or `llm` (Simon Willison's, covers OpenRouter + 100+ providers).
 
 ---
 
-## How a single task flows through chimera
+## How a single task flows through khimaira
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant U as You
     participant S as AI CLI shell
-    participant C as chimera
+    participant C as khimaira
     participant CR as Context resolver
     participant R as AMR router
     participant Run as CLI runner<br/>(claude/ollama/...)
     participant T as Usage tracker
 
     U->>S: "fix the auth bug where ..."
-    S->>C: mcp__chimera__task(description)
+    S->>C: mcp__khimaira__task(description)
     C->>CR: resolve_context(task)
     CR-->>C: ContextBundle (3 files, 2.1k tok)
     C->>R: classify + route(task, context)
@@ -98,7 +98,7 @@ Every dispatch is **classify → route → run → record**. The classifier is a
 
 ```mermaid
 flowchart LR
-    Old["chimera v1<br/>Anthropic API SDK"] -.->|deprecated| New["chimera v2<br/>CLI subprocess only"]
+    Old["khimaira v1<br/>Anthropic API SDK"] -.->|deprecated| New["khimaira v2<br/>CLI subprocess only"]
 
     New --> Sub1["claude (Claude Code subscription)"]
     New --> Sub2["codex (OpenAI subscription)"]
@@ -114,7 +114,7 @@ flowchart LR
     style Sub4 fill:#2da44e,color:#fff
 ```
 
-**Pitch in one sentence:** *"chimera orchestrates your terminal AI tools without ever making an API call of its own. No keys, no surprise bills, no external SDK dependencies."*
+**Pitch in one sentence:** *"khimaira orchestrates your terminal AI tools without ever making an API call of its own. No keys, no surprise bills, no external SDK dependencies."*
 
 ---
 
@@ -122,19 +122,19 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    Root[chimera/<br/>workspace]
+    Root[khimaira/<br/>workspace]
     Root --> P[packages/]
     Root --> S[shared/]
     Root --> A[apps/]
     Root --> D[docs/]
 
-    P --> P1[chimera<br/>orchestrator]
+    P --> P1[khimaira<br/>orchestrator]
     P --> P2[scarlet<br/>cartography]
     P --> P3[seance<br/>semantic search]
     P --> P4[specter<br/>browser debug]
 
-    S --> S1[chimera-types<br/>schemas]
-    S --> S2[chimera-transport<br/>MCP/SSE helpers]
+    S --> S1[khimaira-types<br/>schemas]
+    S --> S2[khimaira-transport<br/>MCP/SSE helpers]
 
     A --> A1[monitor-ui<br/>React dashboard]
 
@@ -143,7 +143,7 @@ flowchart TB
 ```
 
 Each `packages/<name>/` has both:
-- a **library API** (`<name>.api.*`) for in-process use by chimera
+- a **library API** (`<name>.api.*`) for in-process use by khimaira
 - an **MCP server** (`<name>.server.mcp`) for direct shell use
 
 Same logic, two transports — like an SDK and a SQL interface to the same database engine.
@@ -154,7 +154,7 @@ Same logic, two transports — like an SDK and a SQL interface to the same datab
 
 ### Three install paths, pick what matches you
 
-**1. You have a chimera "profile" YAML (you or another maintainer wrote one in dotfiles).** Fastest fresh-machine setup — one command brings the whole agent stack online (chimera + sibling MCP servers + Claude rules/commands symlinks + supervisor + dashboard SPA):
+**1. You have a khimaira "profile" YAML (you or another maintainer wrote one in dotfiles).** Fastest fresh-machine setup — one command brings the whole agent stack online (khimaira + sibling MCP servers + Claude rules/commands symlinks + supervisor + dashboard SPA):
 
 ```bash
 git clone git@github.com:<you>/dotfiles.git ~/dotfiles
@@ -163,45 +163,45 @@ git clone git@github.com:<you>/dotfiles.git ~/dotfiles
 
 See [Profile-driven setup](#profile-driven-setup) below for what the YAML declares. New devs can clone the example profile from this repo and adapt.
 
-**2. You want chimera and that's it.** No personal config, no sibling tools — just the chimera CLI + MCP server on this box:
+**2. You want khimaira and that's it.** No personal config, no sibling tools — just the khimaira CLI + MCP server on this box:
 
 ```bash
-git clone https://github.com/fsocietydisobey/chimera.git ~/dev/chimera
-cd ~/dev/chimera
+git clone https://github.com/fsocietydisobey/khimaira.git ~/dev/khimaira
+cd ~/dev/khimaira
 uv sync
-uv run chimera bootstrap   # uses chimera-shipped default profile
+uv run khimaira bootstrap   # uses khimaira-shipped default profile
 ```
 
-`chimera bootstrap` with no `--profile` arg runs the built-in baseline: registers chimera as an MCP server with Claude Code, writes the chimera SessionStart / UserPromptSubmit / PostToolUse hooks into `~/.claude/settings.json`, installs the host-native supervisor (systemd on Linux, launchd on macOS), builds the dashboard SPA.
+`khimaira bootstrap` with no `--profile` arg runs the built-in baseline: registers khimaira as an MCP server with Claude Code, writes the khimaira SessionStart / UserPromptSubmit / PostToolUse hooks into `~/.claude/settings.json`, installs the host-native supervisor (systemd on Linux, launchd on macOS), builds the dashboard SPA.
 
-**3. You're trying chimera before committing.** Skip bootstrap, just register the MCP server manually:
+**3. You're trying khimaira before committing.** Skip bootstrap, just register the MCP server manually:
 
 ```bash
 # After uv sync above:
-claude mcp add chimera -s user -- bash -lc \
-  'uv --directory ~/dev/chimera run python -m chimera.cli mcp'
+claude mcp add khimaira -s user -- bash -lc \
+  'uv --directory ~/dev/khimaira run python -m khimaira.cli mcp'
 ```
 
-Then `claude` and chimera's MCP tools (`mcp__chimera__*`) are available.
+Then `claude` and khimaira's MCP tools (`mcp__khimaira__*`) are available.
 
 ### Day-to-day commands
 
 ```bash
 # Diagnose your environment (daemon up? supervisor active? hooks current?)
-chimera doctor
+khimaira doctor
 
 # Auto-routed dispatch (dry-run first to see what it'd do)
-chimera task --dry-run "rename this variable"
+khimaira task --dry-run "rename this variable"
 
 # Start the observability daemon (or use the installed supervisor)
-chimera monitor start
+khimaira monitor start
 # → http://127.0.0.1:8740 (loopback only — that IS the auth layer)
 
 # Spin up a project's full dev stack with one command
-chimera dev /path/to/project
+khimaira dev /path/to/project
 
-# List every chimera surface (CLI commands, MCP tools, slash commands, web routes)
-chimera tools
+# List every khimaira surface (CLI commands, MCP tools, slash commands, web routes)
+khimaira tools
 ```
 
 ### Profile-driven setup
@@ -213,12 +213,12 @@ Profiles let you declare your portable agent setup in one YAML file checked into
 - clones declared sibling repos (e.g. seance, specter, scarlet) under `~/dev/`
 - runs each repo's install command (`uv sync`)
 - registers MCP servers with Claude Code
-- writes chimera hooks into `~/.claude/settings.json`
+- writes khimaira hooks into `~/.claude/settings.json`
 - installs the supervisor
 - builds the dashboard SPA
 
 ```yaml
-# chimera-profile.yaml (in your dotfiles repo)
+# khimaira-profile.yaml (in your dotfiles repo)
 name: my-setup
 dotfiles:
   repo: git@github.com:me/dotfiles.git
@@ -228,25 +228,25 @@ dotfiles:
     - { src: claude/rules, dest: ~/.claude/rules }
     - { src: claude/commands, dest: ~/.claude/commands }
 repos:
-  - { name: chimera, url: git@github.com:fsocietydisobey/chimera.git, install: uv sync --all-packages }
+  - { name: khimaira, url: git@github.com:fsocietydisobey/khimaira.git, install: uv sync --all-packages }
 mcp_servers:
-  - name: chimera
-    command: uv --directory ~/dev/chimera run python -m chimera.cli mcp
+  - name: khimaira
+    command: uv --directory ~/dev/khimaira run python -m khimaira.cli mcp
 supervisor:
   auto_install: true
 install_claude_hooks: true
 spa_build: true
 ```
 
-Then on any machine: `chimera bootstrap --profile <local-path-or-url>`. Idempotent — safe to re-run.
+Then on any machine: `khimaira bootstrap --profile <local-path-or-url>`. Idempotent — safe to re-run.
 
-For ongoing cross-machine sync (after profile changes): `chimera sync` from a terminal, or `/chimera-configure` from inside any Claude Code session.
+For ongoing cross-machine sync (after profile changes): `khimaira sync` from a terminal, or `/khimaira-configure` from inside any Claude Code session.
 
 A complete example profile that does all of the above lives at [`tasks/bootstrap-profile/EXAMPLE-PROFILE.yaml`](tasks/bootstrap-profile/EXAMPLE-PROFILE.yaml).
 
 ### MCP tools
 
-42+ MCP tools available across orchestration, monitor, process observability, and multi-session shared state. Discoverable via `chimera tools --category mcp` — ranked by 7-day call count so the most-used tools surface first.
+42+ MCP tools available across orchestration, monitor, process observability, and multi-session shared state. Discoverable via `khimaira tools --category mcp` — ranked by 7-day call count so the most-used tools surface first.
 
 ---
 
@@ -277,18 +277,18 @@ When Séance/Scarlet aren't installed, the resolver falls back to grep + fs heur
 
 ### Pillar 2 — Runtime manager
 
-`chimera dev` is the demoable wow-moment.
+`khimaira dev` is the demoable wow-moment.
 
 ```mermaid
 sequenceDiagram
     participant U as You
-    participant CD as chimera dev
+    participant CD as khimaira dev
     participant DS as dev server
     participant CR as Chrome+CDP
     participant M as monitor daemon
     participant SP as Specter
 
-    U->>CD: chimera dev /path/to/project
+    U->>CD: khimaira dev /path/to/project
     CD->>CD: detect framework (vite/next/uvicorn)
     CD->>M: ensure running (start if not)
     CD->>DS: spawn (tracked process)
@@ -302,7 +302,7 @@ sequenceDiagram
     CD-->>U: clean shutdown
 ```
 
-Without `chimera dev`, the same setup is 4-5 manual commands and orphaned processes when something crashes.
+Without `khimaira dev`, the same setup is 4-5 manual commands and orphaned processes when something crashes.
 
 ### Pillar 3 — AI dispatcher (AMR — automatic model router)
 
@@ -312,7 +312,7 @@ flowchart LR
     Cl --> Class["TaskClassification<br/>type, complexity, model rec"]
     Class --> Rt[Router]
     Rt --> Avail[availability gate]
-    Rt --> Priv[privacy gate<br/>CHIMERA_LOCAL_ONLY]
+    Rt --> Priv[privacy gate<br/>KHIMAIRA_LOCAL_ONLY]
     Rt --> Bud[budget gate]
     Avail --> Pick{pick}
     Priv --> Pick
@@ -329,14 +329,14 @@ The router picks among installed runners using a YAML routing table that ships w
 
 ## LangGraph observability
 
-`chimera attach <app-path>` injects a zero-touch observer into any Python project's venv. No source changes, no env vars, no installed deps in the app's manifest. Restart the app and every LangGraph node, every LLM call, every external HTTP request streams to chimera-monitor in real time.
+`khimaira attach <app-path>` injects a zero-touch observer into any Python project's venv. No source changes, no env vars, no installed deps in the app's manifest. Restart the app and every LangGraph node, every LLM call, every external HTTP request streams to khimaira-monitor in real time.
 
 ```mermaid
 flowchart LR
-    App["your LangGraph app<br/>(jeevy, etc.)"] -->|venv-injected<br/>chimera_observer.pth| Obs["observer v0.4.1<br/>BaseCallbackHandler<br/>+ httpx/requests<br/>monkey-patches"]
-    Obs -->|POST /api/heartbeat| Daemon["chimera-monitor<br/>daemon"]
+    App["your LangGraph app<br/>(jeevy, etc.)"] -->|venv-injected<br/>khimaira_observer.pth| Obs["observer v0.4.1<br/>BaseCallbackHandler<br/>+ httpx/requests<br/>monkey-patches"]
+    Obs -->|POST /api/heartbeat| Daemon["khimaira-monitor<br/>daemon"]
     Daemon -->|in-memory<br/>buffer + SSE| UI["monitor-ui<br/>(localhost:8740)"]
-    Daemon -->|REST endpoints| CLI["chimera observer<br/>trace · compare · slow"]
+    Daemon -->|REST endpoints| CLI["khimaira observer<br/>trace · compare · slow"]
 
     style Obs fill:#1f6feb,color:#fff
     style Daemon fill:#1f6feb,color:#fff
@@ -347,11 +347,11 @@ flowchart LR
 | Surface | What it shows |
 |---|---|
 | `/{project}/topology` | Live LangGraph node-by-node execution + replay |
-| `/{project}/cost` | Estimated USD spend by model, token counts, telemetry-overhead callout (LangSmith calls — opt out via `CHIMERA_DISABLE_LANGSMITH=true`) |
+| `/{project}/cost` | Estimated USD spend by model, token counts, telemetry-overhead callout (LangSmith calls — opt out via `KHIMAIRA_DISABLE_LANGSMITH=true`) |
 | `/{project}/trace/{cid}` | Waterfall view of one app run — chain/llm/tool/external bars on a time axis. The *exact* visualization that proves your `asyncio.gather` is actually concurrent (3 starts within ~10ms = textbook parallel) |
-| `chimera observer trace <p> <cid>` | Full event timeline as text |
-| `chimera observer compare <p> <cid-a> <cid-b>` | A/B per-node wall-time deltas with regression markers |
-| `chimera observer slow <p> --llm 5 --external 30` | Recent calls past per-kind threshold + in-flight stuck detection |
+| `khimaira observer trace <p> <cid>` | Full event timeline as text |
+| `khimaira observer compare <p> <cid-a> <cid-b>` | A/B per-node wall-time deltas with regression markers |
+| `khimaira observer slow <p> --llm 5 --external 30` | Recent calls past per-kind threshold + in-flight stuck detection |
 
 ### Auto-correlation (zero app code changes)
 
@@ -362,10 +362,10 @@ sequenceDiagram
     autonumber
     participant App as Your App
     participant LC as LangChain
-    participant Obs as ChimeraTracer
+    participant Obs as KhimairaTracer
     participant CV as ContextVar
     participant HX as httpx (patched)
-    participant D as chimera-monitor
+    participant D as khimaira-monitor
 
     App->>LC: graph.invoke(state)
     LC->>Obs: on_chain_start(run_id=A, parent=None)
@@ -391,19 +391,19 @@ result = graph.invoke(state)
 # returns every chain/llm/tool/external event for this run
 ```
 
-The observer reads LangChain's `parent_run_id=None` signal on `on_chain_start`, sets a `ContextVar`, and `_enqueue` propagates it through async + thread boundaries to every downstream event including the HTTP monkey-patch interceptors. Override with `chimera_observer.tag_run(my_id)` only when you want a domain-specific identifier (deliverable_id, business txn id) instead of the auto UUID.
+The observer reads LangChain's `parent_run_id=None` signal on `on_chain_start`, sets a `ContextVar`, and `_enqueue` propagates it through async + thread boundaries to every downstream event including the HTTP monkey-patch interceptors. Override with `khimaira_observer.tag_run(my_id)` only when you want a domain-specific identifier (deliverable_id, business txn id) instead of the auto UUID.
 
 ### attach / detach
 
 ```bash
-chimera attach /path/to/your/langgraph/app
-# drops chimera_observer.pth + chimera_observer/ into the venv's site-packages
+khimaira attach /path/to/your/langgraph/app
+# drops khimaira_observer.pth + khimaira_observer/ into the venv's site-packages
 # (gitignored — production builds don't include them)
 
-chimera attached
+khimaira attached
 # list all attached projects + observer version per venv
 
-chimera detach /path/to/your/langgraph/app
+khimaira detach /path/to/your/langgraph/app
 ```
 
 The observer fails silent on every error path — apps must not break because of telemetry setup.
@@ -412,7 +412,7 @@ The observer fails silent on every error path — apps must not break because of
 
 ## Multi-session shared state
 
-When one Claude Code session is grinding on a task, you can't ask related questions in another window without losing context. Chimera externalizes session state so parallel sessions can collaborate — and so future sessions can pick up where stopped ones left off.
+When one Claude Code session is grinding on a task, you can't ask related questions in another window without losing context. Khimaira externalizes session state so parallel sessions can collaborate — and so future sessions can pick up where stopped ones left off.
 
 ### Cross-session messaging — five primitives
 
@@ -445,7 +445,7 @@ flowchart TB
 
 ### Hooks (auto-surfacing — no manual polling required)
 
-Two hooks ship with chimera and install via `chimera install-hooks`:
+Two hooks ship with khimaira and install via `khimaira install-hooks`:
 
 - **SessionStart** — auto-reads inbox + matched handoffs + lists other active sessions
 - **UserPromptSubmit** — auto-fetches inbox notes (with surface-count + 3-turn auto-expire) AND incoming questions targeting this session, injects both into context every turn
@@ -474,7 +474,7 @@ sequenceDiagram
     autonumber
     participant U as You
     participant A as Session A<br/>(running)
-    participant Ch as chimera daemon
+    participant Ch as khimaira daemon
     participant B as Session B<br/>(running)
     participant Bh as B's hook
 
@@ -484,7 +484,7 @@ sequenceDiagram
     U->>B: types anything in B's window
     Bh->>Ch: GET /sessions/B/incoming
     Ch-->>Bh: 1 question targeting B
-    Note over B: agent sees `📨 chimera incoming`
+    Note over B: agent sees `📨 khimaira incoming`
     B->>Ch: post_answer(target=A, qid, "approach 2 because...")
     Ch-->>A: wait_for_answer returns
     Note left of A: A continues in SAME turn
@@ -500,16 +500,16 @@ session_post_handoff(
     text="HANDOFF: shipped tasks #58-#65 + observer v0.4.1. Pickup
           tasks/workspaces/IMPLEMENTATION.md if you want workspace
           isolation. Restart jeevy backend to get auto-correlation.",
-    scope_cwd="/home/_3ntropy/dev/chimera",
+    scope_cwd="/home/_3ntropy/dev/khimaira",
 )
 ```
 
 ```mermaid
 flowchart LR
-    A["session A<br/>(today, 5pm)"] -->|post_handoff| Disk[("~/.local/state/<br/>chimera/handoffs.jsonl<br/>scope_cwd, expires_in=7d")]
+    A["session A<br/>(today, 5pm)"] -->|post_handoff| Disk[("~/.local/state/<br/>khimaira/handoffs.jsonl<br/>scope_cwd, expires_in=7d")]
     Disk -.->|3 days later| Boot[SessionStart hook<br/>in new session]
     Boot -->|cwd matches scope?| Match{match?}
-    Match -->|yes + not in read_by| Inject["📦 chimera handoffs<br/>injected into new agent's<br/>first context block"]
+    Match -->|yes + not in read_by| Inject["📦 khimaira handoffs<br/>injected into new agent's<br/>first context block"]
     Match -->|no| Skip[skip]
 
     style Disk fill:#1f6feb,color:#fff
@@ -532,7 +532,7 @@ flowchart LR
     style Grep fill:#2da44e,color:#fff
 ```
 
-No new LLM API calls from chimera daemon — the agent calling the tool can summarize via its own context if it wants to.
+No new LLM API calls from khimaira daemon — the agent calling the tool can summarize via its own context if it wants to.
 
 ---
 
@@ -547,7 +547,7 @@ flowchart LR
     style New fill:#2da44e,color:#fff
 ```
 
-The chimera daemon tails the process internally; the agent makes one blocking MCP call. Single roundtrip replaces dozens of polls.
+The khimaira daemon tails the process internally; the agent makes one blocking MCP call. Single roundtrip replaces dozens of polls.
 
 ---
 
@@ -562,8 +562,8 @@ See [`tasks/BUILD-PLAN.md`](tasks/BUILD-PLAN.md) for full status. Cliff-notes:
 | 2 — CLI runners (pure-CLI substrate) | ✅ |
 | 3 — AMR (auto model router) | ✅ |
 | 4 — Context resolver (with grep/fs fallbacks) | ✅ |
-| 5 — `chimera dev` runtime manager | ✅ |
-| 6 — `chimera task/route/doctor/monitor/mcp/dev` CLI | ✅ |
+| 5 — `khimaira dev` runtime manager | ✅ |
+| 6 — `khimaira task/route/doctor/monitor/mcp/dev` CLI | ✅ |
 | 7 — Monitor daemon migration | ✅ |
 | 8 — All 8 LangGraph patterns migrated | ✅ |
 | 9 — Frontend (`apps/monitor-ui`) | ✅ |
@@ -585,4 +585,4 @@ See [`tasks/BUILD-PLAN.md`](tasks/BUILD-PLAN.md) for full status. Cliff-notes:
 
 ## Status
 
-Pre-alpha. Active development. Legacy version archived at [`fsocietydisobey/chimera-legacy`](https://github.com/fsocietydisobey/chimera-legacy) for historical reference.
+Pre-alpha. Active development. Legacy version archived at [`fsocietydisobey/khimaira-legacy`](https://github.com/fsocietydisobey/khimaira-legacy) for historical reference.

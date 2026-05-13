@@ -1,3 +1,3 @@
-# chimera-transport
+# khimaira-transport
 
-Shared MCP + SSE transport helpers across chimera packages. FastMCP utilities, EventSource scaffolding.
+Shared MCP + SSE transport helpers across khimaira packages. FastMCP utilities, EventSource scaffolding.

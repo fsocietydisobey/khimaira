@@ -9,7 +9,7 @@
 
 Today's cross-session coordination loop:
 
-1. Session A logs a targeted question → lands as `📨 chimera incoming` in
+1. Session A logs a targeted question → lands as `📨 khimaira incoming` in
    session B's UserPromptSubmit hook output
 2. **You have to type something in B's window to trigger the hook.** Until
    then, the message is invisible.
@@ -18,7 +18,7 @@ If you're heads-down in a different terminal, on a different monitor, or
 afk, you don't know there's something waiting. The "tap to wake B" step
 becomes the bottleneck.
 
-Vue / Slack / iMessage solve this with desktop notifications. Chimera
+Vue / Slack / iMessage solve this with desktop notifications. Khimaira
 should too.
 
 ## Design
@@ -26,16 +26,16 @@ should too.
 ### Architecture
 
 ```
-[ chimera-monitor daemon ]
+[ khimaira-monitor daemon ]
         ↓ SSE (new endpoint)
-[ chimera-notifier — small standalone daemon ]
+[ khimaira-notifier — small standalone daemon ]
         ↓ libnotify / osascript / win-toast
 [ user's desktop notification tray ]
         ↓ click
 [ wakes the matching terminal / Claude session ]
 ```
 
-### New chimera-monitor endpoint
+### New khimaira-monitor endpoint
 
 ```
 GET /api/sessions/notifications/stream
@@ -48,23 +48,23 @@ GET /api/sessions/notifications/stream
 
 Reuse the existing SSE infrastructure (heartbeats already has SSE).
 
-### New chimera-notifier subprocess
+### New khimaira-notifier subprocess
 
 Standalone Python daemon, ~80 LOC. Subscribes to the SSE stream, fires
 desktop notifications via:
 
 - **Linux:** `notify-send "📬 llm-piping-extension has 1 new note"`
   (libnotify is universal; no extra deps)
-- **macOS:** `osascript -e 'display notification "..." with title "chimera"'`
+- **macOS:** `osascript -e 'display notification "..." with title "khimaira"'`
 - **Windows:** `winsdk.ui.notifications` or `win10toast`
 
-Click action: write the session_id to `~/.local/state/chimera/last-clicked.txt`
+Click action: write the session_id to `~/.local/state/khimaira/last-clicked.txt`
 (no API to focus a terminal cross-platform; user picks up from there).
 
 ### Configuration
 
 ```toml
-# ~/.config/chimera/notifier.toml
+# ~/.config/khimaira/notifier.toml
 [notifier]
 enabled = true
 filter_session_ids = []         # empty = all sessions
@@ -74,16 +74,16 @@ quiet_hours = { from = "22:00", to = "08:00" }
 
 ### Distribution
 
-`chimera notifier` subcommand:
+`khimaira notifier` subcommand:
 ```
-chimera notifier start           # daemon-mode, runs forever
-chimera notifier start --foreground
-chimera notifier stop
-chimera notifier test            # fires a sample notification
+khimaira notifier start           # daemon-mode, runs forever
+khimaira notifier start --foreground
+khimaira notifier stop
+khimaira notifier test            # fires a sample notification
 ```
 
-Pair with `chimera monitor restart` so both come up together. Optional
-systemd / launchd integration via `chimera notifier install-service`.
+Pair with `khimaira monitor restart` so both come up together. Optional
+systemd / launchd integration via `khimaira notifier install-service`.
 
 ## What it does NOT do
 
@@ -94,14 +94,14 @@ systemd / launchd integration via `chimera notifier install-service`.
 
 ## Implementation steps
 
-1. **SSE endpoint in chimera-monitor** — `/api/sessions/notifications/stream`
+1. **SSE endpoint in khimaira-monitor** — `/api/sessions/notifications/stream`
    - Subscribes internally to file watchers on inbox.jsonl + handoffs.jsonl
    - Emits one SSE event per new write
-2. **Notifier daemon** in `packages/chimera/src/chimera/notifier/` (or its
+2. **Notifier daemon** in `packages/khimaira/src/khimaira/notifier/` (or its
    own subpackage)
    - Subprocess, polls SSE, fires libnotify/osascript/win
-3. **CLI** — `chimera notifier {start,stop,test,install-service}`
-4. **Config loader** — TOML at `~/.config/chimera/notifier.toml`
+3. **CLI** — `khimaira notifier {start,stop,test,install-service}`
+4. **Config loader** — TOML at `~/.config/khimaira/notifier.toml`
 5. **Tests** — mock SSE source, verify notification calls (mock the OS
    wrapper; don't actually fire real notifications during CI)
 
@@ -127,7 +127,7 @@ cross-platform polish.
    auto-discover via `claude code` process scan or require explicit
    registration.
 2. **Should notifications include an action button** ("View") that
-   opens the appropriate URL in chimera-monitor? GTK notifications
+   opens the appropriate URL in khimaira-monitor? GTK notifications
    support this; macOS NSUserNotification too. Adds polish.
 3. **Aggregation window.** 5 messages in 30 seconds = 5 notifications
    or 1 grouped one? Lean: group at >3 within 60s.

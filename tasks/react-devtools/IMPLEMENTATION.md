@@ -13,13 +13,13 @@ Existing React debugging tooling is fragmented and shallow:
   router ↔ network.
 - **Redux DevTools** — separate panel; manually correlate with component tree.
 - **Browser DevTools** — generic; doesn't understand React component identity.
-- **Specter (chimera's CDP debugger)** — has `check_react`, `get_component_tree`,
+- **Specter (khimaira's CDP debugger)** — has `check_react`, `get_component_tree`,
   `get_component_at`, `get_elements_grouped_by_component`, `get_redux_state`,
   `get_redux_actions`. **MCP-only — no human-facing UI.**
 
 Vue DevTools is the gold standard: component tree on left, live props/data/
 computed on right, dedicated tabs for Pinia/router/performance/timeline, click
-through everywhere. We want that for React, integrated into chimera-monitor.
+through everywhere. We want that for React, integrated into khimaira-monitor.
 
 ## Architecture (data flow)
 
@@ -28,15 +28,15 @@ through everywhere. We want that for React, integrated into chimera-monitor.
         ↓ CDP
 [ Specter (separate repo, /home/_3ntropy/dev/specter) ]
         ↓ MCP / HTTP
-[ chimera-monitor daemon ]
+[ khimaira-monitor daemon ]
         ↓ WebSocket / SSE
-[ chimera-monitor frontend (React) ]
+[ khimaira-monitor frontend (React) ]
         ↓ Redux Toolkit Query
 [ React DevTools Panel UI ]
 ```
 
 **Key principle:** specter is the data extraction layer (CDP + injected
-fiber-walker), chimera-monitor is the visualization layer. Don't duplicate.
+fiber-walker), khimaira-monitor is the visualization layer. Don't duplicate.
 
 ## Specter changes needed
 
@@ -57,10 +57,10 @@ Specter today returns **snapshots**. For Vue-DevTools-quality UX we need
    return parent chain. Lets the UI render the "selected component is at:
    App > Layout > Page > Sidebar > NavItem".
 
-These are extensions to specter, NOT chimera. File specter issues separately
+These are extensions to specter, NOT khimaira. File specter issues separately
 or spec a parallel `react-devtools-extensions/` task in specter's repo.
 
-## Chimera-monitor UI
+## Khimaira-monitor UI
 
 New top-level route: `/:project/react`. Layout:
 
@@ -111,7 +111,7 @@ Tabs along the top:
 
 | feature | React DevTools | this |
 |---|---|---|
-| persistent history | ✗ flickers off on tab close | ✓ chimera-monitor stays open |
+| persistent history | ✗ flickers off on tab close | ✓ khimaira-monitor stays open |
 | cross-tab nav | ✗ separate panels | ✓ click component → see its redux reads |
 | backend correlation | ✗ none | ✓ same UI as langgraph trace waterfall |
 | filter / search | weak | first-class |
@@ -129,7 +129,7 @@ Tabs along the top:
 
 **Effort:** ~2 days
 - Day 1: specter extensions (#1, #2 above, plus serialization rules) + tests
-- Day 2: chimera-monitor UI (tree + selected-component panel)
+- Day 2: khimaira-monitor UI (tree + selected-component panel)
 
 Phase 2: Redux tab + render counts + SSE subscription. ~3 more days.
 Phase 3: Performance + Timeline tabs + cross-correlation with backend traces. ~5 days.
@@ -166,17 +166,17 @@ Phase 3: Performance + Timeline tabs + cross-correlation with backend traces. ~5
 ## Coordination
 
 - Specter changes in /home/_3ntropy/dev/specter (separate repo). PRs there
-  before chimera UI work starts.
-- Chimera-monitor UI in this repo (apps/monitor-ui).
-- New API endpoint in chimera-monitor daemon to proxy specter (apps don't
+  before khimaira UI work starts.
+- Khimaira-monitor UI in this repo (apps/monitor-ui).
+- New API endpoint in khimaira-monitor daemon to proxy specter (apps don't
   hit specter directly — keeps the security/isolation surface clean).
 
 ## Notes
 
 - Naming: "react devtools" is fine internally but if/when this ships,
-  "chimera react inspector" or just "components" view avoids confusion
+  "khimaira react inspector" or just "components" view avoids confusion
   with the official React DevTools extension.
-- This is the kind of feature that justifies a chimera "v1.0" launch —
+- This is the kind of feature that justifies a khimaira "v1.0" launch —
   a visible, demoable product surface. Good story for the README + hero
   screenshot.
 - Once this exists, the trace waterfall + cost dashboard + react

@@ -1,8 +1,8 @@
-# Inbox + Handoffs — chimera's cross-session message system
+# Inbox + Handoffs — khimaira's cross-session message system
 
 > Reference for the cross-session coordination primitives: what they are,
 > how data flows on disk, which slash command + MCP tool maps to which
-> intent. If you're picking up chimera for the first time, **start here**.
+> intent. If you're picking up khimaira for the first time, **start here**.
 
 ## TL;DR
 
@@ -44,7 +44,7 @@ acts.
 ## Storage layout
 
 ```
-~/.local/state/chimera/
+~/.local/state/khimaira/
 ├── sessions/<session-uuid>/
 │   ├── status.json         ← your session name (set via /rename or session_set_name)
 │   ├── inbox.jsonl         ← unread notices + answers (your "Gmail")
@@ -172,7 +172,7 @@ Subscribers stay subscribed across owner changes.
 - Receiver should call `session_ack_notes` after surfacing to clear
 - After expire / ack: moved to `archive.jsonl`, queryable via `session_search_archive`
 - Survives daemon restart (file-backed)
-- Does NOT survive `~/.local/state/chimera/sessions/<uuid>/` deletion
+- Does NOT survive `~/.local/state/khimaira/sessions/<uuid>/` deletion
 
 **Handoffs:**
 - 7-day default expiration (`expires_in_hours=168` override)
@@ -194,7 +194,7 @@ Subscribers stay subscribed across owner changes.
   `session_post_notice` (FYI) or `session_post_handoff` (for future).
   Questions create a ping-pong burden if no answer is needed.
 - **Don't pass cwd paths to `/tell` / `/handoff`.** Use project labels
-  (`chimera attached` to see them). Paths are mechanism; labels are intent.
+  (`khimaira attached` to see them). Paths are mechanism; labels are intent.
 - **Don't poll `session_pending_notes` in a loop.** The hook auto-injects
   on every prompt; manual `/inbox` is for explicit drain.
 - **Don't ignore handoff owner status.** If `_claim_role` is `observer`,
@@ -206,8 +206,8 @@ Subscribers stay subscribed across owner changes.
 
 | Pattern | Fix |
 |---|---|
-| Daemon died, everything silently breaks | `chimera monitor install-service --enable` (systemd) |
-| Stale session-name lookup after `/rename` | UserPromptSubmit hook auto-syncs Claude Code's custom-title to chimera |
+| Daemon died, everything silently breaks | `khimaira monitor install-service --enable` (systemd) |
+| Stale session-name lookup after `/rename` | UserPromptSubmit hook auto-syncs Claude Code's custom-title to khimaira |
 | Agent reads handoff as "informational note", waits for user | SessionStart hook explicitly framed as directive |
 | Two sessions in same cwd both try to act on same handoff | First-consume auto-claim + observer framing for subsequent |
 | MCP `_get` masked HTTP 4xx/5xx as "daemon down" | Differentiates HTTPError from ConnectionRefused |
@@ -224,9 +224,9 @@ don't recur.
 
 | What | Where |
 |---|---|
-| Full MCP tool list | `chimera tools --category mcp` or `/tools` |
+| Full MCP tool list | `khimaira tools --category mcp` or `/tools` |
 | Slash command source | `~/.claude/commands/*.md` (symlinked from dotfiles) |
 | Hooks | `scripts/hooks/{session_start,user_prompt_submit,post_tool_use}.py` |
-| Daemon code | `packages/chimera/src/chimera/monitor/sessions.py` |
+| Daemon code | `packages/khimaira/src/khimaira/monitor/sessions.py` |
 | Engineering rules | `CLAUDE.md` (workspace root) |
-| Tests demonstrating semantics | `packages/chimera/tests/test_sessions_unit.py` |
+| Tests demonstrating semantics | `packages/khimaira/tests/test_sessions_unit.py` |

@@ -6,14 +6,14 @@
 
 ## Problem
 
-Today's chimera multi-session model is "everything visible, only targets
-get pinged." Every session writes to `~/.local/state/chimera/sessions/`,
+Today's khimaira multi-session model is "everything visible, only targets
+get pinged." Every session writes to `~/.local/state/khimaira/sessions/`,
 and every session can read every other session's state via
 `list_sessions()`, `session_state(any_id)`, and `session_recent_decisions()`.
 
 Pings (UserPromptSubmit hook auto-injects) are correctly scoped — only
 the explicit `target_session_id` of a question receives the
-`📨 chimera incoming` block. Unrelated sessions don't get pinged.
+`📨 khimaira incoming` block. Unrelated sessions don't get pinged.
 
 But READ visibility is global. Concrete cases where that's a problem:
 
@@ -42,8 +42,8 @@ Add `workspace` field to `status.json`:
 {
   "status": "implementing",
   "detail": "...",
-  "name": "chimera-builder",
-  "workspace": "chimera-dev",     // NEW; defaults to "default"
+  "name": "khimaira-builder",
+  "workspace": "khimaira-dev",     // NEW; defaults to "default"
   "updated_at": "..."
 }
 ```
@@ -58,10 +58,10 @@ Extend `session_set_name` (or add `session_set_workspace`):
 
 ```python
 # Option A — overload set_name
-session_set_name(session_id, "chimera-builder", workspace="chimera-dev")
+session_set_name(session_id, "khimaira-builder", workspace="khimaira-dev")
 
 # Option B — separate tool
-session_set_workspace(session_id, "chimera-dev")
+session_set_workspace(session_id, "khimaira-dev")
 ```
 
 **Recommendation: Option B.** Separation of concerns. Name and
@@ -113,7 +113,7 @@ the same default workspace, which it will be by definition).
 ### Edge cases
 
 - **Renaming workspaces:** sessions own their workspace string. Bulk
-  rename = a script that walks `~/.local/state/chimera/sessions/` and
+  rename = a script that walks `~/.local/state/khimaira/sessions/` and
   rewrites status.json. Out of scope for v1; add as utility command
   later if needed.
 
@@ -158,8 +158,8 @@ the same default workspace, which it will be by definition).
    daemon-side endpoints will filter by it automatically once
    read-paths gate on workspace.
 
-8. **CLI commands** — `chimera sessions list --workspace X`,
-   `chimera sessions move <id> <workspace>`. Optional v2.
+8. **CLI commands** — `khimaira sessions list --workspace X`,
+   `khimaira sessions move <id> <workspace>`. Optional v2.
 
 ## Test plan
 
@@ -173,7 +173,7 @@ the same default workspace, which it will be by definition).
   - cross-workspace targeted question rejected without
     `cross_workspace=True`
   - same-workspace ops unaffected (no regression on the existing
-    chimera ↔ jeevy collaboration path)
+    khimaira ↔ jeevy collaboration path)
 
 - Backward compat: existing sessions (no workspace field) all behave
   as workspace `"default"`. New session that doesn't call
@@ -187,7 +187,7 @@ the same default workspace, which it will be by definition).
    the noise problem we're trying to solve.
    - Lean: **scope by default, add `workspace="*"` for the all-view.**
 
-2. **Should the daemon's web UI (chimera-monitor frontend) show all
+2. **Should the daemon's web UI (khimaira-monitor frontend) show all
    workspaces or just one?** Today it shows everything. With
    workspaces, the UI needs a workspace switcher.
    - Lean: **default to "all workspaces" in UI, since the user is
@@ -195,7 +195,7 @@ the same default workspace, which it will be by definition).
      visibility, not for the user themselves.**
 
 3. **Workspace inheritance from working directory?** Auto-detect
-   workspace from `cwd` (e.g., chimera repo → `chimera-dev`)?
+   workspace from `cwd` (e.g., khimaira repo → `khimaira-dev`)?
    - Lean: **no.** Explicit > implicit. cwd is fragile (sessions
      can `cd` mid-flight).
 
@@ -207,11 +207,11 @@ the same default workspace, which it will be by definition).
 ## Notes
 
 - Don't ship until there's a real privacy/noise pain point. Today's
-  user (Joseph) has chimera + jeevy both under "default" — adding
+  user (Joseph) has khimaira + jeevy both under "default" — adding
   workspaces now would force a no-op `set_workspace("default")` step
   with zero benefit until a third unrelated project shows up.
 
-- If/when shipped, the `chimera attached` CLI output should display
+- If/when shipped, the `khimaira attached` CLI output should display
   workspace per project. The observer auto-attach machinery doesn't
   need workspace logic — observers just write heartbeats; they're not
   sessions.

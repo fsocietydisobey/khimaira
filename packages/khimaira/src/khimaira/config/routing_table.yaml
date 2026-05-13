@@ -1,0 +1,121 @@
+# AMR routing table — task_type × complexity → (runner, model, thinking_budget)
+#
+# How the router uses this:
+#   1. Classifier produces TaskClassification with task_type + complexity_tier
+#   2. Router looks up the matching cell in this table
+#   3. Router checks if `chosen.runner` is available; if not, walks
+#      `fallback_chain` until one is, recording the fallback reason
+#   4. If user has KHIMAIRA_LOCAL_ONLY=1, prefers `ollama` and `llm` over CLI runners
+#
+# The cells below are SHIPPED DEFAULTS. Devs override via:
+#   ~/.config/khimaira/routing_table.yaml — user-wide
+#   <project>/.khimaira/routing_table.yaml — per-project
+#
+# Edit the defaults here to change shipped behavior. Edit the user file
+# to customize without forking khimaira.
+
+# Per-runner fallback chains. When the preferred runner is unavailable,
+# the router walks down this list. The first available wins.
+fallback_chains:
+  ollama: [ollama, llm, claude, gemini, codex]
+  claude: [claude, codex, gemini, llm, ollama]
+  codex: [codex, claude, gemini, llm, ollama]
+  gemini: [gemini, claude, codex, llm, ollama]
+  llm: [llm, ollama, claude, gemini, codex]
+
+# task_type → complexity_tier → routing recommendation
+#
+# Default models reflect current pricing/quality (May 2026):
+#   claude-haiku-4-5 ≈ trivial-tier ($0.80/$4 per M)
+#   claude-sonnet-4-6 ≈ medium-tier ($3/$15 per M)
+#   claude-opus-4-7 ≈ complex-tier ($15/$75 per M)
+#   gemini-2.5-flash ≈ trivial alternative ($0.075/$0.30)
+#   gemini-2.5-pro ≈ research with 1M context ($1.25/$10)
+#   gpt-5-codex ≈ Codex's flagship coding model
+#   llama3.3:70b (Ollama) ≈ free local default
+#
+# Cost ceilings are worst-case — actual costs are usually 30-60% lower.
+
+routes:
+
+  classify:
+    trivial:   { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.001 }
+    simple:    { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.002 }
+    medium:    { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.005 }
+    complex:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 0,  cost_max_usd: 0.02 }
+    extreme:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 1024, cost_max_usd: 0.05 }
+
+  format:
+    trivial:   { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.001 }
+    simple:    { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.002 }
+    medium:    { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.005 }
+    complex:   { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.01 }
+    extreme:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 0,  cost_max_usd: 0.02 }
+
+  explain:
+    trivial:   { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.002 }
+    simple:    { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.005 }
+    medium:    { runner: claude, model: "claude-sonnet-4-6",   thinking: 0,  cost_max_usd: 0.02 }
+    complex:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 1024, cost_max_usd: 0.05 }
+    extreme:   { runner: claude, model: "claude-opus-4-7",     thinking: 2048, cost_max_usd: 0.20 }
+
+  research:
+    trivial:   { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.01 }
+    simple:    { runner: claude, model: "claude-sonnet-4-6",   thinking: 0,  cost_max_usd: 0.05 }
+    medium:    { runner: gemini, model: "gemini-2.5-pro",      thinking: 0,  cost_max_usd: 0.10 }
+    complex:   { runner: gemini, model: "gemini-2.5-pro",      thinking: 0,  cost_max_usd: 0.30 }
+    extreme:   { runner: gemini, model: "gemini-2.5-pro",      thinking: 0,  cost_max_usd: 1.00 }
+
+  refactor:
+    trivial:   { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.005 }
+    simple:    { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.02 }
+    medium:    { runner: claude, model: "claude-sonnet-4-6",   thinking: 1024, cost_max_usd: 0.10 }
+    complex:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 4096, cost_max_usd: 0.30 }
+    extreme:   { runner: claude, model: "claude-opus-4-7",     thinking: 8192, cost_max_usd: 1.50 }
+
+  implement:
+    trivial:   { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.02 }
+    simple:    { runner: claude, model: "claude-sonnet-4-6",   thinking: 0,  cost_max_usd: 0.10 }
+    medium:    { runner: claude, model: "claude-sonnet-4-6",   thinking: 1024, cost_max_usd: 0.30 }
+    complex:   { runner: claude, model: "claude-opus-4-7",     thinking: 4096, cost_max_usd: 1.00 }
+    extreme:   { runner: claude, model: "claude-opus-4-7",     thinking: 16384, cost_max_usd: 3.00 }
+
+  architect:
+    trivial:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 0,  cost_max_usd: 0.05 }
+    simple:    { runner: claude, model: "claude-sonnet-4-6",   thinking: 1024, cost_max_usd: 0.20 }
+    medium:    { runner: claude, model: "claude-opus-4-7",     thinking: 4096, cost_max_usd: 0.50 }
+    complex:   { runner: claude, model: "claude-opus-4-7",     thinking: 8192, cost_max_usd: 1.50 }
+    extreme:   { runner: claude, model: "claude-opus-4-7",     thinking: 16384, cost_max_usd: 3.00 }
+
+  debug:
+    trivial:   { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.005 }
+    simple:    { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.02 }
+    medium:    { runner: claude, model: "claude-sonnet-4-6",   thinking: 1024, cost_max_usd: 0.10 }
+    complex:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 4096, cost_max_usd: 0.30 }
+    extreme:   { runner: claude, model: "claude-opus-4-7",     thinking: 8192, cost_max_usd: 1.00 }
+
+  chat:
+    trivial:   { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.001 }
+    simple:    { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.002 }
+    medium:    { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.01 }
+    complex:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 0,  cost_max_usd: 0.05 }
+    extreme:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 1024, cost_max_usd: 0.10 }
+
+  other:
+    trivial:   { runner: ollama, model: "llama3.3:70b",        thinking: 0,  cost_max_usd: 0.005 }
+    simple:    { runner: claude, model: "claude-haiku-4-5",    thinking: 0,  cost_max_usd: 0.02 }
+    medium:    { runner: claude, model: "claude-sonnet-4-6",   thinking: 0,  cost_max_usd: 0.10 }
+    complex:   { runner: claude, model: "claude-sonnet-4-6",   thinking: 1024, cost_max_usd: 0.30 }
+    extreme:   { runner: claude, model: "claude-opus-4-7",     thinking: 4096, cost_max_usd: 1.00 }
+
+# Privacy mode — when KHIMAIRA_LOCAL_ONLY=1 in env, only these runners may be picked.
+local_only_runners: [ollama, llm]
+
+# Classifier configuration — uses the cheap-tier runner. When unavailable, falls
+# back to the next-cheapest CLI runner.
+classifier:
+  preferred_runner: ollama
+  preferred_model: llama3.3:70b
+  fallback_runner: claude
+  fallback_model: claude-haiku-4-5
+  timeout_s: 30

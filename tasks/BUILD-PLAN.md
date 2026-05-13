@@ -1,4 +1,4 @@
-# chimera — Build Plan
+# khimaira — Build Plan
 
 > Cross-session tracker. Updated at the end of every session. Use this
 > as the source of truth for "what's done vs. what's next."
@@ -18,19 +18,19 @@
 ```
 [ user's terminal AI CLI ]      ← shell (Claude Code, Codex, Gemini CLI)
          ↓ MCP
-    [ chimera ]                  ← orchestrator — never makes API calls itself
+    [ khimaira ]                  ← orchestrator — never makes API calls itself
          ↓ subprocess
 [ terminal AI CLIs (any) ]      ← brain — also subprocess-only
 ```
 
 **Three pillars:**
 1. **Context resolver** (Séance + Scarlet + Serena) — minimize prompt tokens
-2. **Runtime manager** (`chimera dev`) — dev server + Chrome DevTools + Postgres
+2. **Runtime manager** (`khimaira dev`) — dev server + Chrome DevTools + Postgres
 3. **AI dispatcher** (AMR auto-router) — pick cheapest competent runner per task
 
 **Audience:** the 80% of devs who paste files into Claude Code, hit subscription
 limits, and don't manually compose Séance/Scarlet/Specter. Pitch:
-*"chimera makes your terminal AI tool 5–10× more efficient. Zero config to start.
+*"khimaira makes your terminal AI tool 5–10× more efficient. Zero config to start.
 Local model fills the gaps for free."*
 
 ---
@@ -50,17 +50,17 @@ Local model fills the gaps for free."*
 
 | Item | Status | Where | Notes |
 |---|---|---|---|
-| `TaskClassification` | ✅ | `shared/types/src/chimera_types/classification.py` | AMR classifier output |
-| `FileContext` + `ContextBundle` | ✅ | `shared/types/src/chimera_types/context.py` | resolver output |
-| `UsageRecord` | ✅ | `shared/types/src/chimera_types/usage.py` | now with `task_id` for per-task budgeting |
-| `RoutingDecision` | ✅ | `shared/types/src/chimera_types/routing.py` | router output |
-| `RuntimeStatus` | ✅ | `shared/types/src/chimera_types/runtime.py` | dev server / browser / DB status |
+| `TaskClassification` | ✅ | `shared/types/src/khimaira_types/classification.py` | AMR classifier output |
+| `FileContext` + `ContextBundle` | ✅ | `shared/types/src/khimaira_types/context.py` | resolver output |
+| `UsageRecord` | ✅ | `shared/types/src/khimaira_types/usage.py` | now with `task_id` for per-task budgeting |
+| `RoutingDecision` | ✅ | `shared/types/src/khimaira_types/routing.py` | router output |
+| `RuntimeStatus` | ✅ | `shared/types/src/khimaira_types/runtime.py` | dev server / browser / DB status |
 
 ---
 
 ## Phase 2 — CLI Runners (the pure-CLI substrate) ✅ DONE
 
-The only place chimera talks to LLMs. No API SDK calls anywhere else.
+The only place khimaira talks to LLMs. No API SDK calls anywhere else.
 
 | Runner | Status | File | Notes |
 |---|---|---|---|
@@ -84,8 +84,8 @@ The only place chimera talks to LLMs. No API SDK calls anywhere else.
 | `routing_table.yaml` (default routing matrix) | ✅ | `config/routing_table.yaml` | 10 task_types × 5 complexity_tiers |
 | Config layered loader | ✅ | `config/__init__.py` | shipped → user → project deep-merge |
 | Validator-gated escalation | ⬜ | `dispatch/escalation.py` | retry on bigger model when validator fails |
-| `mcp__chimera__route` MCP tool | ⬜ | `server/tools/route.py` | classify-only, returns recommendation |
-| `mcp__chimera__chain_auto` MCP tool | ⬜ | `server/tools/chain_auto.py` | end-to-end auto-routed dispatch |
+| `mcp__khimaira__route` MCP tool | ⬜ | `server/tools/route.py` | classify-only, returns recommendation |
+| `mcp__khimaira__chain_auto` MCP tool | ⬜ | `server/tools/chain_auto.py` | end-to-end auto-routed dispatch |
 
 ---
 
@@ -109,11 +109,11 @@ The only place chimera talks to LLMs. No API SDK calls anywhere else.
 
 | Item | Status | Where | Notes |
 |---|---|---|---|
-| `chimera dev <project>` | ✅ | `cli/dev.py` | full lifecycle: detect → spawn → wait-ready → launch browser → wait-for-SIGINT → tear-down |
+| `khimaira dev <project>` | ✅ | `cli/dev.py` | full lifecycle: detect → spawn → wait-ready → launch browser → wait-for-SIGINT → tear-down |
 | `dev_server.detect()` | ✅ | `runtime/dev_server.py` | npm/pnpm/yarn/bun + uvicorn + django + manage.py heuristics |
 | `browser.find_chrome()` + `build_launch_cmd()` | ✅ | `runtime/browser.py` | platform-aware Chrome detection, dedicated user-data-dir, free-port picker |
 | Process registry integration | ✅ | uses Phase 12 | every spawn tracked; SIGINT walks reverse spawn order to kill |
-| Auto-start chimera-monitor | ✅ | `_ensure_monitor()` | probes /api/projects, starts daemon if down |
+| Auto-start khimaira-monitor | ✅ | `_ensure_monitor()` | probes /api/projects, starts daemon if down |
 | Wait-for-ready via wait_for_process | ✅ | uses Phase 12 | uses framework-specific URL pattern (Vite "Local: ...", Django "Starting...") |
 | `runtime/postgres.py` | ⬜ | deferred | DB connect/teardown — projects can connect manually for now |
 | `runtime/healthcheck.py` | ⬜ | deferred | explicit readiness probes — wait_for_process covers most cases |
@@ -121,22 +121,22 @@ The only place chimera talks to LLMs. No API SDK calls anywhere else.
 
 ---
 
-## Phase 6 — chimera CLI commands
+## Phase 6 — khimaira CLI commands
 
 | Command | Status | File | Notes |
 |---|---|---|---|
-| `chimera task <description>` | ✅ | `cli/task.py` | end-to-end: classify → route → dispatch → record. Verified with --dry-run. |
-| `chimera route <description>` | ✅ | `cli/route.py` | classify-only, prints routing decision JSON |
-| `chimera doctor` | ✅ | `cli/doctor.py` | env diagnostic, lists available runners + modes |
-| `chimera monitor {start,stop,restart,status,rescan}` | ✅ | `cli/monitor.py` | thin wrapper over migrated monitor.cli |
-| Entry point (`chimera.cli:main`) | ✅ | `cli/__init__.py` | argparse dispatch |
-| `chimera dev <project>` | ⬜ | `cli/dev.py` | (Phase 5) |
-| `chimera init` | ⬜ | `cli/init.py` | first-run UX, detects + suggests Ollama |
-| `chimera install --target` | ⬜ | `cli/install.py` | configures Claude Code / Gemini / Codex MCP |
+| `khimaira task <description>` | ✅ | `cli/task.py` | end-to-end: classify → route → dispatch → record. Verified with --dry-run. |
+| `khimaira route <description>` | ✅ | `cli/route.py` | classify-only, prints routing decision JSON |
+| `khimaira doctor` | ✅ | `cli/doctor.py` | env diagnostic, lists available runners + modes |
+| `khimaira monitor {start,stop,restart,status,rescan}` | ✅ | `cli/monitor.py` | thin wrapper over migrated monitor.cli |
+| Entry point (`khimaira.cli:main`) | ✅ | `cli/__init__.py` | argparse dispatch |
+| `khimaira dev <project>` | ⬜ | `cli/dev.py` | (Phase 5) |
+| `khimaira init` | ⬜ | `cli/init.py` | first-run UX, detects + suggests Ollama |
+| `khimaira install --target` | ⬜ | `cli/install.py` | configures Claude Code / Gemini / Codex MCP |
 
 ---
 
-## Phase 7 — Monitor migration (from chimera-legacy) ✅ DONE (core)
+## Phase 7 — Monitor migration (from khimaira-legacy) ✅ DONE (core)
 
 The observability daemon migrated cleanly — only 3 import patches needed
 (ROOTS, runners). Daemon starts in new repo, /api/projects responds, all
@@ -155,7 +155,7 @@ endpoints accessible.
 | `monitor/api/schema_drift.py` | ✅ | |
 | `monitor/anomalies.py` (self-watch) | ✅ | usage_rate + zombie checks active |
 | `monitor/watchdog.py` (zombie detector) | ✅ | |
-| `chimera.usage` module | ✅ | + `make_langchain_callback` for legacy node usage |
+| `khimaira.usage` module | ✅ | + `make_langchain_callback` for legacy node usage |
 | `monitor/auto_fix.py` | ✅ | |
 | `monitor/discovery/*` | ✅ | project + connection + topology discovery |
 | `monitor/metadata/*` | ✅ | observation collector + scan |
@@ -165,7 +165,7 @@ endpoints accessible.
 
 ---
 
-## Phase 8 — Patterns migration (from chimera-legacy) ✅ DONE
+## Phase 8 — Patterns migration (from khimaira-legacy) ✅ DONE
 
 All 8 graph factories import cleanly. Server tools (MCP exposure) still
 need wiring in Phase 6+9.
@@ -181,7 +181,7 @@ need wiring in Phase 6+9.
 | ACL | Atomic Component Library | ✅ | `chain_components` graph |
 | DCE | Dead Code Eliminator | ✅ | `chain_deadcode` graph |
 | POB | Proactive Observation Builder | ✅ | `chain_toolbuilder` graph |
-| `chimera.server.mcp` MCP entry point | ⬜ | exposes graph factories as MCP tools |
+| `khimaira.server.mcp` MCP entry point | ⬜ | exposes graph factories as MCP tools |
 
 ---
 
@@ -201,22 +201,22 @@ need wiring in Phase 6+9.
 
 | Item | Status | Where | Notes |
 |---|---|---|---|
-| JSONL session store at `~/.local/state/chimera/sessions/<sid>/` | ✅ | `monitor/sessions.py` | decisions, files_touched, questions (in-place updates), status, **inbox** |
-| `mcp__chimera__session_log_decision(text, why)` | ✅ | A's write |
-| `mcp__chimera__session_log_question(text)` → returns question_id | ✅ | A's write |
-| `mcp__chimera__session_log_touch(file, summary, line_range)` | ✅ | A's write |
-| `mcp__chimera__session_set_status(state, detail)` | ✅ | A's status update |
-| **`mcp__chimera__session_post_answer(target_session_id, question_id, answer)`** | ✅ | **B → A write-back: updates question status + drops inbox note** |
-| `mcp__chimera__session_state(session_id)` | ✅ | B's read — full digest |
-| `mcp__chimera__session_recent_decisions()` | ✅ | B's read across all sessions |
-| `mcp__chimera__session_list()` | ✅ | B's read — sessions index |
-| **`mcp__chimera__session_pending_notes(session_id, mark_read)`** | ✅ | **A's inbox read — answers B has posted, auto-marks read** |
+| JSONL session store at `~/.local/state/khimaira/sessions/<sid>/` | ✅ | `monitor/sessions.py` | decisions, files_touched, questions (in-place updates), status, **inbox** |
+| `mcp__khimaira__session_log_decision(text, why)` | ✅ | A's write |
+| `mcp__khimaira__session_log_question(text)` → returns question_id | ✅ | A's write |
+| `mcp__khimaira__session_log_touch(file, summary, line_range)` | ✅ | A's write |
+| `mcp__khimaira__session_set_status(state, detail)` | ✅ | A's status update |
+| **`mcp__khimaira__session_post_answer(target_session_id, question_id, answer)`** | ✅ | **B → A write-back: updates question status + drops inbox note** |
+| `mcp__khimaira__session_state(session_id)` | ✅ | B's read — full digest |
+| `mcp__khimaira__session_recent_decisions()` | ✅ | B's read across all sessions |
+| `mcp__khimaira__session_list()` | ✅ | B's read — sessions index |
+| **`mcp__khimaira__session_pending_notes(session_id, mark_read)`** | ✅ | **A's inbox read — answers B has posted, auto-marks read** |
 | `/api/sessions/*` REST endpoints | ✅ | `monitor/api/sessions.py` | dashboard data |
 | Smoke test verified: bidirectional flow A ↔ B ↔ A | ✅ | | |
 | **PostToolUse hook → auto session_log_touch** | ✅ | `scripts/hooks/post_tool_use.py` | stdlib Python, direct JSONL write, dedupes within MultiEdit, skips non-edit tools |
-| **Periodic `<chimera:reminder>` injection** | ✅ | `scripts/hooks/user_prompt_submit.py` | per-session counter at `~/.local/state/chimera/hook-counters/`, fires every 8th turn |
+| **Periodic `<khimaira:reminder>` injection** | ✅ | `scripts/hooks/user_prompt_submit.py` | per-session counter at `~/.local/state/khimaira/hook-counters/`, fires every 8th turn |
 | **SessionStart hook → call session_pending_notes** | ✅ | `scripts/hooks/session_start.py` | reads inbox.jsonl, atomic-rewrites with read=true, emits hookSpecificOutput JSON |
-| **`chimera install-hooks` installer** | ✅ | `cli/install_hooks.py` | idempotent merge into ~/.claude/settings.json, marker-based uninstall, --dry-run + auto-backup |
+| **`khimaira install-hooks` installer** | ✅ | `cli/install_hooks.py` | idempotent merge into ~/.claude/settings.json, marker-based uninstall, --dry-run + auto-backup |
 | Dashboard panel: live sessions view | ⬜ | deferred | `apps/monitor-ui/src/components/sessions/` |
 
 **Critical design notes (incorporated from review):**
@@ -227,7 +227,7 @@ need wiring in Phase 6+9.
 
 3. **Inbox-read should be automatic.** SessionStart hook calls `session_pending_notes` and surfaces unread answers in the system prompt. The agent sees "session B answered Q3" without the user having to know to ask.
 
-4. **Estimated scope:** ~300-400 LOC + 2-3 Claude Code hook scripts. Reuses existing chimera-monitor daemon, JSONL pattern, FastMCP server scaffolding.
+4. **Estimated scope:** ~300-400 LOC + 2-3 Claude Code hook scripts. Reuses existing khimaira-monitor daemon, JSONL pattern, FastMCP server scaffolding.
 
 ---
 
@@ -236,12 +236,12 @@ need wiring in Phase 6+9.
 | Item | Status | Where | Notes |
 |---|---|---|---|
 | `logged_tool` decorator | ✅ | `monitor/mcp_calls.py` | wraps every MCP tool; appends ts/tool/args/elapsed/success/output_size/error to JSONL |
-| Applied to all 42 chimera MCP tools | ✅ | `server/mcp.py` | one-shot script inserted decorator after each `@mcp.tool()` |
-| `~/.local/state/chimera/mcp-calls.jsonl` | ✅ | append-only, line-atomic via asyncio lock |
+| Applied to all 42 khimaira MCP tools | ✅ | `server/mcp.py` | one-shot script inserted decorator after each `@mcp.tool()` |
+| `~/.local/state/khimaira/mcp-calls.jsonl` | ✅ | append-only, line-atomic via asyncio lock |
 | `GET /api/mcp-calls` | ✅ | `monitor/api/mcp_calls.py` | filterable: window_minutes, tool, only_failures |
 | `GET /api/mcp-calls/summary` | ✅ | `monitor/api/mcp_calls.py` | aggregate by-tool stats + polling-replacement metric |
-| `mcp__chimera__usage_report(window_minutes)` | ✅ | `server/mcp.py` | "is chimera being used effectively?" answer in one call |
-| `mcp__chimera__list_mcp_calls(...)` | ✅ | `server/mcp.py` | recent invocations, drill-down |
+| `mcp__khimaira__usage_report(window_minutes)` | ✅ | `server/mcp.py` | "is khimaira being used effectively?" answer in one call |
+| `mcp__khimaira__list_mcp_calls(...)` | ✅ | `server/mcp.py` | recent invocations, drill-down |
 | Polling-replacement estimator | ✅ | `summarize()` | counts wait_for_process calls + their blocked time, divides by 5s/poll baseline |
 | Smoke-tested | ✅ | | 10 synthetic records → summary correct, by-tool breakdown correct, error samples captured |
 
@@ -249,7 +249,7 @@ need wiring in Phase 6+9.
 convenience functions had been migrated to return `RunnerResult` (breaking
 all legacy callers that expected str). Reverted to returning `.text` for
 backwards compat. Added `run_claude_full` / `run_gemini_full` for new
-callers that want the full result object. New `chimera task` flow already
+callers that want the full result object. New `khimaira task` flow already
 uses `runner.run()` directly so it's unaffected.
 
 ---
@@ -259,11 +259,11 @@ uses `runner.run()` directly so it's unaffected.
 | Item | Status | Where | Notes |
 |---|---|---|---|
 | Process registry in monitor daemon | ✅ | `monitor/processes.py` | spawn/wait/follow/kill — 4MB ring buffer per process |
-| `mcp__chimera__spawn_process` | ✅ | `server/mcp.py` | |
-| `mcp__chimera__wait_for_process` | ✅ | `server/mcp.py` | **Polling replacement primitive — verified end-to-end (signal_match in 0.6s)** |
-| `mcp__chimera__follow_process` | ✅ | `server/mcp.py` | snapshot of current output |
-| `mcp__chimera__list_processes` | ✅ | `server/mcp.py` | |
-| `mcp__chimera__kill_process` | ✅ | `server/mcp.py` | SIGTERM + 5s grace + SIGKILL |
+| `mcp__khimaira__spawn_process` | ✅ | `server/mcp.py` | |
+| `mcp__khimaira__wait_for_process` | ✅ | `server/mcp.py` | **Polling replacement primitive — verified end-to-end (signal_match in 0.6s)** |
+| `mcp__khimaira__follow_process` | ✅ | `server/mcp.py` | snapshot of current output |
+| `mcp__khimaira__list_processes` | ✅ | `server/mcp.py` | |
+| `mcp__khimaira__kill_process` | ✅ | `server/mcp.py` | SIGTERM + 5s grace + SIGKILL |
 | `/api/processes/{label}/stream` SSE | ✅ | `monitor/api/processes.py` | dashboard endpoint |
 | `POST /api/processes/spawn`, `POST /api/processes/{label}/wait` | ✅ | `monitor/api/processes.py` | long-poll wait endpoint |
 | Dashboard panel: live process output | ⬜ | `apps/monitor-ui/src/components/processes/` | UI deferred — backend wired |
@@ -271,7 +271,7 @@ uses `runner.run()` directly so it's unaffected.
 **Use cases this unblocks:**
 
 1. **Wait for tests:** `wait_for_process("npm-test", completion_signal=r"\d+ passed|\d+ failed", timeout_s=300)` — single tool call replaces polling loop.
-2. **Wait for dev server ready:** `wait_for_process("dev-server", completion_signal=r"Local: http", timeout_s=30)` — agent kicks off `chimera dev`, waits one call for the server to be up before it interacts with the browser.
+2. **Wait for dev server ready:** `wait_for_process("dev-server", completion_signal=r"Local: http", timeout_s=30)` — agent kicks off `khimaira dev`, waits one call for the server to be up before it interacts with the browser.
 3. **Wait for build:** `wait_for_process("vite-build", completion_signal=r"built in", timeout_s=120)`.
 4. **Long migrations:** `wait_for_process("alembic-upgrade", completion_signal=r"Done|Error", timeout_s=600)`.
 
@@ -280,7 +280,7 @@ route + dashboard panel). Plumbs through the existing monitor daemon — no
 new long-running services.
 
 **Sequencing:** lands cleanly AFTER Phase 5 (Runtime manager), since
-`chimera dev` will be a heavy user of the process registry.
+`khimaira dev` will be a heavy user of the process registry.
 
 ---
 
@@ -290,7 +290,7 @@ The dev-tool pitch requires "no API keys, no surprise bills." Migration sequence
 
 | Step | Status | Notes |
 |---|---|---|
-| Flip every node default to CLI | ⬜ | API stays as opt-in (`CHIMERA_USE_API=true`) |
+| Flip every node default to CLI | ⬜ | API stays as opt-in (`KHIMAIRA_USE_API=true`) |
 | Build `run_structured` helper | ⏳ | (Phase 2) |
 | Migrate API-using nodes one at a time | ⬜ | watching parse-failure rate via usage tracker |
 | Delete API provider code | ⬜ | once parse-failures stabilize <1% |
@@ -305,18 +305,18 @@ API-using nodes inventory (from legacy):
 
 ### Monitor auto-scan kicks off Claude Opus on daemon startup
 
-When `chimera monitor start` runs, the metadata scanner queues every
+When `khimaira monitor start` runs, the metadata scanner queues every
 discovered project for an LLM-driven scan. Defaults to **Claude Opus 4.7
 on a ~94k-char prompt = ~$1.40 per project, per fresh start.**
 
 For a dev-tool that's pitching "no surprise bills," this is a problem.
-First-run experience burns ~$3 on chimera + 1 other project before the
+First-run experience burns ~$3 on khimaira + 1 other project before the
 user has even queried anything.
 
 **Fix candidates (do one before public release):**
-1. Default `CHIMERA_MONITOR_SCAN_MODEL=gemini` — uses Gemini CLI (subscription) instead of Anthropic API (per-call billing).
-2. Make auto-scan opt-in: env var `CHIMERA_AUTO_SCAN=1` to enable; default off until user runs `chimera monitor scan` manually.
-3. Skip scan entirely under `CHIMERA_LOCAL_ONLY=1`.
+1. Default `KHIMAIRA_MONITOR_SCAN_MODEL=gemini` — uses Gemini CLI (subscription) instead of Anthropic API (per-call billing).
+2. Make auto-scan opt-in: env var `KHIMAIRA_AUTO_SCAN=1` to enable; default off until user runs `khimaira monitor scan` manually.
+3. Skip scan entirely under `KHIMAIRA_LOCAL_ONLY=1`.
 4. Use AMR routing (Phase 3) for the scan call instead of hardcoded Opus — let the auto-router pick a cheaper model.
 
 **Recommendation:** option 4 once AMR's escalation path is solid; option 2
@@ -327,7 +327,7 @@ this command" vs "$3 vanished without consent").
 
 ## Decisions & rationale (sticky notes)
 
-- **Repo:** `chimera` reclaimed; old code lives in `fsocietydisobey/chimera-legacy` (archived).
+- **Repo:** `khimaira` reclaimed; old code lives in `fsocietydisobey/khimaira-legacy` (archived).
 - **Naming:** Sigil/Séance/Scarlet/Specter retained for now. Marketing-readiness later.
 - **Substrate:** pure CLI subprocess. No API SDK calls in the tree (eventual goal).
 - **Library mode:** each perception package exposes `<pkg>.api.*` for in-process import + `<pkg>.server.mcp` for direct shell use. Same logic, two transports.

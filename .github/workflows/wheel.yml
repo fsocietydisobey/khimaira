@@ -1,18 +1,18 @@
 name: wheel-install
 
-# Verifies the "end user installs chimera from a built wheel" path.
+# Verifies the "end user installs khimaira from a built wheel" path.
 # This is the failure mode that bit hardest during cross-machine
-# bootstrap: chimera as a workspace member sources cleanly, but its
+# bootstrap: khimaira as a workspace member sources cleanly, but its
 # wheel doesn't ship workspace-level files (scripts/hooks/), so any
 # code path that resolves data from the workspace root crashes on
 # wheel installs. The fixes:
 #
-#   - hook scripts moved into chimera.hooks subpackage (issue 3)
-#   - install-hooks writes `python -m chimera.hooks.<name>` commands
+#   - hook scripts moved into khimaira.hooks subpackage (issue 3)
+#   - install-hooks writes `python -m khimaira.hooks.<name>` commands
 #   - hatch-vcs version means each commit's wheel has a unique version
 #
 # This workflow exercises all three by actually building + installing
-# a wheel into a fresh venv and verifying chimera works there.
+# a wheel into a fresh venv and verifying khimaira works there.
 
 on:
   push:
@@ -43,49 +43,49 @@ jobs:
       - name: setup python
         run: uv python install 3.13
 
-      - name: build chimera + sibling wheels
-        # chimera depends on workspace-internal chimera-types +
-        # chimera-transport. End users will get them auto-resolved
+      - name: build khimaira + sibling wheels
+        # khimaira depends on workspace-internal khimaira-types +
+        # khimaira-transport. End users will get them auto-resolved
         # from PyPI once we publish; until then CI must build them
         # locally and feed uv pip install via --find-links below.
         run: |
           mkdir -p ${{ runner.temp }}/wheels
-          for pkg in packages/chimera shared/types shared/transport; do
+          for pkg in packages/khimaira shared/types shared/transport; do
             (cd $pkg && uv build --wheel --out-dir ${{ runner.temp }}/wheels)
           done
           ls ${{ runner.temp }}/wheels
 
       - name: install wheel into fresh venv
         # NOT the workspace .venv — we want a clean Python that has
-        # never seen chimera as a workspace member, mirroring the
-        # `pip install chimera` user experience exactly.
+        # never seen khimaira as a workspace member, mirroring the
+        # `pip install khimaira` user experience exactly.
         #
         # --find-links makes uv treat our local wheel dir as an
         # additional package index. PyPI still serves regular deps
         # (fastapi, langgraph, etc.); local wheels satisfy the
-        # workspace-internal chimera/chimera-types/chimera-transport.
+        # workspace-internal khimaira/khimaira-types/khimaira-transport.
         # We `cd /tmp` first so uv can't auto-detect the workspace
-        # from the current directory and route chimera through
+        # from the current directory and route khimaira through
         # [tool.uv.sources] back to the source tree.
         run: |
           uv venv ${{ runner.temp }}/userenv --python 3.13
           cd ${{ runner.temp }} && uv pip install \
             --python ${{ runner.temp }}/userenv/bin/python \
             --find-links ${{ runner.temp }}/wheels \
-            ${{ runner.temp }}/wheels/chimera-*.whl
+            ${{ runner.temp }}/wheels/khimaira-*.whl
 
-      - name: smoke — chimera CLI works from wheel install
+      - name: smoke — khimaira CLI works from wheel install
         run: |
-          ${{ runner.temp }}/userenv/bin/chimera --version
+          ${{ runner.temp }}/userenv/bin/khimaira --version
 
       - name: smoke — hook modules importable from wheel install
-        # If chimera.hooks/* doesn't ship in the wheel, the install-hooks
+        # If khimaira.hooks/* doesn't ship in the wheel, the install-hooks
         # command Claude Code spawns will ModuleNotFoundError at runtime.
         # Catch that here instead of in production.
         run: |
-          ${{ runner.temp }}/userenv/bin/python -c "import chimera.hooks.session_start, chimera.hooks.user_prompt_submit, chimera.hooks.post_tool_use"
+          ${{ runner.temp }}/userenv/bin/python -c "import khimaira.hooks.session_start, khimaira.hooks.user_prompt_submit, khimaira.hooks.post_tool_use"
 
-      - name: smoke — install-hooks succeeds against wheel-installed chimera
+      - name: smoke — install-hooks succeeds against wheel-installed khimaira
         # This is the literal failure mode that motivated the issue 3
         # fix: install-hooks looked up scripts/hooks/ relative to its
         # __file__, which on a wheel install lands in site-packages
@@ -94,8 +94,8 @@ jobs:
         env:
           CLAUDE_SETTINGS_PATH: ${{ runner.temp }}/settings.json
         run: |
-          ${{ runner.temp }}/userenv/bin/chimera install-hooks --dry-run > ${{ runner.temp }}/install-out.txt
-          grep -q 'python.*-m chimera.hooks.session_start' ${{ runner.temp }}/install-out.txt \
+          ${{ runner.temp }}/userenv/bin/khimaira install-hooks --dry-run > ${{ runner.temp }}/install-out.txt
+          grep -q 'python.*-m khimaira.hooks.session_start' ${{ runner.temp }}/install-out.txt \
             || (echo "::error::wheel install-hooks didn't emit python -m form"; cat ${{ runner.temp }}/install-out.txt; exit 1)
 
       - name: smoke — wheel version is git-derived, not the static stub
@@ -104,7 +104,7 @@ jobs:
         # would defeat itself (uv tool install cache would re-trigger).
         # A real built version contains digits + commit info.
         run: |
-          v=$(${{ runner.temp }}/userenv/bin/chimera --version | awk '{print $2}')
+          v=$(${{ runner.temp }}/userenv/bin/khimaira --version | awk '{print $2}')
           echo "wheel version: $v"
           [ "$v" != "0.0.0+unknown" ] || (echo "::error::hatch-vcs not producing a git-derived version"; exit 1)
           [ "$v" != "0.1.0.dev0" ] || (echo "::error::static version 0.1.0.dev0 surfaced; hatch-vcs likely misconfigured"; exit 1)

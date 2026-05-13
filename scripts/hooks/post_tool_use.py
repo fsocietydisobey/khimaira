@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Legacy shim — delegates to chimera.hooks.post_tool_use.
+"""Legacy shim — delegates to khimaira.hooks.post_tool_use.
 
 See scripts/hooks/session_start.py for the migration backstory.
 This shim keeps pre-migration settings.json files working until the
-user re-runs `chimera install-hooks`, which rewrites the command to
-`python -m chimera.hooks.post_tool_use` and stops touching this
+user re-runs `khimaira install-hooks`, which rewrites the command to
+`python -m khimaira.hooks.post_tool_use` and stops touching this
 file.
 """
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 
 try:
-    from chimera.hooks.post_tool_use import main
+    from khimaira.hooks.post_tool_use import main
 except ImportError:
     sys.exit(0)
 

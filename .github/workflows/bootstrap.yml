@@ -1,10 +1,10 @@
 name: bootstrap-e2e
 
-# End-to-end test of `chimera bootstrap` against a synthetic profile.
+# End-to-end test of `khimaira bootstrap` against a synthetic profile.
 # Catches the class of bugs that consumed six rounds of debugging
 # during cross-machine setup: dotfiles symlinks landing wrong,
 # install-hooks crashing on wheel installs, supervisor unit content
-# drift, .venv/bin/chimera disappearing after `uv sync`.
+# drift, .venv/bin/khimaira disappearing after `uv sync`.
 #
 # Doesn't test the supervisor install or SPA build here — both have
 # real side effects (systemd user units, npm-heavy build) that don't
@@ -47,7 +47,7 @@ jobs:
         # The bootstrap profile assumes a dotfiles repo at a clonable
         # URL with a specific layout (claude/CLAUDE.md, claude/rules/,
         # claude/commands/). We construct one on the runner and serve
-        # it via a local file:// remote so the chimera bootstrap path
+        # it via a local file:// remote so the khimaira bootstrap path
         # exercises clone + symlink without depending on GitHub auth.
         run: |
           set -euxo pipefail
@@ -59,19 +59,19 @@ jobs:
           echo "# synthetic /tools" > $DOTFILES/claude/commands/tools.md
           cd $DOTFILES
           git init -q -b main
-          git config user.email "ci@chimera.test"
-          git config user.name "chimera-ci"
+          git config user.email "ci@khimaira.test"
+          git config user.name "khimaira-ci"
           git add .
           git commit -qm "synthetic dotfiles for bootstrap e2e test"
           # Mirror to a bare 'remote' so clone exercises the real path
           git clone --bare $DOTFILES ${{ runner.temp }}/dotfiles.git
 
-      - name: write synthetic chimera-profile.yaml
+      - name: write synthetic khimaira-profile.yaml
         # Profile sized to the CI runner's actual capabilities:
         # - dotfiles points at the bare repo we just built
-        # - repos section is empty (chimera itself is the workspace
+        # - repos section is empty (khimaira itself is the workspace
         #   we're already running from)
-        # - mcp_servers contains chimera only; claude CLI isn't on the
+        # - mcp_servers contains khimaira only; claude CLI isn't on the
         #   runner so register_mcp will return `skipped` gracefully
         # - supervisor + spa_build off (CI shouldn't write systemd units)
         # - install_claude_hooks ON because that's the actual class of
@@ -89,15 +89,15 @@ jobs:
               - { src: claude/commands, dest: ${{ runner.temp }}/fake-home/.claude/commands }
           repos: []
           mcp_servers:
-            - name: chimera
-              command: echo chimera-mcp-stub
+            - name: khimaira
+              command: echo khimaira-mcp-stub
           supervisor:
             auto_install: false
           spa_build: false
           install_claude_hooks: true
           EOF
 
-      - name: run chimera bootstrap
+      - name: run khimaira bootstrap
         env:
           # Point install-hooks at a tmp file rather than the runner's
           # real ~/.claude/settings.json (which doesn't exist; would
@@ -105,7 +105,7 @@ jobs:
           CLAUDE_SETTINGS_PATH: ${{ runner.temp }}/fake-home/.claude/settings.json
         run: |
           mkdir -p ${{ runner.temp }}/fake-home/.claude
-          uv run chimera bootstrap --profile ${{ runner.temp }}/profile.yaml || true
+          uv run khimaira bootstrap --profile ${{ runner.temp }}/profile.yaml || true
           # The `|| true` is because the mcp-register step will fail
           # without claude CLI on PATH — that's expected on CI. We
           # assert the specific outcomes below instead of relying on
@@ -128,12 +128,12 @@ jobs:
 
       - name: verify — install-hooks wrote python -m form
         # The bug class we're catching: hook command strings in
-        # settings.json must point at `python -m chimera.hooks.<name>`,
+        # settings.json must point at `python -m khimaira.hooks.<name>`,
         # NOT at workspace-rooted paths that don't exist in wheel installs.
         run: |
           test -f ${{ runner.temp }}/fake-home/.claude/settings.json \
             || (echo "::error::settings.json not written"; exit 1)
-          grep -q 'python.*-m chimera.hooks.session_start' \
+          grep -q 'python.*-m khimaira.hooks.session_start' \
             ${{ runner.temp }}/fake-home/.claude/settings.json \
             || (echo "::error::settings.json doesn't have python -m form"; \
                 cat ${{ runner.temp }}/fake-home/.claude/settings.json; exit 1)
@@ -148,7 +148,7 @@ jobs:
         env:
           CLAUDE_SETTINGS_PATH: ${{ runner.temp }}/fake-home/.claude/settings.json
         run: |
-          out=$(uv run chimera bootstrap --profile ${{ runner.temp }}/profile.yaml 2>&1 || true)
+          out=$(uv run khimaira bootstrap --profile ${{ runner.temp }}/profile.yaml 2>&1 || true)
           echo "$out"
           # Should not produce new `created` results — everything's
           # already in place from the first run.

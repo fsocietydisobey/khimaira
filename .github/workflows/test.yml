@@ -44,36 +44,36 @@ jobs:
           # Force tests to use a clean state dir, not the runner's home.
           # tests/conftest.py already monkeypatches XDG_STATE_HOME but
           # the env var here covers any code path that bypasses fixture.
-          XDG_STATE_HOME: /tmp/chimera-test-state
+          XDG_STATE_HOME: /tmp/khimaira-test-state
 
       - name: smoke — entry points exist after sync
         # Issue 1 regression guard: `uv sync` must produce every member's
-        # console-script in .venv/bin/. If a future change drops chimera
+        # console-script in .venv/bin/. If a future change drops khimaira
         # from the workspace deps, this catches it before a user hits
-        # "failed to spawn chimera" mid-bootstrap.
+        # "failed to spawn khimaira" mid-bootstrap.
         run: |
-          test -x .venv/bin/chimera || (echo "::error::missing .venv/bin/chimera"; exit 1)
+          test -x .venv/bin/khimaira || (echo "::error::missing .venv/bin/khimaira"; exit 1)
           test -x .venv/bin/scarlet || (echo "::error::missing .venv/bin/scarlet"; exit 1)
           test -x .venv/bin/seance || (echo "::error::missing .venv/bin/seance"; exit 1)
           test -x .venv/bin/specter || (echo "::error::missing .venv/bin/specter"; exit 1)
-          uv run chimera --version
+          uv run khimaira --version
 
       - name: smoke — hook modules importable as python -m
-        # Issue 3 regression guard: chimera.hooks.* must be importable
+        # Issue 3 regression guard: khimaira.hooks.* must be importable
         # AS modules, not just files. install-hooks writes a command of
-        # the form `python -m chimera.hooks.<name>` and Claude Code
+        # the form `python -m khimaira.hooks.<name>` and Claude Code
         # spawns that — if the package vanishes (e.g. someone reverts
-        # the chimera.hooks/ move), the hooks silently fail.
+        # the khimaira.hooks/ move), the hooks silently fail.
         run: |
-          uv run python -c "import chimera.hooks.session_start, chimera.hooks.user_prompt_submit, chimera.hooks.post_tool_use"
+          uv run python -c "import khimaira.hooks.session_start, khimaira.hooks.user_prompt_submit, khimaira.hooks.post_tool_use"
 
       - name: smoke — install-hooks writes new command form
         # The hook commands settings.json picks up must point at
-        # `python -m chimera.hooks.<name>`, not at a legacy
+        # `python -m khimaira.hooks.<name>`, not at a legacy
         # scripts/hooks/*.py path. A regression here means end users
-        # who pip install chimera get hooks pointing at nonexistent
+        # who pip install khimaira get hooks pointing at nonexistent
         # files in their site-packages.
         run: |
-          out=$(uv run chimera install-hooks --dry-run)
-          echo "$out" | grep -q 'python.*-m chimera.hooks.session_start' \
+          out=$(uv run khimaira install-hooks --dry-run)
+          echo "$out" | grep -q 'python.*-m khimaira.hooks.session_start' \
             || (echo "::error::install-hooks --dry-run didn't emit python -m form"; echo "$out"; exit 1)

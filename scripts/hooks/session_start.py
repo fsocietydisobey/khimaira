@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Legacy shim — delegates to chimera.hooks.session_start.
+"""Legacy shim — delegates to khimaira.hooks.session_start.
 
-settings.json files written by `chimera install-hooks` PRE-the-
-chimera.hooks-package migration point at this filesystem path. New
-settings.json (post chimera install-hooks re-run) uses
-`python -m chimera.hooks.session_start` directly and doesn't touch
+settings.json files written by `khimaira install-hooks` PRE-the-
+khimaira.hooks-package migration point at this filesystem path. New
+settings.json (post khimaira install-hooks re-run) uses
+`python -m khimaira.hooks.session_start` directly and doesn't touch
 this file at all.
 
 This shim exists so users who haven't re-run install-hooks since the
 migration don't have their SessionStart hook break silently. The
-moment they run `chimera install-hooks` or `chimera bootstrap` /
-`/chimera-configure`, their settings.json gets rewritten with the
+moment they run `khimaira install-hooks` or `khimaira bootstrap` /
+`/khimaira-configure`, their settings.json gets rewritten with the
 python -m form and this file becomes dead.
 
 Plan: delete this shim after a grace period once all known machines
-have migrated. `chimera doctor` reports drift if settings.json still
+have migrated. `khimaira doctor` reports drift if settings.json still
 references scripts/hooks/*.py — that's the signal to run install-hooks.
 """
 
@@ -23,9 +23,9 @@ from __future__ import annotations
 import sys
 
 try:
-    from chimera.hooks.session_start import main
+    from khimaira.hooks.session_start import main
 except ImportError:
-    # chimera package not on sys.path for this Python — fail silently,
+    # khimaira package not on sys.path for this Python — fail silently,
     # exit 0 to match the hook's never-block-Claude-Code contract.
     sys.exit(0)
 

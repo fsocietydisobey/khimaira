@@ -1,3 +1,3 @@
-# chimera-types
+# khimaira-types
 
-Shared schemas across chimera packages. Pydantic models for `TaskClassification`, `FileContext`, `UsageRecord`, `RoutingDecision`, `RuntimeStatus`.
+Shared schemas across khimaira packages. Pydantic models for `TaskClassification`, `FileContext`, `UsageRecord`, `RoutingDecision`, `RuntimeStatus`.
