@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -30,11 +31,50 @@ from chimera.usage import estimate_cost, log_file_path
 
 log = get_logger("cli.usage")
 
-# The counterfactual baseline. If the user wasn't using chimera auto-mode,
-# the assumption is they'd be calling Opus directly inside Claude Code.
-# That's the dominant pattern for the user we're building for; configurable
-# later if it turns out to be wrong.
-_COUNTERFACTUAL_MODEL = "claude-opus-4-7"
+# Default counterfactual baseline. The assumption is the user, without
+# chimera auto-mode, would be calling Opus directly inside Claude Code.
+# That's the dominant pattern for the user we're building for.
+#
+# Override priority (highest wins):
+#   1. CHIMERA_USAGE_BASELINE_MODEL env var (per-session / per-invocation)
+#   2. baseline_model: top-level key in ~/.chimera/models.yaml (persistent)
+#   3. Hardcoded default below (sane out-of-box)
+#
+# The chosen model id must be one estimate_cost() recognizes (see _PRICES
+# in chimera.usage). Unknown ids return $0 cost — so the savings number
+# silently goes to zero instead of crashing. Doctor check should surface
+# this case eventually.
+_DEFAULT_COUNTERFACTUAL_MODEL = "claude-opus-4-7"
+
+
+def _resolve_counterfactual_model() -> str:
+    """Look up the savings baseline. Env var > registry > default.
+
+    Resolved at call-time (not import-time) so test fixtures and shell
+    env changes take effect without re-importing the module.
+    """
+    env = os.environ.get("CHIMERA_USAGE_BASELINE_MODEL")
+    if env:
+        return env
+
+    # Registry override: top-level `baseline_model:` key in the user's
+    # models.yaml. Reuses the same path resolution as the model registry.
+    try:
+        import yaml
+
+        from chimera.dispatch.registry import _user_registry_path
+
+        path = _user_registry_path()
+        if path.is_file():
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if isinstance(data, dict):
+                baseline = data.get("baseline_model")
+                if baseline:
+                    return str(baseline)
+    except Exception as exc:  # noqa: BLE001 — config read should never break savings
+        log.warning("usage: failed to read baseline_model from registry: %s", exc)
+
+    return _DEFAULT_COUNTERFACTUAL_MODEL
 
 
 def add_subparser(subparsers: argparse._SubParsersAction) -> None:
@@ -128,6 +168,7 @@ def _iter_records(days: int) -> Iterable[dict]:
 
 def _run_savings(args: argparse.Namespace) -> int:
     records = list(_iter_records(args.days))
+    baseline_model = _resolve_counterfactual_model()
 
     if not records:
         print(
@@ -138,7 +179,7 @@ def _run_savings(args: argparse.Namespace) -> int:
         )
         return 0
 
-    # Per-record math: actual cost vs counterfactual Opus cost
+    # Per-record math: actual cost vs counterfactual baseline cost
     total_actual = 0.0
     total_counterfactual = 0.0
     total_auto_actual = 0.0
@@ -152,7 +193,7 @@ def _run_savings(args: argparse.Namespace) -> int:
         in_tok = int(rec.get("input_tokens", 0))
         out_tok = int(rec.get("output_tokens", 0))
         actual = float(rec.get("estimated_cost_usd", 0.0))
-        counterfactual = estimate_cost(_COUNTERFACTUAL_MODEL, in_tok, out_tok)
+        counterfactual = estimate_cost(baseline_model, in_tok, out_tok)
         mode = rec.get("mode", "unknown")
 
         total_actual += actual
@@ -174,13 +215,14 @@ def _run_savings(args: argparse.Namespace) -> int:
     # Render
     print(f"Window: last {args.days} days  ({len(records)} records)")
     print(f"  auto-mode records: {auto_count}")
+    print(f"  baseline model:    {baseline_model}")
     print()
-    print(f"Total actual spend:           ${total_actual:>9.4f}")
-    print(f"If everything had been Opus:  ${total_counterfactual:>9.4f}")
-    print(f"  → savings (auto only):      ${auto_savings:>9.4f}")
+    print(f"Total actual spend:               ${total_actual:>9.4f}")
+    print(f"If everything had been baseline:  ${total_counterfactual:>9.4f}")
+    print(f"  → savings (auto only):          ${auto_savings:>9.4f}")
     if total_auto_counterfactual > 0:
         pct = (auto_savings / total_auto_counterfactual) * 100
-        print(f"  → auto-mode efficiency:     {pct:>9.1f}%  (vs Opus-direct)")
+        print(f"  → auto-mode efficiency:         {pct:>9.1f}%  (vs {baseline_model})")
     print()
 
     print(f"Breakdown by {args.by}:")
@@ -196,9 +238,11 @@ def _run_savings(args: argparse.Namespace) -> int:
         )
     print()
     print(
-        "Note: 'baseline' = Opus-direct cost for the same tokens. Savings "
-        "shown here count ONLY chimera-routed dispatches; direct Claude "
-        "Code calls aren't tracked yet (Phase 4 on the roadmap). The real "
+        f"Note: 'baseline' = {baseline_model} cost for the same tokens. "
+        "Override with CHIMERA_USAGE_BASELINE_MODEL=<model-id> or set "
+        "`baseline_model: <id>` in ~/.chimera/models.yaml. Savings shown "
+        "here count ONLY chimera-routed dispatches; direct Claude Code "
+        "calls aren't tracked yet (Phase 4 on the roadmap). The real "
         "savings number is the floor, not the ceiling.",
     )
     return 0

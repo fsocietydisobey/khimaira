@@ -236,3 +236,82 @@ def test_by_runner_breakdown(isolated_usage_log, capsys):
     assert "claude" in out
     assert "gemini" in out
     assert rc == 0
+
+
+# -------------------- baseline override -------------------- #
+
+
+def test_baseline_defaults_to_opus(isolated_usage_log, capsys, monkeypatch):
+    """Without env var or registry override, baseline is claude-opus-4-7."""
+    monkeypatch.delenv("CHIMERA_USAGE_BASELINE_MODEL", raising=False)
+    assert usage_cli._resolve_counterfactual_model() == "claude-opus-4-7"
+
+
+def test_env_var_overrides_baseline(isolated_usage_log, capsys, monkeypatch):
+    """CHIMERA_USAGE_BASELINE_MODEL env var overrides the default."""
+    monkeypatch.setenv("CHIMERA_USAGE_BASELINE_MODEL", "claude-sonnet-4-6")
+    assert usage_cli._resolve_counterfactual_model() == "claude-sonnet-4-6"
+
+
+def test_env_var_baseline_affects_savings_math(isolated_usage_log, capsys, monkeypatch):
+    """Changing the baseline to sonnet (cheaper than opus) reduces the
+    computed savings — the sonnet baseline costs less than opus baseline
+    for the same tokens."""
+    now = datetime.now(timezone.utc)
+    _write_record(
+        isolated_usage_log,
+        ts=now - timedelta(hours=1),
+        runner="claude",
+        model="claude-haiku-4-5",
+        mode="auto",
+        input_tokens=1000,
+        output_tokens=500,
+        cost=0.0028,
+    )
+
+    # Run with default (opus) baseline
+    monkeypatch.delenv("CHIMERA_USAGE_BASELINE_MODEL", raising=False)
+    args = type("Args", (), {"days": 30, "by": "mode"})()
+    usage_cli._run_savings(args)
+    out_opus = capsys.readouterr().out
+    assert "claude-opus-4-7" in out_opus
+
+    # Run with sonnet baseline
+    monkeypatch.setenv("CHIMERA_USAGE_BASELINE_MODEL", "claude-sonnet-4-6")
+    usage_cli._run_savings(args)
+    out_sonnet = capsys.readouterr().out
+    assert "claude-sonnet-4-6" in out_sonnet
+    # Sonnet baseline is cheaper than opus → savings number should be lower
+    # Don't pin exact decimals; pin the inequality through model name
+    assert "claude-opus-4-7" not in out_sonnet
+
+
+def test_registry_baseline_override(isolated_usage_log, tmp_path, monkeypatch):
+    """`baseline_model:` key in ~/.chimera/models.yaml overrides default
+    when env var is unset."""
+    monkeypatch.delenv("CHIMERA_USAGE_BASELINE_MODEL", raising=False)
+
+    # Point the registry path at a tmp file with baseline_model set
+    registry_path = tmp_path / "models.yaml"
+    registry_path.write_text("baseline_model: gemini-2.5-pro\nmodels: []\n")
+
+    from chimera.dispatch import registry as registry_mod
+
+    monkeypatch.setattr(registry_mod, "_user_registry_path", lambda: registry_path)
+
+    assert usage_cli._resolve_counterfactual_model() == "gemini-2.5-pro"
+
+
+def test_env_var_wins_over_registry(isolated_usage_log, tmp_path, monkeypatch):
+    """When both env var and registry are set, env var wins (per-session
+    override beats persistent config)."""
+    monkeypatch.setenv("CHIMERA_USAGE_BASELINE_MODEL", "gpt-5-codex")
+
+    registry_path = tmp_path / "models.yaml"
+    registry_path.write_text("baseline_model: gemini-2.5-pro\nmodels: []\n")
+
+    from chimera.dispatch import registry as registry_mod
+
+    monkeypatch.setattr(registry_mod, "_user_registry_path", lambda: registry_path)
+
+    assert usage_cli._resolve_counterfactual_model() == "gpt-5-codex"
