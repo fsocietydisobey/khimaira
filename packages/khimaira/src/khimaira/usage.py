@@ -143,6 +143,50 @@ def runner_to_provider(runner: str) -> str:
     }.get(runner, "other")
 
 
+def project_spend_usd(project: str, days: int = 30) -> float:
+    """Sum estimated USD spend for a given project label over the last N days.
+
+    Used by `mcp__khimaira__auto`'s budget gate. The project label is
+    stored in the `task_id` field of UsageRecord — callers pass the same
+    label they used at dispatch time (typically their cwd or a stable
+    project identifier).
+
+    Returns 0.0 if the log file doesn't exist or the project has no
+    matching records in the window. Never raises — budget enforcement
+    must not break dispatch on I/O errors.
+    """
+    if not project or not _LOG_FILE.is_file():
+        return 0.0
+
+    # Cutoff: ISO 8601 lexicographic compare matches strict time order.
+    from datetime import timedelta
+
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    total = 0.0
+    try:
+        with _LOG_FILE.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("task_id") != project:
+                    continue
+                ts = rec.get("ts", "")
+                if ts < cutoff_iso:
+                    continue
+                total += float(rec.get("estimated_cost_usd") or 0.0)
+    except OSError as exc:
+        log.warning("usage: project_spend_usd read failed: %s", exc)
+        return 0.0
+
+    return total
+
+
 # ---------------------------------------------------------------------------
 # LangChain callback — auto-attached to every model built via config/models.py.
 # Migrated from legacy khimaira/usage.py to keep the patterns' usage tracking

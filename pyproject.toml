@@ -49,3 +49,9 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["packages/*/tests", "shared/*/tests"]
+markers = [
+    "integration: end-to-end tests that shell out to real CLI runners (claude/codex/gemini/ollama). Skipped when the required runner isn't installed. Excluded from default `pytest` runs; opt in via `pytest -m integration` or `pytest -m 'not integration'` for the inverse.",
+]
+# Default: only unit tests. CI runs the integration set separately when
+# a runner image is available.
+addopts = "-m 'not integration'"

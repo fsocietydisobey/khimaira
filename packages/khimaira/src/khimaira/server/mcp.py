@@ -383,6 +383,8 @@ async def delegate(
     prompt: str,
     tier: str = "auto",
     timeout_s: int = 120,
+    project: str = "",
+    budget_usd: float | None = None,
 ) -> str:
     """**Lower-token-cost answer.** Delegate a prompt to the cheapest
     competent model and return its answer text.
@@ -410,13 +412,33 @@ async def delegate(
             conversation.
         tier: "auto" | "haiku" | "flash" | "sonnet" | "gemini-pro" | "local".
         timeout_s: max wall time. Default 120s; raise for long generations.
+        project: optional project label (typically your cwd or a stable
+            identifier). Stored as `task_id` on the usage record so
+            `khimaira usage savings --by task_id` can break down spend
+            by project. Required if `budget_usd` is set.
+        budget_usd: optional per-project rolling-30-day budget cap in
+            USD. If accumulated spend for this project already meets or
+            exceeds the cap, the dispatch is refused without running.
+            Loose gate — one in-flight call can overshoot — but stops
+            the next call cold.
     """
-    return await _delegate_impl(prompt, tier=tier, timeout_s=timeout_s)
+    return await _delegate_impl(
+        prompt,
+        tier=tier,
+        timeout_s=timeout_s,
+        project=project,
+        budget_usd=budget_usd,
+    )
 
 
 @mcp.tool()
 @logged_tool("auto")
-async def auto(prompt: str, timeout_s: int = 120) -> str:
+async def auto(
+    prompt: str,
+    timeout_s: int = 120,
+    project: str = "",
+    budget_usd: float | None = None,
+) -> str:
     """**Auto-routed answer.** Same as `delegate(tier="auto")` — picks the
     cheapest competent model from your enabled-for-auto pool, runs the
     prompt, returns the answer.
@@ -436,18 +458,54 @@ async def auto(prompt: str, timeout_s: int = 120) -> str:
     Args:
         prompt: the prompt to delegate.
         timeout_s: max wall time. Default 120s.
+        project: optional project label (cwd or stable identifier).
+            Stored as `task_id` on the usage record so spend can be
+            attributed per-project. Required if `budget_usd` is set.
+        budget_usd: optional per-project rolling-30-day budget cap in
+            USD. Refuses the dispatch if already met or exceeded.
     """
-    return await _delegate_impl(prompt, tier="auto", timeout_s=timeout_s)
+    return await _delegate_impl(
+        prompt,
+        tier="auto",
+        timeout_s=timeout_s,
+        project=project,
+        budget_usd=budget_usd,
+    )
 
 
 # Shared implementation behind `delegate` + `auto`. Kept as a private
 # helper so both MCP tools route through one code path — keeps usage
 # tracking, audit logging, and error envelopes consistent.
-async def _delegate_impl(prompt: str, *, tier: str, timeout_s: int) -> str:
+async def _delegate_impl(
+    prompt: str,
+    *,
+    tier: str,
+    timeout_s: int,
+    project: str = "",
+    budget_usd: float | None = None,
+) -> str:
     from khimaira.dispatch.classifier import classify_task
     from khimaira.dispatch.pool_router import select_from_pool
     from khimaira.dispatch.runners import get_runner
-    from khimaira.usage import get_recorder, runner_to_provider
+    from khimaira.usage import get_recorder, project_spend_usd, runner_to_provider
+
+    # Pre-dispatch budget gate. Loose by design — one in-flight call
+    # can overshoot the cap, but the next call gets cut off cleanly.
+    # Budget without a project label is a usage error (we'd have nothing
+    # to attribute the spend to).
+    if budget_usd is not None:
+        if not project:
+            return (
+                "❌ budget_usd requires project label — pass `project=<cwd or label>` "
+                "so spend can be attributed per-project."
+            )
+        spent = project_spend_usd(project)
+        if spent >= budget_usd:
+            return (
+                f"❌ budget exhausted: project={project!r} has spent "
+                f"${spent:.4f} in the last 30 days (cap ${budget_usd:.4f}). "
+                f"Raise the cap or wait for the rolling window to advance."
+            )
 
     # tier="auto" → classifier + pool router (cheapest competent model
     # from the registry's auto pool). Otherwise: explicit tier shortcut
@@ -508,7 +566,8 @@ async def _delegate_impl(prompt: str, *, tier: str, timeout_s: int) -> str:
         return f"❌ delegate dispatch failed: {e}"
 
     # Record usage with the correct mode so `khimaira usage savings` can
-    # attribute savings only to auto-mode calls.
+    # attribute savings only to auto-mode calls. Project label flows
+    # into task_id so `--by task_id` breakdowns can split spend by project.
     try:
         await get_recorder().record(
             runner=chosen_runner,
@@ -518,6 +577,7 @@ async def _delegate_impl(prompt: str, *, tier: str, timeout_s: int) -> str:
             output_tokens=result.output_tokens,
             latency_s=result.latency_s,
             role="delegate",
+            task_id=project or None,
             source="cli",
             mode=mode,
         )
