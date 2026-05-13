@@ -33,6 +33,11 @@ _LOG_FILE = _LOG_DIR / "usage.jsonl"
 #
 # Match by *prefix*: "claude-opus-4-7-20251022" → "claude-opus-4-7"
 # so future minor revs don't need code changes here.
+#
+# Tuple: (input, output). Cache pricing is derived from input via
+# CACHE_WRITE_MULTIPLIER + CACHE_READ_MULTIPLIER (Anthropic 5-min cache
+# is industry-standard; per-provider override would go here if/when
+# providers diverge enough to matter).
 _PRICES: dict[str, tuple[float, float]] = {
     # Anthropic Claude 4.x
     "claude-opus-4-7": (15.0, 75.0),
@@ -53,9 +58,41 @@ _PRICES: dict[str, tuple[float, float]] = {
     "gpt-4o-mini": (0.15, 0.60),
 }
 
+# Cache token pricing multipliers (relative to base input price).
+# Source: Anthropic public pricing for 5-minute ephemeral cache.
+# Cache write: ~1.25x input  → tokens we just wrote to the cache
+# Cache read:  ~0.10x input  → tokens we re-used from the cache
+# 1-hour cache costs 2x to write (vs 1.25x for 5-min); the savings
+# command undercounts cache_write spend by ~37% for 1-hour cache users
+# but the relative comparison (auto vs baseline) stays consistent
+# because both sides use the same multiplier.
+_CACHE_WRITE_MULTIPLIER = 1.25
+_CACHE_READ_MULTIPLIER = 0.10
 
-def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Estimate USD cost. Returns 0 for unknown models."""
+
+def estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
+    """Estimate USD cost given fresh + cache token counts.
+
+    For callers that don't track cache tokens separately (most CLI
+    runners report only the input_tokens total), pass 0 for the cache
+    args — the cost is computed as the legacy single-bucket
+    `(input + output)` math.
+
+    For callers with the breakdown (the SubagentStop hook reads it
+    from Anthropic-format transcripts), the cache tokens get billed
+    at their reduced rates so the absolute cost number reflects what
+    the provider actually charged.
+
+    Returns 0 for unknown models — keep the savings command running
+    even when a model isn't in the price table.
+    """
     if not model:
         return 0.0
     matches = [k for k in _PRICES if model.startswith(k)]
@@ -63,7 +100,13 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
         return 0.0
     key = max(matches, key=len)
     in_per_m, out_per_m = _PRICES[key]
-    return (input_tokens * in_per_m + output_tokens * out_per_m) / 1_000_000.0
+    total = (
+        input_tokens * in_per_m
+        + output_tokens * out_per_m
+        + cache_creation_tokens * in_per_m * _CACHE_WRITE_MULTIPLIER
+        + cache_read_tokens * in_per_m * _CACHE_READ_MULTIPLIER
+    )
+    return total / 1_000_000.0
 
 
 def log_file_path() -> Path:
@@ -95,8 +138,16 @@ class _Recorder:
         source: str = "cli",
         mode: str = "unknown",
         escalation_count: int = 0,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
     ) -> None:
-        cost = estimate_cost(model, input_tokens, output_tokens)
+        cost = estimate_cost(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
+        )
         record = UsageRecord(
             ts=datetime.now(timezone.utc).isoformat(),
             task_id=task_id,
@@ -106,6 +157,8 @@ class _Recorder:
             role=role,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
             latency_s=latency_s,
             estimated_cost_usd=cost,
             source=source,  # type: ignore[arg-type]

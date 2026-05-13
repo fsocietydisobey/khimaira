@@ -55,6 +55,22 @@ class UsageRecord(BaseModel):
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_tokens: int = Field(
+        default=0,
+        description=(
+            "Tokens billed at the cache-write rate (typically ~1.25x base "
+            "input for Anthropic 5-min cache). Populated only by callers that "
+            "can distinguish — most CLI runners report only the input_tokens "
+            "total and leave this at 0."
+        ),
+    )
+    cache_read_tokens: int = Field(
+        default=0,
+        description=(
+            "Tokens billed at the cache-read rate (~10% of base input for "
+            "Anthropic 5-min cache). 0 when caller can't distinguish."
+        ),
+    )
     latency_s: float = 0.0
     estimated_cost_usd: float = 0.0
 

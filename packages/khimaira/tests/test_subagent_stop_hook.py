@@ -114,8 +114,11 @@ def test_happy_path_writes_one_record(hook_module, tmp_path, monkeypatch):
     assert r["model"] == "claude-haiku-4-5-20251001"
     assert r["runner"] == "claude"
     assert r["provider"] == "anthropic"
-    # input_tokens folds in cache_creation + cache_read
-    assert r["input_tokens"] == 3 + 10965 + 0
+    # Cache tokens are now SEPARATE from input_tokens — cost math
+    # uses the right multiplier for each bucket (#58).
+    assert r["input_tokens"] == 3
+    assert r["cache_creation_tokens"] == 10965
+    assert r["cache_read_tokens"] == 0
     assert r["output_tokens"] == 144
     # Cost estimate non-zero (haiku has prices)
     assert r["estimated_cost_usd"] > 0

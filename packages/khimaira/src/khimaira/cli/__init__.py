@@ -28,6 +28,7 @@ from . import (
     heal,
     install_hooks,
     mcp_serve,
+    models as models_cmd,
     monitor,
     observer,
     route,
@@ -63,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     bootstrap_cmd.add_subparser(subparsers)
     heal.add_subparser(subparsers)
     usage_cmd.add_subparser(subparsers)
+    models_cmd.add_subparser(subparsers)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

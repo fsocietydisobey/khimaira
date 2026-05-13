@@ -67,8 +67,18 @@ _PRICES: dict[str, tuple[float, float]] = {
     "claude-haiku-4": (0.8, 4.0),
 }
 
+# Cache-token multipliers — match khimaira.usage._CACHE_*_MULTIPLIER.
+_CACHE_WRITE_MULTIPLIER = 1.25
+_CACHE_READ_MULTIPLIER = 0.10
 
-def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+
+def _estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
     if not model:
         return 0.0
     matches = [k for k in _PRICES if model.startswith(k)]
@@ -76,25 +86,38 @@ def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
         return 0.0
     key = max(matches, key=len)
     in_per_m, out_per_m = _PRICES[key]
-    return (input_tokens * in_per_m + output_tokens * out_per_m) / 1_000_000.0
+    total = (
+        input_tokens * in_per_m
+        + output_tokens * out_per_m
+        + cache_creation_tokens * in_per_m * _CACHE_WRITE_MULTIPLIER
+        + cache_read_tokens * in_per_m * _CACHE_READ_MULTIPLIER
+    )
+    return total / 1_000_000.0
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_transcript(transcript_path: Path) -> tuple[str, int, int]:
+def _parse_transcript(transcript_path: Path) -> tuple[str, int, int, int, int]:
     """Sum tokens across all assistant turns in the transcript.
 
-    Returns (model, input_tokens, output_tokens). Model is the LAST
-    assistant turn's model — multi-turn subagents are rare but if they
-    happen, all turns are the same agent so the model is stable.
-    Cache-creation and cache-read tokens are folded into input_tokens
-    (they are real input tokens the provider billed for).
+    Returns (model, input_tokens, output_tokens, cache_creation, cache_read).
+    Model is the LAST assistant turn's model — multi-turn subagents are
+    rare but if they happen, all turns share an agent so the model is
+    stable.
+
+    Cache tokens are kept SEPARATE from input_tokens (previously they
+    were folded in). Anthropic bills cache_creation at ~1.25x base
+    input and cache_read at ~0.1x base input — folding all three into
+    input_tokens over-counts the cost. Storing them separately lets
+    estimate_cost apply the right multipliers.
     """
     model = ""
     in_tok = 0
     out_tok = 0
+    cache_creation = 0
+    cache_read = 0
     with transcript_path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -116,10 +139,10 @@ def _parse_transcript(transcript_path: Path) -> tuple[str, int, int]:
             if not isinstance(usage, dict):
                 continue
             in_tok += int(usage.get("input_tokens") or 0)
-            in_tok += int(usage.get("cache_creation_input_tokens") or 0)
-            in_tok += int(usage.get("cache_read_input_tokens") or 0)
+            cache_creation += int(usage.get("cache_creation_input_tokens") or 0)
+            cache_read += int(usage.get("cache_read_input_tokens") or 0)
             out_tok += int(usage.get("output_tokens") or 0)
-    return model, in_tok, out_tok
+    return model, in_tok, out_tok, cache_creation, cache_read
 
 
 def _provider_for(model: str) -> str:
@@ -172,11 +195,15 @@ def main() -> int:
         return 0
 
     try:
-        model, in_tok, out_tok = _parse_transcript(transcript_path)
+        model, in_tok, out_tok, cache_creation, cache_read = _parse_transcript(
+            transcript_path
+        )
     except OSError:
         return 0
 
-    if not model or (in_tok == 0 and out_tok == 0):
+    if not model or (
+        in_tok == 0 and out_tok == 0 and cache_creation == 0 and cache_read == 0
+    ):
         # Nothing to record. Subagent may have errored before producing
         # any assistant turn.
         return 0
@@ -190,8 +217,16 @@ def main() -> int:
         "role": agent_type,  # e.g. "khimaira-factual"
         "input_tokens": in_tok,
         "output_tokens": out_tok,
+        "cache_creation_tokens": cache_creation,
+        "cache_read_tokens": cache_read,
         "latency_s": 0.0,  # not exposed by the hook payload
-        "estimated_cost_usd": _estimate_cost(model, in_tok, out_tok),
+        "estimated_cost_usd": _estimate_cost(
+            model,
+            in_tok,
+            out_tok,
+            cache_creation_tokens=cache_creation,
+            cache_read_tokens=cache_read,
+        ),
         "source": "cli",
         "mode": "subagent",
         "escalation_count": 0,
