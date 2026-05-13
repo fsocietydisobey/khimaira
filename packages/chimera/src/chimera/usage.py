@@ -25,9 +25,7 @@ from chimera.log import get_logger
 
 log = get_logger("usage")
 
-_LOG_DIR = Path(
-    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
-) / "chimera"
+_LOG_DIR = Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))) / "chimera"
 _LOG_FILE = _LOG_DIR / "usage.jsonl"
 
 # Per-million-token prices in USD. Best-effort — unknown models record
@@ -37,22 +35,22 @@ _LOG_FILE = _LOG_DIR / "usage.jsonl"
 # so future minor revs don't need code changes here.
 _PRICES: dict[str, tuple[float, float]] = {
     # Anthropic Claude 4.x
-    "claude-opus-4-7":   (15.0, 75.0),
-    "claude-opus-4-6":   (15.0, 75.0),
-    "claude-opus-4":     (15.0, 75.0),
+    "claude-opus-4-7": (15.0, 75.0),
+    "claude-opus-4-6": (15.0, 75.0),
+    "claude-opus-4": (15.0, 75.0),
     "claude-sonnet-4-6": (3.0, 15.0),
-    "claude-sonnet-4":   (3.0, 15.0),
-    "claude-haiku-4-5":  (0.8, 4.0),
-    "claude-haiku-4":    (0.8, 4.0),
+    "claude-sonnet-4": (3.0, 15.0),
+    "claude-haiku-4-5": (0.8, 4.0),
+    "claude-haiku-4": (0.8, 4.0),
     # Google Gemini 2.5
-    "gemini-2.5-pro":    (1.25, 10.0),
-    "gemini-2.5-flash":  (0.075, 0.30),
-    "gemini-2.0-pro":    (1.25, 10.0),
-    "gemini-2.0-flash":  (0.075, 0.30),
+    "gemini-2.5-pro": (1.25, 10.0),
+    "gemini-2.5-flash": (0.075, 0.30),
+    "gemini-2.0-pro": (1.25, 10.0),
+    "gemini-2.0-flash": (0.075, 0.30),
     # OpenAI Codex (rough; pricing varies across regions/tiers)
-    "gpt-5-codex":       (3.0, 12.0),
-    "gpt-4o":            (2.50, 10.0),
-    "gpt-4o-mini":       (0.15, 0.60),
+    "gpt-5-codex": (3.0, 12.0),
+    "gpt-4o": (2.50, 10.0),
+    "gpt-4o-mini": (0.15, 0.60),
 }
 
 
@@ -95,6 +93,7 @@ class _Recorder:
         role: str | None = None,
         task_id: str | None = None,
         source: str = "cli",
+        mode: str = "unknown",
         escalation_count: int = 0,
     ) -> None:
         cost = estimate_cost(model, input_tokens, output_tokens)
@@ -110,6 +109,7 @@ class _Recorder:
             latency_s=latency_s,
             estimated_cost_usd=cost,
             source=source,  # type: ignore[arg-type]
+            mode=mode,  # type: ignore[arg-type]
             escalation_count=escalation_count,
         )
         try:
@@ -211,11 +211,7 @@ def make_langchain_callback(provider: str, role: str | None = None):
             llm_output = getattr(response, "llm_output", None) or {}
 
             usage = llm_output.get("usage") or llm_output.get("usage_metadata") or {}
-            model = (
-                llm_output.get("model_name")
-                or llm_output.get("model")
-                or "unknown"
-            )
+            model = llm_output.get("model_name") or llm_output.get("model") or "unknown"
 
             input_tokens = (
                 usage.get("input_tokens")

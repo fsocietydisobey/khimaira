@@ -33,6 +33,7 @@ from . import (
     route,
     task,
     tools as tools_cmd,
+    usage as usage_cmd,
 )
 
 
@@ -61,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     tools_cmd.add_subparser(subparsers)
     bootstrap_cmd.add_subparser(subparsers)
     heal.add_subparser(subparsers)
+    usage_cmd.add_subparser(subparsers)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

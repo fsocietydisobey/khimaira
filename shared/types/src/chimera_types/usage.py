@@ -17,9 +17,15 @@ from pydantic import BaseModel, Field
 
 Provider = Literal["anthropic", "openai", "google", "local", "other"]
 Source = Literal[
-    "cli",            # CLI subprocess (claude, codex, gemini, ollama, llm)
-    "api",            # direct API SDK call (legacy, being removed)
-    "manual",         # synthetic record (testing)
+    "cli",  # CLI subprocess (claude, codex, gemini, ollama, llm)
+    "api",  # direct API SDK call (legacy, being removed)
+    "manual",  # synthetic record (testing)
+]
+Mode = Literal[
+    "auto",  # chimera classifier+pool_router picked the model
+    "explicit-tier",  # user passed an explicit tier (haiku/flash/sonnet/local) — bypassed pool_router
+    "manual",  # user picked the model directly (chimera task --model, direct chain call)
+    "unknown",  # legacy / pre-mode-tracking records
 ]
 
 
@@ -52,6 +58,18 @@ class UsageRecord(BaseModel):
     estimated_cost_usd: float = 0.0
 
     source: Source = "cli"
+
+    mode: Mode = Field(
+        default="unknown",
+        description=(
+            "How the model for this call was chosen. 'auto' = chimera "
+            "classifier + pool_router picked. 'explicit-tier' = user passed "
+            "a tier hint (haiku/flash/sonnet/local). 'manual' = user picked "
+            "the model directly. 'unknown' = legacy record predating mode "
+            "tracking. Used by `chimera usage savings` to attribute savings "
+            "only to auto-mode dispatches."
+        ),
+    )
 
     # Budget signal: when the router escalated mid-task (cheap → expensive)
     escalation_count: int = 0

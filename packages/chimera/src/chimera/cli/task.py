@@ -48,19 +48,25 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("description", help="What you want done.")
     p.add_argument(
-        "--project", default=None,
+        "--project",
+        default=None,
         help="Project directory for per-project routing-table overrides. Default: $PWD.",
     )
     p.add_argument(
-        "--budget", type=float, default=None,
+        "--budget",
+        type=float,
+        default=None,
         help="Max USD this task is allowed to cost. Refuses dispatch if classifier estimates over.",
     )
     p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Run classifier + router; print the decision without dispatching.",
     )
     p.add_argument(
-        "--timeout", type=int, default=None,
+        "--timeout",
+        type=int,
+        default=None,
         help="Override the dispatched runner's timeout (seconds).",
     )
     p.set_defaults(func=run)
@@ -152,8 +158,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         )
     except ClaudeAuthError as e:
         print(
-            f"\n[chimera task] STOP — Claude rejected the dispatch:\n  {e}\n"
-            "Not retrying.",
+            f"\n[chimera task] STOP — Claude rejected the dispatch:\n  {e}\nNot retrying.",
             file=sys.stderr,
         )
         return 5
@@ -174,12 +179,14 @@ async def _run_async(args: argparse.Namespace) -> int:
         role=classification.task_type,
         task_id=decision.task_id,
         source="cli",
+        mode="manual",
     )
 
     # Step 5 — print result + cost summary
     print(result.text)
 
     from chimera.usage import estimate_cost
+
     cost = estimate_cost(result.model, result.input_tokens, result.output_tokens)
     print(
         f"\n[chimera task] done in {elapsed:.1f}s · "
