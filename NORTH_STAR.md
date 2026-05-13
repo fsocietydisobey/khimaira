@@ -375,14 +375,14 @@ they don't get lost.
   (#60 — `mcp__khimaira__auto` + `delegate` accept `project` +
   `budget_usd` kwargs; pre-dispatch gate refuses when accumulated
   30-day spend exceeds the cap).
-- **Streaming for delegate responses — SCAFFOLD shipped, real
-  per-chunk streaming deferred** (#55 partial, 2026-05-13). The
-  `CLIRunner.stream()` Protocol + `StreamChunk` dataclass +
-  `default_stream_via_run` helper are in place; ClaudeRunner.stream()
-  currently degenerates to one final chunk (no real streaming). Real
-  `--output-format stream-json` parsing for the Claude runner is a
-  follow-up task — the call-site contract is set so the
-  implementation can drop in without touching consumers.
+- ~~**Streaming for delegate responses.**~~ ✅ shipped 2026-05-13
+  (#55 full). `CLIRunner.stream()` Protocol + `StreamChunk` dataclass +
+  `default_stream_via_run` helper PLUS real per-chunk streaming in
+  `ClaudeRunner.stream()` via `--output-format stream-json` parsing.
+  Yields one StreamChunk per `content_block_delta` text-delta event
+  with a final chunk carrying totals. Other runners use the default
+  helper (one-chunk degenerate stream) — when streaming for those
+  becomes useful, they can override the same Protocol method.
 - ~~**No multi-turn conversation through `mcp__khimaira__auto`.**~~
   ✅ shipped 2026-05-13 (#56 — `continue_task_id` kwarg on `auto()` +
   `delegate()` threads successive calls into one conversation via

@@ -8,13 +8,20 @@ state in favor of caller-passed session IDs.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
 
 from khimaira.log import get_logger
 
-from .base import CLIRunner, RunnerResult, cli_available, run_subprocess
+from .base import (
+    CLIRunner,
+    RunnerResult,
+    _build_subprocess_env,
+    cli_available,
+    run_subprocess,
+)
 
 log = get_logger("dispatch.runners.claude")
 
@@ -169,36 +176,198 @@ class ClaudeRunner:
         timeout: int | None = None,
         cwd: str | None = None,
         session_id: str | None = None,
-        **kwargs: object,
+        # Claude-specific kwargs (others ignored)
+        effort: str = "medium",
+        permission_mode: str = "acceptEdits",
+        extra_dirs: list[str] | None = None,
+        **_: object,
     ):
         """Stream the response as a sequence of StreamChunks.
 
-        Current implementation: scaffolded via `default_stream_via_run` —
-        runs `claude` in non-streaming mode and yields one final chunk.
-        This satisfies the Protocol so callers code against `stream()`
-        and the foundation is in place; a future change can swap in
-        real `--output-format stream-json` parsing without touching
-        the call sites.
+        Uses `claude --output-format stream-json --include-partial-messages`
+        and parses Anthropic's Messages API stream events
+        newline-delimited from stdout. Yields one StreamChunk per
+        `content_block_delta` event (text deltas as they arrive) and
+        one FINAL chunk on the `result` event with full usage + model
+        + session_id metadata.
 
-        Why scaffolded for now: Claude Code's stream-json format is
-        well-defined (Anthropic Messages API streaming events
-        newline-delimited) but the parser is enough work that it
-        deserves its own focused task. Tracked at the same NORTH_STAR
-        Phase 4 stretch where the rest of the streaming-related work
-        lives.
+        Empirical event format (verified 2026-05-13):
+          - system / hook_started / hook_response / init / status — skipped
+          - stream_event.event.message_start — contains initial model
+          - stream_event.event.content_block_delta with delta.type=text_delta
+            → yields one chunk per delta with delta.text
+          - stream_event.event.message_stop — end marker
+          - assistant — intermediate snapshot, skipped
+          - result — final event with total cost, full result text, usage
+
+        Falls back gracefully if any event line doesn't match the
+        expected shape — bad lines are skipped, the stream continues.
         """
-        from .base import default_stream_via_run
+        from .base import StreamChunk
 
-        async for chunk in default_stream_via_run(
-            self,
-            prompt,
-            model=model,
-            timeout=timeout,
+        if not self.is_available():
+            raise RuntimeError(
+                f"Claude CLI not found at `{self.cmd}`. "
+                "Set KHIMAIRA_CLAUDE_CMD or install Claude Code."
+            )
+
+        model_id = model or self.default_model
+
+        cmd = [
+            self.cmd,
+            "--strict-mcp-config",
+            "--mcp-config",
+            "/dev/null",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--verbose",
+            "--permission-mode",
+            permission_mode,
+            "--model",
+            model_id,
+        ]
+        if effort and effort != "medium":
+            cmd.extend(["--effort", effort])
+        for d in extra_dirs or []:
+            cmd.extend(["--add-dir", d])
+        if session_id:
+            cmd.extend(["--session-id", session_id])
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_build_subprocess_env(),
             cwd=cwd,
-            session_id=session_id,
-            **kwargs,
-        ):
-            yield chunk
+        )
+        # Feed prompt via stdin (matches the existing run() pattern).
+        if proc.stdin is not None:
+            proc.stdin.write(prompt.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+
+        # Track running usage so the final chunk has the right totals.
+        running_model = model_id
+        running_input = 0
+        running_output = 0
+        running_cache_creation = 0
+        running_cache_read = 0
+        running_session_id = session_id
+        final_text = ""
+
+        assert proc.stdout is not None
+        try:
+            while True:
+                if timeout is not None:
+                    try:
+                        line = await asyncio.wait_for(
+                            proc.stdout.readline(), timeout=timeout
+                        )
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.communicate()
+                        raise TimeoutError(
+                            f"claude streaming timed out after {timeout}s"
+                        ) from None
+                else:
+                    line = await proc.stdout.readline()
+                if not line:
+                    break
+
+                raw_line = line.decode("utf-8", errors="replace").strip()
+                if not raw_line:
+                    continue
+                try:
+                    rec = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+
+                rec_type = rec.get("type")
+
+                if rec_type == "stream_event":
+                    ev = rec.get("event") or {}
+                    if not isinstance(ev, dict):
+                        continue
+                    ev_type = ev.get("type")
+                    if ev_type == "message_start":
+                        msg = ev.get("message") or {}
+                        if isinstance(msg, dict):
+                            m = msg.get("model")
+                            if isinstance(m, str) and m:
+                                running_model = m
+                            sid = rec.get("session_id")
+                            if isinstance(sid, str) and sid:
+                                running_session_id = sid
+                    elif ev_type == "content_block_delta":
+                        delta = ev.get("delta") or {}
+                        if (
+                            isinstance(delta, dict)
+                            and delta.get("type") == "text_delta"
+                        ):
+                            txt = delta.get("text") or ""
+                            if txt:
+                                final_text += txt
+                                yield StreamChunk(text=txt, is_final=False)
+                    # content_block_start / message_delta / message_stop:
+                    # no text to surface; ignore.
+                elif rec_type == "result":
+                    # Final summary. Pull totals from the rich usage field.
+                    if rec.get("is_error"):
+                        # Surface error in the final chunk's text so callers
+                        # see something — non-fatal: stream still completes.
+                        err_msg = str(rec.get("result", "") or "claude error")
+                        yield StreamChunk(
+                            text=f"\n[claude error: {err_msg}]",
+                            is_final=False,
+                        )
+                    else:
+                        # If we somehow saw no deltas (rare), pick up the
+                        # full text from result.
+                        if not final_text:
+                            r = rec.get("result")
+                            if isinstance(r, str):
+                                final_text = r
+                                yield StreamChunk(text=r, is_final=False)
+                    usage = rec.get("usage") or {}
+                    if isinstance(usage, dict):
+                        running_input = int(usage.get("input_tokens") or 0)
+                        running_output = int(usage.get("output_tokens") or 0)
+                        running_cache_creation = int(
+                            usage.get("cache_creation_input_tokens") or 0
+                        )
+                        running_cache_read = int(
+                            usage.get("cache_read_input_tokens") or 0
+                        )
+                    sid = rec.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        running_session_id = sid
+                # system / assistant / etc — skip silently
+        finally:
+            # Drain stderr so we don't leak a half-closed pipe.
+            try:
+                await proc.communicate()
+            except Exception:
+                pass
+
+        # Final chunk — single source of truth for usage + model.
+        # cache_creation + cache_read folded into input_tokens here so the
+        # StreamChunk's shape matches RunnerResult (the non-streaming
+        # path does the same fold). Callers that care about the
+        # breakdown should record them as separate fields on UsageRecord
+        # (the SubagentStop hook is the canonical example).
+        yield StreamChunk(
+            text="",
+            is_final=True,
+            model=running_model,
+            input_tokens=running_input + running_cache_creation + running_cache_read,
+            output_tokens=running_output,
+            session_id=running_session_id,
+        )
 
 
 # Module-level singleton for convenience
