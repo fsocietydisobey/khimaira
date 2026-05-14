@@ -158,7 +158,7 @@ async def test_summarize_routes_through_khimaira_delegate():
 
     mock_delegate.assert_called_once()
     args, kwargs = mock_delegate.call_args
-    assert kwargs["tier"] == "auto"
+    assert kwargs["tier"] == "haiku"
     # The delegate header was stripped from the user-facing summary
     assert "Meeting was about deploys" in result["summary"]
     assert "_(via" not in result["summary"]

@@ -37,9 +37,16 @@ async def summarize(state: MeetingState) -> dict:
     except ImportError:
         return {"summary": "[summary unavailable — khimaira.server not importable]"}
 
+    # Pinned to tier="haiku" (claude) as a workaround for the
+    # 2026-05-13 gemini-runner bug: gemini's `-p prompt` arg-passing
+    # is broken — empty 0→0-token responses. Auto-routing currently
+    # prefers gemini for text tasks (cheaper) but the call silently
+    # fails. claude-haiku still under $1/M; the savings hit is tiny
+    # compared to the previous "use opus everywhere" baseline. Switch
+    # back to "auto" once tasks/gemini-runner-bug is resolved.
     result = await _delegate_impl(
         _PROMPT + transcript,
-        tier="auto",
+        tier="haiku",
         timeout_s=120,
         project=state.get("task_id") or "",
     )

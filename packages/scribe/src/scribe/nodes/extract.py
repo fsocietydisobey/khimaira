@@ -38,9 +38,11 @@ async def extract_actions(state: MeetingState) -> dict:
     except ImportError:
         return {"action_items": [], "decisions": [], "participants": []}
 
+    # See summarize.py for the gemini-runner workaround rationale —
+    # pinning to claude-haiku until tasks/gemini-runner-bug is resolved.
     raw = await _delegate_impl(
         _PROMPT + transcript,
-        tier="auto",
+        tier="haiku",
         timeout_s=120,
         project=state.get("task_id") or "",
     )
