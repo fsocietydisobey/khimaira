@@ -2756,10 +2756,17 @@ def main():
 
     from khimaira.dispatch.runners import kill_all_subprocesses
     from khimaira.pidlock import acquire_lock
+    from khimaira.server.sibling_tools import register_sibling_tools
 
     setup_logging()
     acquire_lock("graph")
     log.info("khimaira starting starting")
+    # NORTH_STAR Phase 0: surface seance/specter/scarlet tools under khimaira's
+    # MCP so one connection exposes the whole capability suite. Re-registration
+    # happens at server boot (not module import) so failures here can't
+    # break test collection that imports khimaira.server.mcp.
+    registered = register_sibling_tools(mcp)
+    log.info("khimaira mcp: re-registered %d sibling tools", registered)
     atexit.register(kill_all_subprocesses)
     mcp.run()
 
