@@ -22,7 +22,7 @@
 ```
 
 - **`packages/khimaira-chat/`** — workspace package (peer to seance/scarlet/sibyl). Ships a stdio MCP subprocess that Claude Code spawns per session.
-- **Subprocess role** — declares `claude/channel` capability. On first agent tool call, learns its session_id (lazy registration). Subscribes to daemon's `/api/chats/events?session_id=...` SSE stream. New events → emits `notifications/claude/channel` over stdio → agent sees `<channel>` block.
+- **Subprocess role** — declares `claude/channel` capability. On first agent tool call, learns its session_id (lazy registration; SessionStart hook calls `chat_my_chats()` to force this on boot). Subscribes to daemon's `/api/chats/events?session_id=...` SSE stream. Tracks last-seen event id per chat in memory; on reconnect (e.g. after daemon restart) passes `Last-Event-ID` header so daemon backfills from JSONL. New events → emits `notifications/claude/channel` over stdio → agent sees `<channel>` block.
 - **Daemon role (khimaira-monitor extension)** — owns chat state (rooms, members, transcripts), exposes `/api/chats/*` REST + an SSE event stream. Validates sender membership before fan-out (prompt injection gate per channels best practice).
 - **Per-peer install** — `khimaira sync` registers the chat MCP in each peer's `claude mcp` config. One-time setup per machine.
 
@@ -30,10 +30,10 @@
 
 | # | Decision | Rationale |
 |---|---|---|
-| 1. **chat_id model** | Stable per-pair-or-group: `chat_id = "chat-" + sha256(sorted(member_ids))[:12]`. `--new` flag generates a fresh `chat_id` (appends timestamp suffix) so the same members can start a new transcript. | Resume conversation across days by default; opt out for fresh starts. |
+| 1. **chat_id model** | Stable per-pair-or-group: `chat_id = "chat-" + sha256(sorted(member_ids) + (fresh_suffix or "")).hexdigest()[:12]`. `--new` generates a `fresh_suffix` (UTC ISO timestamp at create) that's hashed in, so the same members can start a fresh transcript with a distinct id. | Resume conversation across days by default; opt out for fresh starts. The suffix MUST be in the hash or `--new` collides with resume. |
 | 2. **Cardinality** | Groups from v1 (N-session rooms). Members can be added/removed after creation. Each member goes through handshake. | Joseph picked it; no extra cost vs pairs given the JSONL schema. |
 | 3. **Membership model** | True handshake — invitee must run `chat_accept(chat_id)` (or via `/khimaira-chat-accept`) before they receive messages. Sends to a member in `pending` state queue server-side until they accept. | Prevents surprise-routed messages; matches "phone call" mental model where both parties must answer. |
-| 4. **Lifecycle** | `chat_create_room`, `chat_invite`, `chat_accept`, `chat_send`, `chat_history`, `chat_leave`, `chat_delete`. Delete hard-archives the JSONL (move to `chats/archive/`); doesn't permanently shred. | Matches typical chat affordances. Archive over delete to allow recovery. |
+| 4. **Lifecycle** | `chat_create_room`, `chat_invite`, `chat_accept`, `chat_send`, `chat_history`, `chat_leave`, `chat_delete`. Delete hard-archives the JSONL (move to `chats/archive/`); doesn't permanently shred. **Permission rule: only the creator (`created_by`) can `chat_delete`.** Non-creators wanting out call `chat_leave` (sets their member-state to `left`; doesn't nuke history for everyone else). | Matches typical chat affordances. Archive over delete to allow recovery. Restricting delete to creator prevents hostile-actor "join 5-member group, nuke chat" attack. |
 | 5. **Transport** | `claude/channel` only (no polling fallback). | Matches the phone-feel requirement; the channels primitive is the right abstraction. Polling complexity (cursors, dedup against push) deferred to a v1.1 if real users hit channel breakage. |
 | 6. **MCP server location** | Workspace package `packages/khimaira-chat/`, separate process per session, separate `claude mcp` config entry. | Chat is structurally separate from monitor (different lifecycle, different scaling needs); split now is cheaper than at 50x scale. Pattern matches seance/scarlet/sibyl. |
 | 7. **Subprocess identity** | Lazy registration — agent passes its `session_id` on the first chat tool call. Subprocess stores it for its lifetime, opens SSE subscription. | Claude Code does NOT set `CLAUDE_SESSION_ID` env var for MCP subprocesses (only `CLAUDE_PROJECT_DIR`). Lazy-init is the cleanest workable pattern. |
@@ -66,8 +66,8 @@ Ship the load-bearing pieces:
 2. **Daemon endpoints** — `/api/chats` CRUD + `/api/chats/{chat_id}/events` SSE
 3. **State module** — `khimaira/monitor/chats.py` (write side, replay, sender gating, member transitions)
 4. **Subprocess MCP** — declares `claude/channel`, registers session lazily, subscribes to SSE, emits notifications, exposes `chat_*` tools
-5. **Slash commands** — `/khimaira-chat <peers...>` create+invite combo, `/khimaira-chat-accept <id>`, `/khimaira-chat-send <id> <body>`, `/khimaira-chat-history <id>`, `/khimaira-chat-leave <id>`, `/khimaira-chat-delete <id>`, `/khimaira-chat-list` (my chats)
-6. **Bootstrap integration** — `khimaira sync` registers the chat MCP per peer; `claude mcp add --transport stdio khimaira-chat -- uvx khimaira-chat` (or workspace path during dev)
+5. **Slash commands** — `/khimaira-chat <peers...>` create+invite combo, `/khimaira-chat-accept <id>`, `/khimaira-chat-send <id> <body>`, `/khimaira-chat-history <id>`, `/khimaira-chat-leave <id>`, `/khimaira-chat-delete <id>`, `/khimaira-chat-list` (my chats), `/khimaira-chat-poll <id>` (manual escape hatch — see "Channels failure mode" below)
+6. **Bootstrap integration** — `khimaira sync` registers the chat MCP per peer using `install_mode.detect_upgrade_tool()` so uvx users get `uv tool` and pip users get `pip`. `claude mcp add --transport stdio khimaira-chat -- <detected-runner> khimaira-chat` (or workspace path during dev). SessionStart hook addition: fire a one-shot `chat_my_chats(session_id)` to force subprocess registration on session boot — without this, "joined a chat yesterday, restarted today, didn't get a message until I happened to type" is a real failure mode.
 7. **Tests** — daemon-side: round-trip JSONL, member-state machine, gating (non-member send rejected, pending member doesn't receive). Subprocess-side: notification emit on SSE event. Smoke test: two real Claude Code sessions exchange messages live.
 
 Phase B (deferred):
@@ -121,6 +121,8 @@ packages/khimaira/src/khimaira/monitor/api/chats.py      (new)
   DELETE /api/chats/{chat_id}                             — archive
   GET    /api/chats?session_id=…                          — my chats
   GET    /api/chats/events?session_id=…                   — SSE stream of events for this session's chats
+                                                          — honors Last-Event-ID header for reconnect backfill (replays
+                                                            events from JSONL since the given event_id)
 
 packages/khimaira/src/khimaira/monitor/server.py         (extend)
   + register chats router
@@ -144,6 +146,7 @@ packages/khimaira/tests/test_chats_api.py                (new)
 ~/dotfiles/claude/commands/khimaira-chat-leave.md        (new)
 ~/dotfiles/claude/commands/khimaira-chat-delete.md       (new)
 ~/dotfiles/claude/commands/khimaira-chat-list.md         (new)
+~/dotfiles/claude/commands/khimaira-chat-poll.md         (new — manual escape hatch; pure pull via chat_history(since=last_seen))
 
 packages/khimaira/src/khimaira/bootstrap/runner.py       (extend)
   + register khimaira-chat MCP entry on sync
@@ -176,6 +179,11 @@ If the subprocess sees a tool call with a different `session_id` after registrat
 - **Don't queue messages for `pending` members forever.** Until they accept, sends to them go to a per-chat pending buffer. Cap at last 50 messages or 7 days; older ones drop with a `[N earlier messages dropped before you joined]` marker on accept.
 - **Don't depend on `CLAUDE_SESSION_ID`.** It's not set; lazy-register via tool call.
 - **Don't put chat tools in khimaira-monitor's MCP.** The split is intentional — chat lifetime, scaling, and failure mode differ from monitor. Mixing them couples lifecycles.
+- **Don't conflate chat with the other inbox primitives.** Three coexisting communication channels, three different use cases:
+  - `chat_send` — real-time interactive conversation (push via channels, sub-2s latency, requires both ends running)
+  - `session_post_notice` — async durable FYI to a specific session (lands in inbox, peer sees on next prompt; ack-or-expire after 3 surfaces)
+  - `session_log_question` — async with a reply contract (peer must answer; surfaces as incoming-question block)
+  Don't use chat for "leave a note for them to see when they wake" — that's `session_post_notice`. Don't use notice for "I need their input now" — that's `session_log_question` or chat.
 
 ## Done when
 
@@ -187,6 +195,8 @@ If the subprocess sees a tool call with a different `session_id` after registrat
 - `chat_history` returns the full transcript for accepted members; rejected for non-members
 - Tests cover the gating matrix + state machine transitions + SSE delivery
 - Smoke test: real two-window exchange documented in PR description with screenshots / transcript
+- Perf budget: daemon handles N=20 concurrent SSE connections with p99 fan-out latency < 500ms (verifiable via a tight-loop test fixture; useful for catching regressions)
+- Channels failure mode covered: `/khimaira-chat-poll <chat_id>` works as a manual pull when channels misbehave (research-preview protocol drift, MCP transport hiccup) — calls `chat_history(since=<last_seen>)`, prints new messages inline. Not auto-invoked; user runs explicitly.
 
 ## Open follow-ups (NOT v1 scope)
 
