@@ -518,6 +518,135 @@ def reconcile_mcp_drift(profile_names: set[str]) -> list[OpResult]:
 
 
 # ---------------------------------------------------------------------------
+# Sibling install re-run on profile-cmd change (task #66 v2.3)
+# ---------------------------------------------------------------------------
+
+_INSTALL_HASHES_FILE = (
+    Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
+    / "khimaira"
+    / "install_hashes.json"
+)
+
+
+def _hash_install(command: str) -> str:
+    """sha256-hex of the install command string. Stable across versions."""
+    import hashlib
+
+    return hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
+def _read_install_hashes() -> dict[str, str]:
+    """Map of repo-name → last-applied install-command hash."""
+    import json
+
+    try:
+        if not _INSTALL_HASHES_FILE.is_file():
+            return {}
+        data = json.loads(_INSTALL_HASHES_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items()}
+    except Exception:  # noqa: BLE001
+        log.warning("bootstrap: failed reading %s (ignoring)", _INSTALL_HASHES_FILE)
+        return {}
+
+
+def _write_install_hashes(hashes: dict[str, str]) -> None:
+    """Atomic-rename write of the install-hashes map."""
+    import json
+
+    try:
+        _INSTALL_HASHES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _INSTALL_HASHES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(hashes, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        tmp.replace(_INSTALL_HASHES_FILE)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bootstrap: failed writing %s: %s", _INSTALL_HASHES_FILE, exc)
+
+
+def maybe_reinstall_repo(spec: RepoSpec) -> OpResult:
+    """Re-run a sibling repo's install command IF the command changed.
+
+    Records a hash of the most recently applied install command per
+    repo at `~/.local/state/khimaira/install_hashes.json`. On each
+    sync:
+      - empty `install:` → skipped (nothing to compare)
+      - no recorded hash → BASELINE-only (record current, don't run).
+        Preserves the upgrade path from pre-v2.3 khimaira where
+        bootstrap already ran the install; we trust it succeeded.
+      - hash matches recorded → unchanged
+      - hash differs → run install, update state, return updated
+
+    Idempotent across consecutive syncs: once installed, repeated
+    syncs are no-ops unless the profile's install command is edited.
+    """
+    if not spec.install:
+        return OpResult(
+            op="repo-install",
+            target=spec.name,
+            status="skipped",
+            detail="no install command declared in profile",
+        )
+
+    path = spec.resolved_path()
+    if not path.is_dir():
+        return OpResult(
+            op="repo-install",
+            target=spec.name,
+            status="skipped",
+            detail=f"repo not cloned yet at {path} — run `khimaira bootstrap` first",
+        )
+
+    current_hash = _hash_install(spec.install)
+    hashes = _read_install_hashes()
+    recorded = hashes.get(spec.name)
+
+    if recorded is None:
+        # First time we've seen this repo's install command at the
+        # sync layer. Trust that bootstrap's earlier run was correct;
+        # record the current hash as the baseline without re-running.
+        hashes[spec.name] = current_hash
+        _write_install_hashes(hashes)
+        return OpResult(
+            op="repo-install",
+            target=spec.name,
+            status="unchanged",
+            detail="recorded install baseline (no re-run)",
+        )
+
+    if recorded == current_hash:
+        return OpResult(
+            op="repo-install",
+            target=spec.name,
+            status="unchanged",
+            detail="install command unchanged since last apply",
+        )
+
+    # Hash drifted — install command was edited in the profile. Re-run.
+    proc = _run(spec.install, cwd=path)
+    if proc.returncode != 0:
+        return OpResult(
+            op="repo-install",
+            target=spec.name,
+            status="failed",
+            detail=(
+                "install command failed: "
+                f"{(proc.stderr or proc.stdout).strip()[:300]}"
+            ),
+        )
+    hashes[spec.name] = current_hash
+    _write_install_hashes(hashes)
+    return OpResult(
+        op="repo-install",
+        target=spec.name,
+        status="updated",
+        detail="install command changed in profile — re-ran",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Monitor daemon freshness check (task #66 v2.2)
 # ---------------------------------------------------------------------------
 

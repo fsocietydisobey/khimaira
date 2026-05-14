@@ -700,3 +700,140 @@ def test_restart_monitor_runs_systemctl(monkeypatch):
 
     assert result.status == "updated"
     assert called == [["systemctl", "--user", "restart", "khimaira-monitor"]]
+
+
+# -------------------- v2.3: sibling install re-run -------------------- #
+
+
+def test_maybe_reinstall_repo_skipped_when_no_install_command(isolated_state, tmp_path):
+    """Repo with no `install:` declared → skipped (nothing to compare)."""
+    _, operations = isolated_state
+
+    spec = RepoSpec(name="no-install", url="file://x", path=str(tmp_path), install="")
+    result = operations.maybe_reinstall_repo(spec)
+
+    assert result.status == "skipped"
+    assert "no install command" in result.detail
+
+
+def test_maybe_reinstall_repo_skipped_when_repo_not_cloned(isolated_state, tmp_path):
+    """install: declared but repo dir doesn't exist → skipped (bootstrap path)."""
+    _, operations = isolated_state
+
+    spec = RepoSpec(
+        name="not-cloned",
+        url="file://x",
+        path=str(tmp_path / "does-not-exist"),
+        install="uv sync",
+    )
+    result = operations.maybe_reinstall_repo(spec)
+
+    assert result.status == "skipped"
+    assert "bootstrap" in result.detail.lower()
+
+
+def test_maybe_reinstall_repo_records_baseline_on_first_run(isolated_state, tmp_path):
+    """First sync (no hash recorded) → baseline-only, no run."""
+    _, operations = isolated_state
+
+    repo_path = tmp_path / "myrepo"
+    repo_path.mkdir()
+    spec = RepoSpec(name="myrepo", url="file://x", path=str(repo_path), install="uv sync")
+
+    result = operations.maybe_reinstall_repo(spec)
+
+    assert result.status == "unchanged"
+    assert "baseline" in result.detail.lower()
+    # Hash recorded
+    assert operations._read_install_hashes() == {
+        "myrepo": operations._hash_install("uv sync")
+    }
+
+
+def test_maybe_reinstall_repo_unchanged_when_command_unchanged(isolated_state, tmp_path):
+    """Second sync with same install command → unchanged (no run)."""
+    _, operations = isolated_state
+
+    repo_path = tmp_path / "myrepo"
+    repo_path.mkdir()
+    operations._write_install_hashes({"myrepo": operations._hash_install("uv sync")})
+
+    spec = RepoSpec(name="myrepo", url="file://x", path=str(repo_path), install="uv sync")
+    result = operations.maybe_reinstall_repo(spec)
+
+    assert result.status == "unchanged"
+    assert "unchanged since last apply" in result.detail
+
+
+def test_maybe_reinstall_repo_runs_when_command_changes(isolated_state, tmp_path, monkeypatch):
+    """Profile install command edited → hash drift → re-run + update hash."""
+    _, operations = isolated_state
+
+    repo_path = tmp_path / "myrepo"
+    repo_path.mkdir()
+    # Record OLD hash
+    operations._write_install_hashes({"myrepo": operations._hash_install("uv sync")})
+
+    ran_with: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        ran_with.append(cmd if isinstance(cmd, str) else " ".join(cmd))
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _Proc()
+
+    monkeypatch.setattr(operations, "_run", fake_run)
+
+    # NEW install command — hash will drift
+    spec = RepoSpec(
+        name="myrepo",
+        url="file://x",
+        path=str(repo_path),
+        install="uv sync --all-packages",
+    )
+    result = operations.maybe_reinstall_repo(spec)
+
+    assert result.status == "updated"
+    assert "re-ran" in result.detail
+    # The new command ran (via _run with the string form)
+    assert ran_with == ["uv sync --all-packages"]
+    # Hash file updated to reflect the new command
+    assert operations._read_install_hashes() == {
+        "myrepo": operations._hash_install("uv sync --all-packages")
+    }
+
+
+def test_maybe_reinstall_repo_failed_when_install_errors(isolated_state, tmp_path, monkeypatch):
+    """A non-zero install exit surfaces as failed; hash NOT updated
+    (so next sync retries instead of marking baseline as the new state)."""
+    _, operations = isolated_state
+
+    repo_path = tmp_path / "myrepo"
+    repo_path.mkdir()
+    operations._write_install_hashes({"myrepo": operations._hash_install("uv sync")})
+
+    def fake_run(cmd, **kwargs):
+        class _Proc:
+            returncode = 1
+            stdout = ""
+            stderr = "uv: command not found"
+        return _Proc()
+
+    monkeypatch.setattr(operations, "_run", fake_run)
+
+    spec = RepoSpec(
+        name="myrepo",
+        url="file://x",
+        path=str(repo_path),
+        install="uv sync --new-flag",
+    )
+    result = operations.maybe_reinstall_repo(spec)
+
+    assert result.status == "failed"
+    assert "install command failed" in result.detail
+    # Hash UNCHANGED — next sync should retry
+    assert operations._read_install_hashes() == {
+        "myrepo": operations._hash_install("uv sync")
+    }

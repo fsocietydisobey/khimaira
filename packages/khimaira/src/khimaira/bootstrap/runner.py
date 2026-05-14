@@ -188,6 +188,12 @@ def run_sync(
             ops.maybe_run_uv_sync(workspace_root, any_deps_changed)
         )
 
+    # --- 3b. sibling install re-run (v2.3) — for each repo, re-run
+    #          its `install:` command IFF the command changed in the
+    #          profile since last apply. First-time records baseline. ---
+    for repo_spec in profile.repos:
+        report.results.append(ops.maybe_reinstall_repo(repo_spec))
+
     # --- 4. apply symlinks (idempotent — picks up new entries) ---
     if profile.dotfiles:
         dotfiles_root = Path(os.path.expanduser(profile.dotfiles.path)).resolve()
