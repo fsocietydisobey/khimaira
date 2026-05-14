@@ -1,11 +1,22 @@
 [project]
-name = "specter"
-version = "0.1.0.dev0"
-description = "Browser debugging MCP server via Chrome DevTools Protocol — console, screenshots, React component tree, network, interaction."
+# Distribution name (PyPI): `khimaira-specter` — bare `specter` is
+# squatted on PyPI. Local package name + import path stay as `specter`.
+name = "khimaira-specter"
+version = "0.2.0"
+description = "Browser debugging MCP server via Chrome DevTools Protocol — part of the khimaira workspace. Console, screenshots, React component tree, network, interaction."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "fsocietydisobey" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Debuggers",
+]
+keywords = ["khimaira", "browser-debugging", "chrome-devtools-protocol", "cdp", "mcp"]
 dependencies = [
     "mcp[cli]>=1.0",
     "websockets>=13.0",
@@ -13,7 +24,13 @@ dependencies = [
     "click",
 ]
 
+[project.urls]
+Homepage = "https://github.com/fsocietydisobey/khimaira"
+Repository = "https://github.com/fsocietydisobey/khimaira"
+Issues = "https://github.com/fsocietydisobey/khimaira/issues"
+
 [project.scripts]
+# Binary name stays `specter` for backward-compat with existing MCP configs.
 specter = "specter.cli:main"
 
 [build-system]

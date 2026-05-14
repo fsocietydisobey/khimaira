@@ -12,10 +12,10 @@ requires-python = ">=3.12"
 # below to redirect each name to the workspace member rather than PyPI.
 dependencies = [
     "khimaira",
-    "scarlet",
-    "seance",
-    "sibyl",
-    "specter",
+    "khimaira-scarlet",
+    "khimaira-seance",
+    "khimaira-sibyl",
+    "khimaira-specter",
     "khimaira-transport",
     "khimaira-types",
 ]
@@ -24,11 +24,15 @@ dependencies = [
 members = ["packages/*", "shared/*"]
 
 [tool.uv.sources]
+# v0.2.0 prefix-rename — siblings now publish to PyPI as
+# `khimaira-{seance,specter,scarlet,sibyl}`. Local module paths still
+# resolve via `from seance import ...` etc. (package directories
+# unchanged); only the PyPI distribution names changed.
 khimaira = { workspace = true }
-scarlet = { workspace = true }
-seance = { workspace = true }
-sibyl = { workspace = true }
-specter = { workspace = true }
+khimaira-scarlet = { workspace = true }
+khimaira-seance = { workspace = true }
+khimaira-sibyl = { workspace = true }
+khimaira-specter = { workspace = true }
 khimaira-transport = { workspace = true }
 khimaira-types = { workspace = true }
 

@@ -1,11 +1,23 @@
 [project]
-name = "seance"
-version = "0.1.0.dev0"
-description = "Semantic codebase search MCP server. Indexes code into vector embeddings for natural language retrieval."
+# Distribution name (PyPI): `khimaira-seance` — the bare `seance` name is
+# squatted on PyPI by an unrelated project. Local package name + import
+# path stay as `seance` (src/seance/, `from seance import ...`).
+name = "khimaira-seance"
+version = "0.2.0"
+description = "Semantic codebase search MCP server — part of the khimaira workspace. Indexes code into vector embeddings for natural language retrieval."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "fsocietydisobey" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+keywords = ["khimaira", "semantic-search", "code-search", "vector-embeddings", "tree-sitter", "mcp"]
 dependencies = [
     "mcp[cli]>=1.0",
     "google-genai",
@@ -17,7 +29,16 @@ dependencies = [
     "qdrant-client>=1.17.1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/fsocietydisobey/khimaira"
+Repository = "https://github.com/fsocietydisobey/khimaira"
+Issues = "https://github.com/fsocietydisobey/khimaira/issues"
+
 [project.scripts]
+# Binary name stays `seance` (not `khimaira-seance`) for backward-compat
+# with anyone who already has `seance serve` in their MCP configs or
+# shell history. The distribution-name prefix is a PyPI namespacing
+# decision; the user-facing CLI surface doesn't change.
 seance = "seance.cli:main"
 
 [build-system]

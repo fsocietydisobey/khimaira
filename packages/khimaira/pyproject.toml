@@ -43,7 +43,17 @@ khimaira-types = { workspace = true }
 khimaira-transport = { workspace = true }
 
 [project.optional-dependencies]
-all = []
+# `pip install khimaira[all]` pulls every sibling on PyPI. Resolves to
+# the prefixed distribution names (the bare `seance`/`specter`/`scarlet`/
+# `sibyl` names are squatted on PyPI, so siblings ship as `khimaira-*`).
+# Local-workspace dev still uses the unprefixed local names via
+# [tool.uv.sources] redirects.
+all = [
+    "khimaira-seance>=0.2.0",
+    "khimaira-specter>=0.2.0",
+    "khimaira-scarlet>=0.2.0",
+    "khimaira-sibyl>=0.2.0",
+]
 
 [project.scripts]
 khimaira = "khimaira.cli:main"
