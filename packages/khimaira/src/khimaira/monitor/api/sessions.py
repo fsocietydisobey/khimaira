@@ -176,7 +176,7 @@ def build_router():
 
     @router.get("/sessions/{session_id}/questions/{question_id}/wait")
     async def wait_for_answer(
-        session_id: str, question_id: str, timeout: float = 300.0
+        session_id: str, question_id: str, timeout: float = 900.0
     ) -> dict:
         """Long-poll: block until question_id is answered on session_id.
 

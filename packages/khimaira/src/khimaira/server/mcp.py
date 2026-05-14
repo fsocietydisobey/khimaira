@@ -2420,7 +2420,7 @@ async def session_post_notice(
 async def session_wait_for_answer(
     session_id: str,
     question_id: str,
-    timeout: float = 300.0,
+    timeout: float = 900.0,
 ) -> str:
     """**Real-time block.** Wait for an answer to a targeted question.
 
@@ -2432,7 +2432,7 @@ async def session_wait_for_answer(
             target_session_id="other-session",
         )
         # ... maybe do other work ...
-        answer = session_wait_for_answer(ME, qid, timeout=300)
+        answer = session_wait_for_answer(ME, qid, timeout=900)
 
     This collapses what would otherwise be a two-turn ping-pong
     ("ask, end turn, user wakes A again to read answer") into a
@@ -2443,13 +2443,14 @@ async def session_wait_for_answer(
 
     Use sparingly. Cross-session waits make A blocked-on-B; if B
     isn't going to be woken in time, the timeout fires and you've
-    wasted the wall clock. Default 300s; reduce for low-stakes asks
-    or increase for things you genuinely need before proceeding.
+    wasted the wall clock. Default 900s (15 min) — matches realistic
+    "switch terminal, finish current thought, answer" cadence. Reduce
+    for low-stakes asks; increase if you know B is mid-long-task.
 
     Args:
         session_id: the session that logged the question (you).
         question_id: the 12-char hex id from session_log_question.
-        timeout: max seconds to wait. Default 300 (5 min).
+        timeout: max seconds to wait. Default 900 (15 min).
     """
     return await _monitor_tools.session_wait_for_answer(session_id, question_id, timeout)
 
