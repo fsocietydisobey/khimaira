@@ -119,19 +119,28 @@ If no tasks are open, the block is omitted entirely.
 
 ### Linear adapter
 
-Requires daemon-side MCP dispatch — the SessionStart hook can't call
-`mcp__linear__list_issues` directly. Path:
+**Status (2026-05-14)**: design + skeleton landed. Full implementation
+spec at [`tasks/linear-adapter/IMPLEMENTATION.md`](../linear-adapter/IMPLEMENTATION.md).
+Estimate: ~1-1.5 days for the daemon-side MCP dispatch +
+LinearTaskSource HTTP-client switch.
+
+The skeleton at `packages/khimaira/src/khimaira/task_sources/linear.py`
+returns `[]` cleanly + `hook_safe()=False`. Users can add
+`{kind: linear, enabled: true}` to their `task_sources.yaml` today —
+it resolves but produces no tasks until the daemon endpoint ships.
+
+Architecture (full detail in the dedicated spec):
 
 1. Add `GET /api/task-sources/fetch?kind=<source>` endpoint to the
    khimaira daemon.
-2. Daemon-side: invoke the requested adapter, return JSON list.
-3. Adapters that need MCP (Linear, GitHub via MCP, etc.) live as
-   daemon-side implementations; hook calls them through HTTP.
+2. Daemon-side: invoke the requested adapter via its MCP client
+   subsystem, return JSON list.
+3. Adapters that need MCP (Linear, future Jira/Asana/etc.) live as
+   daemon-side implementations; hook-side adapters become thin
+   HTTP clients pointing at the daemon endpoint.
 4. Hook's `hook_safe_only=True` becomes irrelevant — daemon
-   abstraction makes every source hook-safe at the protocol level.
-
-Cost: ~1 day for the daemon endpoint + adapter; per-source adapter
-work on top of that.
+   abstraction makes every source hook-safe at the protocol level
+   once the endpoint lands.
 
 ### ~~GitHub Issues adapter~~ ✅ shipped
 

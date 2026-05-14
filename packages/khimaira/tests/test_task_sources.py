@@ -164,7 +164,7 @@ async def test_load_configured_sources_ignores_unknown_kind(isolated_home):
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
         "sources:\n"
-        "  - kind: linear\n"   # not built-in; logs warning + skipped
+        "  - kind: not-a-real-tracker\n"  # not built-in; logs warning + skipped
         "    enabled: true\n"
         "  - kind: jsonl\n"
         f"    path: {home / 'todo.jsonl'}\n"
@@ -349,3 +349,48 @@ async def test_fetch_all_open_tasks_exception_isolation(isolated_home):
         [_BrokenSource(), JsonlTaskSource(path=a)]
     )
     assert [t.id for t in tasks] == ["A-1"]
+
+
+# -------------------- LinearTaskSource (skeleton, 2026-05-14) -------------------- #
+
+
+async def test_linear_skeleton_returns_empty():
+    """The skeleton adapter returns [] cleanly — no daemon endpoint yet.
+
+    See tasks/linear-adapter/IMPLEMENTATION.md for the full impl plan.
+    This test pins the contract: until daemon-side MCP dispatch lands,
+    the adapter is a silent no-op, not a NotImplementedError + crash.
+    """
+    from khimaira.task_sources.linear import LinearTaskSource
+
+    src = LinearTaskSource()
+    assert src.name == "linear"
+    assert src.hook_safe() is False  # flips to True after Step 3 in the spec
+    assert await src.fetch_open_tasks() == []
+
+
+def test_linear_kind_resolves_in_config_builder(isolated_home):
+    """`{kind: linear, enabled: true}` in task_sources.yaml resolves to
+    a LinearTaskSource — users can opt in today; the adapter silently
+    returns nothing until the daemon endpoint ships."""
+    from khimaira.task_sources.config import _build_source
+    from khimaira.task_sources.linear import LinearTaskSource
+
+    entry = {"kind": "linear", "enabled": True}
+    source = _build_source(entry)
+    assert source is not None
+    assert isinstance(source, LinearTaskSource)
+    assert source.name == "linear"
+
+
+def test_linear_skeleton_carries_config_overrides():
+    """Config overrides (daemon_port, timeout_s) reach the adapter — when
+    the real impl lands, these tunables wire to the HTTP client."""
+    from khimaira.task_sources.config import _build_source
+    from khimaira.task_sources.linear import LinearTaskSource
+
+    entry = {"kind": "linear", "daemon_port": 9999, "timeout_s": 5.0}
+    source = _build_source(entry)
+    assert isinstance(source, LinearTaskSource)
+    assert source.daemon_port == 9999
+    assert source.timeout_s == 5.0

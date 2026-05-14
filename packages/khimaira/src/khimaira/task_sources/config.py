@@ -37,6 +37,7 @@ from khimaira.log import get_logger
 from . import Task, TaskSource
 from .github import GithubTaskSource
 from .jsonl import JsonlTaskSource
+from .linear import LinearTaskSource
 
 log = get_logger("task_sources.config")
 
@@ -64,10 +65,18 @@ def _build_source(entry: dict[str, Any]) -> TaskSource | None:
             cmd=str(entry.get("cmd", "gh") or "gh"),
             timeout_s=float(entry.get("timeout_s", 10.0) or 10.0),
         )
+    if kind == "linear":
+        # Skeleton — returns [] until daemon-side MCP dispatch ships.
+        # See tasks/linear-adapter/IMPLEMENTATION.md.
+        return LinearTaskSource(
+            daemon_port=int(entry.get("daemon_port", 8740) or 8740),
+            timeout_s=float(entry.get("timeout_s", 10.0) or 10.0),
+        )
     log.warning(
         "task_sources: unknown kind %r in config — ignoring entry %r. "
-        "Built-in kinds: jsonl, github. See tasks/task-sources/IMPLEMENTATION.md "
-        "for the adapter contract if you want to add one.",
+        "Built-in kinds: jsonl, github, linear (linear is currently a "
+        "skeleton — returns no tasks until daemon-side MCP dispatch "
+        "ships, see tasks/linear-adapter/IMPLEMENTATION.md).",
         kind,
         entry,
     )
