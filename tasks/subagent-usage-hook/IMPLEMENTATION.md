@@ -43,7 +43,7 @@ Verification path:
 **Decision point:** if the payload includes `model` and `input_tokens`
 + `output_tokens`, we write a `UsageRecord` directly. If it only
 includes a transcript path, we parse the transcript JSONL to extract
-token counts (~50 LOC parser, chimera-extension's estimate).
+token counts (~50 LOC parser, khimaira-extension's estimate).
 
 ### Step 2 — extend the `Mode` Literal
 
