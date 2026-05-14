@@ -2,11 +2,17 @@
 
 > *To find what is hidden, hold a séance. To bind the names you find, give them to Scarlet.*
 
+> **Scarlet now ships inside [khimaira](https://github.com/fsocietydisobey/khimaira)**
+> as a workspace member at `packages/scarlet/`. Its tools are
+> re-registered on khimaira's MCP server under source-prefixed names
+> (`mcp__khimaira__scarlet_analyze_project`, etc.). The standalone
+> `scarlet serve` path below still works for backward compatibility.
+
 Scarlet is a **codebase cartographer** — an MCP server that walks any project, extracts structural metadata via tree-sitter, and generates the documentation scaffolding AI assistants need to actually understand a feature-organized codebase: per-feature `CLAUDE.md` files, barrel exports (`index.js`/`index.ts`), Mermaid dependency graphs, and symbol manifests.
 
 Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), but works with any MCP-compatible client.
 
-The dark cousin of [Séance](https://github.com/fsocietydisobey/seance): Séance retrieves knowledge from the dead code via vector search; Scarlet inscribes the names of every entity into a permanent record.
+The dark cousin of Séance: Séance retrieves knowledge from the dead code via vector search; Scarlet inscribes the names of every entity into a permanent record. Both now live inside the khimaira workspace.
 
 ## Why "Scarlet"
 

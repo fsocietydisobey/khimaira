@@ -1,5 +1,13 @@
 # Project: Séance
 
+> **Now part of the khimaira monorepo (NORTH_STAR Phase 0, 2026-05-13).**
+> Séance's tools are exposed via khimaira's unified MCP server under
+> source-prefixed names: `mcp__khimaira__seance_semantic_search`,
+> `mcp__khimaira__seance_index_project`, etc. The standalone
+> `seance serve` command below remains for backward compat and
+> isolation testing, but the canonical install path is through
+> khimaira (`uvx khimaira mcp`).
+
 Semantic codebase search MCP server. Indexes source code into vector embeddings using AST-aware chunking (tree-sitter) and serves natural language queries over those embeddings via the MCP protocol. Gives AI assistants (Claude Code, etc.) the ability to answer vague questions like "how does auth work?" without knowing exact symbol names.
 
 ## Commands

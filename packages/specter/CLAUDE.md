@@ -1,8 +1,16 @@
 # Project: Specter
 
+> **Now part of the khimaira monorepo (NORTH_STAR Phase 0, 2026-05-13).**
+> Specter's tools are exposed via khimaira's unified MCP server under
+> source-prefixed names: `mcp__khimaira__specter_take_screenshot`,
+> `mcp__khimaira__specter_get_console_logs`, etc. The standalone
+> `specter serve` command below remains for backward compat and
+> isolation testing, but the canonical install path is through
+> khimaira (`uvx khimaira mcp`).
+
 Browser debugging MCP server. Connects to Firefox via Chrome DevTools Protocol (CDP), captures console logs, errors, network activity, and screenshots in real time. Gives AI assistants eyes into the browser during local development.
 
-Part of the MCP tooling suite alongside Séance (semantic code search), Scarlet (codebase cartography), and Serena (LSP navigation).
+Part of the MCP tooling suite alongside Séance (semantic code search) and Scarlet (codebase cartography) — all three now ship inside the khimaira workspace and surface through khimaira's MCP. Serena (LSP navigation, jeevy-only) remains an independent MCP server.
 
 ## Commands
 

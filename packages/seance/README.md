@@ -1,5 +1,13 @@
 # Séance
 
+> **Séance now ships inside [khimaira](https://github.com/fsocietydisobey/khimaira)**
+> as a workspace member at `packages/seance/`. Its tools are
+> re-registered on khimaira's MCP server under source-prefixed names
+> (`mcp__khimaira__seance_semantic_search`, etc.) so one MCP connection
+> exposes both khimaira's orchestration tools and Séance's search
+> tools. The standalone `seance serve` path below still works for
+> backward compatibility.
+
 Semantic codebase search as an MCP server. Indexes source code into vector embeddings using AST-aware chunking and serves natural language queries over those embeddings. Gives AI assistants the ability to answer vague questions like *"how does auth work?"* without knowing exact symbol names.
 
 Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), but works with any MCP-compatible client.

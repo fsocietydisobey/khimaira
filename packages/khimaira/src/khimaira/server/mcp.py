@@ -1,13 +1,21 @@
-"""KHIMAIRA MCP server — autonomous multi-model orchestration.
+"""KHIMAIRA MCP server — unified multi-model orchestration surface.
 
 Loads .env automatically so API keys don't need to be in MCP config.
 
-19 MCP tools:
-  Orchestration: health, research, architect, brainstorm, classify, chain,
-                 chain_pipeline, chain_refiner, swarm, chain_hypervisor,
-                 status, approve, history, rewind
-  Monitor:       monitor_projects, monitor_active_runs, monitor_thread_state,
-                 monitor_find_stuck, monitor_topology
+Tool categories (live count via `khimaira tools --category mcp`):
+  Cross-session coordination: session_* (~25 tools)
+  Routing + dispatch:         auto, delegate, classify, khimaira_configure
+  Pipeline orchestration:     chain*, architect, research, brainstorm,
+                              swarm, approve, status, history, rewind
+  Process supervision:        spawn_process, wait_for_process,
+                              kill_process, list_processes, follow_process
+  LangGraph observability:    monitor_*, wait_for_run
+  Health + introspection:     health, list_mcp_calls, usage_report
+
+NORTH_STAR Phase 0 (2026-05-13): sibling FastMCP tools from seance,
+specter, and scarlet are re-registered at boot under source-prefixed
+names (seance_*, specter_*, scarlet_*) so one MCP connection serves
+the whole capability suite. See `khimaira.server.sibling_tools`.
 """
 
 import asyncio

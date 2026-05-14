@@ -2,11 +2,17 @@
 
 > *The invisible observer.*
 
+> **Specter now ships inside [khimaira](https://github.com/fsocietydisobey/khimaira)**
+> as a workspace member at `packages/specter/`. Its tools are
+> re-registered on khimaira's MCP server under source-prefixed names
+> (`mcp__khimaira__specter_take_screenshot`, etc.). The standalone
+> `specter serve` path below still works for backward compatibility.
+
 Specter is a **browser debugging MCP server** that connects to Firefox via the Chrome DevTools Protocol (CDP) and gives AI assistants direct eyes into the browser: console logs, JavaScript exceptions, network activity, screenshots, DOM inspection, and runtime JS evaluation — all as MCP tools that Claude can call autonomously during debugging.
 
 Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), but works with any MCP-compatible client.
 
-Part of the dark MCP suite alongside [Séance](https://github.com/fsocietydisobey/seance) (semantic code search), [Scarlet](https://github.com/fsocietydisobey/scarlet) (codebase cartography), and Serena (LSP navigation).
+Part of the khimaira workspace alongside Séance (semantic code search) and Scarlet (codebase cartography); Serena (LSP navigation, jeevy-only) is an independent MCP server.
 
 ## Why "Specter"
 

@@ -68,26 +68,22 @@ If not, it doesn't belong on the critical path.
 - **Workspace consolidation (code-level)**: `packages/seance`,
   `packages/specter`, `packages/scarlet`, `packages/khimaira` all share
   one uv workspace, one lockfile, one `.venv`.
+- **Unified MCP surface (Phase 0, 2026-05-13)**: ✅ sibling source
+  consolidated into `packages/{seance,specter,scarlet}/`, and each
+  sibling's FastMCP tools re-registered on khimaira's MCP server
+  under source-prefixed names (`seance_*`, `specter_*`, `scarlet_*`).
+  `claude mcp list` shows one khimaira entry exposing all 113 tools
+  (65 native + 48 sibling). Standalone `seance serve` / `specter
+  serve` / `scarlet serve` paths remain for backward compat.
+- **Protocol documentation (Phase 1.1, 2026-05-13)**: ✅
+  `docs/PROTOCOL.md` documents the HTTP/MCP/CLI surfaces, stability
+  tiers, and the sibling-prefix contract for adapter authors.
 
 ---
 
 ## What's next
 
 Phases ordered by dependency. Each phase has a clear "done" gate.
-
-### Phase 0 — Unify MCP registration  (2-3 days)
-
-Today: 4 separate MCP servers (khimaira, seance, specter, scarlet).
-After: one khimaira MCP exposes everyone's tools.
-
-- Collapse duplicate copies at `~/dev/{seance,specter,scarlet}` (keep
-  the `packages/` versions as canonical).
-- Import seance/specter/scarlet tools into khimaira's MCP server,
-  re-expose under one connection.
-- Deprecate the standalone `seance serve` / `specter serve` /
-  `scarlet serve` commands.
-
-**Done when**: `claude mcp list` shows one khimaira entry with all tools.
 
 ### Phase 1.0 — MCP-first self-configuration  (3-5 days)
 

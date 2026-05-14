@@ -45,6 +45,8 @@ khimaira/                              # monorepo root, uv workspace
 
 Each perception package (`scarlet`, `seance`, `specter`) exposes BOTH a library API (`<pkg>.api.*` for in-process import by khimaira) AND an MCP server (`<pkg>.server.mcp` for direct shell use). Same logic, two transports — the model is "SDK or SQL, same engine."
 
+**NORTH_STAR Phase 0 (2026-05-13)**: each perception package's FastMCP tools are now also re-registered on khimaira's MCP server at boot under source-prefixed names (`seance_*`, `specter_*`, `scarlet_*`), so one MCP connection from any editor exposes the entire khimaira-family surface (~113 tools). The standalone `seance serve` / `specter serve` / `scarlet serve` paths remain for backward compatibility and isolation testing.
+
 ## khimaira package internals
 
 ```

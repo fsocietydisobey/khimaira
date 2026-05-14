@@ -1,5 +1,13 @@
 # Project: Scarlet
 
+> **Now part of the khimaira monorepo (NORTH_STAR Phase 0, 2026-05-13).**
+> Scarlet's tools are exposed via khimaira's unified MCP server under
+> source-prefixed names: `mcp__khimaira__scarlet_analyze_project`,
+> `mcp__khimaira__scarlet_build_claude_md`, etc. The standalone
+> `scarlet serve` command below remains for backward compat and
+> isolation testing, but the canonical install path is through
+> khimaira (`uvx khimaira mcp`).
+
 Codebase cartographer MCP server. Walks any project, extracts structural metadata via tree-sitter, and generates the documentation scaffolding AI assistants need: per-feature `CLAUDE.md` files, barrel exports (`index.js`/`index.ts`), dependency graphs (Mermaid), and symbol manifests.
 
 The dark cousin of Séance: where Séance summons knowledge from the dead code via vector search, Scarlet inscribes the names of every entity into a permanent record. *"To find what is hidden, hold a séance. To bind the names you find, give them to Scarlet."*
