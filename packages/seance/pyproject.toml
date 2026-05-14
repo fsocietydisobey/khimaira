@@ -1,15 +1,20 @@
 [project]
 name = "seance"
 version = "0.1.0.dev0"
-description = "Semantic code search via vector embeddings"
+description = "Semantic codebase search MCP server. Indexes code into vector embeddings for natural language retrieval."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "fsocietydisobey" }]
 dependencies = [
-    "sentence-transformers>=3.0",
-    "lancedb>=0.13",
-    "pyyaml>=6.0",
+    "mcp[cli]>=1.0",
+    "google-genai",
+    "tree-sitter>=0.21",
+    "tree-sitter-python>=0.21",
+    "tree-sitter-typescript",
+    "tree-sitter-javascript",
+    "click",
+    "qdrant-client>=1.17.1",
 ]
 
 [project.scripts]

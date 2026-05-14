@@ -1,13 +1,18 @@
 [project]
 name = "scarlet"
 version = "0.1.0.dev0"
-description = "Codebase cartography — CLAUDE.md, dep graphs, invariants via tree-sitter"
+description = "Codebase cartographer MCP server. Generates and maintains structural documentation: feature CLAUDE.md files, barrel exports, dependency graphs, symbol manifests."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "fsocietydisobey" }]
 dependencies = [
-    "tree-sitter>=0.23",
+    "mcp[cli]>=1.0",
+    "tree-sitter>=0.21",
+    "tree-sitter-python>=0.21",
+    "tree-sitter-typescript",
+    "tree-sitter-javascript",
+    "click",
     "pyyaml>=6.0",
 ]
 

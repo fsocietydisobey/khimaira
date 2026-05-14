@@ -1,8 +1,8 @@
-"""specter — browser debugging via Chrome DevTools Protocol.
+"""Specter — browser debugging MCP server.
 
-Console logs, screenshots, React component tree, network capture, page interaction.
-Library mode (specter.api.*) for in-process use; MCP server (specter.server)
-for direct shell access.
+The invisible observer. Connects to Firefox via Chrome DevTools Protocol,
+captures console logs, errors, network activity, and screenshots.
+Gives AI assistants eyes into the browser during debugging.
 """
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"

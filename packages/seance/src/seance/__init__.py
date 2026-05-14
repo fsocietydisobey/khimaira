@@ -1,7 +1,3 @@
-"""seance — semantic code search.
+"""Séance — semantic codebase search MCP server."""
 
-Finds relevant code by meaning, not just keywords. Library mode (seance.api.*)
-for in-process use; MCP server (seance.server) for direct shell access.
-"""
-
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"

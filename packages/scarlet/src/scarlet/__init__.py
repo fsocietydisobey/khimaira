@@ -1,8 +1,7 @@
-"""scarlet — codebase cartography for AI dev tools.
+"""Scarlet — codebase cartographer MCP server.
 
-Generates per-feature CLAUDE.md, dep graphs, barrel exports, symbol manifests.
-Library mode (scarlet.api.*) for in-process use; MCP server (scarlet.server)
-for direct shell access.
+She bears the names of every entity. To find what is hidden, hold a séance.
+To bind the names you find, give them to Scarlet.
 """
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"

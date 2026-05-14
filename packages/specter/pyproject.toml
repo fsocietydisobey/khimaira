@@ -1,14 +1,16 @@
 [project]
 name = "specter"
 version = "0.1.0.dev0"
-description = "Browser debugging via Chrome DevTools Protocol"
+description = "Browser debugging MCP server via Chrome DevTools Protocol — console, screenshots, React component tree, network, interaction."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "fsocietydisobey" }]
 dependencies = [
+    "mcp[cli]>=1.0",
     "websockets>=13.0",
     "httpx>=0.27",
+    "click",
 ]
 
 [project.scripts]
