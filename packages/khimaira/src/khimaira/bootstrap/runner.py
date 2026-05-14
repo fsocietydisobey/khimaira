@@ -197,6 +197,13 @@ def run_sync(profile: Profile, *, force: bool = False) -> RunReport:
     for mcp in profile.mcp_servers:
         report.results.append(ops.register_mcp(mcp, force=force))
 
+    # --- 5b. MCP drift reconcile (v2.1) — remove khimaira-managed entries
+    #         that have been dropped from the profile. Never touches
+    #         user-managed servers (only entries tracked in managed_mcp.json
+    #         state file get considered for removal). ---
+    profile_mcp_names = {m.name for m in profile.mcp_servers}
+    report.results.extend(ops.reconcile_mcp_drift(profile_mcp_names))
+
     # --- 6. re-apply Claude Code hooks ---
     # Idempotent at the install-hooks layer — and necessary on sync
     # because a khimaira pull may have shipped new hook modules.

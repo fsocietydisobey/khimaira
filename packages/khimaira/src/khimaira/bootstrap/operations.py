@@ -297,6 +297,49 @@ def apply_symlink(entry: SymlinkEntry, dotfiles_root: Path) -> OpResult:
 # ---------------------------------------------------------------------------
 
 
+# State file recording which MCP servers khimaira itself has registered.
+# Used by reconcile_mcp_drift to safely remove ONLY khimaira-managed
+# entries (never touches user-managed servers from outside the profile).
+_MANAGED_MCP_FILE = (
+    Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
+    / "khimaira"
+    / "managed_mcp.json"
+)
+
+
+def _read_managed_mcp() -> set[str]:
+    """Read the managed-MCP state file. Returns empty set on first run
+    or any read error (worst case: stale entries linger; sync is
+    additive-safe — they get cleaned up next time)."""
+    import json
+
+    try:
+        if not _MANAGED_MCP_FILE.is_file():
+            return set()
+        data = json.loads(_MANAGED_MCP_FILE.read_text(encoding="utf-8"))
+        names = data.get("registered_by_khimaira", []) if isinstance(data, dict) else []
+        return {str(n) for n in names if n}
+    except Exception:  # noqa: BLE001 — state read should never break sync
+        log.warning("bootstrap: failed reading %s (ignoring)", _MANAGED_MCP_FILE)
+        return set()
+
+
+def _write_managed_mcp(names: set[str]) -> None:
+    """Atomic-rename write of the managed-MCP set."""
+    import json
+
+    try:
+        _MANAGED_MCP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _MANAGED_MCP_FILE.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps({"registered_by_khimaira": sorted(names)}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(_MANAGED_MCP_FILE)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bootstrap: failed writing %s: %s", _MANAGED_MCP_FILE, exc)
+
+
 def _claude_mcp_list() -> tuple[bool, set[str]]:
     """Query `claude mcp list` and return (available, names).
 
@@ -384,12 +427,94 @@ def register_mcp(spec: McpServerSpec, *, force: bool = False) -> OpResult:
             status="failed",
             detail=f"claude mcp add failed: {(proc.stderr or proc.stdout).strip()[:300]}",
         )
+    # Track in managed-MCP state so reconcile_mcp_drift can later
+    # safely remove this entry if the profile drops it. Read-merge-write
+    # rather than blind-overwrite — other concurrent registrations
+    # shouldn't clobber each other (rare; safe to assume serial here
+    # since bootstrap/sync run register_mcp in a loop on one process).
+    managed = _read_managed_mcp()
+    if spec.name not in managed:
+        managed.add(spec.name)
+        _write_managed_mcp(managed)
     return OpResult(
         op="mcp-register",
         target=spec.name,
         status="created",
         detail="registered with Claude Code (user scope)",
     )
+
+
+def reconcile_mcp_drift(profile_names: set[str]) -> list[OpResult]:
+    """Remove MCP servers khimaira registered that are no longer in the profile.
+
+    Inverse of register_mcp. Only removes entries tracked in the
+    managed-MCP state file (`~/.local/state/khimaira/managed_mcp.json`)
+    — user-managed MCP servers added outside the profile (e.g. via
+    `claude mcp add personal-thing` by hand) are NEVER touched.
+
+    Returns one OpResult per removal attempt (`updated` on success,
+    `failed` if `claude mcp remove` errored). When nothing's stale,
+    returns a single `unchanged` row so the report stays uniform.
+
+    Idempotent: running on an already-converged state is a no-op.
+    """
+    available, existing = _claude_mcp_list()
+    if not available:
+        return [
+            OpResult(
+                op="mcp-reconcile",
+                target="all",
+                status="skipped",
+                detail="`claude` CLI not on PATH",
+            )
+        ]
+
+    managed = _read_managed_mcp()
+    # Stale = khimaira-managed AND still present in claude AND not in profile
+    stale = (managed & existing) - profile_names
+
+    if not stale:
+        return [
+            OpResult(
+                op="mcp-reconcile",
+                target="all",
+                status="unchanged",
+                detail="no stale khimaira-managed MCP entries",
+            )
+        ]
+
+    results: list[OpResult] = []
+    new_managed = set(managed)
+    for name in sorted(stale):
+        proc = _run(["claude", "mcp", "remove", name, "-s", "user"])
+        if proc.returncode != 0:
+            results.append(
+                OpResult(
+                    op="mcp-reconcile",
+                    target=name,
+                    status="failed",
+                    detail=(
+                        f"claude mcp remove failed: "
+                        f"{(proc.stderr or proc.stdout).strip()[:200]}"
+                    ),
+                )
+            )
+            continue
+        new_managed.discard(name)
+        results.append(
+            OpResult(
+                op="mcp-reconcile",
+                target=name,
+                status="updated",
+                detail="removed stale registration (was in managed state but not in profile)",
+            )
+        )
+
+    # Persist the trimmed state (only on at least one successful removal)
+    if new_managed != managed:
+        _write_managed_mcp(new_managed)
+
+    return results
 
 
 # ---------------------------------------------------------------------------

@@ -447,3 +447,118 @@ def test_summarize_sync_includes_unpushed():
     summary = summarize_sync(report)
     assert "5 unpushed" in summary
     assert "2 repo(s)" in summary
+
+
+# -------------------- v2.1: MCP drift idempotent-remove -------------------- #
+
+
+@pytest.fixture
+def isolated_state(tmp_path, monkeypatch):
+    """Re-root XDG_STATE_HOME so managed_mcp.json writes go to tmp."""
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    # Re-import operations to pick up the new XDG_STATE_HOME
+    import importlib
+    from khimaira.bootstrap import operations
+    importlib.reload(operations)
+    yield state, operations
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    importlib.reload(operations)
+
+
+def test_reconcile_mcp_drift_skipped_without_claude_cli(isolated_state, monkeypatch):
+    """No `claude` CLI on PATH → skip entirely (single OpResult, skipped)."""
+    _, operations = isolated_state
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+
+    results = operations.reconcile_mcp_drift({"khimaira"})
+
+    assert len(results) == 1
+    assert results[0].status == "skipped"
+    assert "claude" in results[0].detail.lower()
+
+
+def test_reconcile_mcp_drift_unchanged_when_no_stale_entries(isolated_state, monkeypatch):
+    """managed=empty + profile={khimaira} → unchanged (nothing to remove)."""
+    _, operations = isolated_state
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/claude")
+    monkeypatch.setattr(
+        operations, "_claude_mcp_list", lambda: (True, {"khimaira", "personal-mcp"})
+    )
+
+    results = operations.reconcile_mcp_drift({"khimaira"})
+
+    assert len(results) == 1
+    assert results[0].status == "unchanged"
+
+
+def test_reconcile_mcp_drift_removes_only_khimaira_managed(isolated_state, monkeypatch):
+    """A server in claude mcp list that's user-added (NOT in managed state)
+    must NOT be removed. Profile says only khimaira; user has personal-mcp;
+    both are present in claude. managed_mcp.json only lists khimaira (the
+    one khimaira ever registered). Result: nothing removed.
+    """
+    _, operations = isolated_state
+    # State: managed_mcp.json tracks ONLY khimaira (user-added personal-mcp
+    # was registered outside the profile, never tracked)
+    operations._write_managed_mcp({"khimaira"})
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/claude")
+    monkeypatch.setattr(
+        operations,
+        "_claude_mcp_list",
+        lambda: (True, {"khimaira", "personal-mcp"}),
+    )
+
+    # Profile contains khimaira; the user-added personal-mcp is NOT in profile
+    results = operations.reconcile_mcp_drift({"khimaira"})
+
+    # Nothing to remove: khimaira is in profile, personal-mcp not in managed state
+    assert all(r.status != "updated" for r in results)
+    # Managed state file unchanged
+    assert operations._read_managed_mcp() == {"khimaira"}
+
+
+def test_reconcile_mcp_drift_removes_dropped_khimaira_entry(isolated_state, monkeypatch):
+    """khimaira state managed=[khimaira, seance]; profile now only has
+    khimaira; both still in claude → seance gets removed."""
+    _, operations = isolated_state
+    operations._write_managed_mcp({"khimaira", "seance"})
+
+    remove_calls = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["claude", "mcp", "remove"]:
+            remove_calls.append(cmd[3])
+            # Return a mock CompletedProcess with returncode=0
+            class _Proc:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _Proc()
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _Proc()
+
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/claude")
+    monkeypatch.setattr(
+        operations,
+        "_claude_mcp_list",
+        lambda: (True, {"khimaira", "seance"}),
+    )
+    monkeypatch.setattr(operations, "_run", fake_run)
+
+    results = operations.reconcile_mcp_drift({"khimaira"})
+
+    # Seance was removed (not in profile but was khimaira-managed)
+    assert "seance" in remove_calls
+    assert "khimaira" not in remove_calls  # still in profile
+
+    updated_results = [r for r in results if r.status == "updated"]
+    assert len(updated_results) == 1
+    assert updated_results[0].target == "seance"
+
+    # Managed state file updated to drop seance
+    assert operations._read_managed_mcp() == {"khimaira"}
