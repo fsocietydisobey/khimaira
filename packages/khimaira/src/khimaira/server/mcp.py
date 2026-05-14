@@ -2416,6 +2416,75 @@ async def session_post_notice(
 
 
 @mcp.tool()
+@logged_tool("schedule_task")
+async def schedule_task(
+    target_session: str,
+    fire_at_utc: str,
+    prompt: str,
+    retry_policy: dict | None = None,
+    expires_in_hours: float = 168.0,
+) -> str:
+    """**Daemon-side ScheduleWakeup replacement.** Fire a prompt into a
+    session's inbox at a future time — survives this agent's window
+    closing, the daemon owns the lifecycle.
+
+    Use INSTEAD OF ScheduleWakeup when the work needs to survive your
+    current window (cross-session handoffs, scheduled cron, retries
+    with backoff, fire-and-forget reminders). Keep ScheduleWakeup for
+    "remind me in 5 min within this same conversation."
+
+    The fired prompt lands as a `kind=scheduled-task` note in the
+    target session's inbox; their UserPromptSubmit hook surfaces it
+    on next user prompt. Target must be alive at fire time — if not,
+    the task retries per `retry_policy` and eventually expires.
+
+    **Idempotency is your contract.** The scheduler is at-least-once
+    (daemon SIGKILL mid-fire → re-fire on restart). Scheduling
+    non-idempotent work (INSERT without upsert, send-email without
+    dedupe) will double-fire under unlucky timing. Make prompts
+    check-then-act.
+
+    Args:
+        target_session: session name or UUID receiving the prompt.
+        fire_at_utc: ISO 8601 UTC timestamp ("2026-05-15T00:15:00Z" or
+            "2026-05-15T00:15:00+00:00").
+        prompt: verbatim text the target agent should run.
+        retry_policy: {"max_attempts": int, "retry_after_seconds": int}.
+            Default {"max_attempts": 1, "retry_after_seconds": 300} —
+            no retry unless you opt in. Phase A is linear backoff only.
+        expires_in_hours: TTL — after this, task → status=expired.
+            Default 168h (7d).
+    """
+    return await _monitor_tools.schedule_task(
+        target_session,
+        fire_at_utc,
+        prompt,
+        retry_policy,
+        expires_in_hours,
+    )
+
+
+@mcp.tool()
+@logged_tool("list_scheduled_tasks")
+async def list_scheduled_tasks(
+    status: str | None = None, target: str | None = None
+) -> str:
+    """List scheduled tasks. Filter by status (`"scheduled,pending_retry"`)
+    or target session name/id."""
+    return await _monitor_tools.list_scheduled_tasks(status, target)
+
+
+@mcp.tool()
+@logged_tool("cancel_scheduled_task")
+async def cancel_scheduled_task(task_id: str) -> str:
+    """Cancel a scheduled task by id. Returns 409-equivalent message if
+    the task is currently firing (cancellation is racy mid-fire — stop
+    the daemon if you really need to halt it). Terminal-status tasks
+    (fired/expired/cancelled) are idempotent no-ops."""
+    return await _monitor_tools.cancel_scheduled_task(task_id)
+
+
+@mcp.tool()
 @logged_tool("session_wait_for_answer")
 async def session_wait_for_answer(
     session_id: str,

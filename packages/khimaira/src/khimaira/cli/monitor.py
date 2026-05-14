@@ -126,6 +126,24 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     p_uninstall_launchd.set_defaults(func=_run_uninstall_launchd)
 
+    p_compact_sched = sub.add_parser(
+        "compact-scheduler-state",
+        help="Rewrite ~/.local/state/khimaira/scheduled_tasks.jsonl, dropping terminal entries",
+        description=(
+            "Daemon-side scheduler state is append-only JSONL. Terminal "
+            "entries (fired/cancelled/expired) accumulate until compacted. "
+            "Compaction is opt-in — daemon boot doesn't auto-compact (avoids "
+            "thrash). Run when the state file grows large or as part of "
+            "periodic maintenance."
+        ),
+    )
+    p_compact_sched.add_argument(
+        "--force",
+        action="store_true",
+        help="Compact even if the state file is below the size threshold (1MB)",
+    )
+    p_compact_sched.set_defaults(func=_run_compact_scheduler_state)
+
 
 def _run_start(args: argparse.Namespace) -> int:
     from khimaira.monitor.cli import _cmd_start, _load_env
@@ -189,3 +207,23 @@ def _run_uninstall_launchd(args: argparse.Namespace) -> int:
     from khimaira.monitor.cli import _cmd_uninstall_launchd
 
     return _cmd_uninstall_launchd(args)
+
+
+def _run_compact_scheduler_state(args: argparse.Namespace) -> int:
+    from khimaira.monitor import scheduler
+
+    rewrote = scheduler.compact_if_needed(force=args.force)
+    path = scheduler._state_path()
+    if rewrote:
+        size = path.stat().st_size if path.exists() else 0
+        print(f"khimaira monitor: compacted {path} → {size} bytes")
+    else:
+        if not path.exists():
+            print(f"khimaira monitor: no scheduler state at {path} — nothing to compact")
+        else:
+            size = path.stat().st_size
+            print(
+                f"khimaira monitor: scheduler state at {path} is {size} bytes — "
+                f"below 1MB threshold, skipped. Use --force to compact anyway."
+            )
+    return 0

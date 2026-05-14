@@ -8,8 +8,8 @@
 
 from __future__ import annotations
 
-import os
 import asyncio
+import os
 import sys
 
 from khimaira.config import ROOTS
@@ -64,7 +64,9 @@ def build_app():
     connections_by_project = {p.path: discover_all(p.path) for p in projects}
     _print_banner(projects, connections_by_project)
 
-    app = fastapi.FastAPI(title="Khimaira Monitor", docs_url="/api/docs", openapi_url="/api/openapi.json")
+    app = fastapi.FastAPI(
+        title="Khimaira Monitor", docs_url="/api/docs", openapi_url="/api/openapi.json"
+    )
 
     # Mount API routers (lazy imports so optional deps don't bite at import time)
     from .api import anomalies as anomalies_api
@@ -74,6 +76,7 @@ def build_app():
     from .api import mcp_calls as mcp_calls_api
     from .api import processes as processes_api
     from .api import projects as projects_api
+    from .api import scheduled_tasks as scheduled_tasks_api
     from .api import schema_drift as drift_api
     from .api import sessions as sessions_api
     from .api import threads as threads_api
@@ -92,6 +95,16 @@ def build_app():
     app.include_router(sessions_api.build_router(), prefix="/api")
     app.include_router(mcp_calls_api.build_router(), prefix="/api")
     app.include_router(heartbeats_api.build_router(), prefix="/api")
+    app.include_router(scheduled_tasks_api.build_router(), prefix="/api")
+
+    # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
+    # Replay-on-boot recovers stuck-firing tasks; worker tick fires due tasks.
+    @app.on_event("startup")
+    async def _start_scheduler_worker() -> None:
+        from . import scheduler as scheduler_mod
+
+        scheduler_mod.replay()
+        asyncio.create_task(scheduler_mod.scheduler_loop())
 
     # Auto-scan: kick off background metadata enrichment for any project
     # whose cache is missing or stale. The worker drains serially so we
@@ -103,8 +116,7 @@ def build_app():
         n = meta_scanner.enqueue_stale([(p.name, p.path) for p in projects])
         if n:
             print(
-                f"khimaira monitor: queued {n} project(s) for metadata scan "
-                f"(runs in background)",
+                f"khimaira monitor: queued {n} project(s) for metadata scan (runs in background)",
                 file=sys.stderr,
             )
 
@@ -171,6 +183,7 @@ def build_app():
     @app.on_event("startup")
     async def _start_heartbeat_gc() -> None:
         from . import heartbeats as heartbeats_module
+
         asyncio.create_task(heartbeats_module.gc_loop())
 
     # Attach supervisor — auto-reattach khimaira_observer when target venvs
@@ -231,6 +244,7 @@ def build_app():
             # SPA fallback — serve index.html for any non-API route
             return FileResponse(str(dist / "index.html"))
     else:
+
         @app.get("/")
         async def placeholder():
             return {

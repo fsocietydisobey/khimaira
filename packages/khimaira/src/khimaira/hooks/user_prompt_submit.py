@@ -238,8 +238,12 @@ def _format_inbox(notes: list[dict], session_id: str) -> str:
         from_sid = (n.get("from_session_id") or "")[:8] or "external"
         nid = n.get("id", "?")
         remaining = n.get("_remaining_surfaces")
-        # 'answer' notes have answer text in `answer` field, not `text`.
-        body = (n.get("answer") or n.get("text") or "").strip()
+        # 'answer' notes have body in `answer`; 'notice' in `text`;
+        # 'scheduled-task' (daemon-side scheduler) in `prompt`.
+        body = (n.get("answer") or n.get("text") or n.get("prompt") or "").strip()
+        if kind == "scheduled-task":
+            task_id = n.get("task_id", "?")
+            body = f"🕒 scheduled task `{task_id}` fired — run this prompt:\n\n{body}"
         # 2500 chars (~625 tokens) — bounded by the 3-surface auto-expire.
         # Previous 600-char limit truncated answers mid-content; receivers
         # then reported "body cut off" without the key info even reaching

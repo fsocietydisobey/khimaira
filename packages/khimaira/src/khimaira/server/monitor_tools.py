@@ -1555,3 +1555,87 @@ async def session_list() -> str:
         "names internally, no need to list-then-filter._"
     )
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Persistent scheduler — daemon-side ScheduleWakeup replacement
+# ---------------------------------------------------------------------------
+
+
+async def schedule_task(
+    target_session: str,
+    fire_at_utc: str,
+    prompt: str,
+    retry_policy: dict | None = None,
+    expires_in_hours: float = 168.0,
+) -> str:
+    """Schedule a prompt to fire at fire_at_utc into target_session's inbox."""
+    data = _post(
+        "/api/scheduled-tasks",
+        {
+            "target_session": target_session,
+            "fire_at_utc": fire_at_utc,
+            "prompt": prompt,
+            "retry_policy": retry_policy,
+            "expires_in_hours": expires_in_hours,
+        },
+        timeout=10.0,
+    )
+    if isinstance(data, str):
+        return data
+    return (
+        f"🕒 scheduled task `{data['id']}` — fires at {data['fire_at_utc']} "
+        f"into `{data['target_session_name']}` (status: {data['status']})"
+    )
+
+
+async def list_scheduled_tasks(
+    status: str | None = None, target: str | None = None
+) -> str:
+    """List scheduled tasks. status='scheduled,pending_retry' filters by status;
+    target='<session-name-or-id>' filters by recipient."""
+    params: list[str] = []
+    if status:
+        params.append(f"status={urllib.parse.quote(status)}")
+    if target:
+        params.append(f"target={urllib.parse.quote(target)}")
+    qs = ("?" + "&".join(params)) if params else ""
+    data = _get(f"/api/scheduled-tasks{qs}", timeout=10.0)
+    if isinstance(data, str):
+        return data
+    tasks = data.get("tasks", [])
+    if not tasks:
+        return "No scheduled tasks match the filter."
+    lines = [f"**{len(tasks)} scheduled task(s):**\n"]
+    for t in tasks:
+        lines.append(
+            f"- `{t['id']}` → `{t['target_session_name']}` "
+            f"@ {t['fire_at_utc']} ({t['status']})"
+            f" — `{t['prompt'][:60]}{'…' if len(t['prompt']) > 60 else ''}`"
+        )
+    return "\n".join(lines)
+
+
+async def cancel_scheduled_task(task_id: str) -> str:
+    """Cancel a scheduled task. Valid only in scheduled/pending_retry states."""
+    url = f"{_DEFAULT_BASE}/api/scheduled-tasks/{urllib.parse.quote(task_id)}"
+    req = urllib.request.Request(url, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return f"❌ cancelled task `{task_id}` (was: {data.get('status', '?')})"
+    except urllib.error.HTTPError as e:
+        try:
+            payload = e.read().decode("utf-8")
+            detail = json.loads(payload).get("detail", payload)
+        except Exception:
+            detail = ""
+        if e.code == 409:
+            return f"⚠️  task `{task_id}` is firing right now — cancellation racy. {detail}"
+        if e.code == 404:
+            return f"⚠️  no scheduled task with id `{task_id}`."
+        return f"khimaira-monitor DELETE {url} → HTTP {e.code}: {detail[:300]}"
+    except urllib.error.URLError:
+        return _DAEMON_DOWN_HINT.format(base=_DEFAULT_BASE)
+    except Exception as exc:
+        return f"khimaira-monitor cancel failed: {exc}"
