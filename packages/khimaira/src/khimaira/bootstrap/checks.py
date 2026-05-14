@@ -339,3 +339,124 @@ def check_spa(khimaira_root: Path) -> OpResult:
         status="created",
         detail="would build SPA",
     )
+
+
+# ---------------------------------------------------------------------------
+# Sync-specific drift checks (task #66) — fetches but never merges.
+# ---------------------------------------------------------------------------
+
+
+def check_git_pull_repo(spec: "RepoSpec") -> OpResult:
+    """`khimaira sync --check` preview: what WOULD git_pull_repo do?
+
+    Runs `git fetch` (network op — keeps origin/main fresh) then
+    diffs HEAD against FETCH_HEAD locally. Returns:
+      - `unchanged` / "in sync with origin"  — nothing to pull
+      - `updated` / "would pull N commits"   — would-pull on apply
+      - `failed` / "would refuse ff-only"    — local diverged
+      - `skipped`                            — no git dir
+
+    Mirror of `git_pull_repo` from operations.py but with --check
+    semantics (no merge, no side effects on the working tree). The
+    `meta` dict carries the same commits_pulled + deps_changed flags
+    so the sync summary line can aggregate them in --check mode.
+    """
+    from khimaira.bootstrap.operations import (
+        _deps_touched_between,
+        _git_head,
+        _run,
+    )
+
+    path = spec.resolved_path()
+    if not (path / ".git").is_dir():
+        return OpResult(
+            op="repo-pull",
+            target=spec.name,
+            status="skipped",
+            detail=f"no git repo at {path} — run `khimaira bootstrap` first",
+        )
+
+    current_head = _git_head(path)
+    if current_head is None:
+        return OpResult(
+            op="repo-pull",
+            target=spec.name,
+            status="failed",
+            detail="couldn't read current HEAD",
+        )
+
+    fetch = _run(["git", "-C", str(path), "fetch", "--quiet"])
+    if fetch.returncode != 0:
+        return OpResult(
+            op="repo-pull",
+            target=spec.name,
+            status="failed",
+            detail=f"git fetch failed: {(fetch.stderr or fetch.stdout).strip()[:300]}",
+        )
+
+    fetch_head_p = _run(["git", "-C", str(path), "rev-parse", "FETCH_HEAD"])
+    if fetch_head_p.returncode != 0:
+        return OpResult(
+            op="repo-pull",
+            target=spec.name,
+            status="unchanged",
+            detail="nothing fetched (already in sync with upstream)",
+        )
+    fetch_head = (fetch_head_p.stdout or "").strip()
+
+    if current_head == fetch_head:
+        return OpResult(
+            op="repo-pull",
+            target=spec.name,
+            status="unchanged",
+            detail="in sync with origin",
+        )
+
+    # Would ff-only succeed? Use merge-base to detect divergence.
+    base_p = _run(
+        ["git", "-C", str(path), "merge-base", current_head, fetch_head]
+    )
+    base = (base_p.stdout or "").strip()
+    if base_p.returncode != 0 or not base:
+        return OpResult(
+            op="repo-pull",
+            target=spec.name,
+            status="failed",
+            detail="couldn't compute merge-base; manual git inspection needed",
+        )
+
+    if base != current_head:
+        # Local has commits not on FETCH_HEAD — ff-only would refuse.
+        return OpResult(
+            op="repo-pull",
+            target=spec.name,
+            status="failed",
+            detail=(
+                "would refuse ff-only — local has commits not on origin. "
+                f"Resolve manually: cd {path} && git status"
+            ),
+        )
+
+    # ff-only would succeed. Count commits + detect dep changes.
+    count_p = _run(
+        ["git", "-C", str(path), "rev-list", "--count", f"{current_head}..{fetch_head}"]
+    )
+    commits_pulled = 0
+    if count_p.returncode == 0:
+        try:
+            commits_pulled = int((count_p.stdout or "0").strip())
+        except ValueError:
+            pass
+
+    deps_changed = _deps_touched_between(path, current_head, fetch_head)
+    detail = f"would pull {commits_pulled} commit(s)"
+    if deps_changed:
+        detail += " · pyproject/uv.lock would change"
+
+    return OpResult(
+        op="repo-pull",
+        target=spec.name,
+        status="updated",
+        detail=detail,
+        meta={"commits_pulled": commits_pulled, "deps_changed": deps_changed},
+    )

@@ -294,3 +294,121 @@ def check_bootstrap(profile: Profile) -> RunReport:
             report.results.append(checks.check_spa(root))
 
     return report
+
+
+def check_sync(profile: Profile) -> RunReport:
+    """Read-only drift report: what would `run_sync` do right now?
+
+    Mirrors `run_sync`'s order but uses checks that fetch (network)
+    + diff locally rather than merging. No side effects on any
+    working tree:
+
+      1. dotfiles drift (clone status only — sync_dotfiles itself
+         is a `git pull`, which is the apply path)
+      2. sibling-repo would-pull preview (git fetch + diff)
+      3. uv-sync trigger (predicted, based on any deps_changed flag)
+      4. symlink drift
+      5. MCP server drift
+      6. Claude Code hooks drift
+      7. unpushed-commits report (already informational; reuse)
+
+    Distinct from `check_bootstrap`: bootstrap-check covers clone +
+    install paths; sync-check covers pull + dep-refresh paths. Both
+    fit together via `khimaira doctor` (which calls both).
+    """
+    report = RunReport()
+
+    # --- 1. dotfiles clone presence ---
+    if profile.dotfiles:
+        report.results.append(checks.check_dotfiles(profile.dotfiles))
+
+    # --- 2. sibling repos would-pull preview ---
+    any_deps_changed = False
+    for repo_spec in profile.repos:
+        r = checks.check_git_pull_repo(repo_spec)
+        report.results.append(r)
+        if r.meta.get("deps_changed"):
+            any_deps_changed = True
+
+    # --- 3. uv-sync trigger preview ---
+    workspace_root = _khimaira_repo_root()
+    if workspace_root is not None:
+        if any_deps_changed:
+            report.results.append(
+                ops.OpResult(
+                    op="uv-sync",
+                    target="workspace",
+                    status="updated",
+                    detail="would re-resolve workspace deps",
+                )
+            )
+        else:
+            report.results.append(
+                ops.OpResult(
+                    op="uv-sync",
+                    target="workspace",
+                    status="unchanged",
+                    detail="no pyproject/uv.lock changes incoming",
+                )
+            )
+
+    # --- 4. symlinks ---
+    if profile.dotfiles:
+        dotfiles_root = Path(os.path.expanduser(profile.dotfiles.path)).resolve()
+        if dotfiles_root.is_dir():
+            for entry in profile.dotfiles.symlinks:
+                report.results.append(checks.check_symlink(entry, dotfiles_root))
+
+    # --- 5. MCP server registrations ---
+    for mcp in profile.mcp_servers:
+        report.results.append(checks.check_mcp(mcp))
+
+    # --- 6. Claude Code hooks ---
+    if profile.install_claude_hooks:
+        report.results.append(checks.check_claude_hooks())
+
+    # --- 7. unpushed-commits report (reusing the apply-mode op — it's
+    #        already read-only / informational) ---
+    for repo_spec in profile.repos:
+        report.results.append(ops.check_unpushed(repo_spec))
+
+    return report
+
+
+def summarize_sync(report: RunReport) -> str:
+    """Aggregate task #66 metrics from a sync RunReport.
+
+    Reads `meta` from repo-pull + uv-sync + unpushed-check ops to
+    produce a single one-line summary suitable for the final report
+    tail (and parseable by `--quiet` mode + cron post-processors).
+
+    Format: "X commits pulled across N repo(s), Y deps refreshed,
+    Z unpushed commits on M repo(s)".
+    """
+    commits_pulled = 0
+    repos_pulled = 0
+    deps_refreshed = False
+    unpushed_total = 0
+    repos_with_unpushed = 0
+
+    for r in report.results:
+        if r.op == "repo-pull" and r.status == "updated":
+            commits_pulled += r.meta.get("commits_pulled", 0)
+            repos_pulled += 1
+        elif r.op == "uv-sync" and r.status == "updated":
+            deps_refreshed = True
+        elif r.op == "unpushed-check" and r.status == "updated":
+            unpushed_total += r.meta.get("unpushed_count", 0)
+            repos_with_unpushed += 1
+
+    parts: list[str] = []
+    if commits_pulled or repos_pulled:
+        parts.append(f"{commits_pulled} commit(s) across {repos_pulled} repo(s)")
+    if deps_refreshed:
+        parts.append("workspace deps refreshed")
+    if unpushed_total:
+        parts.append(
+            f"{unpushed_total} unpushed commit(s) on {repos_with_unpushed} repo(s)"
+        )
+
+    return " · ".join(parts) if parts else "no changes"

@@ -16,7 +16,14 @@ import argparse
 import sys
 
 from khimaira.bootstrap import dump_profile_json, load_profile, ProfileError
-from khimaira.bootstrap.runner import RunReport, check_bootstrap, run_bootstrap, run_sync
+from khimaira.bootstrap.runner import (
+    RunReport,
+    check_bootstrap,
+    check_sync,
+    run_bootstrap,
+    run_sync,
+    summarize_sync,
+)
 
 # Status → terminal-friendly glyph. Keep narrow (1 char + space) so output
 # columns align cleanly when the user pipes through `column` or similar.
@@ -73,12 +80,14 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
 
     p_sync = subparsers.add_parser(
         "sync",
-        help="Pull dotfiles + re-apply the profile manifest (ongoing cross-machine sync).",
+        help="Pull dotfiles + sibling repos + re-apply the profile manifest.",
         description=(
             "After the initial `khimaira bootstrap`, run `khimaira sync` "
-            "to pick up profile changes (new symlinks, new MCP servers, "
-            "etc.). Pulls the dotfiles repo, re-applies the manifest. "
-            "Idempotent — only changes what's actually drifted."
+            "to pick up changes across all machines (new commits in "
+            "dotfiles or sibling repos, new MCP servers, new hooks, "
+            "etc.). Idempotent — only changes what's actually drifted. "
+            "For full re-application (e.g. after a profile schema bump), "
+            "use `khimaira bootstrap` directly — no separate --reset flag."
         ),
     )
     p_sync.add_argument(
@@ -89,6 +98,25 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         "--force",
         action="store_true",
         help="Re-register MCP servers even if Claude Code already lists them.",
+    )
+    p_sync.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Read-only preview — fetch every repo, show what WOULD be "
+            "pulled / installed / re-registered, but apply nothing. "
+            "Network ops (git fetch) still run; local working trees + "
+            "settings.json are untouched."
+        ),
+    )
+    p_sync.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress per-operation rows; print only the final summary. "
+            "Suitable for cron / systemd timer invocations — silent on "
+            "no-op runs, single line on changes."
+        ),
     )
     p_sync.set_defaults(func=_run_sync)
 
@@ -206,8 +234,34 @@ def _run_sync(args: argparse.Namespace) -> int:
     if rc is not None:
         return rc
 
-    _print_header(args, "sync")
+    if args.check:
+        # --check is read-only: fetch + preview, no merges, no
+        # symlink rewrites, no MCP add. Header + per-op rows go to
+        # stdout; quiet mode suppresses the rows but keeps the summary.
+        if not args.quiet:
+            _print_header(args, "sync --check")
+            print("\nread-only drift report — nothing applied:")
+        report = check_sync(args.profile_obj)
+        if not args.quiet:
+            _print_report(report, action="check")
+        # Summarize task #66 metrics — runs in both verbose and quiet modes.
+        summary_line = summarize_sync(report)
+        if not args.quiet or summary_line != "no changes":
+            print(f"\nwould: {summary_line}")
+        return 1 if report.had_failures else 0
+
+    if not args.quiet:
+        _print_header(args, "sync")
 
     report = run_sync(args.profile_obj, force=args.force)
-    _print_report(report)
+
+    if not args.quiet:
+        _print_report(report)
+
+    summary_line = summarize_sync(report)
+    # Quiet mode is "silent on no-op": only print the summary if anything
+    # actually changed. Verbose always prints the summary.
+    if not args.quiet or summary_line != "no changes":
+        print(f"\ndone: {summary_line}")
+
     return 1 if report.had_failures else 0

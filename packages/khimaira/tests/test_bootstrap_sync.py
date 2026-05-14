@@ -303,3 +303,147 @@ def test_opresult_meta_carries_arbitrary_payload():
     assert r.meta["commits_pulled"] == 5
     assert r.meta["deps_changed"] is True
     assert r.meta["extra"] == "ok"
+
+
+# -------------------- check_git_pull_repo (--check semantics) -------------------- #
+
+
+def test_check_git_pull_repo_unchanged_when_in_sync(remote_with_clone):
+    """No new commits on remote → would-pull-0, status=unchanged."""
+    from khimaira.bootstrap.checks import check_git_pull_repo
+
+    _, local = remote_with_clone
+    result = check_git_pull_repo(_spec_for(local))
+
+    assert result.status == "unchanged"
+    assert "in sync" in result.detail.lower()
+
+
+def test_check_git_pull_repo_previews_pull_without_merging(remote_with_clone, tmp_path):
+    """A commit on remote shows as `updated` with would-pull detail —
+    BUT the working tree is NOT touched (no merge happens)."""
+    from khimaira.bootstrap.checks import check_git_pull_repo
+
+    remote, local = remote_with_clone
+    pre_head = subprocess.run(
+        ["git", "-C", str(local), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    pusher = tmp_path / "pusher"
+    subprocess.run(["git", "clone", str(remote), str(pusher)], check=True, capture_output=True)
+    _seed_commit(pusher, "feature.py", "x = 1\n", "add feature")
+    _git(pusher, "push", "origin", "main")
+
+    result = check_git_pull_repo(_spec_for(local))
+
+    assert result.status == "updated"
+    assert result.meta["commits_pulled"] == 1
+    assert "would pull" in result.detail.lower()
+    # The working tree must NOT have moved — check pinned local HEAD
+    post_head = subprocess.run(
+        ["git", "-C", str(local), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert post_head == pre_head, "check mode should not move HEAD"
+
+
+def test_check_git_pull_repo_flags_dep_changes(remote_with_clone, tmp_path):
+    """Pending pyproject change is surfaced in --check meta + detail."""
+    from khimaira.bootstrap.checks import check_git_pull_repo
+
+    remote, local = remote_with_clone
+    pusher = tmp_path / "pusher"
+    subprocess.run(["git", "clone", str(remote), str(pusher)], check=True, capture_output=True)
+    _seed_commit(
+        pusher,
+        "pyproject.toml",
+        '[project]\nname = "demo"\nversion = "0.1.0"\n',
+        "add pyproject.toml",
+    )
+    _git(pusher, "push", "origin", "main")
+
+    result = check_git_pull_repo(_spec_for(local))
+
+    assert result.meta["deps_changed"] is True
+    assert "pyproject/uv.lock would change" in result.detail
+
+
+def test_check_git_pull_repo_failed_when_local_diverged(remote_with_clone, tmp_path):
+    """Local has commits remote doesn't → would-refuse ff-only, status=failed."""
+    from khimaira.bootstrap.checks import check_git_pull_repo
+
+    remote, local = remote_with_clone
+    _seed_commit(local, "local-only.txt", "local\n", "local commit")
+
+    pusher = tmp_path / "pusher"
+    subprocess.run(["git", "clone", str(remote), str(pusher)], check=True, capture_output=True)
+    _seed_commit(pusher, "remote-only.txt", "remote\n", "remote commit")
+    _git(pusher, "push", "origin", "main")
+
+    result = check_git_pull_repo(_spec_for(local))
+
+    assert result.status == "failed"
+    assert "would refuse ff-only" in result.detail.lower()
+
+
+# -------------------- summarize_sync (final report tail) -------------------- #
+
+
+def test_summarize_sync_returns_no_changes_when_empty():
+    """Empty report (no ops) → 'no changes'. Quiet mode uses this to
+    decide whether to print anything at all."""
+    from khimaira.bootstrap.runner import RunReport, summarize_sync
+
+    assert summarize_sync(RunReport()) == "no changes"
+
+
+def test_summarize_sync_aggregates_commits_pulled():
+    """Sums commits_pulled across all updated repo-pull rows; ignores
+    unchanged rows."""
+    from khimaira.bootstrap.runner import RunReport, summarize_sync
+
+    report = RunReport()
+    report.results = [
+        OpResult(op="repo-pull", target="a", status="updated", meta={"commits_pulled": 3, "deps_changed": False}),
+        OpResult(op="repo-pull", target="b", status="updated", meta={"commits_pulled": 5, "deps_changed": False}),
+        OpResult(op="repo-pull", target="c", status="unchanged"),
+    ]
+
+    summary = summarize_sync(report)
+    assert "8 commit(s)" in summary
+    assert "2 repo(s)" in summary  # only the two updated ones
+
+
+def test_summarize_sync_includes_deps_refreshed():
+    """If uv-sync ran (status=updated), 'workspace deps refreshed' lands."""
+    from khimaira.bootstrap.runner import RunReport, summarize_sync
+
+    report = RunReport()
+    report.results = [
+        OpResult(op="repo-pull", target="a", status="updated", meta={"commits_pulled": 1, "deps_changed": True}),
+        OpResult(op="uv-sync", target="workspace", status="updated"),
+    ]
+
+    summary = summarize_sync(report)
+    assert "workspace deps refreshed" in summary
+
+
+def test_summarize_sync_includes_unpushed():
+    """Unpushed commits across repos roll up into one phrase."""
+    from khimaira.bootstrap.runner import RunReport, summarize_sync
+
+    report = RunReport()
+    report.results = [
+        OpResult(op="unpushed-check", target="a", status="updated", meta={"unpushed_count": 2}),
+        OpResult(op="unpushed-check", target="b", status="updated", meta={"unpushed_count": 3}),
+        OpResult(op="unpushed-check", target="c", status="unchanged"),
+    ]
+
+    summary = summarize_sync(report)
+    assert "5 unpushed" in summary
+    assert "2 repo(s)" in summary
