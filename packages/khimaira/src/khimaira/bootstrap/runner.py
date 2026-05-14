@@ -136,7 +136,9 @@ def run_bootstrap(profile: Profile, *, force: bool = False) -> RunReport:
     return report
 
 
-def run_sync(profile: Profile, *, force: bool = False) -> RunReport:
+def run_sync(
+    profile: Profile, *, force: bool = False, auto_restart_monitor: bool = False
+) -> RunReport:
     """Ongoing sync — pulls every declared repo + re-applies the manifest.
 
     Order (task #66):
@@ -209,6 +211,13 @@ def run_sync(profile: Profile, *, force: bool = False) -> RunReport:
     # because a khimaira pull may have shipped new hook modules.
     if profile.install_claude_hooks:
         report.results.append(ops.install_claude_hooks())
+
+    # --- 6b. monitor freshness check (v2.2) — surface stale-daemon
+    #          warning; with auto_restart=True, run systemctl restart. ---
+    freshness = ops.check_monitor_freshness(workspace_root)
+    report.results.append(freshness)
+    if freshness.status == "updated" and auto_restart_monitor:
+        report.results.append(ops.restart_monitor())
 
     # --- 7. unpushed-commits report (informational; sync never pushes) ---
     # Surface AFTER the pulls + applies so the user sees the

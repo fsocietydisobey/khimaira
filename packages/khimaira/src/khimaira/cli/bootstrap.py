@@ -118,6 +118,18 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
             "no-op runs, single line on changes."
         ),
     )
+    p_sync.add_argument(
+        "--auto-restart",
+        dest="auto_restart",
+        action="store_true",
+        help=(
+            "If the khimaira-monitor daemon is older than the latest "
+            "khimaira commit (running stale code), automatically run "
+            "`systemctl --user restart khimaira-monitor` instead of "
+            "just printing a suggestion. Linux-only — macOS uses "
+            "`khimaira monitor watch` foreground supervisor."
+        ),
+    )
     p_sync.set_defaults(func=_run_sync)
 
 
@@ -253,7 +265,11 @@ def _run_sync(args: argparse.Namespace) -> int:
     if not args.quiet:
         _print_header(args, "sync")
 
-    report = run_sync(args.profile_obj, force=args.force)
+    report = run_sync(
+        args.profile_obj,
+        force=args.force,
+        auto_restart_monitor=args.auto_restart,
+    )
 
     if not args.quiet:
         _print_report(report)

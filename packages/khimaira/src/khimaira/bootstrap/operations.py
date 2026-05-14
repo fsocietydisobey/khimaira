@@ -518,6 +518,184 @@ def reconcile_mcp_drift(profile_names: set[str]) -> list[OpResult]:
 
 
 # ---------------------------------------------------------------------------
+# Monitor daemon freshness check (task #66 v2.2)
+# ---------------------------------------------------------------------------
+
+
+def _monitor_active_enter_ts() -> str | None:
+    """Read the khimaira-monitor systemd unit's ActiveEnterTimestamp.
+
+    Returns the raw timestamp string (e.g. "Wed 2026-05-14 14:32:18 CDT")
+    when the unit is loaded + active, None otherwise. Empty string
+    (`ActiveEnterTimestamp=`) means the unit exists but isn't active.
+
+    Linux-only — macOS uses launchd and the existing `khimaira monitor
+    watch` foreground supervisor pattern is the recommended path there.
+    """
+    if not shutil.which("systemctl"):
+        return None
+    proc = _run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "khimaira-monitor",
+            "--property=ActiveEnterTimestamp",
+        ]
+    )
+    if proc.returncode != 0:
+        return None
+    # Output: "ActiveEnterTimestamp=Wed 2026-05-14 14:32:18 CDT"
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("ActiveEnterTimestamp="):
+            raw = line.split("=", 1)[1].strip()
+            return raw or None
+    return None
+
+
+def _systemd_ts_to_epoch(raw: str) -> float | None:
+    """Parse systemd's ActiveEnterTimestamp format to epoch float.
+
+    systemd uses locale-formatted timestamps like
+    `"Wed 2026-05-14 14:32:18 CDT"`. We delegate parsing to `date -d`
+    rather than rolling a strptime that has to know every timezone
+    abbreviation. Returns None if parsing fails (skip silently —
+    monitor staleness is a hint, not load-bearing).
+    """
+    if not raw or not shutil.which("date"):
+        return None
+    proc = _run(["date", "-d", raw, "+%s"])
+    if proc.returncode != 0:
+        return None
+    try:
+        return float((proc.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+def check_monitor_freshness(workspace_root: Path | None) -> OpResult:
+    """Compare khimaira-monitor daemon boot time to latest khimaira commit.
+
+    If the running daemon predates the latest khimaira commit, it's
+    running stale code (most often after `git pull` brings new server
+    changes but the daemon hasn't been restarted). Returns:
+      - `unchanged` — daemon is fresher than HEAD, no work needed
+      - `updated`   — daemon is stale; suggests restart (run_sync
+                       passes `auto_restart=True` to flip this into
+                       an actual `restart_monitor` call)
+      - `skipped`   — systemctl unavailable, unit not loaded, or
+                       workspace not on disk (installed-wheel mode)
+
+    workspace_root is the khimaira repo root (or None when running
+    from an installed wheel). When None, skip — there's no commit
+    timestamp to compare against.
+    """
+    if workspace_root is None:
+        return OpResult(
+            op="monitor-fresh",
+            target="khimaira-monitor",
+            status="skipped",
+            detail="installed-wheel mode — no workspace HEAD to compare",
+        )
+    raw_ts = _monitor_active_enter_ts()
+    if not raw_ts:
+        return OpResult(
+            op="monitor-fresh",
+            target="khimaira-monitor",
+            status="skipped",
+            detail="systemctl unavailable or khimaira-monitor unit not active",
+        )
+    daemon_epoch = _systemd_ts_to_epoch(raw_ts)
+    if daemon_epoch is None:
+        return OpResult(
+            op="monitor-fresh",
+            target="khimaira-monitor",
+            status="skipped",
+            detail=f"couldn't parse systemd timestamp {raw_ts!r}",
+        )
+
+    # Latest khimaira commit timestamp (committer date, ISO8601 strict)
+    proc = _run(
+        ["git", "-C", str(workspace_root), "log", "-1", "--format=%ct", "HEAD"]
+    )
+    if proc.returncode != 0:
+        return OpResult(
+            op="monitor-fresh",
+            target="khimaira-monitor",
+            status="skipped",
+            detail="couldn't read HEAD commit timestamp",
+        )
+    try:
+        head_epoch = float((proc.stdout or "0").strip())
+    except ValueError:
+        return OpResult(
+            op="monitor-fresh",
+            target="khimaira-monitor",
+            status="skipped",
+            detail="HEAD timestamp parse failed",
+        )
+
+    if daemon_epoch >= head_epoch:
+        return OpResult(
+            op="monitor-fresh",
+            target="khimaira-monitor",
+            status="unchanged",
+            detail="daemon was started after latest khimaira commit",
+            meta={"daemon_epoch": daemon_epoch, "head_epoch": head_epoch},
+        )
+
+    age_minutes = (head_epoch - daemon_epoch) / 60
+    return OpResult(
+        op="monitor-fresh",
+        target="khimaira-monitor",
+        status="updated",
+        detail=(
+            f"daemon predates HEAD by ~{age_minutes:.0f}m — "
+            "consider `systemctl --user restart khimaira-monitor` "
+            "(or run sync with --auto-restart)"
+        ),
+        meta={
+            "daemon_epoch": daemon_epoch,
+            "head_epoch": head_epoch,
+            "age_seconds": head_epoch - daemon_epoch,
+        },
+    )
+
+
+def restart_monitor() -> OpResult:
+    """Run `systemctl --user restart khimaira-monitor`.
+
+    Best-effort: returns `failed` cleanly if systemctl errors. The
+    user can still restart manually; sync doesn't gate further ops
+    on this.
+    """
+    if not shutil.which("systemctl"):
+        return OpResult(
+            op="monitor-restart",
+            target="khimaira-monitor",
+            status="skipped",
+            detail="systemctl unavailable",
+        )
+    proc = _run(["systemctl", "--user", "restart", "khimaira-monitor"])
+    if proc.returncode != 0:
+        return OpResult(
+            op="monitor-restart",
+            target="khimaira-monitor",
+            status="failed",
+            detail=(
+                f"systemctl restart failed: "
+                f"{(proc.stderr or proc.stdout).strip()[:200]}"
+            ),
+        )
+    return OpResult(
+        op="monitor-restart",
+        target="khimaira-monitor",
+        status="updated",
+        detail="khimaira-monitor restarted",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Supervisor + SPA build
 # ---------------------------------------------------------------------------
 

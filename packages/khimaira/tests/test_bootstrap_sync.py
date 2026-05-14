@@ -562,3 +562,141 @@ def test_reconcile_mcp_drift_removes_dropped_khimaira_entry(isolated_state, monk
 
     # Managed state file updated to drop seance
     assert operations._read_managed_mcp() == {"khimaira"}
+
+
+# -------------------- v2.2: monitor freshness check + restart -------------------- #
+
+
+def test_check_monitor_freshness_skipped_when_no_workspace():
+    """Installed-wheel mode (workspace_root=None) → skipped."""
+    from khimaira.bootstrap.operations import check_monitor_freshness
+
+    result = check_monitor_freshness(None)
+
+    assert result.status == "skipped"
+    assert "installed-wheel" in result.detail
+
+
+def test_check_monitor_freshness_skipped_when_systemctl_unavailable(tmp_path, monkeypatch):
+    """No systemctl on PATH → skipped (macOS, minimal containers, etc.)."""
+    from khimaira.bootstrap import operations
+
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+
+    result = operations.check_monitor_freshness(tmp_path)
+    assert result.status == "skipped"
+    assert "systemctl" in result.detail.lower()
+
+
+def test_check_monitor_freshness_unchanged_when_daemon_newer_than_head(tmp_path, monkeypatch):
+    """Daemon ActiveEnterTimestamp newer than latest commit → unchanged."""
+    from khimaira.bootstrap import operations
+
+    # Build a minimal git repo with one commit at a known timestamp
+    repo = tmp_path / "khimaira"
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(repo)],
+        check=True,
+        capture_output=True,
+    )
+    _seed_commit(repo, "x.txt", "x\n", "init")
+    # Force commit timestamp to a known epoch
+    head_epoch = "1700000000"  # 2023-11-14
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--amend", "--no-edit",
+         "--date", head_epoch, "-c", f"user.email=t@t", "-c", "user.name=t"],
+        capture_output=True,
+    )
+
+    # Mock systemctl to return a future-ish daemon start time
+    def fake_run(cmd, **kwargs):
+        class _Proc:
+            returncode = 0
+            stderr = ""
+        if cmd[:1] == ["systemctl"]:
+            _Proc.stdout = "ActiveEnterTimestamp=Wed 2026-05-14 14:32:18 CDT\n"
+        elif cmd[:1] == ["date"]:
+            _Proc.stdout = "1747242738\n"  # well after head_epoch
+        elif cmd[:1] == ["git"]:
+            _Proc.stdout = f"{head_epoch}\n"
+        else:
+            _Proc.stdout = ""
+        return _Proc()
+
+    monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(operations, "_run", fake_run)
+
+    result = operations.check_monitor_freshness(repo)
+    assert result.status == "unchanged"
+
+
+def test_check_monitor_freshness_updated_when_daemon_older_than_head(tmp_path, monkeypatch):
+    """Daemon older than HEAD → updated, with age + restart suggestion."""
+    from khimaira.bootstrap import operations
+
+    repo = tmp_path / "khimaira"
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(repo)],
+        check=True,
+        capture_output=True,
+    )
+    _seed_commit(repo, "x.txt", "x\n", "init")
+
+    def fake_run(cmd, **kwargs):
+        class _Proc:
+            returncode = 0
+            stderr = ""
+        if cmd[:1] == ["systemctl"]:
+            _Proc.stdout = "ActiveEnterTimestamp=Sun 2024-01-01 00:00:00 CDT\n"
+        elif cmd[:1] == ["date"]:
+            _Proc.stdout = "1704096000\n"  # 2024-01-01
+        elif cmd[:1] == ["git"]:
+            _Proc.stdout = "1704182400\n"  # 2024-01-02 (24h after daemon)
+        else:
+            _Proc.stdout = ""
+        return _Proc()
+
+    monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(operations, "_run", fake_run)
+
+    result = operations.check_monitor_freshness(repo)
+
+    assert result.status == "updated"
+    assert "predates HEAD" in result.detail
+    assert "--auto-restart" in result.detail
+    # 24h = 1440 min
+    assert result.meta["age_seconds"] == 1704182400 - 1704096000
+
+
+def test_restart_monitor_skipped_without_systemctl(monkeypatch):
+    """No systemctl → skipped, not failed."""
+    from khimaira.bootstrap import operations
+
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+
+    result = operations.restart_monitor()
+    assert result.status == "skipped"
+
+
+def test_restart_monitor_runs_systemctl(monkeypatch):
+    """With systemctl + a healthy unit, restart runs + returns updated."""
+    from khimaira.bootstrap import operations
+
+    monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+
+    called: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        called.append(cmd)
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _Proc()
+
+    monkeypatch.setattr(operations, "_run", fake_run)
+
+    result = operations.restart_monitor()
+
+    assert result.status == "updated"
+    assert called == [["systemctl", "--user", "restart", "khimaira-monitor"]]
