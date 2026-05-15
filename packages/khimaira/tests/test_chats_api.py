@@ -208,6 +208,44 @@ def test_delete_by_creator_returns_200(chats_api_client):
     assert "archived_to" in resp.json()
 
 
+def test_reject_pending_returns_200(chats_api_client):
+    client, _ = chats_api_client
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    resp = client.post(f"/api/chats/{chat_id}/reject", json={"session_id": "bob"})
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "rejected"
+
+
+def test_reject_unknown_chat_returns_404(chats_api_client):
+    client, _ = chats_api_client
+    resp = client.post("/api/chats/chat-doesnotexis/reject", json={"session_id": "bob"})
+    assert resp.status_code == 404
+
+
+def test_latest_pending_returns_chat_id(chats_api_client):
+    client, _ = chats_api_client
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    expected_chat_id = created["meta"]["chat_id"]
+
+    resp = client.get("/api/chats/pending/latest?session_id=bob")
+    assert resp.status_code == 200
+    assert resp.json()["chat_id"] == expected_chat_id
+
+
+def test_latest_pending_returns_null_when_none(chats_api_client):
+    client, _ = chats_api_client
+    resp = client.get("/api/chats/pending/latest?session_id=alice")
+    assert resp.status_code == 200
+    assert resp.json()["chat_id"] is None
+
+
 def test_delete_unknown_returns_404(chats_api_client):
     client, _ = chats_api_client
     resp = client.delete("/api/chats/chat-doesnotexis?by_session_id=alice")

@@ -128,10 +128,37 @@ async def _sse_loop(session: Any) -> None:
             _state.last_event_id = evt_id
 
         kind = record.get("kind")
+
+        # Pending-invite record routed to invitee → render as a "you've
+        # been invited" channel notification so the receiver doesn't
+        # have to poll chat_my_chats.
+        if (
+            kind == "member"
+            and record.get("state") == "pending"
+            and record.get("session_id") == _state.session_id
+        ):
+            chat_id = record.get("chat_id", "")
+            inviter = record.get("invited_by", "someone")
+            content = (
+                f"{inviter} invited you to chat {chat_id}. "
+                f"Accept with `/khimaira-chat-accept` or decline with "
+                f"`/khimaira-chat-reject` (no chat_id needed — defaults "
+                f"to this invite)."
+            )
+            meta = {
+                "chat_id": str(chat_id),
+                "kind": "invite",
+                "from": str(inviter),
+            }
+            try:
+                await _emit_channel_notification(session, content, meta)
+            except Exception as exc:
+                log.warning("khimaira-chat: failed to emit invite notification — %s", exc)
+            continue
+
         if kind != "msg":
-            # member transitions / meta updates aren't surfaced as chat
-            # messages — they're still observable via chat_history if the
-            # agent needs them.
+            # Other member transitions / meta updates aren't surfaced as
+            # chat messages — they're still observable via chat_history.
             continue
 
         sender_id = record.get("sender_id")
@@ -210,14 +237,39 @@ def _build_server() -> Server:
             ),
             types.Tool(
                 name="chat_accept",
-                description="Accept an invite into a chat. After this, you start receiving messages.",
+                description=(
+                    "Accept an invite into a chat. If chat_id is omitted, "
+                    "accepts the most recent pending invite (the common case — "
+                    "you don't need to know the chat_id)."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "session_id": {"type": "string"},
-                        "chat_id": {"type": "string"},
+                        "chat_id": {
+                            "type": "string",
+                            "description": "Optional; defaults to latest pending",
+                        },
                     },
-                    "required": ["session_id", "chat_id"],
+                    "required": ["session_id"],
+                },
+            ),
+            types.Tool(
+                name="chat_reject",
+                description=(
+                    "Decline an invite. If chat_id is omitted, rejects the most "
+                    "recent pending invite. Creator can re-invite later."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "chat_id": {
+                            "type": "string",
+                            "description": "Optional; defaults to latest pending",
+                        },
+                    },
+                    "required": ["session_id"],
                 },
             ),
             types.Tool(
@@ -342,7 +394,19 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "chat_invite":
         return daemon_client.invite(args["chat_id"], sid, args["invitee"])
     if name == "chat_accept":
-        return daemon_client.accept(args["chat_id"], sid)
+        chat_id = args.get("chat_id")
+        if not chat_id:
+            chat_id = daemon_client.latest_pending(sid)
+            if not chat_id:
+                return {"error": "no pending invites to accept"}
+        return daemon_client.accept(chat_id, sid)
+    if name == "chat_reject":
+        chat_id = args.get("chat_id")
+        if not chat_id:
+            chat_id = daemon_client.latest_pending(sid)
+            if not chat_id:
+                return {"error": "no pending invites to reject"}
+        return daemon_client.reject(chat_id, sid)
     if name == "chat_send":
         return daemon_client.send_message(args["chat_id"], sid, args["body"])
     if name == "chat_history":

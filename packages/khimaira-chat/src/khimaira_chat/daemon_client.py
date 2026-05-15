@@ -94,6 +94,28 @@ def accept(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[s
     return resp.json()
 
 
+def reject(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[str, Any]:
+    resp = httpx.post(
+        f"{base}/api/chats/{chat_id}/reject",
+        json={"session_id": session_id},
+        timeout=10.0,
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
+def latest_pending(session_id: str, *, base: str = DEFAULT_BASE) -> str | None:
+    """Return the chat_id of the most recent pending invite for this
+    session, or None if no pending invites."""
+    resp = httpx.get(
+        f"{base}/api/chats/pending/latest",
+        params={"session_id": session_id},
+        timeout=10.0,
+    )
+    _raise_for_status(resp)
+    return resp.json().get("chat_id")
+
+
 def send_message(
     chat_id: str, sender_session_id: str, body: str, *, base: str = DEFAULT_BASE
 ) -> dict[str, Any]:

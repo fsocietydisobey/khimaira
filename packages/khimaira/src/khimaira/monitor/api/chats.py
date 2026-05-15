@@ -51,6 +51,10 @@ class LeaveReq(BaseModel):
     session_id: str
 
 
+class RejectReq(BaseModel):
+    session_id: str
+
+
 def build_router():
     fastapi = require("fastapi")
     sse_starlette = require("sse_starlette.sse")
@@ -123,6 +127,26 @@ def build_router():
             return chats.accept(chat_id, req.session_id)
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
+
+    @router.post("/chats/{chat_id}/reject")
+    async def reject_invite(chat_id: str, req: RejectReq) -> dict:
+        try:
+            return chats.reject(chat_id, req.session_id)
+        except ValueError as exc:
+            raise fastapi.HTTPException(404, str(exc)) from exc
+
+    @router.get("/chats/pending/latest")
+    async def latest_pending(session_id: str) -> dict:
+        """Return the most-recent pending chat_id for this session, or null.
+
+        Used by /khimaira-chat-accept and /khimaira-chat-reject so the
+        slash commands work without the user knowing the chat_id.
+        """
+        try:
+            chat_id = chats.latest_pending_chat_id(session_id)
+        except ValueError as exc:
+            raise fastapi.HTTPException(404, str(exc)) from exc
+        return {"chat_id": chat_id}
 
     @router.post("/chats/{chat_id}/messages")
     async def send_message(chat_id: str, req: SendReq) -> dict:

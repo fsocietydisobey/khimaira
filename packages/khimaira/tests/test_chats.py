@@ -361,6 +361,99 @@ def test_my_chats_lists_pending_and_accepted(isolated_chats):
     assert carol_chats[0]["my_state"] == c.ACCEPTED
 
 
+def test_reject_pending_invite(isolated_chats):
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    _make_session(sessions_mod, "alice")
+    _make_session(sessions_mod, "bob")
+
+    room = c.create_room("alice", ["bob"])
+    chat_id = room["meta"]["chat_id"]
+
+    rec = c.reject(chat_id, "bob")
+    assert rec["state"] == c.REJECTED
+
+    # Rejected member cannot then accept.
+    with pytest.raises(ValueError):
+        c.accept(chat_id, "bob")
+
+    # Rejected member cannot send.
+    with pytest.raises(ValueError):
+        c.send_message(chat_id, "bob", "should fail")
+
+
+def test_reject_non_pending_raises(isolated_chats):
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    _make_session(sessions_mod, "alice")
+    _make_session(sessions_mod, "bob")
+
+    room = c.create_room("alice", ["bob"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob")
+    # bob is now accepted, not pending — can't reject.
+    with pytest.raises(ValueError):
+        c.reject(chat_id, "bob")
+
+
+def test_latest_pending_returns_chat_id(isolated_chats):
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    _make_session(sessions_mod, "alice")
+    _make_session(sessions_mod, "bob")
+
+    room = c.create_room("alice", ["bob"])
+    chat_id = room["meta"]["chat_id"]
+
+    assert c.latest_pending_chat_id("bob") == chat_id
+
+
+def test_latest_pending_returns_none_when_no_invites(isolated_chats):
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    _make_session(sessions_mod, "alice")
+    assert c.latest_pending_chat_id("alice") is None
+
+
+def test_invite_broadcast_routes_to_invitee(isolated_chats):
+    """When a member is added in pending state, the broadcast must go
+    ONLY to the invitee — even though they're not yet `accepted`. This
+    is what surfaces "you've been invited" to the receiver as a channel
+    notification."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    _make_session(sessions_mod, "alice")
+    _make_session(sessions_mod, "bob")
+
+    async def run():
+        gen = c.subscribe("bob")
+        received: list[dict] = []
+
+        async def collect():
+            async for record in gen:
+                received.append(record)
+                if len(received) >= 1:
+                    return
+
+        task = asyncio.create_task(collect())
+        await asyncio.sleep(0.05)
+        c.create_room("alice", ["bob"])  # bob gets invited as pending
+        await asyncio.wait_for(task, timeout=2.0)
+        return received
+
+    received = asyncio.run(run())
+    # Should receive bob's own member-pending record.
+    assert any(
+        r.get("kind") == "member" and r.get("state") == "pending" and r.get("session_id") == "bob"
+        for r in received
+    )
+
+
 def test_my_chats_excludes_left(isolated_chats):
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod

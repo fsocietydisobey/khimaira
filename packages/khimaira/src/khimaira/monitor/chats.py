@@ -35,6 +35,7 @@ log = get_logger("monitor.chats")
 # Member states.
 PENDING = "pending"
 ACCEPTED = "accepted"
+REJECTED = "rejected"  # invitee declined; can be re-invited later
 LEFT = "left"
 REMOVED = "removed"
 
@@ -293,6 +294,53 @@ def accept(chat_id: str, session_id: str) -> dict[str, Any]:
     return record
 
 
+def reject(chat_id: str, session_id: str) -> dict[str, Any]:
+    """Decline a pending invite. The chat continues without this session;
+    creator can re-invite later if desired."""
+    session_id = _resolve_or_uuid(session_id)
+    room = load_room(chat_id)
+    member = room["members"].get(session_id)
+    if not member:
+        raise ValueError(
+            f"Session {session_id!r} is not a member of {chat_id!r}; nothing to reject."
+        )
+    if member["state"] != PENDING:
+        raise ValueError(
+            f"Session {session_id!r} is in state {member['state']!r}, not 'pending'. "
+            f"Can only reject a pending invite."
+        )
+    record = {
+        "kind": MEMBER,
+        "event_id": _new_event_id(),
+        "ts": _now_iso(),
+        "chat_id": chat_id,
+        "session_id": session_id,
+        "session_name": _resolve_session_name(session_id) or session_id[:8],
+        "state": REJECTED,
+    }
+    _append(chat_id, record)
+    log.info("chats: %s rejected %s", session_id, chat_id)
+    return record
+
+
+def latest_pending_chat_id(session_id: str) -> str | None:
+    """Find the most-recently-invited pending chat for this session.
+
+    Used by `/khimaira-chat-accept` and `/khimaira-chat-reject` so the
+    user doesn't have to know the chat_id — the latest pending invite
+    is almost always the one they meant to act on. Returns None if no
+    pending invites; the slash command should surface that as
+    'no pending invites'.
+    """
+    session_id = _resolve_or_uuid(session_id)
+    chats = my_chats(session_id)
+    pending = [c for c in chats if c.get("my_state") == PENDING]
+    if not pending:
+        return None
+    pending.sort(key=lambda c: c.get("last_message_ts") or "", reverse=True)
+    return pending[0]["chat_id"]
+
+
 def send_message(chat_id: str, sender_session_id: str, body: str) -> dict[str, Any]:
     """Append a message. Sender must be an accepted member; otherwise 403-ish ValueError."""
     sender_session_id = _resolve_or_uuid(sender_session_id)
@@ -428,17 +476,38 @@ _subscribers: dict[str, set[asyncio.Queue]] = {}
 
 
 def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
-    """Push a new chat event to every accepted member's active subscribers.
+    """Push a new chat event to the right subscribers.
 
-    Sender's own session is included — the subprocess MCP filters its own
-    messages out before emitting channel notifications. Doing the filter
-    server-side would miss the case where sender has multiple subprocesses
-    (e.g., two terminals open).
+    Routing rules:
+      - kind=member with state=pending → push ONLY to the invitee. They
+        haven't accepted yet, so the existing "accepted only" filter
+        would skip them — but we WANT them to see "you've been invited"
+        without having to poll chat_my_chats. Subprocess maps this
+        record to a channel notification with kind=invite.
+      - All other records (msg, member transitions to accepted/left/etc,
+        meta updates) → push to every accepted member.
+
+    Sender's own session is included for non-invite records — the
+    subprocess MCP filters its own messages out before emitting channel
+    notifications. Server-side filtering would miss the case where
+    sender has multiple subprocesses (e.g., two terminals open).
     """
     try:
         room = load_room(chat_id)
     except ValueError:
         return
+
+    # Invite-targeted broadcast: deliver to invitee only.
+    if record.get("kind") == MEMBER and record.get("state") == PENDING:
+        invitee = record.get("session_id")
+        for q in _subscribers.get(invitee, ()):
+            try:
+                q.put_nowait(record)
+            except asyncio.QueueFull:
+                log.warning("chats: dropping invite for %s (queue full)", invitee)
+        return
+
+    # Default broadcast: to every accepted member.
     for sid, member in room["members"].items():
         if member["state"] != ACCEPTED:
             continue
