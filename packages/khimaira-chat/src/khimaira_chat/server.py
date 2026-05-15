@@ -509,47 +509,92 @@ async def _serve() -> None:
         await server.run(read_stream, write_stream, init_opts)
 
 
+def _ancestor_pids(max_depth: int = 5) -> list[int]:
+    """Walk the parent chain via /proc/<pid>/status, return ancestor PIDs.
+
+    Claude Code spawns chat MCP via `bash -lc 'uv run khimaira-chat ...'`,
+    so the actual chain is Claude Code → bash → uv → khimaira-chat.
+    The SessionStart hook (also spawned by Claude Code) posts its OWN
+    ppid (= Claude Code's PID). This subprocess's getppid() returns uv's
+    PID, not Claude Code's — so a single ppid lookup misses. Walking
+    up to grandparents (and beyond) until we find the registered ppid
+    bridges that gap.
+
+    Linux-only via /proc; returns [] on other platforms.
+    """
+    import os as _os
+
+    out: list[int] = []
+    cur = _os.getppid()
+    for _ in range(max_depth):
+        if cur <= 1:
+            break
+        out.append(cur)
+        try:
+            with open(f"/proc/{cur}/status", "r", encoding="utf-8") as f:
+                next_pid = None
+                for line in f:
+                    if line.startswith("PPid:"):
+                        next_pid = int(line.split()[1])
+                        break
+            if next_pid is None or next_pid == cur:
+                break
+            cur = next_pid
+        except (OSError, ValueError):
+            break
+    return out
+
+
 def _try_auto_register_from_ppid() -> None:
     """At subprocess startup, query the daemon for our session_id by
-    parent PID. The SessionStart hook posted {ppid: getppid(), session_id}
-    at session boot; this lookup retrieves it. If found, we skip the
-    lazy-registration step that previously required the agent's first
-    chat tool call.
+    parent (or grandparent / great-grandparent) PID. The SessionStart
+    hook posted {ppid: getppid(), session_id} at boot; this lookup
+    retrieves it. If found, we skip lazy registration.
 
-    **Race-tolerant**: the SessionStart hook and this subprocess are both
-    spawned by Claude Code roughly concurrently. If the subprocess wins
-    and queries before the hook's POST lands, the lookup returns null.
-    Retry with backoff over ~3s to absorb that race.
+    **Walks the ancestor chain** because `bash -lc 'uv run khimaira-chat'`
+    means our direct parent is `uv`, not Claude Code. The hook's ppid
+    is Claude Code's PID (a few levels up). Try each ancestor.
 
-    Best-effort: silent on persistent failure. The agent's first chat
-    tool call is still the fallback.
+    **Race-tolerant**: the hook and this subprocess are spawned roughly
+    concurrently. If subprocess wins, lookup returns null at each
+    ancestor. Retry the whole walk with backoff over ~3s.
+
+    Best-effort: silent on persistent failure; lazy registration takes
+    over on the agent's first chat tool call.
     """
     import time
 
-    try:
-        ppid = os.getppid()
-    except Exception as exc:
-        log.warning("khimaira-chat: ppid lookup failed — %s", exc)
+    ancestors = _ancestor_pids(max_depth=6)
+    if not ancestors:
+        log.info("khimaira-chat: no ancestor PIDs found, skipping bridge")
         return
 
     session_id = None
-    for attempt in range(6):  # ~3s total: 0.1+0.2+0.4+0.8+1.5 = ~3s
-        try:
-            session_id = daemon_client.lookup_session_by_ppid(ppid)
-        except Exception:
-            session_id = None
+    matched_ppid = None
+    for attempt in range(6):  # ~3s total: 0.1+0.2+0.4+0.8+1.5 = 3s
+        for ppid in ancestors:
+            try:
+                session_id = daemon_client.lookup_session_by_ppid(ppid)
+            except Exception:
+                session_id = None
+            if session_id:
+                matched_ppid = ppid
+                break
         if session_id:
             break
         time.sleep(0.1 * (2**attempt))
 
     if not session_id:
-        log.info("khimaira-chat: ppid=%s lookup gave no session_id, falling back to lazy", ppid)
+        log.info(
+            "khimaira-chat: no session_id found for ancestors %s, falling back to lazy",
+            ancestors,
+        )
         return
     _state.session_id = session_id
     log.info(
-        "khimaira-chat: auto-registered session_id=%s via ppid=%s (no agent tool call needed)",
+        "khimaira-chat: auto-registered session_id=%s via ancestor ppid=%s (no agent tool call needed)",
         session_id,
-        ppid,
+        matched_ppid,
     )
     _maybe_register_display_name(session_id)
 

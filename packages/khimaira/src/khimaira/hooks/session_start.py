@@ -630,6 +630,12 @@ def main() -> int:
     # the agent still has the explicit session_id in the context block
     # below and can register lazily. Failure here must NEVER fail the
     # hook (would block session boot).
+    #
+    # Order matters: this POST runs BEFORE _ensure_chat_mcp_registered
+    # because the latter calls `claude mcp list` (with health checks
+    # that can take seconds). The chat MCP subprocess starts in
+    # parallel and retries the lookup for ~3s; we need the POST to
+    # land within that window or the bridge falls back to lazy.
     try:
         _http_post_json(
             "/api/chats/register-pending-session",
@@ -645,7 +651,8 @@ def main() -> int:
     # it's friction. Auto-detect-and-restore here so each fresh
     # `claude-chat` launch self-heals: if `claude mcp list` doesn't
     # show khimaira-chat, run the registration command silently.
-    # Best-effort, must never block session boot.
+    # Best-effort, must never block session boot. Runs AFTER the ppid
+    # POST so the slow `claude mcp list` doesn't delay the bridge.
     try:
         _ensure_chat_mcp_registered()
     except Exception:
