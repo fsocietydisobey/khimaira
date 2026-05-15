@@ -1,0 +1,9 @@
+[Unit]
+Description=khimaira — detect master-as-bottleneck conditions and notify
+Documentation=https://github.com/fsocietydisobey/khimaira
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/khimaira-bottleneck-watch.sh
+StandardOutput=append:%h/.local/state/khimaira/bottleneck-watch.log
+StandardError=append:%h/.local/state/khimaira/bottleneck-watch.log

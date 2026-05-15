@@ -1,0 +1,14 @@
+[Unit]
+Description=khimaira — periodic bottleneck-detection probe
+Documentation=https://github.com/fsocietydisobey/khimaira
+
+[Timer]
+# Every 5 minutes — short interval so the deputize hint fires before
+# the rate-limit window closes. Cooldown logic in the script prevents
+# repeat-spam during a single bottleneck episode.
+OnCalendar=*-*-* *:0/5:13
+Persistent=true
+Unit=khimaira-bottleneck-watch.service
+
+[Install]
+WantedBy=timers.target
