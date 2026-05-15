@@ -223,15 +223,33 @@ By now there's signal. Match it to a path:
 - **Phase B v1.4 (`chat_set_creator`).** Admin-style retroactive role
   propagation for `chat_transfer_membership`. test-master surfaced this during
   Round 6 Lane E. Deferred to next round.
-- **Model-per-role / model-per-task routing.** New idea from Joseph
-  2026-05-15: assign Opus to master/orchestrator, Sonnet to implementing
-  agents, Haiku to observers. Mitigates rate-limit blowups during dogfood
-  rounds (today's session burned through usage cap mid-flow). Implementation
-  options: (a) session-level model preference in `status.json`, (b) task-level
-  `recommended_model` hint on `chat_task_create`, (c) role-based defaults
-  (master=Opus, agent=Sonnet, observer=Haiku) implicit unless overridden.
-  Option (c) is cleanest; maps to existing role gating. Relayed to khimaira-0
-  for next round consideration.
+- **Model + thinking-mode per role.** New idea from Joseph 2026-05-15
+  (extended same day): assign Opus + ultrathink to master/orchestrator, Sonnet
+  + short-think to implementing agents, Haiku + no-think to observers.
+  Mitigates rate-limit blowups during dogfood rounds (today's session burned
+  through usage cap mid-flow). Two dimensions compound:
+  - Model: ~5× difference Opus→Sonnet, ~10-20× Opus→Haiku
+  - Thinking budget: ~10-50× difference between max-thinking and no-thinking
+    AT THE SAME MODEL. Thinking mode is arguably the larger lever.
+
+  Recommended budget table:
+
+  | Role | Model | Thinking |
+  |---|---|---|
+  | Master / orchestrator | Opus 4.7 | ultrathink / think harder |
+  | Implementing agent | Sonnet 4.6 | think (short budget) |
+  | Observer / peer-reviewer | Haiku 4.5 | none / default |
+
+  Implementation options: (a) session-level preference in `status.json`,
+  (b) task-level `recommended_model` + `recommended_thinking` hint on
+  `chat_task_create`, (c) role-based defaults implicit unless overridden,
+  surfaced as convention in the templated brief.
+
+  Option (c) is cleanest; maps to existing role gating without MCP changes.
+  Relayed to khimaira-0 for next round consideration. Concrete deliverable:
+  update `khimaira-orchestrate.md` + `khimaira-transfer-session.md`
+  templates to include both dimensions, plus a "Token-cost budgeting"
+  section in `docs/khimaira-chat.md`.
 
 ## Decision log entries (already captured in khimaira session state)
 
