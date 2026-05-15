@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 
+from fastapi import Request
 from pydantic import BaseModel
 
 from khimaira.monitor import chats
@@ -76,7 +77,7 @@ def build_router():
             raise fastapi.HTTPException(404, str(exc)) from exc
 
     @router.get("/chats/events")
-    async def chat_events(session_id: str, request: fastapi.Request):
+    async def chat_events(session_id: str, request: Request):
         try:
             chats._resolve_or_uuid(session_id)
         except ValueError as exc:
