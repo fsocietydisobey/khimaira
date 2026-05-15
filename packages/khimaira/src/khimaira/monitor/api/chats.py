@@ -78,7 +78,7 @@ def build_router():
     @router.get("/chats/events")
     async def chat_events(session_id: str, request: fastapi.Request):
         try:
-            chats.sessions_mod.resolve_session_id(session_id)
+            chats._resolve_or_uuid(session_id)
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
 
@@ -102,7 +102,7 @@ def build_router():
             room = chats.load_room(chat_id)
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
-        member = room["members"].get(chats.sessions_mod.resolve_session_id(session_id))
+        member = room["members"].get(chats._resolve_or_uuid(session_id))
         if not member or member["state"] not in (chats.PENDING, chats.ACCEPTED):
             raise fastapi.HTTPException(
                 403, f"Session {session_id!r} is not a member of {chat_id!r}"

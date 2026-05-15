@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import uuid
 from datetime import UTC, datetime
@@ -82,6 +83,32 @@ def _append(chat_id: str, record: dict[str, Any]) -> None:
 
 def _read(chat_id: str) -> list[dict[str, Any]]:
     return sessions_mod._read_jsonl(_chat_path(chat_id))
+
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _resolve_or_uuid(session_id_or_name: str) -> str:
+    """Resolve a session name → UUID, OR accept a UUID verbatim.
+
+    `_resolve_or_uuid` requires the session's state dir to
+    exist (the session has logged decisions / set status / etc). Fresh
+    Claude Code sessions don't have a dir until they write something —
+    but they DO have a session_id from the SessionStart hook, and the
+    chat lazy-registration design depends on accepting that id even
+    before the session has any other state.
+
+    Resolution order:
+      1. If the input matches a canonical UUID format → trust it
+         verbatim. Cost: a chat targeted at a non-existent UUID is
+         silently a no-op (no subscriber to deliver to). Acceptable
+         wart for the lazy-registration win.
+      2. Otherwise treat as a friendly name → resolve via the standard
+         path; raises if the name doesn't match any session.
+    """
+    if _UUID_RE.match(session_id_or_name):
+        return session_id_or_name
+    return sessions_mod.resolve_session_id(session_id_or_name)
 
 
 def derive_chat_id(member_session_ids: list[str], fresh_suffix: str | None = None) -> str:
@@ -156,8 +183,8 @@ def create_room(
 ) -> dict[str, Any]:
     """Create a new chat room. Creator is auto-`accepted`; other members
     start `pending` and must call `accept()` to receive notifications."""
-    creator_session_id = sessions_mod.resolve_session_id(creator_session_id)
-    resolved_members = [sessions_mod.resolve_session_id(m) for m in member_session_ids]
+    creator_session_id = _resolve_or_uuid(creator_session_id)
+    resolved_members = [_resolve_or_uuid(m) for m in member_session_ids]
     if creator_session_id not in resolved_members:
         resolved_members.append(creator_session_id)
 
@@ -208,8 +235,8 @@ def create_room(
 
 def invite(chat_id: str, by_session_id: str, invitee_session_id: str) -> dict[str, Any]:
     """Add a new member in `pending` state. Caller must be an accepted member."""
-    by_session_id = sessions_mod.resolve_session_id(by_session_id)
-    invitee_session_id = sessions_mod.resolve_session_id(invitee_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id)
+    invitee_session_id = _resolve_or_uuid(invitee_session_id)
     room = load_room(chat_id)
     members = room["members"]
     if members.get(by_session_id, {}).get("state") != ACCEPTED:
@@ -240,7 +267,7 @@ def invite(chat_id: str, by_session_id: str, invitee_session_id: str) -> dict[st
 
 def accept(chat_id: str, session_id: str) -> dict[str, Any]:
     """Move a pending member to accepted. Required before they receive notifications."""
-    session_id = sessions_mod.resolve_session_id(session_id)
+    session_id = _resolve_or_uuid(session_id)
     room = load_room(chat_id)
     member = room["members"].get(session_id)
     if not member:
@@ -268,7 +295,7 @@ def accept(chat_id: str, session_id: str) -> dict[str, Any]:
 
 def send_message(chat_id: str, sender_session_id: str, body: str) -> dict[str, Any]:
     """Append a message. Sender must be an accepted member; otherwise 403-ish ValueError."""
-    sender_session_id = sessions_mod.resolve_session_id(sender_session_id)
+    sender_session_id = _resolve_or_uuid(sender_session_id)
     room = load_room(chat_id)
     member = room["members"].get(sender_session_id)
     if not member or member["state"] != ACCEPTED:
@@ -300,7 +327,7 @@ def history(
     since_event_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return messages visible to requester. Must be an accepted member."""
-    requester_session_id = sessions_mod.resolve_session_id(requester_session_id)
+    requester_session_id = _resolve_or_uuid(requester_session_id)
     room = load_room(chat_id)
     member = room["members"].get(requester_session_id)
     if not member or member["state"] != ACCEPTED:
@@ -319,7 +346,7 @@ def history(
 
 def leave(chat_id: str, session_id: str) -> dict[str, Any]:
     """Mark caller as `left`. They no longer receive notifications."""
-    session_id = sessions_mod.resolve_session_id(session_id)
+    session_id = _resolve_or_uuid(session_id)
     room = load_room(chat_id)
     member = room["members"].get(session_id)
     if not member:
@@ -346,7 +373,7 @@ def leave(chat_id: str, session_id: str) -> dict[str, Any]:
 
 def delete(chat_id: str, by_session_id: str) -> dict[str, Any]:
     """Archive the chat JSONL. Only the creator can call this."""
-    by_session_id = sessions_mod.resolve_session_id(by_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id)
     room = load_room(chat_id)
     creator = room["meta"].get("created_by")
     if creator != by_session_id:
@@ -365,7 +392,7 @@ def delete(chat_id: str, by_session_id: str) -> dict[str, Any]:
 
 def my_chats(session_id: str) -> list[dict[str, Any]]:
     """List chats where session is an accepted member, with brief metadata."""
-    session_id = sessions_mod.resolve_session_id(session_id)
+    session_id = _resolve_or_uuid(session_id)
     out: list[dict[str, Any]] = []
     if not _chat_dir().exists():
         return out
@@ -432,7 +459,7 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
     session is accepted in) for backfill, then streams new events as they
     arrive. Yielding stops only when the caller cancels.
     """
-    session_id = sessions_mod.resolve_session_id(session_id)
+    session_id = _resolve_or_uuid(session_id)
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     _subscribers.setdefault(session_id, set()).add(queue)
     try:

@@ -58,6 +58,35 @@ def test_derive_chat_id_stable_for_same_members(isolated_chats):
     assert a == b  # order-invariant
 
 
+def test_my_chats_accepts_unresolved_uuid(isolated_chats):
+    """Lazy registration: a fresh session whose state dir doesn't exist
+    yet (Claude Code just spawned the chat MCP subprocess; no
+    session_log_* call has hit the daemon) must still be able to call
+    chat_my_chats with its session_id from the SessionStart hook.
+
+    Regression test for the original lazy-registration 404 bug — `chat_my_chats`
+    used `sessions_mod.resolve_session_id` which required the dir to
+    exist. Now it accepts UUIDs verbatim via `_resolve_or_uuid`.
+    """
+    c = isolated_chats
+    fresh_uuid = "280bcb97-3c9f-4a2b-9813-5d3c76169967"
+    # No _make_session call — this UUID has no state dir.
+    result = c.my_chats(fresh_uuid)
+    assert result == []  # no chats yet, but the call succeeds
+
+
+def test_resolve_or_uuid_passes_uuid_through(isolated_chats):
+    c = isolated_chats
+    uuid_in = "deadbeef-1234-5678-9abc-def012345678"
+    assert c._resolve_or_uuid(uuid_in) == uuid_in
+
+
+def test_resolve_or_uuid_rejects_unknown_name(isolated_chats):
+    c = isolated_chats
+    with pytest.raises(ValueError):
+        c._resolve_or_uuid("not-a-uuid-and-not-a-session")
+
+
 def test_derive_chat_id_changes_with_fresh_suffix(isolated_chats):
     c = isolated_chats
     base = c.derive_chat_id(["alice", "bob"])
