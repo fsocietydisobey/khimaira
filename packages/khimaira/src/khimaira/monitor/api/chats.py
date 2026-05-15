@@ -55,6 +55,11 @@ class RejectReq(BaseModel):
     session_id: str
 
 
+class RegisterPpidReq(BaseModel):
+    ppid: int
+    session_id: str
+
+
 def build_router():
     fastapi = require("fastapi")
     sse_starlette = require("sse_starlette.sse")
@@ -79,6 +84,35 @@ def build_router():
             return {"chats": chats.my_chats(session_id)}
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
+
+    # Specific routes BEFORE the {chat_id} catch-all, or FastAPI matches
+    # the wildcard first (treats "session-by-ppid" as a chat_id).
+    @router.post("/chats/register-pending-session")
+    async def register_pending_session(req: RegisterPpidReq) -> dict:
+        """SessionStart hook posts {ppid, session_id} so the chat MCP
+        subprocess (same parent ppid) can self-register at startup
+        without waiting for the agent's first chat tool call."""
+        chats.register_session_by_ppid(req.ppid, req.session_id)
+        return {"ok": True, "ppid": req.ppid, "session_id": req.session_id}
+
+    @router.get("/chats/session-by-ppid")
+    async def session_by_ppid(ppid: int) -> dict:
+        """Chat MCP subprocess at startup queries by its own getppid().
+        Returns the session_id the SessionStart hook registered, or null."""
+        return {"session_id": chats.lookup_session_by_ppid(ppid)}
+
+    @router.get("/chats/pending/latest")
+    async def latest_pending(session_id: str) -> dict:
+        """Return the most-recent pending chat_id for this session, or null.
+
+        Used by /khimaira-chat-accept and /khimaira-chat-reject so the
+        slash commands work without the user knowing the chat_id.
+        """
+        try:
+            chat_id = chats.latest_pending_chat_id(session_id)
+        except ValueError as exc:
+            raise fastapi.HTTPException(404, str(exc)) from exc
+        return {"chat_id": chat_id}
 
     @router.get("/chats/events")
     async def chat_events(session_id: str, request: Request):
@@ -134,19 +168,6 @@ def build_router():
             return chats.reject(chat_id, req.session_id)
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
-
-    @router.get("/chats/pending/latest")
-    async def latest_pending(session_id: str) -> dict:
-        """Return the most-recent pending chat_id for this session, or null.
-
-        Used by /khimaira-chat-accept and /khimaira-chat-reject so the
-        slash commands work without the user knowing the chat_id.
-        """
-        try:
-            chat_id = chats.latest_pending_chat_id(session_id)
-        except ValueError as exc:
-            raise fastapi.HTTPException(404, str(exc)) from exc
-        return {"chat_id": chat_id}
 
     @router.post("/chats/{chat_id}/messages")
     async def send_message(chat_id: str, req: SendReq) -> dict:

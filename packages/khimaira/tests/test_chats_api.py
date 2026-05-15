@@ -226,6 +226,28 @@ def test_reject_unknown_chat_returns_404(chats_api_client):
     assert resp.status_code == 404
 
 
+def test_register_pending_session_then_lookup(chats_api_client):
+    """Hook posts {ppid, session_id}; subprocess looks up by ppid."""
+    client, _ = chats_api_client
+    resp = client.post(
+        "/api/chats/register-pending-session",
+        json={"ppid": 88888, "session_id": "session-xyz"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    lookup = client.get("/api/chats/session-by-ppid?ppid=88888")
+    assert lookup.status_code == 200
+    assert lookup.json()["session_id"] == "session-xyz"
+
+
+def test_session_by_ppid_returns_null_when_unknown(chats_api_client):
+    client, _ = chats_api_client
+    resp = client.get("/api/chats/session-by-ppid?ppid=99999")
+    assert resp.status_code == 200
+    assert resp.json()["session_id"] is None
+
+
 def test_latest_pending_returns_chat_id(chats_api_client):
     client, _ = chats_api_client
     created = client.post(

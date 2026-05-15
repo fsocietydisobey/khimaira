@@ -480,6 +480,54 @@ def my_chats(session_id: str) -> list[dict[str, Any]]:
 _subscribers: dict[str, set[asyncio.Queue]] = {}
 
 
+# ---------------------------------------------------------------------------
+# PPID-bridged session registration — solves the lazy-registration problem
+# for cold sessions. Claude Code spawns the chat MCP subprocess at session
+# boot, but the subprocess can't know its session_id from env (no
+# CLAUDE_SESSION_ID is set). The SessionStart hook *does* know the
+# session_id; both the hook and the subprocess share the same parent
+# process (Claude Code's PID). The hook posts {ppid, session_id} here at
+# boot; the subprocess reads it back at startup and registers + subscribes
+# without waiting for the agent's first chat tool call.
+#
+# Map is TTL'd (5 min) so stale entries don't accumulate.
+# ---------------------------------------------------------------------------
+
+_PPID_TTL_SECONDS = 300  # 5 min — subprocess should fetch within this window
+# ppid → (session_id, registered_at_unix_ts)
+_pending_session_by_ppid: dict[int, tuple[str, float]] = {}
+
+
+def register_session_by_ppid(ppid: int, session_id: str) -> None:
+    """SessionStart hook calls this with the session_id it knows about."""
+    import time
+
+    _gc_pending_sessions()
+    _pending_session_by_ppid[ppid] = (session_id, time.time())
+
+
+def lookup_session_by_ppid(ppid: int) -> str | None:
+    """Subprocess at startup calls this to find its session_id.
+    Returns None if no entry or entry expired."""
+    _gc_pending_sessions()
+    entry = _pending_session_by_ppid.get(ppid)
+    if entry is None:
+        return None
+    return entry[0]
+
+
+def _gc_pending_sessions() -> None:
+    """Drop entries older than _PPID_TTL_SECONDS."""
+    import time
+
+    now = time.time()
+    expired = [
+        ppid for ppid, (_sid, ts) in _pending_session_by_ppid.items() if now - ts > _PPID_TTL_SECONDS
+    ]
+    for ppid in expired:
+        _pending_session_by_ppid.pop(ppid, None)
+
+
 def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
     """Push a new chat event to the right subscribers.
 

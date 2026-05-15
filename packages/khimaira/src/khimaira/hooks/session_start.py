@@ -43,6 +43,23 @@ _ENDPOINT = os.environ.get("KHIMAIRA_ENDPOINT", "http://127.0.0.1:8740").rstrip(
 _HTTP_TIMEOUT_S = 1.5
 
 
+def _http_post_json(path: str, body: dict) -> dict | None:
+    """POST JSON to <endpoint>/<path>; return parsed response or None.
+
+    Quiet by design — hooks must never bubble errors to Claude Code.
+    """
+    url = f"{_ENDPOINT}{path}"
+    try:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, method="POST", headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+
+
 def _http_get_json(path: str) -> dict | None:
     """GET <endpoint>/<path> → parsed JSON, or None on any failure.
 
@@ -567,6 +584,21 @@ def main() -> int:
     session_id = data.get("session_id") or ""
     if not session_id:
         return 0
+
+    # Bridge to chat MCP subprocess: post {ppid, session_id} so the
+    # subprocess (same parent ppid as this hook) can self-register on
+    # startup without waiting for the agent's first chat tool call.
+    # Best-effort — if daemon is down or the chat MCP isn't registered,
+    # the agent still has the explicit session_id in the context block
+    # below and can register lazily. Failure here must NEVER fail the
+    # hook (would block session boot).
+    try:
+        _http_post_json(
+            "/api/chats/register-pending-session",
+            {"ppid": os.getppid(), "session_id": session_id},
+        )
+    except Exception:
+        pass
 
     # Three parallel jobs:
     #   (1) Surface this session's khimaira id so the agent can pass it to

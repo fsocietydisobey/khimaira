@@ -450,6 +450,29 @@ def test_send_message_strips_thinking_tags(isolated_chats):
     assert "actual content" in msg["body"]
 
 
+def test_register_and_lookup_session_by_ppid(isolated_chats):
+    c = isolated_chats
+    assert c.lookup_session_by_ppid(99999) is None
+    c.register_session_by_ppid(99999, "uuid-aaaa-bbbb")
+    assert c.lookup_session_by_ppid(99999) == "uuid-aaaa-bbbb"
+
+
+def test_lookup_session_by_ppid_expires(isolated_chats, monkeypatch):
+    c = isolated_chats
+    import time
+
+    real_time = time.time
+    fake_t = [real_time()]
+    monkeypatch.setattr(time, "time", lambda: fake_t[0])
+
+    c.register_session_by_ppid(12345, "uuid-fresh")
+    assert c.lookup_session_by_ppid(12345) == "uuid-fresh"
+
+    # Advance past TTL.
+    fake_t[0] += c._PPID_TTL_SECONDS + 1
+    assert c.lookup_session_by_ppid(12345) is None
+
+
 def test_subscribe_replays_pending_invite_when_late(isolated_chats):
     """Real bug: invitee subscribes AFTER an invite was broadcast. The
     live broadcast missed an empty queue, so the catch-up on subscribe()

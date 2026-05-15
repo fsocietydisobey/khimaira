@@ -211,6 +211,26 @@ def delete_chat(chat_id: str, by_session_id: str, *, base: str = DEFAULT_BASE) -
     return resp.json()
 
 
+def lookup_session_by_ppid(ppid: int, *, base: str = DEFAULT_BASE) -> str | None:
+    """At subprocess startup, ask the daemon what session_id corresponds
+    to this subprocess's parent PID (Claude Code). The SessionStart hook
+    posted that mapping at boot. Returns None if no entry — falls back
+    to lazy registration via the agent's first chat tool call.
+    """
+    try:
+        resp = _request_with_retry(
+            "GET",
+            f"{base}/api/chats/session-by-ppid",
+            params={"ppid": ppid},
+            timeout=2.0,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json().get("session_id")
+    except Exception:
+        return None
+
+
 def set_session_name(session_id: str, name: str, *, base: str = DEFAULT_BASE) -> dict[str, Any]:
     """Register a friendly name for this session in the daemon's session
     registry. Used by the chat MCP subprocess to auto-resolve the

@@ -509,12 +509,44 @@ async def _serve() -> None:
         await server.run(read_stream, write_stream, init_opts)
 
 
+def _try_auto_register_from_ppid() -> None:
+    """At subprocess startup, query the daemon for our session_id by
+    parent PID. The SessionStart hook posted {ppid: getppid(), session_id}
+    at session boot; this lookup retrieves it. If found, we skip the
+    lazy-registration step that previously required the agent's first
+    chat tool call.
+
+    Side effect: if found, also auto-registers the friendly name (via
+    `-n NAME` detection) — same path as `_state.register()` would
+    take on lazy-register.
+
+    Best-effort: silent on failure. The agent's first chat tool call
+    is still the fallback.
+    """
+    try:
+        ppid = os.getppid()
+        session_id = daemon_client.lookup_session_by_ppid(ppid)
+    except Exception as exc:
+        log.warning("khimaira-chat: ppid lookup failed — %s", exc)
+        return
+    if not session_id:
+        return
+    _state.session_id = session_id
+    log.info(
+        "khimaira-chat: auto-registered session_id=%s via ppid=%s (no agent tool call needed)",
+        session_id,
+        ppid,
+    )
+    _maybe_register_display_name(session_id)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stderr,
     )
+    _try_auto_register_from_ppid()
     asyncio.run(_serve())
 
 
