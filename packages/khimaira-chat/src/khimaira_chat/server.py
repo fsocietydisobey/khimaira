@@ -149,6 +149,19 @@ def _maybe_register_display_name(session_id: str) -> None:
         # Likely: name already taken, or daemon unreachable. Either way,
         # don't fail the chat tool call — fallback is /rename.
         log.warning("khimaira-chat: name auto-register failed for %r — %s", name, exc)
+        return
+    # Apply any persistent by-name auto-accept allowlist now that the
+    # session has its durable identity. No-op if no allowlist file exists.
+    try:
+        result = daemon_client.apply_auto_accept_by_name(session_id, name)
+        if result.get("applied"):
+            log.info(
+                "khimaira-chat: applied by-name auto-accept allowlist (%d peers) for %s",
+                len(result.get("allow", [])),
+                name,
+            )
+    except Exception as exc:
+        log.warning("khimaira-chat: by-name auto-accept apply failed for %r — %s", name, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +187,105 @@ async def _emit_channel_notification(session: Any, content: str, meta: dict[str,
 
 
 # ---------------------------------------------------------------------------
+# Routing — pure function deciding whether/how to emit a channel block
+# ---------------------------------------------------------------------------
+
+
+def _route_record(
+    record: dict[str, Any], my_session_id: str
+) -> tuple[str, dict[str, str]] | None:
+    """Decide whether this subprocess should emit a channel notification
+    for an incoming SSE record, and if so, the (content, meta) to send.
+
+    Returns None to skip. Pure function for testability — neither SSE
+    loop should embed routing logic directly. Phase B v1.1 extended this
+    from msg-only to also cover task creations and task_update transitions.
+
+    Routing rules:
+    - kind=member, state=pending, session_id == me → invite notification
+    - kind=msg, sender != me → message notification
+    - kind=task, (assignee == me) OR (unassigned AND sender != me) → task created
+    - kind=task_update, by_session_id != me → task transition (the actor
+      doesn't see their own action echoed; everyone else in the chat does,
+      which covers the master-sees-agent-done and agent-sees-master-approve
+      cases without an extra lookup)
+    - All other kinds → skip
+    """
+    kind = record.get("kind")
+
+    if (
+        kind == "member"
+        and record.get("state") == "pending"
+        and record.get("session_id") == my_session_id
+    ):
+        chat_id = record.get("chat_id", "")
+        inviter = record.get("invited_by", "someone")
+        content = (
+            f"{inviter} invited you to chat {chat_id}. "
+            f"Accept with `/khimaira-chat-accept` or decline with "
+            f"`/khimaira-chat-reject` (no chat_id needed — defaults "
+            f"to this invite)."
+        )
+        meta = {"chat_id": str(chat_id), "kind": "invite", "from": str(inviter)}
+        return content, meta
+
+    if kind == "msg":
+        sender_id = record.get("sender_id")
+        if sender_id == my_session_id:
+            return None
+        content = record.get("body", "")
+        meta = {
+            "chat_id": str(record.get("chat_id", "")),
+            "sender": str(record.get("sender_name") or sender_id or ""),
+            "msg_id": str(record.get("id", "")),
+        }
+        return content, meta
+
+    if kind == "task":
+        sender_id = record.get("sender_id")
+        assignee_id = record.get("assignee_id")
+        if assignee_id == my_session_id:
+            pass  # I'm the assignee — emit
+        elif assignee_id is None and sender_id != my_session_id:
+            pass  # unassigned, not my own — emit (broadcast-to-accepted shape)
+        else:
+            return None
+        task_id = record.get("id", "")
+        sender_name = record.get("sender_name") or sender_id or ""
+        body = record.get("body", "")
+        content = f"📋 task {task_id} [pending] from {sender_name}: {body}"
+        meta = {
+            "chat_id": str(record.get("chat_id", "")),
+            "kind": "task",
+            "task_id": str(task_id),
+            "sender": str(sender_name),
+            "status": "pending",
+        }
+        return content, meta
+
+    if kind == "task_update":
+        by_session_id = record.get("by_session_id")
+        if by_session_id == my_session_id:
+            return None  # don't echo own transition
+        task_id = record.get("task_id", "")
+        by_name = record.get("by_name") or by_session_id or ""
+        status = record.get("status", "")
+        note = record.get("note")
+        suffix = f": {note}" if note else ""
+        content = f"📋 task {task_id} [{status}] from {by_name}{suffix}"
+        meta = {
+            "chat_id": str(record.get("chat_id", "")),
+            "kind": "task_update",
+            "task_id": str(task_id),
+            "sender": str(by_name),
+            "status": str(status),
+        }
+        return content, meta
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # SSE subscriber — runs in background, emits channel notifications
 # ---------------------------------------------------------------------------
 
@@ -181,8 +293,7 @@ async def _emit_channel_notification(session: Any, content: str, meta: dict[str,
 async def _sse_loop(session: Any) -> None:
     """Pump events from the daemon's SSE stream into channel notifications.
 
-    Filters out the subprocess's own session_id as the sender — otherwise
-    the agent's own send echoes back as a channel block.
+    Routing lives in `_route_record`; this loop just pumps and emits.
     """
     assert _state.session_id is not None
     async for record in daemon_client.subscribe_events(
@@ -192,51 +303,10 @@ async def _sse_loop(session: Any) -> None:
         if evt_id:
             _state.last_event_id = evt_id
 
-        kind = record.get("kind")
-
-        # Pending-invite record routed to invitee → render as a "you've
-        # been invited" channel notification so the receiver doesn't
-        # have to poll chat_my_chats.
-        if (
-            kind == "member"
-            and record.get("state") == "pending"
-            and record.get("session_id") == _state.session_id
-        ):
-            chat_id = record.get("chat_id", "")
-            inviter = record.get("invited_by", "someone")
-            content = (
-                f"{inviter} invited you to chat {chat_id}. "
-                f"Accept with `/khimaira-chat-accept` or decline with "
-                f"`/khimaira-chat-reject` (no chat_id needed — defaults "
-                f"to this invite)."
-            )
-            meta = {
-                "chat_id": str(chat_id),
-                "kind": "invite",
-                "from": str(inviter),
-            }
-            try:
-                await _emit_channel_notification(session, content, meta)
-            except Exception as exc:
-                log.warning("khimaira-chat: failed to emit invite notification — %s", exc)
+        decision = _route_record(record, _state.session_id)
+        if decision is None:
             continue
-
-        if kind != "msg":
-            # Other member transitions / meta updates aren't surfaced as
-            # chat messages — they're still observable via chat_history.
-            continue
-
-        sender_id = record.get("sender_id")
-        if sender_id == _state.session_id:
-            # don't echo own messages back
-            continue
-
-        content = record.get("body", "")
-        meta = {
-            "chat_id": str(record.get("chat_id", "")),
-            "sender": str(record.get("sender_name") or sender_id or ""),
-            "msg_id": str(record.get("id", "")),
-        }
+        content, meta = decision
         try:
             await _emit_channel_notification(session, content, meta)
         except Exception as exc:
@@ -663,6 +733,8 @@ async def _proactive_sse_loop() -> None:
     notifications directly to write_stream — bypassing the session
     object, so the subscriber runs WITHOUT waiting for any agent
     tool call. The whole point of channels.
+
+    Routing lives in `_route_record`.
     """
     assert _state.session_id is not None
     assert _state.write_stream is not None
@@ -676,38 +748,10 @@ async def _proactive_sse_loop() -> None:
         evt_id = record.get("event_id")
         if evt_id:
             _state.last_event_id = evt_id
-        kind = record.get("kind")
-
-        if (
-            kind == "member"
-            and record.get("state") == "pending"
-            and record.get("session_id") == _state.session_id
-        ):
-            chat_id = record.get("chat_id", "")
-            inviter = record.get("invited_by", "someone")
-            content = (
-                f"{inviter} invited you to chat {chat_id}. "
-                f"Accept with `/khimaira-chat-accept` or decline with "
-                f"`/khimaira-chat-reject` (no chat_id needed — defaults "
-                f"to this invite)."
-            )
-            meta = {"chat_id": str(chat_id), "kind": "invite", "from": str(inviter)}
-            await _direct_channel_notify(content, meta)
+        decision = _route_record(record, _state.session_id)
+        if decision is None:
             continue
-
-        if kind != "msg":
-            continue
-
-        sender_id = record.get("sender_id")
-        if sender_id == _state.session_id:
-            continue  # don't echo own messages
-
-        content = record.get("body", "")
-        meta = {
-            "chat_id": str(record.get("chat_id", "")),
-            "sender": str(record.get("sender_name") or sender_id or ""),
-            "msg_id": str(record.get("id", "")),
-        }
+        content, meta = decision
         await _direct_channel_notify(content, meta)
 
 

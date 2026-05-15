@@ -657,7 +657,7 @@ Two improvements are already designed and queued, both small in scope:
 
    ~30 LOC + 2 tests. Once shipped, the `to=[...]` mechanism from Phase B becomes the natural implementation layer — the two features compose.
 
-2. **Wiring auto-accept across session reboots.** Today the allowlist is keyed by session UUID, which Claude Code regenerates each boot — so the persisted allowlist is useless past a single session's lifetime. The fix: also persist a per-friendly-name copy at `~/.local/state/khimaira/chats/auto-accept-by-name-<name>.json`. The SessionStart hook (after `session_set_name`) re-applies the by-name file to the new UUID. Survives reboots; matches `session_set_name` as the durable identity primitive everywhere else in khimaira. ~50 LOC + 3 tests.
+2. **Wiring auto-accept across session reboots** — ✅ shipped 2026-05-15 in the same Phase B v1.1 commit. Named sessions now persist their allowlist at `~/.local/state/khimaira/chats/auto-accept-by-name-<name>.json` (durable across UUID churn). The chat MCP subprocess auto-applies the by-name file at boot, immediately after the dual-name auto-bridge calls `session_set_name`. Unnamed sessions fall back to UUID-keyed storage (legacy behavior). `get_auto_accept` prefers by-name when the session has a name. See `apply_auto_accept_by_name` in `khimaira.monitor.chats` and the `POST /api/sessions/{sid}/auto-accept/apply-by-name?name=…` endpoint.
 
 Phase B+ items still in [`tasks/khimaira-chat/PHASE-B-VISION.md`](../tasks/khimaira-chat/PHASE-B-VISION.md) that did NOT land in v1.0 / v1.1:
 

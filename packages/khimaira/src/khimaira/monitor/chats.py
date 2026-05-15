@@ -619,19 +619,57 @@ def _auto_accept_path(session_id: str) -> Path:
     return _chat_dir() / f"auto-accept-{session_id}.json"
 
 
+def _auto_accept_by_name_path(name: str) -> Path:
+    return _chat_dir() / f"auto-accept-by-name-{name}.json"
+
+
 def set_auto_accept(session_id: str, allowlist: list[str]) -> dict[str, Any]:
-    """Replace this session's auto-accept allowlist. Pass [] to clear."""
+    """Replace this session's auto-accept allowlist. Pass [] to clear.
+
+    If the session has a friendly name (via `session_set_name`), the
+    allowlist is persisted under that name so it survives session UUID
+    churn — Claude Code regenerates UUIDs each boot, but names are
+    durable. Unnamed sessions fall back to UUID-keyed storage (works
+    only within the session's lifetime).
+    """
     session_id = _resolve_or_uuid(session_id)
     _ensure_dir()
     payload = {"allow": list(allowlist), "updated_at": _now_iso()}
-    _auto_accept_path(session_id).write_text(json.dumps(payload), encoding="utf-8")
-    log.info("chats: set auto-accept for %s → %d allowed peers", session_id, len(allowlist))
+    name = _resolve_session_name(session_id)
+    if name:
+        _auto_accept_by_name_path(name).write_text(json.dumps(payload), encoding="utf-8")
+        log.info(
+            "chats: set auto-accept for %s (by-name=%s) → %d allowed peers",
+            session_id,
+            name,
+            len(allowlist),
+        )
+    else:
+        _auto_accept_path(session_id).write_text(json.dumps(payload), encoding="utf-8")
+        log.info(
+            "chats: set auto-accept for %s (UUID-only, unnamed) → %d allowed peers",
+            session_id,
+            len(allowlist),
+        )
     return payload
 
 
 def get_auto_accept(session_id: str) -> dict[str, Any]:
-    """Read this session's auto-accept allowlist; returns {'allow': []} if unset."""
+    """Read this session's auto-accept allowlist; returns {'allow': []} if unset.
+
+    Prefers the durable by-name file when the session has a name —
+    this is what makes the allowlist survive session UUID churn.
+    Falls back to UUID-keyed file for unnamed sessions or legacy state.
+    """
     session_id = _resolve_or_uuid(session_id)
+    name = _resolve_session_name(session_id)
+    if name:
+        path = _auto_accept_by_name_path(name)
+        if path.is_file():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
     path = _auto_accept_path(session_id)
     if not path.is_file():
         return {"allow": []}
@@ -639,6 +677,32 @@ def get_auto_accept(session_id: str) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"allow": []}
+
+
+def apply_auto_accept_by_name(session_id: str, name: str) -> dict[str, Any]:
+    """Surface a by-name allowlist file for a freshly-named session.
+
+    Called by the chat MCP subprocess at boot, right after the dual-name
+    auto-bridge detects `-n NAME` and registers it via `set_session_name`.
+    Functionally a no-op — `get_auto_accept` already prefers the by-name
+    file when the session has a name — but it returns whether the file
+    existed so the caller can log the boot-time application.
+    """
+    session_id = _resolve_or_uuid(session_id)
+    path = _auto_accept_by_name_path(name)
+    if not path.is_file():
+        return {"applied": False, "allow": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"applied": False, "allow": []}
+    log.info(
+        "chats: by-name allowlist surfaced for %s (name=%s) — %d allowed peers",
+        session_id,
+        name,
+        len(data.get("allow", [])),
+    )
+    return {"applied": True, **data}
 
 
 def should_auto_accept(invitee_session_id: str, inviter_session_id: str) -> bool:

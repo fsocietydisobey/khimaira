@@ -253,6 +253,24 @@ def set_auto_accept(
     return resp.json()
 
 
+def apply_auto_accept_by_name(
+    session_id: str, name: str, *, base: str = DEFAULT_BASE
+) -> dict[str, Any]:
+    """Surface a by-name auto-accept allowlist file for a freshly-named
+    session. Called at chat MCP subprocess boot, immediately after the
+    dual-name auto-bridge calls `set_session_name`. No-op if no by-name
+    file exists for `name` — just enables logging that the boot-time
+    apply ran."""
+    resp = _request_with_retry(
+        "POST",
+        f"{base}/api/sessions/{session_id}/auto-accept/apply-by-name",
+        params={"name": name},
+        timeout=10.0,
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
 def history(
     chat_id: str,
     session_id: str,

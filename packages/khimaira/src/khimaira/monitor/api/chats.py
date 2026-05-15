@@ -239,6 +239,17 @@ def build_router():
             raise fastapi.HTTPException(404, str(exc)) from exc
         return {"ok": True, "session_id": session_id, "allowlist": req.allowlist}
 
+    @router.post("/sessions/{session_id}/auto-accept/apply-by-name")
+    async def apply_auto_accept_by_name(session_id: str, name: str) -> dict:
+        """Surface the by-name allowlist file for a freshly-named session.
+        Called by the chat MCP subprocess at boot, after the dual-name
+        auto-bridge detects `-n NAME` and registers it. No-op if no
+        by-name file exists for `name`."""
+        try:
+            return chats.apply_auto_accept_by_name(session_id, name)
+        except ValueError as exc:
+            raise fastapi.HTTPException(404, str(exc)) from exc
+
     @router.get("/chats/{chat_id}/messages")
     async def get_history(
         chat_id: str,

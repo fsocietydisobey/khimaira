@@ -867,3 +867,60 @@ def test_set_auto_accept_unknown_session_raises(isolated_chats):
     c = isolated_chats
     with pytest.raises(ValueError, match="No session"):
         c.set_auto_accept("nope-not-real", ["whoever"])
+
+
+# ---------------------------------------------------------------------------
+# Phase B v1.1: per-friendly-name auto-accept persistence
+# ---------------------------------------------------------------------------
+
+
+def test_set_auto_accept_writes_by_name_when_session_has_name(isolated_chats):
+    """When a session has a friendly name, set_auto_accept persists under
+    that name (durable across UUID churn), NOT under the UUID."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid-v1", "alice")
+    c.set_auto_accept("alice-uuid-v1", ["bob"])
+    # By-name file exists, by-UUID file does NOT.
+    assert c._auto_accept_by_name_path("alice").is_file()
+    assert not c._auto_accept_path("alice-uuid-v1").is_file()
+
+
+def test_get_auto_accept_prefers_by_name_for_named_session(isolated_chats):
+    """Once a session has a name, get_auto_accept reads the by-name file —
+    even if a stale by-UUID file exists from a prior session that wrote
+    UUID-only state. This is the load-bearing assertion: if the same name
+    boots with a NEW UUID, it inherits the by-name allowlist."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid-v2", "alice")
+    # Manually write a by-name file (simulating a prior session having set it).
+    c._ensure_dir()
+    c._auto_accept_by_name_path("alice").write_text(
+        '{"allow": ["bob", "carol"], "updated_at": "2026-05-15T00:00:00+00:00"}',
+        encoding="utf-8",
+    )
+    payload = c.get_auto_accept("alice-uuid-v2")
+    assert payload["allow"] == ["bob", "carol"]
+
+
+def test_apply_auto_accept_by_name_returns_applied_true_when_file_exists(isolated_chats):
+    """apply_auto_accept_by_name (called at chat MCP subprocess boot)
+    surfaces the by-name allowlist for a freshly-named session."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid-v3", "alice")
+    c._ensure_dir()
+    c._auto_accept_by_name_path("alice").write_text(
+        '{"allow": ["master-bot"], "updated_at": "2026-05-15T00:00:00+00:00"}',
+        encoding="utf-8",
+    )
+    result = c.apply_auto_accept_by_name("alice-uuid-v3", "alice")
+    assert result["applied"] is True
+    assert result["allow"] == ["master-bot"]
+    # And: a fresh call with NO file present returns applied=False.
+    result_missing = c.apply_auto_accept_by_name("alice-uuid-v3", "no-such-name")
+    assert result_missing == {"applied": False, "allow": []}
