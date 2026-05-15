@@ -348,6 +348,29 @@ def main() -> int:
             "Skip if nothing to log."
         )
 
+    # --- Phase B v1.7.2: per-turn role-budget reminder --------------------
+    # Surfaces "you are role X in chat Y → /model A, /effort B" on every
+    # prompt submission across every session. Closes the gap where v1.5's
+    # role-directive emit fires only on role change (one-shot) and v1.6.1's
+    # SessionStart hook fires only on boot — between boots + non-change-
+    # events, the user could forget to apply the budget recommendation.
+    # Reusing v1.6.1's _discover_chat_roles + _format_chat_roles helpers
+    # (file-scan-primary; same logic that surfaces in the SessionStart block).
+    # Silent when no chats have a role for this session (empty result).
+    # Opt-out: KHIMAIRA_ROLE_BUDGET_REMINDER=0.
+    role_budget_block = ""
+    if os.environ.get("KHIMAIRA_ROLE_BUDGET_REMINDER") not in ("0", "false", "no"):
+        try:
+            from khimaira.hooks.session_start import (
+                _discover_chat_roles,
+                _format_chat_roles,
+            )
+            _roles = _discover_chat_roles(session_id)
+            if _roles:
+                role_budget_block = _format_chat_roles(_roles)
+        except Exception:  # noqa: BLE001 — hook must not break
+            role_budget_block = ""
+
     # --- Phase B v1.7.1: real-time bottleneck check (every turn) ----------
     # Mirrors khimaira-bottleneck-watch.sh's heuristic but runs synchronously
     # in the UserPromptSubmit hot path. Detection cost: ~10-30ms (one daemon
@@ -391,15 +414,15 @@ def main() -> int:
         and not reminder_block
         and not delegate_block
         and not bottleneck_block
+        and not role_budget_block
     ):
         return 0
 
-    # Bottleneck block leads — it's the highest-priority signal (saturation
-    # is what blocks every other workflow). Followed by delegate nudge (tier
-    # drop suggestion), inbox (other-session communication), incoming
-    # questions, and the periodic decision reminder.
+    # Ordering: bottleneck (highest-priority, only fires on saturation) →
+    # role_budget (per-turn role + recommended /model + /effort reminder) →
+    # delegate nudge → inbox → incoming questions → periodic reminder.
     additional_context = "\n\n".join(
-        b for b in (bottleneck_block, delegate_block, inbox_block, incoming_block, reminder_block) if b
+        b for b in (bottleneck_block, role_budget_block, delegate_block, inbox_block, incoming_block, reminder_block) if b
     )
 
     output = {
