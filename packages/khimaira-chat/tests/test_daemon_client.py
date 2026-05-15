@@ -90,6 +90,16 @@ def _mock_transport(handler):
     return httpx.MockTransport(handler)
 
 
+def _patch_request(monkeypatch, handler):
+    """Route httpx.request() calls through a MockTransport for tests."""
+    transport = _mock_transport(handler)
+    monkeypatch.setattr(
+        httpx,
+        "request",
+        lambda method, url, **kw: httpx.Client(transport=transport).request(method, url, **kw),
+    )
+
+
 def test_create_room_happy_path(monkeypatch):
     sent = {}
 
@@ -104,17 +114,7 @@ def test_create_room_happy_path(monkeypatch):
             },
         )
 
-    monkeypatch.setattr(httpx, "post", lambda *a, **kw: handler(httpx.Request("POST", a[0])))
-    # The above monkeypatch is too coarse — real handler needs to receive
-    # the actual content. Use a real client transport instead.
-    monkeypatch.undo()
-
-    transport = _mock_transport(handler)
-    monkeypatch.setattr(
-        httpx,
-        "post",
-        lambda url, **kw: httpx.Client(transport=transport).post(url, **kw),
-    )
+    _patch_request(monkeypatch, handler)
 
     result = daemon_client.create_room("alice", ["bob"], title="alice + bob")
     assert result["meta"]["chat_id"] == "chat-test123abcde"
@@ -126,12 +126,7 @@ def test_create_room_raises_on_404(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"detail": "unknown member"})
 
-    transport = _mock_transport(handler)
-    monkeypatch.setattr(
-        httpx,
-        "post",
-        lambda url, **kw: httpx.Client(transport=transport).post(url, **kw),
-    )
+    _patch_request(monkeypatch, handler)
 
     with pytest.raises(daemon_client.DaemonError) as excinfo:
         daemon_client.create_room("alice", ["ghost"])
@@ -143,16 +138,56 @@ def test_send_message_raises_on_403(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"detail": "non-member can't send"})
 
-    transport = _mock_transport(handler)
-    monkeypatch.setattr(
-        httpx,
-        "post",
-        lambda url, **kw: httpx.Client(transport=transport).post(url, **kw),
-    )
+    _patch_request(monkeypatch, handler)
 
     with pytest.raises(daemon_client.DaemonError) as excinfo:
         daemon_client.send_message("chat-x", "eve", "hostile")
     assert excinfo.value.status_code == 403
+
+
+def test_request_with_retry_recovers_after_transient_connect_error(monkeypatch):
+    """Brief connection refused → retry → success on second attempt."""
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise httpx.ConnectError("connection refused (test)")
+        return httpx.Response(200, json={"chats": []})
+
+    transport = _mock_transport(handler)
+
+    def fake_request(method, url, **kw):
+        return httpx.Client(transport=transport).request(method, url, **kw)
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    # Stub time.sleep so the test doesn't actually pause _RETRY_DELAY_S.
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    result = daemon_client.my_chats("alice")
+    assert result == []
+    assert attempts["count"] == 2  # one failure + one success
+
+
+def test_request_with_retry_gives_up_after_max_attempts(monkeypatch):
+    """Persistent connection failure → all retries fail → raise."""
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        raise httpx.ConnectError("daemon down (test)")
+
+    transport = _mock_transport(handler)
+
+    def fake_request(method, url, **kw):
+        return httpx.Client(transport=transport).request(method, url, **kw)
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    with pytest.raises(httpx.ConnectError):
+        daemon_client.my_chats("alice")
+    assert attempts["count"] == daemon_client._RETRY_ATTEMPTS
 
 
 def test_my_chats_returns_list(monkeypatch):
@@ -167,12 +202,7 @@ def test_my_chats_returns_list(monkeypatch):
             },
         )
 
-    transport = _mock_transport(handler)
-    monkeypatch.setattr(
-        httpx,
-        "get",
-        lambda url, **kw: httpx.Client(transport=transport).get(url, **kw),
-    )
+    _patch_request(monkeypatch, handler)
 
     result = daemon_client.my_chats("alice")
     assert len(result) == 2

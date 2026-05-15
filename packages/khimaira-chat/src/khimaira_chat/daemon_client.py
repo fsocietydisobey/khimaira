@@ -19,6 +19,12 @@ import httpx
 
 DEFAULT_BASE = os.environ.get("KHIMAIRA_MONITOR_URL", "http://127.0.0.1:8740")
 
+# Brief retry on connection-refused absorbs a daemon restart (~1-3s
+# downtime). 4xx/5xx responses are NOT retried — they're real server
+# answers, not transport hiccups.
+_RETRY_ATTEMPTS = 3
+_RETRY_DELAY_S = 0.5
+
 
 class DaemonError(Exception):
     """Raised when the daemon returns an HTTP error."""
@@ -38,6 +44,29 @@ def _raise_for_status(resp: httpx.Response) -> None:
         raise DaemonError(resp.status_code, detail or f"HTTP {resp.status_code}")
 
 
+def _request_with_retry(method: str, url: str, **kwargs) -> httpx.Response:
+    """httpx call with brief retry on connection refused / network errors.
+
+    Absorbs a daemon restart without surfacing the failure to the agent.
+    Last attempt's exception bubbles up unchanged so the caller still
+    sees a real DaemonError if the daemon stays down.
+    """
+    import time
+
+    last_exc: Exception | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            return httpx.request(method, url, **kwargs)
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+            last_exc = exc
+            if attempt < _RETRY_ATTEMPTS - 1:
+                time.sleep(_RETRY_DELAY_S)
+                continue
+            raise
+    # Defensive — loop always returns or raises.
+    raise last_exc if last_exc else RuntimeError("unreachable")
+
+
 # ---------------------------------------------------------------------------
 # REST calls — thin wrappers over the daemon's /api/chats/* endpoints
 # ---------------------------------------------------------------------------
@@ -51,7 +80,8 @@ def create_room(
     fresh: bool = False,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
-    resp = httpx.post(
+    resp = _request_with_retry(
+        "POST",
         f"{base}/api/chats",
         json={
             "creator_session_id": creator_session_id,
@@ -72,7 +102,8 @@ def invite(
     *,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
-    resp = httpx.post(
+    resp = _request_with_retry(
+        "POST",
         f"{base}/api/chats/{chat_id}/invite",
         json={
             "by_session_id": by_session_id,
@@ -85,7 +116,8 @@ def invite(
 
 
 def accept(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[str, Any]:
-    resp = httpx.post(
+    resp = _request_with_retry(
+        "POST",
         f"{base}/api/chats/{chat_id}/accept",
         json={"session_id": session_id},
         timeout=10.0,
@@ -95,7 +127,8 @@ def accept(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[s
 
 
 def reject(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[str, Any]:
-    resp = httpx.post(
+    resp = _request_with_retry(
+        "POST",
         f"{base}/api/chats/{chat_id}/reject",
         json={"session_id": session_id},
         timeout=10.0,
@@ -107,7 +140,8 @@ def reject(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[s
 def latest_pending(session_id: str, *, base: str = DEFAULT_BASE) -> str | None:
     """Return the chat_id of the most recent pending invite for this
     session, or None if no pending invites."""
-    resp = httpx.get(
+    resp = _request_with_retry(
+        "GET",
         f"{base}/api/chats/pending/latest",
         params={"session_id": session_id},
         timeout=10.0,
@@ -119,7 +153,8 @@ def latest_pending(session_id: str, *, base: str = DEFAULT_BASE) -> str | None:
 def send_message(
     chat_id: str, sender_session_id: str, body: str, *, base: str = DEFAULT_BASE
 ) -> dict[str, Any]:
-    resp = httpx.post(
+    resp = _request_with_retry(
+        "POST",
         f"{base}/api/chats/{chat_id}/messages",
         json={"sender_session_id": sender_session_id, "body": body},
         timeout=10.0,
@@ -139,19 +174,24 @@ def history(
     params: dict[str, Any] = {"session_id": session_id, "limit": limit}
     if since:
         params["since"] = since
-    resp = httpx.get(f"{base}/api/chats/{chat_id}/messages", params=params, timeout=10.0)
+    resp = _request_with_retry(
+        "GET", f"{base}/api/chats/{chat_id}/messages", params=params, timeout=10.0
+    )
     _raise_for_status(resp)
     return resp.json().get("messages", [])
 
 
 def my_chats(session_id: str, *, base: str = DEFAULT_BASE) -> list[dict[str, Any]]:
-    resp = httpx.get(f"{base}/api/chats", params={"session_id": session_id}, timeout=10.0)
+    resp = _request_with_retry(
+        "GET", f"{base}/api/chats", params={"session_id": session_id}, timeout=10.0
+    )
     _raise_for_status(resp)
     return resp.json().get("chats", [])
 
 
 def leave(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[str, Any]:
-    resp = httpx.post(
+    resp = _request_with_retry(
+        "POST",
         f"{base}/api/chats/{chat_id}/leave",
         json={"session_id": session_id},
         timeout=10.0,
@@ -161,7 +201,8 @@ def leave(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[st
 
 
 def delete_chat(chat_id: str, by_session_id: str, *, base: str = DEFAULT_BASE) -> dict[str, Any]:
-    resp = httpx.delete(
+    resp = _request_with_retry(
+        "DELETE",
         f"{base}/api/chats/{chat_id}",
         params={"by_session_id": by_session_id},
         timeout=10.0,
@@ -171,7 +212,9 @@ def delete_chat(chat_id: str, by_session_id: str, *, base: str = DEFAULT_BASE) -
 
 
 def get_room(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[str, Any]:
-    resp = httpx.get(f"{base}/api/chats/{chat_id}", params={"session_id": session_id}, timeout=10.0)
+    resp = _request_with_retry(
+        "GET", f"{base}/api/chats/{chat_id}", params={"session_id": session_id}, timeout=10.0
+    )
     _raise_for_status(resp)
     return resp.json()
 
@@ -186,19 +229,29 @@ async def subscribe_events(
     *,
     last_event_id: str | None = None,
     base: str = DEFAULT_BASE,
-    reconnect_backoff_s: float = 2.0,
+    initial_backoff_s: float = 1.0,
+    max_backoff_s: float = 30.0,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield chat events from the daemon's SSE stream.
 
     Reconnects forever with the last-seen event id so a daemon restart
     or transient network blip doesn't lose messages. Caller cancels the
     iterator to stop.
+
+    Backoff strategy: exponential — 1s → 2s → 4s → 8s → 16s → 30s (cap)
+    — and resets to `initial_backoff_s` after a successful connect (any
+    bytes received). This keeps the reconnect prompt during a daemon
+    restart while not hammering the daemon if it stays down. Caps at 30s
+    so eventual reconnect after a long outage still happens within
+    half a minute.
     """
     url = f"{base}/api/chats/events"
+    backoff = initial_backoff_s
     while True:
         headers: dict[str, str] = {"Accept": "text/event-stream"}
         if last_event_id:
             headers["Last-Event-ID"] = last_event_id
+        connected = False
         try:
             async with (
                 httpx.AsyncClient(timeout=None) as client,
@@ -207,14 +260,18 @@ async def subscribe_events(
                 ) as resp,
             ):
                 resp.raise_for_status()
+                connected = True
+                backoff = initial_backoff_s  # successful connect → reset
                 async for record in _parse_sse_lines(resp.aiter_lines()):
                     evt_id = record.get("event_id")
                     if evt_id:
                         last_event_id = evt_id
                     yield record
         except (httpx.HTTPError, httpx.NetworkError):
-            # Transient failure — back off and retry.
-            await asyncio.sleep(reconnect_backoff_s)
+            await asyncio.sleep(backoff)
+            if not connected:
+                # Failed to connect at all → exponential backoff.
+                backoff = min(backoff * 2, max_backoff_s)
             continue
 
 
