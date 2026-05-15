@@ -60,6 +60,16 @@ TASK_DONE = "done"
 TASK_APPROVED = "approved"
 TASK_CHANGES_REQUESTED = "changes_requested"
 
+# Phase B v2: explicit member roles in room.meta.member_roles.
+# Single-master-with-delegation invariant (audit F2): exactly one session
+# holds ROLE_MASTER at a time. v1-era chats with no explicit `member_roles`
+# fall back to implicit master = `created_by` via `_is_master`.
+ROLE_MASTER = "master"
+ROLE_AGENT = "agent"
+ROLE_OBSERVER = "observer"
+ROLE_CRITIC = "critic"
+_VALID_ROLES: frozenset[str] = frozenset({ROLE_MASTER, ROLE_AGENT, ROLE_OBSERVER, ROLE_CRITIC})
+
 # (from_status, to_status) → roles allowed to perform the transition.
 # "master" = chat creator; "assignee_or_any" = assignee if set, else any accepted member.
 _TASK_TRANSITIONS: dict[tuple[str, str], set[str]] = {
@@ -110,6 +120,30 @@ def _append(chat_id: str, record: dict[str, Any]) -> None:
 
 def _read(chat_id: str) -> list[dict[str, Any]]:
     return sessions_mod._read_jsonl(_chat_path(chat_id))
+
+
+def _is_master(room: dict[str, Any], sid: str) -> bool:
+    """Phase B v2 master check.
+
+    Returns True iff `sid` holds the master role in this chat.
+
+    Resolution order:
+      1. If `room.meta.member_roles` is present (post-v2 chat OR a v1-era
+         chat that has had any `chat_grant_role` call), it is the SOLE
+         source of truth. Check `member_roles.get(sid) == ROLE_MASTER`.
+      2. Otherwise (v1-era chat, never had an explicit role write), fall
+         back to implicit master = `created_by`.
+
+    First `chat_grant_role` call on a v1-era chat materializes the implicit
+    master into the explicit dict, so the fallback fires only for chats
+    that have NEVER had a role write. This removes the implicit/explicit
+    duality after the first explicit role mutation — auditability +
+    enforcement consistency.
+    """
+    member_roles = room["meta"].get("member_roles")
+    if member_roles is not None:
+        return member_roles.get(sid) == ROLE_MASTER
+    return room["meta"].get("created_by") == sid
 
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -383,6 +417,17 @@ def latest_pending_chat_id(session_id: str) -> str | None:
 _sanitize_message_body = sessions_mod.sanitize_agent_text
 
 
+def _check_not_observer(room: dict[str, Any], sid: str, action: str) -> None:
+    """Phase B v2: observers can read everything but cannot write. Pre-check
+    helper for send_message / create_task / update_task_status."""
+    member_roles = room["meta"].get("member_roles") or {}
+    if member_roles.get(sid) == ROLE_OBSERVER:
+        raise ValueError(
+            f"Session {sid!r} is an observer in {room['meta'].get('chat_id', '?')!r}; "
+            f"observers cannot {action}."
+        )
+
+
 def send_message(
     chat_id: str,
     sender_session_id: str,
@@ -396,6 +441,10 @@ def send_message(
     broadcast goes only to those sessions (plus sender for echo-drop).
     The message is still appended to the JSONL — chat_history shows it
     for everyone. Private-in-real-time, public-in-record.
+
+    Phase B v2: observers (member_roles[sid] == "observer") cannot send;
+    raises ValueError. Critic role behaves identically to agent for write
+    paths — opinion-only role, label visible in member listings.
     """
     sender_session_id = _resolve_or_uuid(sender_session_id)
     room = load_room(chat_id)
@@ -406,6 +455,7 @@ def send_message(
             f"Session {sender_session_id!r} is {state!r} in {chat_id!r}; "
             f"only accepted members can send messages."
         )
+    _check_not_observer(room, sender_session_id, "send messages")
 
     resolved_to: list[str] | None = None
     if to:
@@ -449,7 +499,10 @@ def create_task(
     assignee_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Append a TASK record (status=pending). Sender must be an accepted member;
-    if assignee_session_id is set, that session must also be accepted."""
+    if assignee_session_id is set, that session must also be accepted.
+
+    Phase B v2: observers cannot create tasks.
+    """
     sender_session_id = _resolve_or_uuid(sender_session_id)
     room = load_room(chat_id)
     member = room["members"].get(sender_session_id)
@@ -459,6 +512,7 @@ def create_task(
             f"Session {sender_session_id!r} is {state!r} in {chat_id!r}; "
             f"only accepted members can create tasks."
         )
+    _check_not_observer(room, sender_session_id, "create tasks")
 
     assignee_resolved = None
     assignee_name = None
@@ -505,7 +559,11 @@ def update_task_status(
     note: str | None = None,
 ) -> dict[str, Any]:
     """Append a TASK_UPDATE record. Validates the from→to transition and
-    the caller's role (master vs assignee vs accepted-member)."""
+    the caller's role (master vs assignee vs accepted-member).
+
+    Phase B v2: observers cannot update task status (no write paths for
+    observer role).
+    """
     by_session_id = _resolve_or_uuid(by_session_id)
     room = load_room(chat_id)
     member = room["members"].get(by_session_id)
@@ -515,6 +573,7 @@ def update_task_status(
             f"Session {by_session_id!r} is {state!r} in {chat_id!r}; "
             f"only accepted members can update task status."
         )
+    _check_not_observer(room, by_session_id, "update task status")
 
     task_record = None
     current_status = None
@@ -538,8 +597,10 @@ def update_task_status(
             f"From {current_status!r} you can go to: {valid_targets or '(terminal)'}."
         )
 
-    creator = room["meta"].get("created_by")
-    is_master = by_session_id == creator
+    # Phase B v2: master check goes through _is_master so member_roles
+    # (when present) is the source of truth; falls back to created_by
+    # for v1-era chats.
+    is_master = _is_master(room, by_session_id)
     assignee = task_record.get("assignee_id")
     is_assignee = assignee is not None and by_session_id == assignee
 
@@ -626,11 +687,12 @@ def signal_task_start(
             f"signal_start only valid on pending tasks."
         )
 
-    creator = room["meta"].get("created_by")
-    if by_session_id != creator:
+    # Phase B v2: master check via _is_master so granted masters can
+    # signal-start in v2 chats with explicit member_roles.
+    if not _is_master(room, by_session_id):
         raise ValueError(
-            f"Session {by_session_id!r} is not the master (creator={creator!r}) of "
-            f"{chat_id!r}; only the master can signal start on pending tasks."
+            f"Session {by_session_id!r} is not the master of {chat_id!r}; "
+            f"only the master can signal start on pending tasks."
         )
 
     record = {
@@ -821,7 +883,14 @@ def history(
 
 
 def leave(chat_id: str, session_id: str) -> dict[str, Any]:
-    """Mark caller as `left`. They no longer receive notifications."""
+    """Mark caller as `left`. They no longer receive notifications.
+
+    Phase B v2: refuses if the caller is the chat's current master.
+    Master must first transfer their seat via chat_transfer_membership or
+    promote another member to master via chat_grant_role, then leave.
+    Closes the v1 footgun where a creator's chat_leave made `done →
+    approved` unreachable for the rest of the chat's lifetime.
+    """
     session_id = _resolve_or_uuid(session_id)
     room = load_room(chat_id)
     member = room["members"].get(session_id)
@@ -832,6 +901,12 @@ def leave(chat_id: str, session_id: str) -> dict[str, Any]:
     if member["state"] in (LEFT, REMOVED):
         raise ValueError(
             f"Session {session_id!r} already in state {member['state']!r}; cannot leave again."
+        )
+    if _is_master(room, session_id):
+        raise ValueError(
+            f"Session {session_id!r} is the master of {chat_id!r} and cannot leave "
+            f"directly. Use chat_transfer_membership to hand off membership, or "
+            f"chat_grant_role to promote another accepted member to master, then leave."
         )
     record = {
         "kind": MEMBER,
@@ -917,6 +992,21 @@ def transfer_membership(
         creator_meta_update["created_by_name"] = to_name
         creator_meta_update["event_id"] = _new_event_id()
         creator_meta_update["ts"] = ts
+        # Phase B v2: propagate master role in member_roles too. The v1.3
+        # created_by swap fixed the implicit-master fallback; v2 needs the
+        # explicit member_roles entry updated so that, after a future
+        # chat_grant_role on this chat materializes the dict, the
+        # successor's master status survives. If member_roles was already
+        # explicit, demote the old creator to agent and promote the new
+        # creator to master in the same write.
+        member_roles = dict(existing_meta.get("member_roles") or {})
+        if member_roles:
+            # Explicit dict pre-existed: demote from-creator (if they had
+            # master), promote to-creator.
+            if member_roles.get(from_session_id) == ROLE_MASTER:
+                member_roles[from_session_id] = ROLE_AGENT
+            member_roles[to_session_id] = ROLE_MASTER
+            creator_meta_update["member_roles"] = member_roles
 
     out_record = {
         "kind": MEMBER,
@@ -979,12 +1069,181 @@ def transfer_membership(
     }
 
 
+def set_creator(chat_id: str, new_creator_session_id: str) -> dict[str, Any]:
+    """Re-anchor master/creator for an orphaned chat (Phase B v2).
+
+    Use when the current `created_by` session is TRANSFERRED_OUT — a pre-v1.3
+    transfer_membership left the chat with no surviving master, so `done →
+    approved` is unreachable. Any accepted member can call set_creator on
+    an orphaned-by-transfer chat to claim master and unstick the lifecycle.
+
+    Strictly TRANSFERRED_OUT only — set_creator does NOT unlock chats where
+    the master is LEFT (voluntary departure should have been refused by the
+    v2 master-leave guard) or REMOVED (eviction is a different story). For
+    chats with a still-ACCEPTED master, use chat_grant_role instead.
+
+    Emits a fresh META record with updated created_by, created_by_name, and
+    member_roles[new_creator] = "master". Single-master invariant preserved:
+    the TRANSFERRED_OUT predecessor's role entry (if any) is left alone — they
+    no longer have an ACCEPTED seat, so the role is operationally moot.
+    """
+    new_creator_session_id = _resolve_or_uuid(new_creator_session_id)
+    room = load_room(chat_id)
+
+    member = room["members"].get(new_creator_session_id)
+    if not member or member["state"] != ACCEPTED:
+        state = (member or {}).get("state", "non-member")
+        raise ValueError(
+            f"Session {new_creator_session_id!r} is {state!r} in {chat_id!r}; "
+            f"only accepted members can be set as creator."
+        )
+
+    current_creator = room["meta"].get("created_by")
+    if current_creator:
+        current_state = (room["members"].get(current_creator) or {}).get("state", "non-member")
+        if current_state != TRANSFERRED_OUT:
+            raise ValueError(
+                f"Current creator {current_creator!r} state is {current_state!r}, not "
+                f"{TRANSFERRED_OUT!r}; chat_set_creator only unlocks chats orphaned by "
+                f"transfer_membership. For active creators use chat_grant_role; for LEFT "
+                f"creators the chat stays archived (master-leave-guard should have refused)."
+            )
+
+    existing_meta = {k: v for k, v in room["meta"].items() if k != "event_id"}
+    new_meta = {
+        **existing_meta,
+        "kind": META,
+        "event_id": _new_event_id(),
+        "ts": _now_iso(),
+        "created_by": new_creator_session_id,
+        "created_by_name": member.get("session_name") or new_creator_session_id[:8],
+    }
+    member_roles = dict(existing_meta.get("member_roles") or {})
+    member_roles[new_creator_session_id] = "master"
+    new_meta["member_roles"] = member_roles
+    _append(chat_id, new_meta)
+    log.info(
+        "chats: set_creator %s for orphaned chat %s (was %s)",
+        new_creator_session_id,
+        chat_id,
+        current_creator,
+    )
+    return new_meta
+
+
+def chat_grant_role(
+    chat_id: str,
+    by_session_id: str,
+    target_session_id: str,
+    role: str,
+    *,
+    demote_to: str = ROLE_AGENT,
+) -> dict[str, Any]:
+    """Phase B v2: master-only role-grant primitive.
+
+    Sets `target_session_id`'s role in `room.meta.member_roles`. Atomic
+    promote-demote when `role == ROLE_MASTER`: the existing master is
+    demoted to `demote_to` in the SAME META write that promotes the new
+    master, preserving the single-master-with-delegation invariant (no
+    window where two sessions both hold master).
+
+    **First-grant materialization**: on a v1-era chat with no explicit
+    `member_roles`, the first `chat_grant_role` call materializes the
+    implicit creator-master into the new dict BEFORE applying the
+    requested grant. After the first explicit role write, `member_roles`
+    is the sole source of truth — `_is_master`'s fallback to `created_by`
+    only fires for chats that have never had any role mutation.
+
+    Raises ValueError if:
+      - caller is not currently master
+      - target is not an ACCEPTED member of the chat
+      - `role` is not in _VALID_ROLES
+      - `demote_to` is not in _VALID_ROLES
+      - `demote_to == ROLE_MASTER` (closes the quorum loophole)
+    """
+    by_session_id = _resolve_or_uuid(by_session_id)
+    target_session_id = _resolve_or_uuid(target_session_id)
+
+    if role not in _VALID_ROLES:
+        raise ValueError(f"Invalid role {role!r}. Valid roles: {sorted(_VALID_ROLES)}.")
+    if demote_to not in _VALID_ROLES:
+        raise ValueError(f"Invalid demote_to {demote_to!r}. Valid roles: {sorted(_VALID_ROLES)}.")
+    if demote_to == ROLE_MASTER:
+        raise ValueError(
+            "demote_to cannot be 'master' — single-master-with-delegation "
+            "invariant requires at most one session holds master at a time."
+        )
+
+    room = load_room(chat_id)
+
+    if not _is_master(room, by_session_id):
+        raise ValueError(
+            f"Session {by_session_id!r} is not the master of {chat_id!r}; "
+            f"only the master can grant roles."
+        )
+
+    target_member = room["members"].get(target_session_id)
+    if not target_member or target_member["state"] != ACCEPTED:
+        state = (target_member or {}).get("state", "non-member")
+        raise ValueError(
+            f"Target {target_session_id!r} is {state!r} in {chat_id!r}; "
+            f"only accepted members can be assigned a role."
+        )
+
+    existing_meta = dict(room.get("meta") or {})
+    member_roles = dict(existing_meta.get("member_roles") or {})
+    first_explicit_write = "member_roles" not in existing_meta
+
+    # First-grant materialization: capture the implicit master before any
+    # demote/promote logic so the resulting dict reflects the v1-era state
+    # explicitly. The implicit master is room.meta.created_by.
+    if first_explicit_write:
+        implicit_master = existing_meta.get("created_by")
+        if implicit_master:
+            member_roles[implicit_master] = ROLE_MASTER
+
+    # Atomic promote-demote when promoting a new master. Find the current
+    # master (after materialization, this comes from member_roles); demote
+    # them unless they're the same as the target (no-op promotion).
+    if role == ROLE_MASTER:
+        current_master = None
+        for sid, r in member_roles.items():
+            if r == ROLE_MASTER:
+                current_master = sid
+                break
+        if current_master and current_master != target_session_id:
+            member_roles[current_master] = demote_to
+
+    # Apply the requested grant.
+    member_roles[target_session_id] = role
+
+    new_meta = {
+        **existing_meta,
+        "kind": META,
+        "event_id": _new_event_id(),
+        "ts": _now_iso(),
+        "member_roles": member_roles,
+    }
+    _append(chat_id, new_meta)
+    log.info(
+        "chats: grant_role chat=%s target=%s role=%s by=%s%s",
+        chat_id,
+        target_session_id,
+        role,
+        by_session_id,
+        " (first explicit write — materialized implicit master)" if first_explicit_write else "",
+    )
+    return new_meta
+
+
 def delete(chat_id: str, by_session_id: str) -> dict[str, Any]:
-    """Archive the chat JSONL. Only the creator can call this."""
+    """Archive the chat JSONL. Only the master can call this (v2:
+    `_is_master` reads `member_roles`; v1-era chats fall back to
+    `created_by`)."""
     by_session_id = _resolve_or_uuid(by_session_id)
     room = load_room(chat_id)
-    creator = room["meta"].get("created_by")
-    if creator != by_session_id:
+    if not _is_master(room, by_session_id):
+        creator = room["meta"].get("created_by")
         raise ValueError(
             f"Only the chat creator ({creator!r}) can delete {chat_id!r}. "
             f"Non-creators should use chat_leave instead."

@@ -1,6 +1,6 @@
-# Meeting Scribe — Study Guide
+# Sibyl — Study Guide
 
-A deep-dive into how every piece of Meeting Scribe works, from audio capture to AI processing. Read this to understand the full flow well enough to rebuild it from scratch.
+A deep-dive into how every piece of Sibyl works, from audio capture to AI processing. Read this to understand the full flow well enough to rebuild it from scratch.
 
 ---
 
@@ -27,11 +27,11 @@ A deep-dive into how every piece of Meeting Scribe works, from audio capture to 
 
 ## 1. System Overview
 
-Meeting Scribe has two independent modes that share some components:
+Sibyl has two independent modes that share some components:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                       MEETING SCRIBE                            │
+│                            SIBYL                                │
 │                                                                 │
 │  ┌──────────────┐     ┌──────────────────────────────────────┐  │
 │  │  LIVE MODE   │     │           BATCH MODE                 │  │
@@ -65,7 +65,7 @@ Meeting Scribe has two independent modes that share some components:
 
 ## 2. Entry Point: CLI
 
-**File:** `src/meeting_scribe/cli.py`
+**File:** `src/sibyl/cli.py`
 
 The CLI uses Python's `argparse` with subcommands. Each subcommand maps to a handler function:
 
@@ -83,10 +83,10 @@ main()
 
 ```toml
 [project.scripts]
-meeting-scribe = "meeting_scribe.cli:main"
+sibyl = "sibyl.cli:main"
 ```
 
-When you run `uv run meeting-scribe`, uv creates a script in `.venv/bin/meeting-scribe` that calls `cli.main()`. This is a standard Python entry point — nothing uv-specific.
+When you run `uv run sibyl`, uv creates a script in `.venv/bin/sibyl` that calls `cli.main()`. This is a standard Python entry point — nothing uv-specific.
 
 ### Handler flow
 
@@ -113,7 +113,7 @@ Pretty-prints every field from the pipeline state and writes a `.json` file next
 
 ## 3. Audio Recording: recorder.py
 
-**File:** `src/meeting_scribe/recorder.py`
+**File:** `src/sibyl/recorder.py`
 
 This is the most hardware-dependent part. It captures audio from two sources simultaneously.
 
@@ -196,7 +196,7 @@ We intercept `SIGINT` (Ctrl+C) to set the stop event gracefully instead of crash
 
 ## 4. Live Transcription: live.py
 
-**File:** `src/meeting_scribe/live.py`
+**File:** `src/sibyl/live.py`
 
 This is completely separate from the LangGraph pipeline. It uses the **Gemini Live API** — a bidirectional WebSocket protocol.
 
@@ -268,7 +268,7 @@ async for response in session.receive():
 
 ## 5. The LangGraph Pipeline: graph.py
 
-**File:** `src/meeting_scribe/graph.py`
+**File:** `src/sibyl/graph.py`
 
 ### What is LangGraph?
 
@@ -352,7 +352,7 @@ async def process_meeting(audio_path):
 
 ## 6. Pipeline State: state.py
 
-**File:** `src/meeting_scribe/state.py`
+**File:** `src/sibyl/state.py`
 
 ```python
 class MeetingState(TypedDict, total=False):
@@ -374,7 +374,7 @@ class MeetingState(TypedDict, total=False):
 
 ## 7. Node: Transcribe
 
-**File:** `src/meeting_scribe/nodes/transcribe.py`
+**File:** `src/sibyl/nodes/transcribe.py`
 
 ```python
 async def transcribe(state: MeetingState) -> dict:
@@ -399,7 +399,7 @@ This works because Gemini processes the full audio holistically — it can assoc
 
 ## 8. Node: Summarize
 
-**File:** `src/meeting_scribe/nodes/summarize.py`
+**File:** `src/sibyl/nodes/summarize.py`
 
 ```python
 async def summarize(state: MeetingState) -> dict:
@@ -415,7 +415,7 @@ This node is text-in, text-out. It doesn't need the audio file.
 
 ## 9. Node: Extract Actions
 
-**File:** `src/meeting_scribe/nodes/extract.py`
+**File:** `src/sibyl/nodes/extract.py`
 
 ```python
 async def extract_actions(state: MeetingState) -> dict:
@@ -441,7 +441,7 @@ Even though the prompt says "no markdown fences," models sometimes add them. Thi
 
 ## 10. Node: Detect Emotions
 
-**File:** `src/meeting_scribe/nodes/emotion.py`
+**File:** `src/sibyl/nodes/emotion.py`
 
 ```python
 async def detect_emotions(state: MeetingState) -> dict:
@@ -468,7 +468,7 @@ async def detect_emotions(state: MeetingState) -> dict:
 
 ## 11. Shared Client: nodes/__init__.py
 
-**File:** `src/meeting_scribe/nodes/__init__.py`
+**File:** `src/sibyl/nodes/__init__.py`
 
 ```python
 def get_client() -> genai.Client:
@@ -484,14 +484,14 @@ Every node calls `get_client()` to create a Gemini client. This centralizes the 
 
 ## 12. Configuration: config.py
 
-**File:** `src/meeting_scribe/config.py`
+**File:** `src/sibyl/config.py`
 
 ```python
 @dataclass
 class Config:
     gemini_api_key: str      # From GOOGLE_AI_API_KEY
     gemini_model: str        # Default: "gemini-2.5-flash"
-    output_dir: Path         # Default: ~/.local/share/meeting-scribe
+    output_dir: Path         # Default: ~/.local/share/sibyl
     sample_rate: int         # Default: 16000
     channels: int            # Default: 1
     record_system_audio: bool # Default: True
@@ -504,17 +504,17 @@ class Config:
 
 ## 13. Logging: log.py
 
-**File:** `src/meeting_scribe/log.py`
+**File:** `src/sibyl/log.py`
 
 ```python
 def get_logger(name: str) -> logging.Logger:
 ```
 
-Creates loggers namespaced under `meeting_scribe.*` (e.g., `meeting_scribe.transcribe`). Writes to **stderr** so it doesn't interfere with stdout output. Controlled by `LOG_LEVEL` env var.
+Creates loggers namespaced under `sibyl.*` (e.g., `sibyl.transcribe`). Writes to **stderr** so it doesn't interfere with stdout output. Controlled by `LOG_LEVEL` env var.
 
 Each node creates its own logger:
 ```python
-log = get_logger("transcribe")  # → meeting_scribe.transcribe
+log = get_logger("transcribe")  # → sibyl.transcribe
 log.info("Transcribing: %s", audio_path.name)
 ```
 
@@ -525,7 +525,7 @@ log.info("Transcribing: %s", audio_path.name)
 ### Batch mode: `record -p`
 
 ```
-User runs: uv run meeting-scribe record -p
+User runs: uv run sibyl record -p
 
 cli.main()
   └── cmd_record(args)
@@ -562,7 +562,7 @@ cli.main()
 ### Live mode: `live -s`
 
 ```
-User runs: uv run meeting-scribe live -s
+User runs: uv run sibyl live -s
 
 cli.main()
   └── cmd_live(args)
@@ -659,10 +659,10 @@ If two nodes write to the same key, the last one wins (undefined order). That's 
 
 ### Adding a new parallel node
 
-1. Create `src/meeting_scribe/nodes/my_node.py`:
+1. Create `src/sibyl/nodes/my_node.py`:
 ```python
-from meeting_scribe.nodes import get_client
-from meeting_scribe.state import MeetingState
+from sibyl.nodes import get_client
+from sibyl.state import MeetingState
 
 async def my_node(state: MeetingState) -> dict:
     # Use state["transcript"], state["audio_path"], etc.
@@ -678,7 +678,7 @@ class MeetingState(TypedDict, total=False):
 
 3. Wire it into `graph.py`:
 ```python
-from meeting_scribe.nodes.my_node import my_node
+from sibyl.nodes.my_node import my_node
 
 graph.add_node("my_node", my_node)
 graph.add_edge("transcribe", "my_node")

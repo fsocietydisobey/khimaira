@@ -1162,3 +1162,386 @@ def test_signal_task_start_rejects_non_pending(isolated_chats):
     c.update_task_status(chat_id, task["id"], "bob-uuid", c.TASK_IN_PROGRESS)
     with pytest.raises(ValueError, match="not 'pending'"):
         c.signal_task_start(chat_id, task["id"], "alice-uuid")
+
+
+# ---------------------------------------------------------------------------
+# Phase B v2 Lane V2: master-leave guard (Piece A) + chat_set_creator (Piece B)
+# ---------------------------------------------------------------------------
+
+
+def test_master_cannot_leave_directly(isolated_chats):
+    """Piece A: chat_leave refuses for the current master. Closes the v1
+    footgun where a creator's chat_leave made done→approved unreachable."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    c.create_room("alice-uuid", ["bob-uuid"], title="t")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+
+    # Alice (creator → implicit master via v1 fallback) tries to leave → refused.
+    with pytest.raises(ValueError, match="master of"):
+        c.leave(chat_id, "alice-uuid")
+
+    # Bob (non-master) can still leave normally.
+    rec = c.leave(chat_id, "bob-uuid")
+    assert rec["state"] == c.LEFT
+
+
+def test_set_creator_unlocks_orphaned_by_transfer(isolated_chats):
+    """Piece B: chat_set_creator re-anchors master on a chat whose creator
+    is TRANSFERRED_OUT. The exact dogfood failure from this session's v1.2
+    miss: a transfer happened pre-v1.3, leaving no surviving master to
+    approve tasks."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    _make_session(sessions_mod, "carol-uuid", "carol")
+    c.create_room("alice-uuid", ["bob-uuid", "carol-uuid"], title="t")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+    c.accept(chat_id, "carol-uuid")
+
+    # Pre-v1.3-style transfer: Alice (creator) transfers her membership to a
+    # NEW session "dave-uuid" but the old transfer_membership did NOT
+    # propagate created_by — simulate that gap. (Real v1.3 fixes this in
+    # transfer_membership; here we manually wedge the chat into the broken
+    # state to test the recovery primitive.)
+    _make_session(sessions_mod, "dave-uuid", "dave")
+    c.transfer_membership(chat_id, "alice-uuid", "dave-uuid")
+    # After v1.3 transfer, created_by has been updated to dave. To simulate
+    # the pre-v1.3 broken state, we forcibly re-emit a META record putting
+    # created_by back on alice (who is now TRANSFERRED_OUT).
+    room = c.load_room(chat_id)
+    broken_meta = {
+        **{k: v for k, v in room["meta"].items() if k != "event_id"},
+        "kind": c.META,
+        "event_id": c._new_event_id(),
+        "ts": c._now_iso(),
+        "created_by": "alice-uuid",
+        "created_by_name": "alice",
+    }
+    c._append(chat_id, broken_meta)
+
+    # Confirm the orphan: alice is TRANSFERRED_OUT but still created_by.
+    room = c.load_room(chat_id)
+    assert room["meta"]["created_by"] == "alice-uuid"
+    assert room["members"]["alice-uuid"]["state"] == c.TRANSFERRED_OUT
+
+    # Bob (accepted member) calls set_creator to claim master.
+    new_meta = c.set_creator(chat_id, "bob-uuid")
+    assert new_meta["created_by"] == "bob-uuid"
+    assert new_meta["created_by_name"] == "bob"
+    assert new_meta["member_roles"]["bob-uuid"] == "master"
+
+    # Re-load and confirm the new state is canonical.
+    room = c.load_room(chat_id)
+    assert room["meta"]["created_by"] == "bob-uuid"
+    assert c._is_master(room, "bob-uuid") is True
+    assert c._is_master(room, "alice-uuid") is False
+
+
+def test_set_creator_refuses_when_creator_still_accepted(isolated_chats):
+    """Piece B: chat_set_creator is reserved for orphaned-by-transfer.
+    A still-accepted creator must use chat_grant_role (V1) instead — set_creator
+    raises to prevent silently overriding an active master."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    c.create_room("alice-uuid", ["bob-uuid"], title="t")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+
+    # Alice (creator) is still ACCEPTED — bob trying set_creator must fail.
+    with pytest.raises(ValueError, match="not 'transferred-out'"):
+        c.set_creator(chat_id, "bob-uuid")
+
+
+def test_set_creator_rejects_non_member_target(isolated_chats):
+    """Piece B: the new creator must be an accepted member of the chat."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    _make_session(sessions_mod, "carol-uuid", "carol")
+    c.create_room("alice-uuid", ["bob-uuid"], title="t")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+
+    # Orphan the chat first.
+    _make_session(sessions_mod, "dave-uuid", "dave")
+    c.transfer_membership(chat_id, "alice-uuid", "dave-uuid")
+    # Simulate the pre-v1.3 broken state again.
+    room = c.load_room(chat_id)
+    broken_meta = {
+        **{k: v for k, v in room["meta"].items() if k != "event_id"},
+        "kind": c.META,
+        "event_id": c._new_event_id(),
+        "ts": c._now_iso(),
+        "created_by": "alice-uuid",
+        "created_by_name": "alice",
+    }
+    c._append(chat_id, broken_meta)
+
+    # Carol is not a member of this chat — set_creator must refuse her.
+    with pytest.raises(ValueError, match="non-member"):
+        c.set_creator(chat_id, "carol-uuid")
+
+
+# ---------------------------------------------------------------------------
+# Phase B v2: chat_grant_role + member_roles + _is_master
+# ---------------------------------------------------------------------------
+
+
+def _setup_v1_chat(c, sessions_mod, creator: str, *members: str) -> str:
+    """v1-style chat: creator + accepted members, no explicit member_roles."""
+    _make_session(sessions_mod, creator, creator)
+    for m in members:
+        _make_session(sessions_mod, m, m)
+    room = c.create_room(creator, list(members), title="t")
+    chat_id = room["meta"]["chat_id"]
+    for m in members:
+        c.accept(chat_id, m)
+    return chat_id
+
+
+def test_grant_role_master_only(isolated_chats):
+    """Non-master accepted members cannot grant roles."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _setup_v1_chat(c, sessions_mod, "alice", "bob", "carol")
+    # bob is not master; can't grant any role
+    with pytest.raises(ValueError, match="only the master"):
+        c.chat_grant_role(chat_id, "bob", "carol", c.ROLE_OBSERVER)
+
+
+def test_grant_role_promotes_and_demotes_atomically(isolated_chats):
+    """Promoting B to master atomically demotes the previous master to
+    `demote_to` (default agent). Single META write captures both."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _setup_v1_chat(c, sessions_mod, "alice", "bob")
+
+    result = c.chat_grant_role(chat_id, "alice", "bob", c.ROLE_MASTER)
+
+    roles = result["member_roles"]
+    assert roles["bob"] == c.ROLE_MASTER
+    assert roles["alice"] == c.ROLE_AGENT
+    # _is_master agrees with the dict
+    room = c.load_room(chat_id)
+    assert c._is_master(room, "bob") is True
+    assert c._is_master(room, "alice") is False
+
+
+def test_grant_role_demote_to_observer_kwarg(isolated_chats):
+    """The granting master can specify what role the outgoing master
+    becomes — `demote_to="observer"` means the prior master loses both
+    master rights AND send rights (Lane V2 enforcement)."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _setup_v1_chat(c, sessions_mod, "alice", "bob")
+
+    result = c.chat_grant_role(chat_id, "alice", "bob", c.ROLE_MASTER, demote_to=c.ROLE_OBSERVER)
+
+    roles = result["member_roles"]
+    assert roles["bob"] == c.ROLE_MASTER
+    assert roles["alice"] == c.ROLE_OBSERVER
+
+
+def test_load_room_backward_compat_synthesizes_master(isolated_chats):
+    """A v1-era chat (no member_roles in META) resolves master via
+    `_is_master`'s fallback to `created_by`."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _setup_v1_chat(c, sessions_mod, "alice", "bob")
+    room = c.load_room(chat_id)
+
+    # Pre-condition: no explicit member_roles in META.
+    assert "member_roles" not in room["meta"]
+    # _is_master uses the fallback path.
+    assert c._is_master(room, "alice") is True
+    assert c._is_master(room, "bob") is False
+
+
+def test_chat_task_update_uses_member_roles_gate(isolated_chats):
+    """After granting B master (demoting A), B can approve tasks and A
+    cannot. Master gate now reads `member_roles`, not the static
+    `created_by`."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _setup_v1_chat(c, sessions_mod, "alice", "bob")
+
+    c.chat_grant_role(chat_id, "alice", "bob", c.ROLE_MASTER)
+
+    task = c.create_task(chat_id, "bob", "do thing", assignee_session_id="alice")
+    c.update_task_status(chat_id, task["id"], "alice", c.TASK_IN_PROGRESS)
+    c.update_task_status(chat_id, task["id"], "alice", c.TASK_DONE)
+
+    # Alice (former master, now agent) cannot approve.
+    with pytest.raises(ValueError, match="not authorized"):
+        c.update_task_status(chat_id, task["id"], "alice", c.TASK_APPROVED)
+    # Bob (new master) can approve.
+    c.update_task_status(chat_id, task["id"], "bob", c.TASK_APPROVED)
+    assert c.task_status(chat_id, "bob")[0]["status"] == c.TASK_APPROVED
+
+
+def test_grant_role_materializes_implicit_master_on_first_call(isolated_chats):
+    """First `chat_grant_role` on a v1-era chat materializes the implicit
+    master into member_roles BEFORE applying the grant. Subsequent reads
+    use the explicit dict as sole source of truth — no implicit/explicit
+    duality."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _setup_v1_chat(c, sessions_mod, "alice", "bob", "carol")
+    # Alice grants Carol observer — a non-master grant.
+    result = c.chat_grant_role(chat_id, "alice", "carol", c.ROLE_OBSERVER)
+
+    # Both alice's implicit master AND carol's new observer are in the dict.
+    roles = result["member_roles"]
+    assert roles == {"alice": c.ROLE_MASTER, "carol": c.ROLE_OBSERVER}
+    # bob is unmentioned (no explicit role assigned).
+    assert "bob" not in roles
+
+
+def test_transfer_membership_propagates_role_dict(isolated_chats):
+    """v1.3 Lane E fix (creator-transfer propagates created_by) — when
+    member_roles is already explicit, the transfer must also demote the
+    old creator and promote the new one in the same META write."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _setup_v1_chat(c, sessions_mod, "alice", "bob")
+    _make_session(sessions_mod, "dave", "dave")
+
+    # Materialize member_roles via an explicit grant first (any grant works).
+    c.chat_grant_role(chat_id, "alice", "bob", c.ROLE_AGENT)
+    # Pre-transfer: alice is master per explicit dict.
+    room = c.load_room(chat_id)
+    assert room["meta"]["member_roles"].get("alice") == c.ROLE_MASTER
+
+    # Now alice (creator + master) transfers her membership to dave.
+    c.transfer_membership(chat_id, "alice", "dave")
+    room = c.load_room(chat_id)
+
+    # v1.3 invariant preserved.
+    assert room["meta"]["created_by"] == "dave"
+    # v2 invariant: member_roles updated atomically.
+    assert room["meta"]["member_roles"]["dave"] == c.ROLE_MASTER
+    assert room["meta"]["member_roles"]["alice"] == c.ROLE_AGENT
+    # _is_master agrees.
+    assert c._is_master(room, "dave") is True
+    assert c._is_master(room, "alice") is False
+
+
+# ---------------------------------------------------------------------------
+# Phase B v2 Lane V2: observer enforcement (Piece C) + critic surface (Piece D)
+# ---------------------------------------------------------------------------
+
+
+def test_observer_cannot_send_message(isolated_chats):
+    """Piece C: observers can read everything but cannot send messages."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    c.create_room("alice-uuid", ["bob-uuid"], title="t")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+
+    # Alice (master) grants Bob the observer role.
+    c.chat_grant_role(chat_id, "alice-uuid", "bob-uuid", c.ROLE_OBSERVER)
+
+    # Bob sends → refused with the observer-specific error.
+    with pytest.raises(ValueError, match="observer"):
+        c.send_message(chat_id, "bob-uuid", "hi")
+
+
+def test_observer_cannot_create_or_update_tasks(isolated_chats):
+    """Piece C: observers cannot create_task or update_task_status. All
+    write paths in the task lifecycle are closed to observers."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    c.create_room("alice-uuid", ["bob-uuid"], title="t")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+    c.chat_grant_role(chat_id, "alice-uuid", "bob-uuid", c.ROLE_OBSERVER)
+
+    # Observer cannot create tasks.
+    with pytest.raises(ValueError, match="observer"):
+        c.create_task(chat_id, "bob-uuid", "some work")
+
+    # Observer cannot update task status — even for tasks they're notionally
+    # assigned to (the grant pre-dates the role demotion in this contrived
+    # scenario, but the observer gate is the load-bearing check).
+    task = c.create_task(chat_id, "alice-uuid", "work", assignee_session_id="alice-uuid")
+    with pytest.raises(ValueError, match="observer"):
+        c.update_task_status(chat_id, task["id"], "bob-uuid", c.TASK_IN_PROGRESS)
+
+
+def test_observer_can_still_read_history(isolated_chats):
+    """Piece C: observer's write paths are closed but read paths stay open.
+    The point of the role is audit-style visibility — closing reads would
+    defeat it."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    c.create_room("alice-uuid", ["bob-uuid"], title="t")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+    # Alice sends something before Bob becomes an observer.
+    c.send_message(chat_id, "alice-uuid", "pre-observer broadcast")
+    c.chat_grant_role(chat_id, "alice-uuid", "bob-uuid", c.ROLE_OBSERVER)
+
+    # Bob (observer) reads — succeeds, sees Alice's message.
+    msgs = c.history(chat_id, "bob-uuid")
+    assert any(m.get("body") == "pre-observer broadcast" for m in msgs)
+
+
+def test_critic_can_send_and_read_but_not_approve(isolated_chats):
+    """Piece D: critic role is opinion-only — no write-path restriction
+    beyond agent (can send, can create tasks, can read), but the master gate
+    on done→approved still applies (critic ≠ master). The SPR-4 'critic is
+    judge-not-king' precedent at chat level."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    c.create_room("alice-uuid", ["bob-uuid"], title="t")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+    c.chat_grant_role(chat_id, "alice-uuid", "bob-uuid", c.ROLE_CRITIC)
+
+    # Critic can send free-form messages (opinion).
+    msg = c.send_message(chat_id, "bob-uuid", "I think this needs more polish")
+    assert msg["body"] == "I think this needs more polish"
+
+    # Critic can read history.
+    history = c.history(chat_id, "bob-uuid")
+    assert any(m.get("body") == "I think this needs more polish" for m in history)
+
+    # Critic CANNOT approve a task — master gate still applies.
+    task = c.create_task(chat_id, "alice-uuid", "work", assignee_session_id="alice-uuid")
+    c.update_task_status(chat_id, task["id"], "alice-uuid", c.TASK_IN_PROGRESS)
+    c.update_task_status(chat_id, task["id"], "alice-uuid", c.TASK_DONE)
+    with pytest.raises(ValueError, match="not authorized"):
+        c.update_task_status(chat_id, task["id"], "bob-uuid", c.TASK_APPROVED)

@@ -1,6 +1,6 @@
 """Sibyl MCP tools — drive the meeting pipeline from any Claude Code session.
 
-Tools (all surface under `mcp__khimaira__scribe_*` via khimaira's
+Tools (all surface under `mcp__khimaira__sibyl_*` via khimaira's
 sibling-tools registry):
 
 - `record_start(output_path?)` — start audio capture as a managed
@@ -103,7 +103,7 @@ async def record_start(
         f"  pid:          {info['pid']}\n"
         f"  started_at:   {info['started_at']}\n"
         f"{hints_block}"
-        f"\nCall `scribe_record_stop(recording_id={info['recording_id']!r})` "
+        f"\nCall `sibyl_record_stop(recording_id={info['recording_id']!r})` "
         f"when the meeting ends. Stop will echo your participant list + "
         f"accent so you can pipe them into `sibyl_process` without "
         f"retyping."
@@ -176,7 +176,7 @@ async def transcribe(
         audio_path: Path to a WAV / audio file.
         known_speakers: Comma-separated participant names. When set,
             transcribe filters background voices and labels with these
-            names. See `scribe_record_start` for the full semantics.
+            names. See `sibyl_record_start` for the full semantics.
         accent_hint: Acoustic context (e.g. "Indian English").
     """
     path = Path(audio_path).expanduser().resolve()

@@ -199,11 +199,11 @@ async def test_extract_handles_malformed_json():
 # -------------------- MCP server tools -------------------- #
 
 
-def test_scribe_mcp_exposes_six_tools():
+def test_sibyl_mcp_exposes_six_tools():
     """The sibyl MCP server registers all six tools."""
-    from sibyl.server import mcp as scribe_mcp
+    from sibyl.server import mcp as sibyl_mcp
 
-    tools = scribe_mcp._tool_manager.list_tools()
+    tools = sibyl_mcp._tool_manager.list_tools()
     names = sorted(t.name for t in tools)
     assert names == [
         "list_active_recordings",
