@@ -341,27 +341,9 @@ def latest_pending_chat_id(session_id: str) -> str | None:
     return pending[0]["chat_id"]
 
 
-_AGENT_TAG_RE = re.compile(
-    r"</?(thinking|scratchpad|reasoning|reflection|inner_monologue)\b[^>]*>",
-    re.IGNORECASE,
-)
-
-
-def _sanitize_message_body(body: str) -> str:
-    """Strip stray XML tags that agents sometimes leak into tool args.
-
-    Observed in the wild: agents accidentally include `</thinking>` and
-    similar internal-monologue tags in chat message bodies (Claude Code
-    prompt-rendering edge case in research-preview channels). Daemon-
-    side strip is defensive — agents that don't leak see no change;
-    those that do get clean message bodies. Whitespace normalized so
-    the strip doesn't leave double-spaces or leading/trailing space.
-    """
-    cleaned = _AGENT_TAG_RE.sub("", body)
-    # Collapse runs of whitespace introduced by the strip; preserve
-    # newlines because chat messages can be multi-line.
-    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
-    return cleaned
+# Sanitizer lives in sessions.py (re-used by post_answer / post_notice / chat
+# message bodies). Re-exported here for backward-compat with existing tests.
+_sanitize_message_body = sessions_mod.sanitize_agent_text
 
 
 def send_message(chat_id: str, sender_session_id: str, body: str) -> dict[str, Any]:

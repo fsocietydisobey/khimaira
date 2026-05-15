@@ -87,6 +87,35 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_AGENT_TAG_RE = re.compile(
+    r"</?(thinking|scratchpad|reasoning|reflection|inner_monologue|answer|invoke)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def sanitize_agent_text(text: str) -> str:
+    """Strip stray XML tags that agents sometimes leak into tool args.
+
+    Observed in the wild: agents accidentally include `</thinking>`,
+    `</answer>`, `</invoke>`, etc. in their tool parameter values
+    (Claude Code prompt-rendering edge case where internal-monologue
+    or tool-call scaffolding bleeds into a string). Defensive strip
+    is applied at the daemon's text-acceptance boundary
+    (post_answer's answer, post_notice's text, chats.send_message's
+    body) so agents that don't leak see no change; those that do
+    get clean stored text.
+
+    Whitespace normalized (runs of spaces/tabs collapsed) so the
+    strip doesn't leave double-spaces or leading/trailing space.
+    Newlines preserved for multi-line bodies.
+    """
+    if not text:
+        return text
+    cleaned = _AGENT_TAG_RE.sub("", text)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Write side — called by the WORKING agent (session A) as it works
 # ---------------------------------------------------------------------------
@@ -389,6 +418,7 @@ def post_answer(
     `target_session_id` accepts either a UUID or a friendly name.
     """
     target_session_id = resolve_session_id(target_session_id)
+    answer = sanitize_agent_text(answer)
     qpath = _session_dir(target_session_id) / "questions.jsonl"
     questions = _read_jsonl(qpath)
     matched: dict | None = None
@@ -1480,6 +1510,7 @@ def post_notice(
     purpose-built notification.
     """
     target_session_id = resolve_session_id(target_session_id)
+    text = sanitize_agent_text(text)
     note = {
         "id": uuid.uuid4().hex[:12],
         "ts": _now_iso(),
