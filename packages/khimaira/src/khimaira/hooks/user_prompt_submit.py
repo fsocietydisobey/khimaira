@@ -348,6 +348,22 @@ def main() -> int:
             "Skip if nothing to log."
         )
 
+    # --- Phase B v1.7.1: real-time bottleneck check (every turn) ----------
+    # Mirrors khimaira-bottleneck-watch.sh's heuristic but runs synchronously
+    # in the UserPromptSubmit hot path. Detection cost: ~10-30ms (one daemon
+    # HTTP call). Value: real-time per-turn signal vs the watcher's 5-min
+    # polling cadence — every session sees the saturation prompt at the exact
+    # moment they submit a prompt, not after a delayed inbox-post.
+    #
+    # If your daemon is down OR the check throws, it's a silent no-op (the
+    # hook must never break SessionStart / UserPromptSubmit).
+    bottleneck_block = ""
+    if os.environ.get("KHIMAIRA_BOTTLENECK_PROMPT") not in ("0", "false", "no"):
+        try:
+            bottleneck_block = _check_bottleneck(session_id)
+        except Exception:  # noqa: BLE001 — hook must not break
+            bottleneck_block = ""
+
     # --- Auto-delegate nudge (opt-in; saves tokens on trivial prompts) ---
     # Heuristic — no API call from this hot path; if the user's prompt
     # looks trivial, surface a strong "consider delegating" nudge so
@@ -374,11 +390,16 @@ def main() -> int:
         and not incoming_block
         and not reminder_block
         and not delegate_block
+        and not bottleneck_block
     ):
         return 0
 
+    # Bottleneck block leads — it's the highest-priority signal (saturation
+    # is what blocks every other workflow). Followed by delegate nudge (tier
+    # drop suggestion), inbox (other-session communication), incoming
+    # questions, and the periodic decision reminder.
     additional_context = "\n\n".join(
-        b for b in (delegate_block, inbox_block, incoming_block, reminder_block) if b
+        b for b in (bottleneck_block, delegate_block, inbox_block, incoming_block, reminder_block) if b
     )
 
     output = {
@@ -389,6 +410,113 @@ def main() -> int:
     }
     sys.stdout.write(json.dumps(output))
     return 0
+
+
+def _check_bottleneck(session_id: str) -> str:
+    """Phase B v1.7.1: real-time per-turn bottleneck check.
+
+    Mirrors khimaira-bottleneck-watch.sh's heuristic (≥2 sessions in
+    `awaiting-review` for > 30 min AND at least one `orchestrating`
+    session whose latest decision is > 20 min stale) but runs
+    synchronously in the UserPromptSubmit hot path. Surfaces a
+    personalized prompt depending on whether the caller is the master
+    or an agent — master gets a strong "drop tier OR deputize" prompt;
+    agents get a softer "consider dropping tier" prompt.
+
+    Returns the prompt text to surface, or "" if no bottleneck. Quiet
+    on daemon-down (returns "").
+    """
+    from datetime import datetime, timezone, timedelta
+
+    url = f"{_ENDPOINT}/api/sessions"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=_INBOX_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return ""
+
+    sessions = payload if isinstance(payload, list) else (payload.get("sessions") or [])
+    if not sessions:
+        return ""
+
+    now = datetime.now(timezone.utc)
+    threshold = timedelta(minutes=30)
+    decision_stale = timedelta(minutes=20)
+
+    awaiting_count = 0
+    master_stale_name = None
+    master_stale_sid = None
+    master_stale_minutes = None
+    am_master = False
+
+    for s in sessions:
+        sid = s.get("session_id") or ""
+        status = s.get("status") or ""
+        la = s.get("last_active_at") or s.get("updated_at") or ""
+        if not la:
+            continue
+        try:
+            if la.endswith("Z"):
+                la = la[:-1] + "+00:00"
+            dt = datetime.fromisoformat(la)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        age = now - dt
+        if status == "awaiting-review" and age > threshold:
+            awaiting_count += 1
+        if status == "orchestrating":
+            recents = s.get("recent_decisions") or []
+            if recents:
+                ts = recents[0].get("ts", "")
+                try:
+                    if ts.endswith("Z"):
+                        ts = ts[:-1] + "+00:00"
+                    ldt = datetime.fromisoformat(ts)
+                    if ldt.tzinfo is None:
+                        ldt = ldt.replace(tzinfo=timezone.utc)
+                    decision_age = now - ldt
+                    if decision_age > decision_stale:
+                        master_stale_name = s.get("name") or (sid[:8] if sid else "?")
+                        master_stale_sid = sid
+                        master_stale_minutes = int(decision_age.total_seconds() / 60)
+                        if sid == session_id:
+                            am_master = True
+                except (ValueError, TypeError):
+                    pass
+
+    if awaiting_count < 2 or master_stale_minutes is None:
+        return ""
+
+    vice_name = (master_stale_name or "master") + "-vice"
+
+    if am_master:
+        return (
+            f"⚠️ khimaira bottleneck signal — YOU (master) are saturated.\n"
+            f"  • {awaiting_count} session(s) awaiting review\n"
+            f"  • Your last decision was {master_stale_minutes}m ago\n"
+            f"\n"
+            f"Take action RIGHT NOW (type in this window):\n"
+            f"  /model sonnet      — drop model tier (~5x cost reduction)\n"
+            f"  /effort medium     — drop thinking tier (~5-10x reduction)\n"
+            f"  /khimaira-deputize {vice_name} 'rate-limit'\n"
+            f"\n"
+            f"Auto-deputize T2 fires at ~15m total elapsed (opt-out: KHIMAIRA_AUTO_DEPUTIZE=0).\n"
+            f"This prompt fires real-time per turn; opt-out: KHIMAIRA_BOTTLENECK_PROMPT=0."
+        )
+    else:
+        return (
+            f"⚠️ khimaira bottleneck signal — master {master_stale_name} saturated "
+            f"({awaiting_count} session(s) awaiting review; master idle {master_stale_minutes}m).\n"
+            f"\n"
+            f"If you're saturated too, drop tier (type in this window):\n"
+            f"  /model sonnet      — drop model tier\n"
+            f"  /effort medium     — drop thinking tier\n"
+            f"\n"
+            f"Opt-out for this prompt: KHIMAIRA_BOTTLENECK_PROMPT=0."
+        )
 
 
 def _looks_trivial(prompt: str) -> bool:
