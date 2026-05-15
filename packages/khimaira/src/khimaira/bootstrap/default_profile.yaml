@@ -24,16 +24,19 @@ supervisor:
 
 mcp_servers:
   - name: khimaira
-    # bash -lc so the user's PATH (uv, etc.) is in scope; 2>>log so a
-    # crashed launch leaves a breadcrumb the user can find via doctor.
-    command: bash -lc 'uv --directory ~/dev/khimaira run khimaira mcp 2>>/tmp/khimaira.log'
+    # bootstrap.register_mcp wraps the command in `bash -lc` itself —
+    # don't pre-wrap or you get a non-functional `bash -lc bash -lc '…'`
+    # double-shell that Claude Code's MCP supervisor eventually prunes.
+    # The wrapper provides login-shell PATH (so `uv` resolves) and lets
+    # the `2>>log` redirect work.
+    command: uv --directory ~/dev/khimaira run khimaira mcp 2>>/tmp/khimaira.log
 
   - name: khimaira-chat
     # Cross-session real-time chat MCP. Spawned as stdio subprocess by
     # Claude Code per session. Talks to khimaira-monitor (HTTP/SSE) for
     # state + fan-out. Channels are research-preview, so peers must
     # launch with `--dangerously-load-development-channels server:khimaira-chat`.
-    command: bash -lc 'uv --directory ~/dev/khimaira run khimaira-chat 2>>/tmp/khimaira-chat.log'
+    command: uv --directory ~/dev/khimaira run khimaira-chat 2>>/tmp/khimaira-chat.log
 
 # No repos block: the default assumes khimaira itself is already cloned
 # (bootstrap is being run from inside it). Profiles that want sibling
