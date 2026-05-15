@@ -37,6 +37,7 @@ import os
 import re
 import time
 import uuid
+from datetime import UTC
 from pathlib import Path
 from typing import Any  # noqa: F401  (used in helper signatures)
 
@@ -82,9 +83,9 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _now_iso() -> str:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 _AGENT_TAG_RE = re.compile(
@@ -262,12 +263,65 @@ def set_status(session_id: str, status: str, detail: str = "") -> dict:
     return record
 
 
+# UUID-drift threshold: matches the "active in the last 30 min" window used
+# elsewhere (SessionStart hook listing). Sessions older than this are
+# treated as dead and their names are silently recyclable.
+_UUID_DRIFT_STALE_THRESHOLD_S = 30 * 60
+
+
+def _find_active_session_with_name(name: str, exclude_session_id: str) -> dict | None:
+    """Scan every session's status.json for `name == name` (excluding self).
+    Returns the most-recently-active match if any, else None.
+
+    Used by set_name() UUID-drift detection. Cheap — one status.json read
+    per session; not on a hot path.
+    """
+    import time
+
+    if not _BASE_DIR.exists():
+        return None
+    candidates: list[tuple[float, str]] = []
+    for d in _BASE_DIR.iterdir():
+        if not d.is_dir() or d.name == exclude_session_id:
+            continue
+        status_path = d / "status.json"
+        if not status_path.is_file():
+            continue
+        try:
+            s = json.loads(status_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if s.get("name") != name:
+            continue
+        try:
+            mtime = max(
+                (p.stat().st_mtime for p in d.iterdir() if p.is_file()),
+                default=0.0,
+            )
+        except OSError:
+            mtime = 0.0
+        candidates.append((mtime, d.name))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    mtime, sid = candidates[0]
+    return {"session_id": sid, "last_active": mtime, "age_s": time.time() - mtime}
+
+
 def set_name(session_id: str, name: str) -> dict:
     """Set a friendly name for the session — surfaces in session_list and
     enables name-based resolution from other sessions.
 
     Names should be slug-shaped: lowercase, dashes, no spaces. Two sessions
     can share a name; lookup prefers most-recently-active.
+
+    Phase B v1.3 UUID-drift detection: if another active session (mtime
+    within ~30 min) already holds this name, the returned record includes
+    `merge_needed=True` and `conflicts_with=<other_session_id>`. The
+    daemon does not auto-merge — the orchestrator decides whether to
+    migrate state, rename, or accept the collision. Stale conflicts
+    (>30 min idle) are silently recyclable, preserving the existing
+    "two sessions can share a name" affordance for legitimate re-use.
     """
     path = _session_dir(session_id) / "status.json"
     existing: dict[str, Any] = {}
@@ -282,6 +336,23 @@ def set_name(session_id: str, name: str) -> dict:
     path.write_text(json.dumps(record, indent=2))
     _invalidate_list_sessions_cache()
     log.info("session %s: named %r", session_id, name)
+
+    # UUID-drift detection: surface live collisions for the caller to handle.
+    conflict = _find_active_session_with_name(name, exclude_session_id=session_id)
+    if conflict is not None and conflict["age_s"] < _UUID_DRIFT_STALE_THRESHOLD_S:
+        log.warning(
+            "sessions.set_name: name %r already in use by session %s "
+            "(last active %.0fs ago); merge_needed surfaced to caller.",
+            name,
+            conflict["session_id"],
+            conflict["age_s"],
+        )
+        return {
+            **record,
+            "merge_needed": True,
+            "conflicts_with": conflict["session_id"],
+            "conflicts_with_last_active_s": conflict["age_s"],
+        }
     return record
 
 
@@ -389,8 +460,7 @@ def resolve_session_id(query: str) -> str:
 
     if not candidates:
         raise ValueError(
-            f"No session named or id'd {query!r}. "
-            f"Use session_list() to see available sessions."
+            f"No session named or id'd {query!r}. Use session_list() to see available sessions."
         )
 
     # Most-recently-active wins on name collision
@@ -459,9 +529,7 @@ def post_answer(
         "surface_count": 0,
     }
     _append_jsonl(_session_dir(target_session_id) / "inbox.jsonl", note)
-    desktop_notify.notify_answer(
-        target_session_id, from_session_id, matched.get("text", "")
-    )
+    desktop_notify.notify_answer(target_session_id, from_session_id, matched.get("text", ""))
     log.info(
         "session %s: answer posted by %s for q=%s",
         target_session_id,
@@ -511,9 +579,7 @@ def state(session_id: str, recent: int = 10, *, workspace: str | None = None) ->
         "recent_files": files[-recent:],
         "file_touch_count": len(files),
         "open_questions": [q for q in questions if q.get("status") == "open"],
-        "answered_questions": [q for q in questions if q.get("status") == "answered"][
-            -recent:
-        ],
+        "answered_questions": [q for q in questions if q.get("status") == "answered"][-recent:],
     }
 
 
@@ -534,9 +600,7 @@ def summary(session_id: str) -> dict:
     decisions_path = sd / "decisions.jsonl"
     files_path = sd / "files_touched.jsonl"
     decision_count = (
-        sum(1 for ln in decisions_path.open() if ln.strip())
-        if decisions_path.exists()
-        else 0
+        sum(1 for ln in decisions_path.open() if ln.strip()) if decisions_path.exists() else 0
     )
     file_touch_count = (
         sum(1 for ln in files_path.open() if ln.strip()) if files_path.exists() else 0
@@ -687,9 +751,7 @@ def _extract_text_from_message(msg: Any) -> str:
             tname = msg.get("name", "?")
             args = msg.get("input", {})
             if isinstance(args, dict):
-                arg_summary = ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items())[
-                    :300
-                ]
+                arg_summary = ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items())[:300]
             else:
                 arg_summary = str(args)[:300]
             return f"[tool_use {tname}({arg_summary})]"
@@ -776,8 +838,7 @@ def query_transcript(
                         else None
                     ),
                     "is_match": j == idx,
-                    "text_preview": t["_text"][:500]
-                    + ("…" if len(t["_text"]) > 500 else ""),
+                    "text_preview": t["_text"][:500] + ("…" if len(t["_text"]) > 500 else ""),
                 }
             )
         matches.append(
@@ -1332,9 +1393,7 @@ def _broadcast_to_handoff_subscribers(
         handoffs_snapshot = _read_jsonl(_HANDOFFS_PATH)
     except OSError:
         return
-    owned = [
-        h for h in handoffs_snapshot if h.get("owner_session_id") == owner_session_id
-    ]
+    owned = [h for h in handoffs_snapshot if h.get("owner_session_id") == owner_session_id]
     if not owned:
         return
 
@@ -1475,9 +1534,7 @@ def consume_handoffs(session_id: str, cwd: str) -> list[dict]:
                     f.write(json.dumps(h, separators=(",", ":")) + "\n")
             tmp.replace(_HANDOFFS_PATH)
         except OSError:
-            log.warning(
-                "failed to rewrite handoffs.jsonl; read state may double-surface"
-            )
+            log.warning("failed to rewrite handoffs.jsonl; read state may double-surface")
 
     return matched
 
@@ -1581,9 +1638,7 @@ def surface_inbox_for_hook(session_id: str) -> list[dict]:
             remaining.append(n)
 
         copy = dict(n)
-        copy["_remaining_surfaces"] = max(
-            0, _HOOK_AUTO_EXPIRE_AFTER - n["surface_count"]
-        )
+        copy["_remaining_surfaces"] = max(0, _HOOK_AUTO_EXPIRE_AFTER - n["surface_count"])
         surfaced.append(copy)
 
     if modified:
@@ -1730,15 +1785,12 @@ async def wait_for_answer(
             if status == "answered":
                 return q
             if status == "withdrawn":
-                raise ValueError(
-                    f"Question {question_id} was withdrawn before being answered."
-                )
+                raise ValueError(f"Question {question_id} was withdrawn before being answered.")
             break  # found the question but not yet answered; keep polling
         await asyncio.sleep(poll_interval)
 
-    raise asyncio.TimeoutError(
-        f"No answer to question {question_id} on session "
-        f"{target_session_id} within {timeout:.0f}s"
+    raise TimeoutError(
+        f"No answer to question {question_id} on session {target_session_id} within {timeout:.0f}s"
     )
 
 
@@ -1864,9 +1916,7 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
             questions = _read_jsonl(sd / "questions.jsonl")
             open_q = sum(1 for q in questions if q.get("status") == "open")
             status_path = sd / "status.json"
-            status = (
-                json.loads(status_path.read_text()) if status_path.exists() else None
-            )
+            status = json.loads(status_path.read_text()) if status_path.exists() else None
 
             # Resolve workspace from status.json once + surface in the row
             # so cached lookups don't need to re-stat status.json.
@@ -1882,9 +1932,7 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
                     "name": (status.get("name") if isinstance(status, dict) else None),
                     "workspace": ws_value,
                     "last_active": last_mtime,
-                    "last_active_age_s": (
-                        time.time() - last_mtime if last_mtime else None
-                    ),
+                    "last_active_age_s": (time.time() - last_mtime if last_mtime else None),
                     "status": status,
                     "decision_count": decisions,
                     "file_touch_count": files,
@@ -1896,9 +1944,7 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
         return _filter_sessions_by_workspace(out, workspace)
 
 
-def _filter_sessions_by_workspace(
-    rows: list[dict], workspace: str | None
-) -> list[dict]:
+def _filter_sessions_by_workspace(rows: list[dict], workspace: str | None) -> list[dict]:
     """Apply workspace filter to a list_sessions result.
 
     None or "*" returns the full list (no filter). A concrete name

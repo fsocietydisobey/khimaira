@@ -94,9 +94,7 @@ def test_search_archive_substring(isolated_state):
     """search_archive matches body substring case-insensitively."""
     target = "target-3"
     isolated_state.log_decision(target, "init", "")
-    isolated_state.post_notice(
-        target, text="Roboflow concurrency check", from_session_id="me"
-    )
+    isolated_state.post_notice(target, text="Roboflow concurrency check", from_session_id="me")
     isolated_state.post_notice(target, text="something unrelated", from_session_id="me")
     isolated_state.pending_notes(target, mark_read=True)
 
@@ -220,9 +218,7 @@ def test_broadcast_returns_immediately_when_no_subscribers(isolated_state, tmp_p
         expires_in_hours=24,
     )
     isolated_state.consume_handoffs("owner", str(project))  # claim ownership
-    isolated_state.log_decision(
-        "subscriber-1", "init", ""
-    )  # materialize but DON'T subscribe
+    isolated_state.log_decision("subscriber-1", "init", "")  # materialize but DON'T subscribe
 
     # Time log_decision — should be fast (no broadcast work)
     t0 = time.perf_counter()
@@ -366,7 +362,6 @@ def test_release_handoff_rejects_non_owner(isolated_state, tmp_path):
 
 def test_consume_handoffs_expired_dropped(isolated_state, tmp_path, monkeypatch):
     """Expired handoffs are not surfaced AND dropped on next consume."""
-    import time as time_mod
 
     asker = "asker"
     project = tmp_path / "p"
@@ -662,3 +657,59 @@ def test_recent_decisions_workspace_filter(isolated_state):
 
     everything = isolated_state.recent_decisions(workspace=None)
     assert {d["session_id"] for d in everything} == {"s1", "s2"}
+
+
+# ---------------------------------------------------------------------------
+# Phase B v1.3 Lane B: UUID-drift detection in set_name
+# ---------------------------------------------------------------------------
+
+
+def test_set_name_with_stale_collision_takes_name(isolated_state, monkeypatch):
+    """When the colliding session is older than the stale threshold (~30 min
+    idle), set_name should silently take the name without merge_needed —
+    preserves the existing 'two sessions can share a name' affordance for
+    legitimate post-death name reuse."""
+    import os
+    import time
+
+    # Session A claims "alice" first.
+    isolated_state.log_decision("session-a", "init", "")
+    isolated_state.set_name("session-a", "alice")
+
+    # Backdate A's status.json to before the stale threshold (~31 min ago).
+    sd_a = isolated_state._session_dir("session-a")
+    stale_ts = time.time() - (31 * 60)
+    for p in sd_a.iterdir():
+        if p.is_file():
+            os.utime(p, (stale_ts, stale_ts))
+
+    # Session B now claims "alice" — should succeed cleanly (no merge_needed).
+    isolated_state.log_decision("session-b", "init", "")
+    result = isolated_state.set_name("session-b", "alice")
+    assert result["name"] == "alice"
+    assert "merge_needed" not in result
+    assert "conflicts_with" not in result
+
+
+def test_set_name_with_fresh_collision_signals_merge_needed(isolated_state, caplog):
+    """When the colliding session is still active (within stale threshold),
+    set_name still writes the name but surfaces merge_needed + conflicts_with
+    so the caller (orchestrator) can decide whether to migrate or rename."""
+    import logging
+
+    # Session A claims "alice" first (fresh — just created, mtime is now).
+    isolated_state.log_decision("session-a", "init", "")
+    isolated_state.set_name("session-a", "alice")
+
+    # Session B claims "alice" immediately after — collision should fire.
+    isolated_state.log_decision("session-b", "init", "")
+    with caplog.at_level(logging.WARNING, logger="khimaira.monitor.sessions"):
+        result = isolated_state.set_name("session-b", "alice")
+
+    assert result["name"] == "alice"
+    assert result.get("merge_needed") is True
+    assert result.get("conflicts_with") == "session-a"
+    assert result.get("conflicts_with_last_active_s") is not None
+    assert result["conflicts_with_last_active_s"] < 30 * 60
+    # Warning log emitted with the conflict detail.
+    assert any("already in use by session" in rec.message for rec in caplog.records)

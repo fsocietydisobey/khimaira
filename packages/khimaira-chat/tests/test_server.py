@@ -295,3 +295,278 @@ def test_task_signal_skips_own_signal():
         "assignee_id": OTHER_SID,
     }
     assert _route_record(record, MY_SID) is None
+
+
+# ---------------------------------------------------------------------------
+# Phase B v1.3: subscriber watchdog self-healing
+# ---------------------------------------------------------------------------
+
+
+import asyncio  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_watchdog_restarts_crashed_subscriber(monkeypatch):
+    """When `subscriber_task` crashes, the watchdog must replace it with
+    a fresh task within one tick interval. The replacement task must be
+    a different object AND still running (not instantly done — guards
+    against false positives from a stub coroutine that returns immediately)."""
+    import contextlib
+
+    from khimaira_chat import server
+
+    # Stub out _proactive_sse_loop so the restart doesn't try to hit a
+    # real daemon. Sleeps indefinitely; cancellation handles cleanup.
+    async def stub_subscriber():
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(server, "_proactive_sse_loop", stub_subscriber)
+    monkeypatch.setattr(server, "_WATCHDOG_INTERVAL_S", 0.05)
+
+    # Snapshot the live _state's mutated fields so we restore them
+    # after the test — _state is module-level singleton.
+    orig = (
+        server._state.session_id,
+        server._state.subscriber_task,
+        server._state.watchdog_task,
+        server._state.write_stream,
+        server._state.subscriber_restart_count,
+    )
+    try:
+        server._state.session_id = "test-session"
+        server._state.write_stream = object()  # just needs to be non-None
+        server._state.subscriber_restart_count = 0
+
+        # Inject a subscriber task that crashes immediately.
+        async def crashing_sub():
+            raise RuntimeError("simulated subscriber crash")
+
+        crashed = asyncio.create_task(crashing_sub())
+        await asyncio.sleep(0.01)
+        assert crashed.done()
+        server._state.subscriber_task = crashed
+
+        # Start the watchdog. It should detect the crashed task on its
+        # first tick (~0.05s) and reincarnate it.
+        wd = asyncio.create_task(server._subscriber_watchdog())
+        try:
+            # Poll for restart, max ~1s wall-time.
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+                if server._state.subscriber_task is not crashed:
+                    break
+
+            new_task = server._state.subscriber_task
+            assert new_task is not crashed, "watchdog did not replace crashed subscriber_task"
+            assert not new_task.done(), "replacement task ended instantly (stub-coroutine smell)"
+            assert server._state.subscriber_restart_count == 1, "restart counter not bumped"
+        finally:
+            wd.cancel()
+            new_task = server._state.subscriber_task
+            if new_task is not None and not new_task.done():
+                new_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wd
+            if new_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await new_task
+    finally:
+        (
+            server._state.session_id,
+            server._state.subscriber_task,
+            server._state.watchdog_task,
+            server._state.write_stream,
+            server._state.subscriber_restart_count,
+        ) = orig
+
+
+@pytest.mark.asyncio
+async def test_dispatch_tool_restarts_dead_subscriber(monkeypatch):
+    """Phase B v1.3 Lane B: when an agent calls a chat_* tool and the
+    subscriber_task is dead, _dispatch_tool restarts it before dispatching.
+    Complements the passive watchdog: agents that wake and immediately
+    call chat tools shouldn't wait 30s for the next watchdog tick."""
+    import contextlib
+
+    from khimaira_chat import server
+
+    # Stub _proactive_sse_loop so the restart doesn't hit a real daemon.
+    async def stub_subscriber():
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(server, "_proactive_sse_loop", stub_subscriber)
+
+    # Stub daemon_client.my_chats so the dispatch call doesn't try to
+    # talk to a real daemon — only the precheck behavior matters here.
+    monkeypatch.setattr(server.daemon_client, "my_chats", lambda sid: [])
+
+    orig = (
+        server._state.session_id,
+        server._state.subscriber_task,
+        server._state.write_stream,
+        server._state.subscriber_restart_count,
+    )
+    try:
+        server._state.session_id = "test-session"
+        server._state.write_stream = object()
+        server._state.subscriber_restart_count = 0
+
+        # Inject a subscriber task that has already exited.
+        async def dead_sub():
+            return
+
+        dead = asyncio.create_task(dead_sub())
+        await asyncio.sleep(0.01)
+        assert dead.done()
+        server._state.subscriber_task = dead
+
+        # Dispatch a chat tool — precheck should restart the subscriber.
+        await server._dispatch_tool("chat_my_chats", {"session_id": "test-session"})
+
+        new_task = server._state.subscriber_task
+        assert new_task is not dead, "precheck did not replace dead subscriber_task"
+        assert not new_task.done(), "replacement task ended instantly"
+        assert server._state.subscriber_restart_count == 1, "restart counter not bumped"
+
+        # Healthy subscriber on subsequent dispatch → no further restart.
+        await server._dispatch_tool("chat_my_chats", {"session_id": "test-session"})
+        assert server._state.subscriber_restart_count == 1, (
+            "precheck should be a no-op when subscriber is alive"
+        )
+
+        # Cleanup.
+        if not new_task.done():
+            new_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await new_task
+    finally:
+        (
+            server._state.session_id,
+            server._state.subscriber_task,
+            server._state.write_stream,
+            server._state.subscriber_restart_count,
+        ) = orig
+
+
+# ---------------------------------------------------------------------------
+# Phase B v1.3 Lane D: async ppid-bridge eager subscription
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_async_ppid_bridge_sets_session_id_when_lookup_succeeds(monkeypatch):
+    """When the daemon's ppid registry has an entry for one of our
+    ancestors, `_async_try_auto_register_from_ppid` should populate
+    `_state.session_id` so the caller (_serve) can spawn the subscriber.
+    Regression-prevention for the v1.2 dogfood bug — subprocess never
+    saw the chat_transfer_membership block because the eager-reg never
+    fired."""
+    from khimaira_chat import server
+
+    orig = (
+        server._state.session_id,
+        server._state.subscriber_task,
+        server._state.write_stream,
+        server._state.subscriber_restart_count,
+    )
+    try:
+        server._state.session_id = None  # force the bridge to actually run
+        expected_sid = "test-async-ppid-success"
+        monkeypatch.setattr(server, "_ancestor_pids", lambda max_depth=6: [12345])
+        monkeypatch.setattr(
+            server.daemon_client, "lookup_session_by_ppid", lambda ppid: expected_sid
+        )
+        # Don't bother with display-name registration in tests — stub out.
+        monkeypatch.setattr(server, "_maybe_register_display_name", lambda sid: None)
+
+        await server._async_try_auto_register_from_ppid()
+
+        assert server._state.session_id == expected_sid
+    finally:
+        (
+            server._state.session_id,
+            server._state.subscriber_task,
+            server._state.write_stream,
+            server._state.subscriber_restart_count,
+        ) = orig
+
+
+@pytest.mark.asyncio
+async def test_async_ppid_bridge_gives_up_when_lookup_always_none(monkeypatch):
+    """When the daemon never has an entry (hook never posted), the
+    bridge must exhaust its budget and return cleanly — `_state.session_id`
+    stays None, lazy-reg takes over on the agent's first tool call.
+    No exceptions raised; this is the existing-behavior preservation
+    guarantee that lets the watchdog (Lane A) be the only restart path
+    for the not-yet-registered case."""
+    from khimaira_chat import server
+
+    orig = (
+        server._state.session_id,
+        server._state.subscriber_task,
+        server._state.write_stream,
+        server._state.subscriber_restart_count,
+    )
+    try:
+        server._state.session_id = None
+        monkeypatch.setattr(server, "_ancestor_pids", lambda max_depth=6: [99999])
+        monkeypatch.setattr(server.daemon_client, "lookup_session_by_ppid", lambda ppid: None)
+        # Shrink the budget so the test doesn't actually sleep 5s.
+        monkeypatch.setattr(server, "_ASYNC_PPID_BUDGET_S", 0.3)
+
+        await server._async_try_auto_register_from_ppid()
+
+        assert server._state.session_id is None, (
+            "session_id must stay None when bridge exhausts budget; "
+            "otherwise lazy-reg fallback would be unreachable"
+        )
+    finally:
+        (
+            server._state.session_id,
+            server._state.subscriber_task,
+            server._state.write_stream,
+            server._state.subscriber_restart_count,
+        ) = orig
+
+
+@pytest.mark.asyncio
+async def test_async_ppid_bridge_noop_when_session_id_already_set(monkeypatch):
+    """If main()'s sync attempt already populated `_state.session_id`,
+    the async retry must be a no-op — must not re-fetch, must not
+    overwrite. Otherwise we'd risk double-registration races."""
+    from khimaira_chat import server
+
+    orig = (
+        server._state.session_id,
+        server._state.subscriber_task,
+        server._state.write_stream,
+        server._state.subscriber_restart_count,
+    )
+    try:
+        preset_sid = "test-already-registered"
+        server._state.session_id = preset_sid
+
+        call_count = {"n": 0}
+
+        def counting_lookup(ppid):
+            call_count["n"] += 1
+            return "should-never-be-set"
+
+        monkeypatch.setattr(server, "_ancestor_pids", lambda max_depth=6: [12345])
+        monkeypatch.setattr(server.daemon_client, "lookup_session_by_ppid", counting_lookup)
+
+        await server._async_try_auto_register_from_ppid()
+
+        assert server._state.session_id == preset_sid, (
+            "must not overwrite an established session_id"
+        )
+        assert call_count["n"] == 0, "must not call lookup when session_id is already set"
+    finally:
+        (
+            server._state.session_id,
+            server._state.subscriber_task,
+            server._state.write_stream,
+            server._state.subscriber_restart_count,
+        ) = orig

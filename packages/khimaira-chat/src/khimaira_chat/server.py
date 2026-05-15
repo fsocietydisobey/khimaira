@@ -85,6 +85,16 @@ class _SubprocessState:
         self.session_id: str | None = None
         self.last_event_id: str | None = None
         self.subscriber_task: asyncio.Task | None = None
+        # Phase B v1.3: watchdog supervises subscriber_task. Restarts it
+        # if it crashes; logs the crash reason via task.exception(). One
+        # watchdog per subprocess lifetime, spawned in _serve().
+        self.watchdog_task: asyncio.Task | None = None
+        # Restart counter — bumped each time the watchdog reincarnates a
+        # crashed subscriber. Logged on every restart so the steady-state
+        # "subscriber restarted N times" pattern is grep-able. Hot-restart
+        # loops (persistent daemon-down case) become visible without
+        # special-casing exponential backoff.
+        self.subscriber_restart_count: int = 0
         # write_stream captured at stdio_server() time so the SSE
         # subscriber can emit notifications/claude/channel directly,
         # without needing the session object from request_context.
@@ -726,6 +736,29 @@ def _build_server() -> Server:
 
 async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
     sid = args["session_id"]
+    # Phase B v1.3 Lane B: force-resubscribe on dead subscriber.
+    # Active-path complement to Lane A's 30s passive watchdog — when an
+    # agent issues a chat tool call against a stale subscriber, restart
+    # before dispatch so subsequent messages flow. Fire-and-forget: the
+    # new task starts scheduling but isn't awaited, so this first call's
+    # response may race the subscriber's first connect. That's acceptable
+    # — next chat call onwards is healthy, and a 30s gap is the worst
+    # case before Lane A's watchdog would have caught it anyway.
+    if (
+        name.startswith("chat_")
+        and _state.session_id is not None
+        and _state.write_stream is not None
+    ):
+        task = _state.subscriber_task
+        if task is None or task.done():
+            log.warning(
+                "khimaira-chat: subscriber task %s on tool dispatch — force-resubscribe "
+                "(restart_count was %d)",
+                "missing" if task is None else "done",
+                _state.subscriber_restart_count,
+            )
+            _state.subscriber_restart_count += 1
+            _state.subscriber_task = asyncio.create_task(_proactive_sse_loop())
     if name == "chat_create_room":
         return daemon_client.create_room(
             sid,
@@ -864,9 +897,93 @@ async def _serve() -> None:
         # auto-delivery: subscriber starts at boot, pushes events
         # the moment they arrive, agent sees them on next turn.
         _state.write_stream = write_stream
+
+        # Phase B v1.3 Lane D: eager subscription via async ppid-bridge.
+        # The sync version in main() already ran with a ~3s budget; if it
+        # missed (SessionStart hook slow / not-yet-posted), this async
+        # retry gives a longer window without blocking startup. No-op if
+        # main() already established session_id.
+        if _state.session_id is None:
+            try:
+                await _async_try_auto_register_from_ppid()
+            except Exception:
+                log.exception("khimaira-chat: async ppid-bridge raised; falling back to lazy-reg")
+
         if _state.session_id and _state.subscriber_task is None:
             _state.subscriber_task = asyncio.create_task(_proactive_sse_loop())
+        # Phase B v1.3: watchdog supervises subscriber_task for its
+        # subprocess lifetime. Spawned BEFORE the subscriber (or instead
+        # of it, in lazy-reg case) — that way even if _proactive_sse_loop
+        # fails to start, the watchdog reincarnates it on first tick.
+        if _state.watchdog_task is None:
+            _state.watchdog_task = asyncio.create_task(_subscriber_watchdog())
         await server.run(read_stream, write_stream, init_opts)
+
+
+# Phase B v1.3 Lane D: async ppid-bridge total budget. Module-level so
+# tests can shrink it for fast-running assertions. ~5s gives a real
+# slow-hook scenario room to land while still bounded.
+_ASYNC_PPID_BUDGET_S: float = 5.0
+
+
+async def _async_try_auto_register_from_ppid() -> None:
+    """Async sibling of `_try_auto_register_from_ppid`.
+
+    main() runs the sync version (3s budget, time.sleep). If the
+    SessionStart hook is slow to post the {ppid, session_id} mapping
+    (which we observed in v1.2 dogfood — subprocess booted before the
+    hook landed), the sync attempt misses entirely. This async version
+    runs from inside the event loop after stdio_server is up, giving a
+    longer total budget (~5s default) via asyncio.sleep without blocking
+    interactive use — agent tool calls can dispatch concurrently and
+    lazy-reg still serves as the fallback if even this attempt misses.
+
+    On match: sets `_state.session_id` and registers display name.
+    Subscriber spawn happens in the caller (`_serve`) so the spawn site
+    stays single-source-of-truth.
+
+    Always best-effort: catches exceptions per-attempt and on persistent
+    failure logs + returns. Never raises to the caller.
+    """
+    if _state.session_id is not None:
+        return  # main() already succeeded; nothing to do
+    ancestors = _ancestor_pids(max_depth=6)
+    if not ancestors:
+        log.info("khimaira-chat: async ppid-bridge — no ancestors, skipping")
+        return
+    deadline = asyncio.get_event_loop().time() + _ASYNC_PPID_BUDGET_S
+    attempt = 0
+    while asyncio.get_event_loop().time() < deadline:
+        attempt += 1
+        for ppid in ancestors:
+            try:
+                sid = daemon_client.lookup_session_by_ppid(ppid)
+            except Exception:
+                sid = None
+            if sid:
+                _state.session_id = sid
+                log.info(
+                    "khimaira-chat: async ppid-bridge succeeded on attempt %d "
+                    "via ancestor ppid=%s → session_id=%s",
+                    attempt,
+                    ppid,
+                    sid,
+                )
+                _maybe_register_display_name(sid)
+                return
+        # Backoff: 0.5s, 1s, 1.5s, 2s. Total ~5s matches the deadline.
+        await asyncio.sleep(min(0.5 * attempt, 2.0))
+    log.info(
+        "khimaira-chat: async ppid-bridge gave up after %d attempts for ancestors %s; "
+        "lazy-reg takes over",
+        attempt,
+        ancestors,
+    )
+
+
+# Phase B v1.3: watchdog tick interval. Module-level so tests can
+# monkeypatch it (~0.5s) and exercise restart logic in seconds.
+_WATCHDOG_INTERVAL_S: float = 30.0
 
 
 async def _proactive_sse_loop() -> None:
@@ -876,6 +993,19 @@ async def _proactive_sse_loop() -> None:
     tool call. The whole point of channels.
 
     Routing lives in `_route_record`.
+
+    **Phase B v1.3 layered exception handling:**
+    - INNER try/except wraps per-record processing — one bad message
+      (malformed payload, transient emit failure) is logged + skipped,
+      stream loop continues. Single message failures must not kill the
+      subscriber.
+    - OUTER try/except wraps the entire `async for` + `subscribe_events`
+      invocation — stream-killing failures (httpx blowup past reconnect,
+      malformed framing that breaks iteration) are logged with traceback
+      then RE-RAISED so the watchdog sees `task.done()` + `task.exception()`
+      and can reincarnate the subscriber.
+    - `asyncio.CancelledError` always propagates uncaught in both layers
+      so orderly shutdown isn't broken.
     """
     assert _state.session_id is not None
     assert _state.write_stream is not None
@@ -883,17 +1013,104 @@ async def _proactive_sse_loop() -> None:
         "khimaira-chat: proactive SSE subscriber starting for session_id=%s",
         _state.session_id,
     )
-    async for record in daemon_client.subscribe_events(
-        _state.session_id, last_event_id=_state.last_event_id
-    ):
-        evt_id = record.get("event_id")
-        if evt_id:
-            _state.last_event_id = evt_id
-        decision = _route_record(record, _state.session_id)
-        if decision is None:
+    try:
+        async for record in daemon_client.subscribe_events(
+            _state.session_id, last_event_id=_state.last_event_id
+        ):
+            try:
+                evt_id = record.get("event_id")
+                if evt_id:
+                    _state.last_event_id = evt_id
+                decision = _route_record(record, _state.session_id)
+                if decision is None:
+                    continue
+                content, meta = decision
+                await _direct_channel_notify(content, meta)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Inner: one bad record must not break the stream. Log
+                # with traceback so we can diagnose; continue with the
+                # next record. evt_id of the bad record is in last_event_id
+                # at this point, so a watchdog restart resumes AFTER it.
+                log.exception(
+                    "khimaira-chat: per-record processing failed (event_id=%s); skipping",
+                    record.get("event_id"),
+                )
+                continue
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Outer: stream-killing failure (subscribe_events generator died,
+        # or any uncaught surprise). Log with traceback; re-raise so the
+        # watchdog catches it via task.exception() and restarts. The
+        # restart picks up via Last-Event-ID; no message loss for the
+        # gap modulo the daemon's SSE backfill window.
+        log.exception("khimaira-chat: _proactive_sse_loop crashed; re-raising for watchdog")
+        raise
+
+
+async def _subscriber_watchdog() -> None:
+    """Phase B v1.3: supervise `_state.subscriber_task`, restart on crash.
+
+    Sleeps `_WATCHDOG_INTERVAL_S` between ticks. On each tick:
+    - If `subscriber_task` exists and is done → log the crash reason via
+      `task.exception()` (which captures the traceback) and reincarnate
+      it. `_state.last_event_id` persists across restarts so the new
+      task resumes via Last-Event-ID backfill.
+    - If `subscriber_task` is None BUT `session_id` is set → the ppid
+      bridge didn't fire at boot (rare but real); start the subscriber.
+    - If `subscriber_task` is None AND `session_id` is None → still in
+      lazy-registration window; nothing to do yet, sleep again.
+
+    `asyncio.CancelledError` propagates (orderly shutdown). Any other
+    exception inside the watchdog itself is logged + swallowed so a
+    watchdog crash doesn't lose subscriber supervision.
+    """
+    assert _state.write_stream is not None
+    log.info("khimaira-chat: subscriber watchdog starting (interval=%ss)", _WATCHDOG_INTERVAL_S)
+    while True:
+        try:
+            await asyncio.sleep(_WATCHDOG_INTERVAL_S)
+            if _state.session_id is None:
+                continue  # still lazy-reg phase, nothing to supervise
+            task = _state.subscriber_task
+            if task is None:
+                # Session is registered but subscriber never started —
+                # likely ppid bridge missed. Bootstrap it now.
+                log.warning(
+                    "khimaira-chat: watchdog found no subscriber_task for "
+                    "session_id=%s; starting one",
+                    _state.session_id,
+                )
+                _state.subscriber_task = asyncio.create_task(_proactive_sse_loop())
+                continue
+            if task.done():
+                exc = task.exception() if not task.cancelled() else None
+                _state.subscriber_restart_count += 1
+                if exc is not None:
+                    log.error(
+                        "khimaira-chat: subscriber_task crashed (restart #%d) — %s: %s",
+                        _state.subscriber_restart_count,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=exc,
+                    )
+                else:
+                    # Returned normally (or was cancelled). Restart anyway —
+                    # the subscriber should never exit cleanly during normal
+                    # operation; a clean exit is itself a bug worth restarting.
+                    log.warning(
+                        "khimaira-chat: subscriber_task ended without "
+                        "exception (restart #%d); reincarnating",
+                        _state.subscriber_restart_count,
+                    )
+                _state.subscriber_task = asyncio.create_task(_proactive_sse_loop())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("khimaira-chat: watchdog tick failed; continuing")
             continue
-        content, meta = decision
-        await _direct_channel_notify(content, meta)
 
 
 async def _direct_channel_notify(content: str, meta: dict[str, str]) -> None:

@@ -1040,6 +1040,71 @@ def test_transfer_membership_duplicate_target_raises(isolated_chats):
         c.transfer_membership(chat_id, "bob", "carol")
 
 
+# Phase B v1.3 Lane E: creator/master role propagation on transfer.
+# Surfaced when khimaira-21 → khimaira-0 transfer left the successor with
+# chat membership but `room.meta.created_by` still pinned to khimaira-21,
+# so chat_task_update done→approved 404'd with Required roles: ['master'].
+
+
+def test_transfer_membership_propagates_creator_role(isolated_chats):
+    """When the chat creator transfers their membership, `room.meta.created_by`
+    must also update to the recipient. Without this, the successor inherits
+    membership but cannot exercise master-gated primitives (chat_task_update
+    done→approved, chat_delete) — the chat is effectively orphaned of its
+    master role.
+    """
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice", "alice")
+    _make_session(sessions_mod, "bob", "bob")
+    _make_session(sessions_mod, "carol", "carol")
+
+    room = c.create_room("alice", ["bob"], title="ops")
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob")
+
+    # Pre-transfer: alice is the creator/master.
+    assert room["meta"]["created_by"] == "alice"
+    assert room["meta"]["created_by_name"] == "alice"
+
+    c.transfer_membership(chat_id, "alice", "carol")
+
+    fresh_room = c.load_room(chat_id)
+    assert fresh_room["meta"]["created_by"] == "carol", (
+        "master role must transfer with membership when the source is the creator"
+    )
+    assert fresh_room["meta"]["created_by_name"] == "carol"
+    # Sanity: member-state transitions still happen normally.
+    assert fresh_room["members"]["alice"]["state"] == c.TRANSFERRED_OUT
+    assert fresh_room["members"]["carol"]["state"] == c.ACCEPTED
+
+
+def test_transfer_membership_non_creator_preserves_meta_created_by(isolated_chats):
+    """When a non-creator transfers their membership, `room.meta.created_by`
+    stays pinned to the original creator. Lane E only propagates the master
+    role when the transferring session IS the creator — non-creator
+    transfers must not silently steal the master role.
+    """
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice", "alice")
+    _make_session(sessions_mod, "bob", "bob")
+    _make_session(sessions_mod, "dave", "dave")
+
+    room = c.create_room("alice", ["bob"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob")
+
+    # bob is NOT the creator; his transfer must leave meta.created_by alone.
+    c.transfer_membership(chat_id, "bob", "dave")
+
+    fresh_room = c.load_room(chat_id)
+    assert fresh_room["meta"]["created_by"] == "alice"
+    assert fresh_room["meta"]["created_by_name"] == "alice"
+
+
 # ---------------------------------------------------------------------------
 # Phase B v1.2: master-signal-to-start primitive (task_signal records)
 # ---------------------------------------------------------------------------

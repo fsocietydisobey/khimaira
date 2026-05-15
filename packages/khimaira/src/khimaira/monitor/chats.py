@@ -861,6 +861,13 @@ def transfer_membership(
     accepted members see a synthetic system message in the chat so the
     handoff is visible in transcript and post-hoc audit.
 
+    **Phase B v1.3 creator-role propagation:** when `from` is the chat
+    creator (master), the master role transfers with the membership — a
+    fresh META record is emitted with `created_by` / `created_by_name`
+    updated to `to`. Without this, the successor inherits membership but
+    not approval-gating rights (chat_task_update done→approved checks
+    `room.meta.created_by`). Non-creator transfers leave META alone.
+
     State transitions are passive: the `state != ACCEPTED` gate in
     `_broadcast` and `send_message` handles cutoff — no special teardown.
     A previously-transferred-out session can be re-invited, accept, and
@@ -894,6 +901,22 @@ def transfer_membership(
     from_name = from_member.get("session_name") or from_session_id[:8]
     to_name = _resolve_session_name(to_session_id) or to_session_id[:8]
     ts = _now_iso()
+
+    # Phase B v1.3: propagate master/creator role on creator-transfer.
+    # `load_room` folds META last-write-wins, so a fresh META record with
+    # updated `created_by` swaps the master designation atomically with
+    # the membership transfer. Surfaced organically when the v1.2
+    # khimaira-21 → khimaira-0 transfer left the successor with
+    # membership but no approval-gating rights — the v1.2 round-trip test
+    # never read META post-transfer, so the gap was invisible.
+    creator_meta_update: dict[str, Any] | None = None
+    existing_meta = room.get("meta") or {}
+    if existing_meta.get("created_by") == from_session_id:
+        creator_meta_update = dict(existing_meta)
+        creator_meta_update["created_by"] = to_session_id
+        creator_meta_update["created_by_name"] = to_name
+        creator_meta_update["event_id"] = _new_event_id()
+        creator_meta_update["ts"] = ts
 
     out_record = {
         "kind": MEMBER,
@@ -935,15 +958,18 @@ def transfer_membership(
             "to": to_session_id,
         },
     }
+    if creator_meta_update is not None:
+        _append(chat_id, creator_meta_update)
     _append(chat_id, out_record)
     _append(chat_id, in_record)
     _append(chat_id, sys_msg)
     log.info(
-        "chats: transfer chat=%s from=%s to=%s transfer_id=%s",
+        "chats: transfer chat=%s from=%s to=%s transfer_id=%s%s",
         chat_id,
         from_session_id,
         to_session_id,
         transfer_id,
+        " (creator role propagated)" if creator_meta_update is not None else "",
     )
     return {
         "chat_id": chat_id,
