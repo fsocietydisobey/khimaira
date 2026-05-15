@@ -88,7 +88,8 @@ def _now_iso() -> str:
 
 
 _AGENT_TAG_RE = re.compile(
-    r"</?(thinking|scratchpad|reasoning|reflection|inner_monologue|answer|invoke)\b[^>]*>",
+    r"</?(thinking|scratchpad|reasoning|reflection|inner_monologue|"
+    r"answer|invoke|parameter|body|tool_use|function_calls)\b[^>]*>",
     re.IGNORECASE,
 )
 
