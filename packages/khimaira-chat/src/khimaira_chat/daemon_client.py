@@ -377,9 +377,15 @@ async def subscribe_events(
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield chat events from the daemon's SSE stream.
 
-    Reconnects forever with the last-seen event id so a daemon restart
-    or transient network blip doesn't lose messages. Caller cancels the
-    iterator to stop.
+    Reconnects forever with the last-seen event id so a daemon restart,
+    transient network blip, or laptop-suspend doesn't lose messages.
+    Caller cancels the iterator to stop.
+
+    Suspend/resume protection: the daemon sends an SSE keepalive comment
+    every 15s. We set a 45s read timeout (3× ping interval, safe buffer
+    for one missed ping). After a laptop wakes from suspend, the dead
+    SSE socket triggers httpx.ReadTimeout within 45s → reconnect →
+    daemon serves any missed events via Last-Event-ID backfill.
 
     Backoff strategy: exponential — 1s → 2s → 4s → 8s → 16s → 30s (cap)
     — and resets to `initial_backoff_s` after a successful connect (any
@@ -390,6 +396,10 @@ async def subscribe_events(
     """
     url = f"{base}/api/chats/events"
     backoff = initial_backoff_s
+    # Read timeout 45s matches the daemon's 15s keepalive ping at 3x —
+    # one missed ping is acceptable noise, two means the connection is
+    # actually dead and we should reconnect.
+    sse_timeout = httpx.Timeout(connect=5.0, read=45.0, write=10.0, pool=5.0)
     while True:
         headers: dict[str, str] = {"Accept": "text/event-stream"}
         if last_event_id:
@@ -397,7 +407,7 @@ async def subscribe_events(
         connected = False
         try:
             async with (
-                httpx.AsyncClient(timeout=None) as client,
+                httpx.AsyncClient(timeout=sse_timeout) as client,
                 client.stream(
                     "GET", url, params={"session_id": session_id}, headers=headers
                 ) as resp,
@@ -410,7 +420,21 @@ async def subscribe_events(
                     if evt_id:
                         last_event_id = evt_id
                     yield record
-        except (httpx.HTTPError, httpx.NetworkError):
+        except (httpx.HTTPError, httpx.NetworkError) as exc:
+            # Log distinguishes "couldn't connect" (daemon down) from
+            # "lost a working connection" (suspend/resume, server restart).
+            # The latter is the load-bearing case for the keepalive fix —
+            # if we see ReadTimeout here, the heartbeat is working as
+            # intended.
+            import logging
+
+            logging.getLogger("khimaira_chat.daemon_client").info(
+                "khimaira-chat: SSE %s — %s — reconnecting in %.1fs (last_event_id=%s)",
+                "lost (was connected)" if connected else "connect failed",
+                type(exc).__name__,
+                backoff,
+                last_event_id,
+            )
             await asyncio.sleep(backoff)
             if not connected:
                 # Failed to connect at all → exponential backoff.

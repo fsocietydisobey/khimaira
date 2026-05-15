@@ -151,7 +151,14 @@ def build_router():
                     "data": json.dumps(record, separators=(",", ":")),
                 }
 
-        return sse_starlette.EventSourceResponse(event_generator())
+        # ping=15 makes sse_starlette emit a `: keepalive` comment line
+        # every 15 seconds. SSE comments are valid keep-alives that don't
+        # show up as events but DO refresh TCP buffers and reset the
+        # client-side read timeout. Without this, an SSE connection that
+        # survives a laptop suspend (or any long network silence) becomes
+        # silently dead — the daemon's view is gone but the client's
+        # aiter_lines() blocks forever waiting for events that never come.
+        return sse_starlette.EventSourceResponse(event_generator(), ping=15)
 
     @router.get("/chats/{chat_id}")
     async def get_room(chat_id: str, session_id: str) -> dict:
