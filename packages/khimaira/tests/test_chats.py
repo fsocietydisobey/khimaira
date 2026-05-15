@@ -419,6 +419,46 @@ def test_latest_pending_returns_none_when_no_invites(isolated_chats):
     assert c.latest_pending_chat_id("alice") is None
 
 
+def test_subscribe_replays_pending_invite_when_late(isolated_chats):
+    """Real bug: invitee subscribes AFTER an invite was broadcast. The
+    live broadcast missed an empty queue, so the catch-up on subscribe()
+    must yield the pending-invite record from the JSONL."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    _make_session(sessions_mod, "alice")
+    _make_session(sessions_mod, "bob")
+
+    # Invite happens BEFORE bob subscribes. The live broadcast goes to
+    # an empty subscriber set (silently dropped).
+    c.create_room("alice", ["bob"])
+
+    async def run():
+        # Now bob subscribes — should immediately receive the pending
+        # invite from JSONL replay, even though no live broadcast was
+        # captured.
+        gen = c.subscribe("bob")
+        received: list[dict] = []
+
+        async def collect():
+            async for record in gen:
+                received.append(record)
+                if len(received) >= 1:
+                    return
+
+        task = asyncio.create_task(collect())
+        await asyncio.wait_for(task, timeout=2.0)
+        return received
+
+    received = asyncio.run(run())
+    assert any(
+        r.get("kind") == "member"
+        and r.get("state") == "pending"
+        and r.get("session_id") == "bob"
+        for r in received
+    )
+
+
 def test_invite_broadcast_routes_to_invitee(isolated_chats):
     """When a member is added in pending state, the broadcast must go
     ONLY to the invitee — even though they're not yet `accepted`. This
@@ -508,7 +548,10 @@ def test_subscribe_receives_new_messages(isolated_chats):
     assert received[0]["kind"] == c.MSG
 
 
-def test_subscribe_skips_pending_members(isolated_chats):
+def test_subscribe_skips_messages_for_pending_members(isolated_chats):
+    """Pending member's subscribe yields the pending-invite catch-up record
+    (so they can see they've been invited), but does NOT receive chat
+    messages until they accept. Verify the message broadcast is skipped."""
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
 
@@ -526,13 +569,14 @@ def test_subscribe_skips_pending_members(isolated_chats):
         async def collect():
             async for record in gen:
                 received.append(record)
-                if len(received) >= 1:
+                # Stop after we get at least the catch-up invite + a chance
+                # for any errant message to arrive.
+                if len(received) >= 5:
                     return
 
         task = asyncio.create_task(collect())
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # let subscribe yield catch-up
         c.send_message(chat_id, "alice", "ping pending")
-        # Wait briefly; bob shouldn't receive (pending).
         try:
             await asyncio.wait_for(task, timeout=0.5)
         except TimeoutError:
@@ -540,4 +584,7 @@ def test_subscribe_skips_pending_members(isolated_chats):
         return received
 
     received = asyncio.run(run())
-    assert received == []
+    # The pending-invite catch-up record should be present.
+    assert any(r.get("kind") == "member" and r.get("state") == "pending" for r in received)
+    # But NO chat message should have been delivered.
+    assert not any(r.get("kind") == "msg" for r in received)

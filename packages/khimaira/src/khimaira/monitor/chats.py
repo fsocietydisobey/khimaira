@@ -532,6 +532,27 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     _subscribers.setdefault(session_id, set()).add(queue)
     try:
+        # Pending-invite catch-up. The invite broadcast at create_room
+        # time goes to active subscribers only — if the invitee's
+        # subprocess wasn't subscribed yet (lazy registration hadn't
+        # fired), the broadcast lands in an empty queue. Replay any
+        # currently-pending invites for this session on subscribe so
+        # the subprocess always sees its outstanding invites. Cheap
+        # because pending invites are bounded (one per chat the user
+        # is invited to but hasn't accepted/rejected).
+        for chat_meta in my_chats(session_id):
+            if chat_meta.get("my_state") != PENDING:
+                continue
+            chat_id = chat_meta["chat_id"]
+            for line in _read(chat_id):
+                if (
+                    line.get("kind") == MEMBER
+                    and line.get("session_id") == session_id
+                    and line.get("state") == PENDING
+                ):
+                    yield line
+                    break  # only the most recent pending record per chat
+
         if since_event_id:
             # v1.1 follow-up: when since_event_id is unrecognized in any
             # chat (cursor older than chat history, archived chat,
