@@ -77,6 +77,19 @@ class LeaveReq(BaseModel):
 class TransferMembershipReq(BaseModel):
     from_session_id: str
     to_session_id: str
+    # Phase B v1.6: when True, atomically writes
+    # meta.deputized_original_master = from_session_id AND skips the donor's
+    # TRANSFERRED_OUT MEMBER write so the donor stays ACCEPTED throughout
+    # the deputize→resume cycle. Default False = terminal-handoff behavior.
+    as_deputize: bool = False
+
+
+class ResumeMasterReq(BaseModel):
+    # Phase B v1.6: caller (must equal recorded meta.deputized_original_master).
+    by_session_id: str
+    # Role the vice gets demoted to on resume. Defaults to "agent"; cannot be
+    # "master" (closes quorum loophole, mirrors chat_grant_role).
+    demote_to: str = "agent"
 
 
 class RejectReq(BaseModel):
@@ -306,12 +319,39 @@ def build_router():
     @router.post("/chats/{chat_id}/transfer-membership")
     async def transfer_membership(chat_id: str, req: TransferMembershipReq) -> dict:
         try:
-            return chats.transfer_membership(chat_id, req.from_session_id, req.to_session_id)
+            return chats.transfer_membership(
+                chat_id,
+                req.from_session_id,
+                req.to_session_id,
+                as_deputize=req.as_deputize,
+            )
         except ValueError as exc:
             msg = str(exc)
             if "already accepted" in msg:
                 code = 409
             elif "only accepted members" in msg:
+                code = 403
+            else:
+                code = 404
+            raise fastapi.HTTPException(code, msg) from exc
+
+    @router.post("/chats/{chat_id}/resume-master")
+    async def resume_master(chat_id: str, req: ResumeMasterReq) -> dict:
+        """Phase B v1.6: caller (original master per meta marker) reclaims
+        master role from the vice that's currently holding it. Pairs with
+        /khimaira-resume on the skill side. See chats.chat_resume_master for
+        semantics + invariants."""
+        try:
+            return chats.chat_resume_master(
+                chat_id,
+                req.by_session_id,
+                demote_to=req.demote_to,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "not currently deputized" in msg or "no deputized_original_master" in msg:
+                code = 409
+            elif "not the recorded original master" in msg or "demote_to" in msg:
                 code = 403
             else:
                 code = 404

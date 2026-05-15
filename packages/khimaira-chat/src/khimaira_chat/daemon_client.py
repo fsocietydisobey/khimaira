@@ -338,6 +338,7 @@ def transfer_membership(
     from_session_id: str,
     to_session_id: str,
     *,
+    as_deputize: bool = False,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
     """Hand `from`'s chat membership to `to` in one atomic call.
@@ -346,6 +347,12 @@ def transfer_membership(
     can hand its active chats to a fresh successor without a handshake on
     the receiving end. The receiving session lands accepted immediately
     and inherits the full chat_history.
+
+    Phase B v1.6: `as_deputize=True` writes
+    `meta.deputized_original_master = from_session_id` atomically with the
+    transfer AND skips the donor's TRANSFERRED_OUT MEMBER write — donor
+    stays ACCEPTED through the deputize→resume cycle. Used by
+    /khimaira-deputize.
     """
     resp = _request_with_retry(
         "POST",
@@ -353,6 +360,34 @@ def transfer_membership(
         json={
             "from_session_id": from_session_id,
             "to_session_id": to_session_id,
+            "as_deputize": as_deputize,
+        },
+        timeout=10.0,
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
+def resume_master(
+    chat_id: str,
+    by_session_id: str,
+    *,
+    demote_to: str = "agent",
+    base: str = DEFAULT_BASE,
+) -> dict[str, Any]:
+    """Phase B v1.6: caller (original master per meta marker) reclaims
+    master role from the current vice.
+
+    Pairs with /khimaira-resume. Validates caller matches
+    meta.deputized_original_master; atomically swaps master role back via
+    v1.5 directive emits; clears the meta marker.
+    """
+    resp = _request_with_retry(
+        "POST",
+        f"{base}/api/chats/{chat_id}/resume-master",
+        json={
+            "by_session_id": by_session_id,
+            "demote_to": demote_to,
         },
         timeout=10.0,
     )

@@ -513,12 +513,18 @@ def _build_server() -> Server:
                 description=(
                     "Transfer your chat membership to a different session (for "
                     "session handoff). The receiving session lands accepted "
-                    "immediately, no handshake. You become transferred-out "
-                    "(no further pushes, no send rights — your chat_history "
-                    "rights persist via the JSONL). Other accepted members "
-                    "see a 📦 system message in the transcript. Pairs with "
-                    "/khimaira-transfer-session — use it for context-handoff "
-                    "to a fresh session, NOT as a generic re-assign primitive."
+                    "immediately, no handshake. By default you become "
+                    "transferred-out (no further pushes, no send rights — your "
+                    "chat_history rights persist via the JSONL). Other accepted "
+                    "members see a 📦 system message in the transcript. Pairs "
+                    "with /khimaira-transfer-session — use it for context-"
+                    "handoff to a fresh session. "
+                    "Phase B v1.6: pass `as_deputize=true` for the "
+                    "/khimaira-deputize variant — atomically writes "
+                    "`meta.deputized_original_master = from_session_id` AND "
+                    "skips the donor's TRANSFERRED_OUT write so the donor "
+                    "stays ACCEPTED throughout the pause-and-handoff cycle. "
+                    "Use `chat_resume_master` to reverse."
                 ),
                 inputSchema={
                     "type": "object",
@@ -536,6 +542,16 @@ def _build_server() -> Server:
                             "type": "string",
                             "description": "Recipient session (must be a known registered session, must not already be an accepted member)",
                         },
+                        "as_deputize": {
+                            "type": "boolean",
+                            "description": (
+                                "Phase B v1.6 deputize variant. When true, "
+                                "writes meta.deputized_original_master AND "
+                                "skips donor's TRANSFERRED_OUT write. "
+                                "Default false (terminal-handoff)."
+                            ),
+                            "default": False,
+                        },
                     },
                     "required": [
                         "session_id",
@@ -543,6 +559,40 @@ def _build_server() -> Server:
                         "from_session_id",
                         "to_session_id",
                     ],
+                },
+            ),
+            types.Tool(
+                name="chat_resume_master",
+                description=(
+                    "Phase B v1.6: caller (original master per meta marker) "
+                    "reclaims master role from the current vice that's "
+                    "holding it. Pairs with /khimaira-resume. Reverses a "
+                    "deliberate `chat_transfer_membership(..., "
+                    "as_deputize=true)` swap. Admin-style: vice cooperation "
+                    "not required. Validates caller matches "
+                    "`meta.deputized_original_master`; atomically swaps "
+                    "master role back via v1.5 role-directive emits to "
+                    "both sides; clears the meta marker."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Your session id (the original master reclaiming)",
+                        },
+                        "chat_id": {"type": "string"},
+                        "demote_to": {
+                            "type": "string",
+                            "description": (
+                                "Role the vice gets demoted to on resume. "
+                                "Default 'agent'. Cannot be 'master' (closes "
+                                "quorum loophole)."
+                            ),
+                            "default": "agent",
+                        },
+                    },
+                    "required": ["session_id", "chat_id"],
                 },
             ),
             # ---- Phase B tools ----
@@ -807,7 +857,21 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
                     f"session ({sid!r}). You can only transfer your own membership."
                 )
             }
-        return daemon_client.transfer_membership(args["chat_id"], sid, args["to_session_id"])
+        return daemon_client.transfer_membership(
+            args["chat_id"],
+            sid,
+            args["to_session_id"],
+            as_deputize=bool(args.get("as_deputize", False)),
+        )
+    if name == "chat_resume_master":
+        # Phase B v1.6: caller reclaims master role from the current vice.
+        # The daemon validates that `sid` matches the chat's recorded
+        # meta.deputized_original_master — no client-side check needed here.
+        return daemon_client.resume_master(
+            args["chat_id"],
+            sid,
+            demote_to=args.get("demote_to", "agent"),
+        )
     # ---- Phase B ----
     if name == "chat_send_to":
         return daemon_client.send_message(args["chat_id"], sid, args["body"], to=args["to"])
