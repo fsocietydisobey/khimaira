@@ -78,6 +78,7 @@ def create_room(
     *,
     title: str | None = None,
     fresh: bool = False,
+    topology: str = "flat",
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
     resp = _request_with_retry(
@@ -88,6 +89,7 @@ def create_room(
             "member_session_ids": member_session_ids,
             "title": title,
             "fresh": fresh,
+            "topology": topology,
         },
         timeout=10.0,
     )
@@ -156,7 +158,7 @@ def send_message(
     body: str,
     *,
     to: list[str] | None = None,
-    private: bool = False,
+    private: bool | None = None,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
     """Send a message to a chat.
@@ -167,12 +169,15 @@ def send_message(
 
     `private=True`: message hidden from non-recipients in chat_history.
     Requires `to` to be non-empty.
+
+    `private=None` (default): server applies the chat's topology default.
+    In "hierarchical" chats, targeted messages default to private=True.
     """
     payload: dict[str, Any] = {"sender_session_id": sender_session_id, "body": body}
     if to:
         payload["to"] = to
-    if private:
-        payload["private"] = True
+    if private is not None:
+        payload["private"] = private
     resp = _request_with_retry(
         "POST",
         f"{base}/api/chats/{chat_id}/messages",

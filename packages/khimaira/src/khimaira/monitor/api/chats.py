@@ -31,6 +31,7 @@ class CreateRoomReq(BaseModel):
     member_session_ids: list[str]
     title: str | None = None
     fresh: bool = False
+    topology: str = "flat"  # v1.9.5: flat | hierarchical | custom
 
 
 class InviteReq(BaseModel):
@@ -46,7 +47,7 @@ class SendReq(BaseModel):
     sender_session_id: str
     body: str
     to: list[str] | None = None  # Phase B: optional per-recipient addressing
-    private: bool = False  # v1.9.2: hide from non-recipients in chat_history
+    private: bool | None = None  # v1.9.2: hide from non-recipients; None = topology default
 
 
 class CreateTaskReq(BaseModel):
@@ -133,6 +134,7 @@ def build_router():
                 req.member_session_ids,
                 title=req.title,
                 fresh=req.fresh,
+                topology=req.topology,
             )
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc

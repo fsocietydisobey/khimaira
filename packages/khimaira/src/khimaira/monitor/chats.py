@@ -324,15 +324,30 @@ def _resolve_session_name(session_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+_VALID_TOPOLOGIES: frozenset[str] = frozenset({"flat", "hierarchical", "custom"})
+
+
 def create_room(
     creator_session_id: str,
     member_session_ids: list[str],
     *,
     title: str | None = None,
     fresh: bool = False,
+    topology: str = "flat",
 ) -> dict[str, Any]:
     """Create a new chat room. Creator is auto-`accepted`; other members
-    start `pending` and must call `accept()` to receive notifications."""
+    start `pending` and must call `accept()` to receive notifications.
+
+    `topology` controls privacy semantics for targeted messages:
+      - "flat" (default): send_to pushes to `to` only; history visible to all.
+      - "hierarchical": send_to auto-defaults private=True when not explicitly passed.
+      - "custom": no automatic privacy defaults; caller drives privacy explicitly.
+    Existing chats without a topology field are backward-compatible with "flat".
+    """
+    if topology not in _VALID_TOPOLOGIES:
+        raise ValueError(
+            f"Invalid topology {topology!r}. Valid values: {sorted(_VALID_TOPOLOGIES)}."
+        )
     creator_session_id = _resolve_or_uuid(creator_session_id)
     resolved_members = [_resolve_or_uuid(m) for m in member_session_ids]
     if creator_session_id not in resolved_members:
@@ -361,6 +376,7 @@ def create_room(
         "created_by_name": creator_name,
         "title": derived_title,
         "fresh_suffix": fresh_suffix,
+        "topology": topology,
     }
     _append(chat_id, meta)
 
@@ -528,7 +544,7 @@ def send_message(
     body: str,
     *,
     to: list[str] | None = None,
-    private: bool = False,
+    private: bool | None = None,
 ) -> dict[str, Any]:
     """Append a message. Sender must be an accepted member.
 
@@ -538,12 +554,16 @@ def send_message(
     `private=True`: message is hidden from non-recipients in chat_history.
     Requires `to` to be non-empty (private with no recipients is meaningless).
 
+    `private=None` (default): resolved against the chat's topology field.
+    In "hierarchical" chats, targeted messages (with `to`) default to
+    private=True. In "flat" or "custom" chats, defaults to False.
+
     Phase B v2: observers (member_roles[sid] == "observer") cannot send;
     raises ValueError. Critic role behaves identically to agent for write
     paths — opinion-only role, label visible in member listings.
     """
     sender_session_id = _resolve_or_uuid(sender_session_id)
-    if private and not to:
+    if private is True and not to:
         raise ValueError(
             "private=True requires a non-empty `to` list — "
             "a private message with no recipients is meaningless."
@@ -557,6 +577,14 @@ def send_message(
             f"only accepted members can send messages."
         )
     _check_not_observer(room, sender_session_id, "send messages")
+
+    # v1.9.5: topology-based privacy default. "hierarchical" chats treat
+    # targeted messages as private by default when caller didn't specify.
+    effective_topology = room["meta"].get("topology", "flat")
+    if private is None and to and effective_topology == "hierarchical":
+        effective_private = True
+    else:
+        effective_private = bool(private)
 
     resolved_to: list[str] | None = None
     if to:
@@ -582,15 +610,16 @@ def send_message(
         "sender_name": member.get("session_name") or sender_session_id[:8],
         "body": _sanitize_message_body(body),
         "to": resolved_to,
-        "private": private,
+        "private": effective_private,
     }
     _append(chat_id, record)
     log.info(
-        "chats: msg from %s to %s (to=%s private=%s)",
+        "chats: msg from %s to %s (to=%s private=%s topology=%s)",
         sender_session_id,
         chat_id,
         resolved_to or "*",
-        private,
+        effective_private,
+        effective_topology,
     )
     return record
 
@@ -860,10 +889,19 @@ def task_status(chat_id: str, requester_session_id: str) -> list[dict[str, Any]]
             f"cannot read task status."
         )
 
+    is_req_master = _is_master(room, requester_session_id)
     tasks: dict[str, dict[str, Any]] = {}
     for line in _read(chat_id):
         k = line.get("kind")
         if k == TASK:
+            # Apply same private filter as history(): private tasks are only
+            # visible to sender, explicit recipients (to=[]), and the master.
+            if line.get("private") and not (
+                line.get("sender_id") == requester_session_id
+                or requester_session_id in (line.get("to") or [])
+                or is_req_master
+            ):
+                continue
             tid = line["id"]
             tasks[tid] = {
                 "task_id": tid,

@@ -2502,3 +2502,148 @@ def test_private_task_hidden_from_non_assignee(isolated_chats):
     # Master (sender + audit) sees it
     master_history = c.history(chat_id, master_id)
     assert any(m.get("kind") == "task" and m.get("private") for m in master_history)
+
+
+# ---------------------------------------------------------------------------
+# topology field — v1.9.5
+# ---------------------------------------------------------------------------
+
+
+def test_topology_flat_mode_send_to_visible_to_all(isolated_chats):
+    """In flat-mode chat, send_to without explicit private is visible to all accepted members."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    master_id = "topo-flat-master"
+    agent_id = "topo-flat-agent"
+    observer_id = "topo-flat-obs"
+    for sid in (master_id, agent_id, observer_id):
+        _make_session(sessions_mod, sid)
+    chat_id = c.create_room(
+        master_id, [agent_id, observer_id], title="flat chat", topology="flat"
+    )["meta"]["chat_id"]
+    c.accept(chat_id, agent_id)
+    c.accept(chat_id, observer_id)
+
+    c.send_message(chat_id, master_id, "flat broadcast", to=[agent_id])
+
+    # Non-recipient observer still sees it — flat mode has no implicit private
+    observer_history = c.history(chat_id, observer_id)
+    assert any(m.get("body") == "flat broadcast" for m in observer_history), (
+        "flat topology: send_to without explicit private is NOT private — all members see it"
+    )
+
+
+def test_topology_hierarchical_mode_send_to_defaults_private(isolated_chats):
+    """In hierarchical-mode chat, send_to without explicit private defaults to private=True."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    master_id = "topo-hier-master"
+    agent_id = "topo-hier-agent"
+    observer_id = "topo-hier-obs"
+    for sid in (master_id, agent_id, observer_id):
+        _make_session(sessions_mod, sid)
+    chat_id = c.create_room(
+        master_id, [agent_id, observer_id], title="hierarchical chat", topology="hierarchical"
+    )["meta"]["chat_id"]
+    c.accept(chat_id, agent_id)
+    c.accept(chat_id, observer_id)
+
+    # No explicit private= arg — topology should default to private=True
+    c.send_message(chat_id, master_id, "hierarchy msg", to=[agent_id])
+
+    # Recipient sees it
+    agent_history = c.history(chat_id, agent_id)
+    assert any(m.get("body") == "hierarchy msg" for m in agent_history)
+
+    # Non-recipient observer does NOT see it — topology defaulted private=True
+    observer_history = c.history(chat_id, observer_id)
+    assert not any(m.get("body") == "hierarchy msg" for m in observer_history), (
+        "hierarchical topology: send_to without explicit private defaults to private — "
+        "non-recipient observer must not see the message"
+    )
+
+
+def test_topology_missing_field_defaults_to_flat_backward_compat(isolated_chats):
+    """Chats created without a topology arg default to flat — backward-compatible behavior."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    master_id = "topo-compat-master"
+    agent_id = "topo-compat-agent"
+    observer_id = "topo-compat-obs"
+    for sid in (master_id, agent_id, observer_id):
+        _make_session(sessions_mod, sid)
+    # create_room called without topology — must behave as flat
+    chat_id = c.create_room(
+        master_id, [agent_id, observer_id], title="legacy chat"
+    )["meta"]["chat_id"]
+    c.accept(chat_id, agent_id)
+    c.accept(chat_id, observer_id)
+
+    c.send_message(chat_id, master_id, "legacy msg", to=[agent_id])
+
+    # Observer sees it — no topology field → flat default → no implicit private
+    observer_history = c.history(chat_id, observer_id)
+    assert any(m.get("body") == "legacy msg" for m in observer_history), (
+        "no topology field → flat behavior (backward-compat): non-recipient observer sees the message"
+    )
+
+
+def test_topology_hierarchical_explicit_private_false_overrides_default(isolated_chats):
+    """explicit private=False in hierarchical mode overrides the topology's private default."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    master_id = "topo-over-master"
+    agent_id = "topo-over-agent"
+    observer_id = "topo-over-obs"
+    for sid in (master_id, agent_id, observer_id):
+        _make_session(sessions_mod, sid)
+    chat_id = c.create_room(
+        master_id, [agent_id, observer_id], title="override test", topology="hierarchical"
+    )["meta"]["chat_id"]
+    c.accept(chat_id, agent_id)
+    c.accept(chat_id, observer_id)
+
+    # Explicit private=False must override the hierarchical topology default
+    c.send_message(chat_id, master_id, "public in hierarchy", to=[agent_id], private=False)
+
+    # Observer sees it — explicit False wins over topology default
+    observer_history = c.history(chat_id, observer_id)
+    assert any(m.get("body") == "public in hierarchy" for m in observer_history), (
+        "explicit private=False must override hierarchical topology default — "
+        "non-recipient observer should see this message"
+    )
+
+
+def test_private_task_hidden_from_non_assignee_in_task_status(isolated_chats):
+    """task_status() applies the same private filter as chat_history.
+
+    Non-assignee members must not see private tasks via the task_status
+    surface — closing the v1.9.2 private-leak noted in STATE.md.
+    """
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(c, sessions_mod)
+    c.create_task(
+        chat_id,
+        master_id,
+        "private task body",
+        assignee_session_id=agent_id,
+        private=True,
+    )
+
+    # Assignee sees the task
+    agent_tasks = c.task_status(chat_id, agent_id)
+    assert any(t["body"] == "private task body" for t in agent_tasks)
+
+    # Non-assignee observer does NOT see it
+    observer_tasks = c.task_status(chat_id, observer_id)
+    assert not any(t["body"] == "private task body" for t in observer_tasks)
+
+    # Master (audit) sees it
+    master_tasks = c.task_status(chat_id, master_id)
+    assert any(t["body"] == "private task body" for t in master_tasks)

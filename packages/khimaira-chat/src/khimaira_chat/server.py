@@ -367,7 +367,9 @@ def _build_server() -> Server:
                     "Create a new chat room with the given members. Creator is "
                     "auto-accepted; invitees go through handshake (chat_accept). "
                     "If the same members already have a chat, returns the existing "
-                    "one — pass fresh=True for a new transcript."
+                    "one — pass fresh=True for a new transcript. "
+                    "v1.9.5: pass topology='hierarchical' to make targeted messages "
+                    "(chat_send_to) default to private=True automatically."
                 ),
                 inputSchema={
                     "type": "object",
@@ -383,6 +385,17 @@ def _build_server() -> Server:
                         },
                         "title": {"type": "string", "description": "Optional room title"},
                         "fresh": {"type": "boolean", "default": False},
+                        "topology": {
+                            "type": "string",
+                            "enum": ["flat", "hierarchical", "custom"],
+                            "description": (
+                                "Privacy semantics for targeted messages. "
+                                "'flat' (default): history visible to all. "
+                                "'hierarchical': send_to defaults to private=True. "
+                                "'custom': no automatic defaults."
+                            ),
+                            "default": "flat",
+                        },
                     },
                     "required": ["session_id", "members"],
                 },
@@ -843,6 +856,7 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
             args["members"],
             title=args.get("title"),
             fresh=bool(args.get("fresh", False)),
+            topology=args.get("topology", "flat"),
         )
     if name == "chat_invite":
         return daemon_client.invite(args["chat_id"], sid, args["invitee"])
@@ -862,7 +876,7 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
         return daemon_client.reject(chat_id, sid)
     if name == "chat_send":
         return daemon_client.send_message(
-            args["chat_id"], sid, args["body"], private=args.get("private", False)
+            args["chat_id"], sid, args["body"], private=args.get("private")
         )
     if name == "chat_history":
         return daemon_client.history(
@@ -909,7 +923,7 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
             sid,
             args["body"],
             to=args["to"],
-            private=args.get("private", False),
+            private=args.get("private"),
         )
     if name == "chat_task_create":
         return daemon_client.create_task(
