@@ -103,6 +103,82 @@ def test_search_archive_substring(isolated_state):
     assert "Roboflow" in hits[0]["text"]
 
 
+def test_notice_scope_cwd_surfaces_to_matching_session(isolated_state, tmp_path):
+    """Notice with scope_cwd=A is surfaced to a session whose cwd is A."""
+    target = "scoped-target-1"
+    isolated_state.log_decision(target, "init", "")
+    project = tmp_path / "proj-a"
+    project.mkdir()
+
+    isolated_state.post_notice(
+        target,
+        text="scoped to proj-a",
+        from_session_id="sender",
+        scope_cwd=str(project),
+    )
+
+    pending = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(project))
+    assert len(pending) == 1
+    assert pending[0]["text"] == "scoped to proj-a"
+
+
+def test_notice_scope_cwd_withheld_from_mismatched_session(isolated_state, tmp_path):
+    """Notice with scope_cwd=A is NOT surfaced to a session whose cwd is B."""
+    target = "scoped-target-2"
+    isolated_state.log_decision(target, "init", "")
+    proj_a = tmp_path / "proj-a"
+    proj_b = tmp_path / "proj-b"
+    proj_a.mkdir()
+    proj_b.mkdir()
+
+    isolated_state.post_notice(
+        target,
+        text="only for proj-a",
+        from_session_id="sender",
+        scope_cwd=str(proj_a),
+    )
+
+    pending = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(proj_b))
+    assert pending == [], "cross-project notice must not surface to wrong cwd"
+
+    # Verify the note is still in inbox (not consumed by the mismatched read).
+    pending_a = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(proj_a))
+    assert len(pending_a) == 1, "notice must remain available for the correct cwd"
+
+
+def test_notice_no_scope_cwd_surfaces_to_any_session(isolated_state, tmp_path):
+    """Notice without scope_cwd surfaces regardless of the caller's cwd (broadcast)."""
+    target = "scoped-target-3"
+    isolated_state.log_decision(target, "init", "")
+    proj = tmp_path / "some-project"
+    proj.mkdir()
+
+    isolated_state.post_notice(target, text="global broadcast", from_session_id="sender")
+
+    pending = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(proj))
+    assert len(pending) == 1
+    assert pending[0]["text"] == "global broadcast"
+
+
+def test_notice_scope_cwd_surfaces_to_child_path(isolated_state, tmp_path):
+    """Notice scoped to parent dir surfaces to a session in a child directory."""
+    target = "scoped-target-4"
+    isolated_state.log_decision(target, "init", "")
+    parent = tmp_path / "proj"
+    child = parent / "packages" / "sub"
+    child.mkdir(parents=True)
+
+    isolated_state.post_notice(
+        target,
+        text="parent-scoped notice",
+        from_session_id="sender",
+        scope_cwd=str(parent),
+    )
+
+    pending = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(child))
+    assert len(pending) == 1, "child cwd must match parent scope_cwd"
+
+
 def test_post_handoff_cwd_inferred_from_files(isolated_state, tmp_path):
     """When scope_cwd not given, infer from from_session's file_touched dir."""
     asker = "asker"
@@ -713,3 +789,50 @@ def test_set_name_with_fresh_collision_signals_merge_needed(isolated_state, capl
     assert result["conflicts_with_last_active_s"] < 30 * 60
     # Warning log emitted with the conflict detail.
     assert any("already in use by session" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _format_pending_assignments — banner text (hooks/user_prompt_submit.py)
+# ---------------------------------------------------------------------------
+
+
+def test_pending_assignments_banner_includes_suppression_block():
+    """Suppression directive appears in banner when there is ≥1 pending assignment."""
+    from khimaira.hooks.user_prompt_submit import _format_pending_assignments
+
+    assignments = [
+        {
+            "task_id": "task-abc123",
+            "task_body": "implement the thing",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+            "sender_name": "khimaira-0",
+            "chat_id": "chat-deadbeef",
+        }
+    ]
+    result = _format_pending_assignments(assignments)
+    assert "ENFORCEMENT GATE ACTIVE" in result
+    assert "DO NOT pre-read files" in result
+    assert "/agent-ready" in result
+    assert "task-abc123" in result
+
+
+def test_pending_assignments_banner_suppression_appears_once_for_multiple_tasks():
+    """Suppression block appears exactly once regardless of pending task count."""
+    from khimaira.hooks.user_prompt_submit import _format_pending_assignments
+
+    assignments = [
+        {
+            "task_id": f"task-{i:08x}",
+            "task_body": f"task {i}",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+            "sender_name": "khimaira-0",
+            "chat_id": "chat-deadbeef",
+        }
+        for i in range(3)
+    ]
+    result = _format_pending_assignments(assignments)
+    assert result.count("ENFORCEMENT GATE ACTIVE") == 1
+    # Per-entry "Run /agent-ready" line removed; only the section-level block remains.
+    assert "Run /agent-ready when budget is set" not in result

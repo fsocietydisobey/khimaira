@@ -24,9 +24,7 @@ from typing import Any
 
 # Default to the monitor daemon's bind address. Override with
 # KHIMAIRA_MONITOR_URL if the daemon runs elsewhere (rare).
-_DEFAULT_BASE = os.environ.get("KHIMAIRA_MONITOR_URL", "http://127.0.0.1:8740").rstrip(
-    "/"
-)
+_DEFAULT_BASE = os.environ.get("KHIMAIRA_MONITOR_URL", "http://127.0.0.1:8740").rstrip("/")
 
 _DAEMON_DOWN_HINT = (
     "khimaira-monitor daemon is not running or unreachable at {base}.\n"
@@ -35,9 +33,7 @@ _DAEMON_DOWN_HINT = (
 )
 
 
-def _get(
-    path: str, *, base: str = _DEFAULT_BASE, timeout: float = 5.0
-) -> dict[str, Any] | str:
+def _get(path: str, *, base: str = _DEFAULT_BASE, timeout: float = 5.0) -> dict[str, Any] | str:
     """GET request → parsed JSON, or a friendly error string on failure.
 
     Error mapping (matches _post's pattern — earlier this was a bug:
@@ -137,8 +133,7 @@ async def list_projects() -> str:
     for p in data:
         conns = p.get("connections", [])
         conn_summary = (
-            ", ".join(f"{c['kind']}:{c.get('label', '?')}" for c in conns)
-            or "no checkpointer"
+            ", ".join(f"{c['kind']}:{c.get('label', '?')}" for c in conns) or "no checkpointer"
         )
         lines.append(f"- `{p['name']}` — {p['path']} ({conn_summary})")
     return "\n".join(lines)
@@ -304,18 +299,14 @@ async def find_stuck(project: str) -> str:
     if not stuck and not stale:
         return f"No stuck or stale threads in `{project}`."
 
-    lines = [
-        f"**`{project}` — {len(stuck)} stuck, {len(stale)} stale** (threshold={threshold}s)\n"
-    ]
+    lines = [f"**`{project}` — {len(stuck)} stuck, {len(stale)} stale** (threshold={threshold}s)\n"]
     for age, t in sorted(stuck, key=lambda x: -x[0]):
         lines.append(
-            f"🔴 STUCK  `{t['thread_id'][:50]}`  @{t.get('current_node') or '-'}"
-            f"  {age:.0f}s ago"
+            f"🔴 STUCK  `{t['thread_id'][:50]}`  @{t.get('current_node') or '-'}  {age:.0f}s ago"
         )
     for age, t in sorted(stale, key=lambda x: -x[0]):
         lines.append(
-            f"🟡 stale  `{t['thread_id'][:50]}`  @{t.get('current_node') or '-'}"
-            f"  {age:.0f}s ago"
+            f"🟡 stale  `{t['thread_id'][:50]}`  @{t.get('current_node') or '-'}  {age:.0f}s ago"
         )
     return "\n".join(lines)
 
@@ -377,9 +368,7 @@ async def anomalies(limit: int = 20, only_failures: bool = True) -> str:
     items = data.get("items", [])
     if not items:
         return "No anomalies in the recent log." + (
-            " Pass `only_failures=False` to see passing checks too."
-            if only_failures
-            else ""
+            " Pass `only_failures=False` to see passing checks too." if only_failures else ""
         )
     lines = [f"**{len(items)} anomaly entries** (most recent first):\n"]
     for item in reversed(items):
@@ -415,9 +404,7 @@ async def frontend_components(project: str, with_api_calls_only: bool = False) -
         f"**`{project}` — {len(comps)} component(s)** "
         f"({data.get('with_api_calls', 0)} make API calls)\n"
     ]
-    comps.sort(
-        key=lambda c: (not c.get("api_calls"), c.get("file", ""), c.get("line", 0))
-    )
+    comps.sort(key=lambda c: (not c.get("api_calls"), c.get("file", ""), c.get("line", 0)))
     for c in comps[:60]:  # cap output for chat readability
         marker = "→api" if c.get("api_calls") else "    "
         loc = f"{c.get('file', '?')}:{c.get('line', 0)}"
@@ -452,9 +439,7 @@ async def schema_drift(project: str) -> str:
     for r in drifty[:20]:
         loc = f"{r.get('file', '?')}:{r.get('line', 0)}"
         if not r.get("table_exists"):
-            lines.append(
-                f"❌ `{r.get('model')}` → table `{r.get('table')}` MISSING  ({loc})"
-            )
+            lines.append(f"❌ `{r.get('model')}` → table `{r.get('table')}` MISSING  ({loc})")
             continue
         bits = []
         if r.get("only_in_model"):
@@ -462,10 +447,7 @@ async def schema_drift(project: str) -> str:
         if r.get("only_in_db"):
             bits.append(f"in DB only: {r['only_in_db']}")
         if r.get("type_mismatches"):
-            mm = [
-                f"{m['field']}({m['model_type']}→{m['db_type']})"
-                for m in r["type_mismatches"]
-            ]
+            mm = [f"{m['field']}({m['model_type']}→{m['db_type']})" for m in r["type_mismatches"]]
             bits.append(f"type mismatch: {', '.join(mm)}")
         lines.append(f"⚠️ `{r.get('model')}` ↔ `{r.get('table')}`  ({loc})")
         for b in bits:
@@ -597,13 +579,9 @@ async def wait_for_process(
     stdout = (data.get("stdout_text") or "").strip()
     stderr = (data.get("stderr_text") or "").strip()
     if stdout:
-        parts.append(
-            f"\n**stdout** ({len(stdout)} chars):\n```\n{_tail(stdout, 4000)}\n```"
-        )
+        parts.append(f"\n**stdout** ({len(stdout)} chars):\n```\n{_tail(stdout, 4000)}\n```")
     if stderr:
-        parts.append(
-            f"\n**stderr** ({len(stderr)} chars):\n```\n{_tail(stderr, 2000)}\n```"
-        )
+        parts.append(f"\n**stderr** ({len(stderr)} chars):\n```\n{_tail(stderr, 2000)}\n```")
     return "\n".join(parts)
 
 
@@ -628,13 +606,9 @@ async def follow_process(label: str, max_chunks: int = 100) -> str:
     stdout = (data.get("stdout_text") or "").strip()
     stderr = (data.get("stderr_text") or "").strip()
     if stdout:
-        parts.append(
-            f"\n**stdout** ({len(stdout)} chars):\n```\n{_tail(stdout, 4000)}\n```"
-        )
+        parts.append(f"\n**stdout** ({len(stdout)} chars):\n```\n{_tail(stdout, 4000)}\n```")
     if stderr:
-        parts.append(
-            f"\n**stderr** ({len(stderr)} chars):\n```\n{_tail(stderr, 2000)}\n```"
-        )
+        parts.append(f"\n**stderr** ({len(stderr)} chars):\n```\n{_tail(stderr, 2000)}\n```")
     return "\n".join(parts)
 
 
@@ -742,8 +716,7 @@ async def usage_report(window_minutes: int = 1440) -> str:
         p95 = entry.get("p95_ms", 0)
         warn = " ⚠️" if f_count > 0 and f_count >= calls * 0.5 else ""
         parts.append(
-            f"- `{tool}` — {calls} calls ({f_count} failed) · "
-            f"p50={p50}ms p95={p95}ms{warn}"
+            f"- `{tool}` — {calls} calls ({f_count} failed) · p50={p50}ms p95={p95}ms{warn}"
         )
         if entry.get("errors_sampled"):
             for e in entry["errors_sampled"][:2]:
@@ -883,9 +856,7 @@ async def session_search_archive(
     limit: int = 50,
 ) -> str:
     """Search archived inbox notes by substring."""
-    qstr = (
-        f"?q={urllib.parse.quote(query)}&limit={limit}" if query else f"?limit={limit}"
-    )
+    qstr = f"?q={urllib.parse.quote(query)}&limit={limit}" if query else f"?limit={limit}"
     data = _get(
         f"/api/sessions/{urllib.parse.quote(session_id)}/inbox/archive{qstr}",
         timeout=10.0,
@@ -943,10 +914,7 @@ async def session_query_transcript(
     Returns matched turns + surrounding context. Use to read what a
     now-stopped session discussed.
     """
-    qstr = (
-        f"?q={urllib.parse.quote(query)}"
-        f"&context_lines={context_lines}&max_matches={max_matches}"
-    )
+    qstr = f"?q={urllib.parse.quote(query)}&context_lines={context_lines}&max_matches={max_matches}"
     data = _get(
         f"/api/sessions/{urllib.parse.quote(session_id)}/transcript/query{qstr}",
         timeout=15.0,
@@ -971,9 +939,7 @@ async def session_query_transcript(
             lines.append(f"  {marker} [{role}] {preview}")
         lines.append("")
     if data.get("truncated"):
-        lines.append(
-            f"(truncated at {max_matches} matches; refine query or raise max_matches)"
-        )
+        lines.append(f"(truncated at {max_matches} matches; refine query or raise max_matches)")
     return "\n".join(lines)
 
 
@@ -1014,9 +980,7 @@ async def session_summarize_transcript(
         lines.append(f"    · {a[:200]}")
     if data.get("focus_query"):
         lines.append("")
-        lines.append(
-            f"  focus={data['focus_query']!r}: {data.get('focus_match_count', 0)} matches"
-        )
+        lines.append(f"  focus={data['focus_query']!r}: {data.get('focus_match_count', 0)} matches")
         for m in data.get("focus_matches", [])[:5]:
             for ex in m.get("excerpt", []):
                 if ex.get("is_match"):
@@ -1057,7 +1021,9 @@ async def session_release_handoff(handoff_id: str, session_id: str) -> str:
     )
     if isinstance(data, str):
         return data
-    return f"✋ released ownership of handoff {handoff_id[:8]}; next session to consume becomes owner"
+    return (
+        f"✋ released ownership of handoff {handoff_id[:8]}; next session to consume becomes owner"
+    )
 
 
 async def session_invite_handoff(
@@ -1109,9 +1075,7 @@ async def session_consume_handoffs(session_id: str, cwd: str) -> str:
             install dir — handoffs are scoped to where the work
             lives, and the MCP server's cwd is the wrong source.
     """
-    qs = (
-        f"session_id={urllib.parse.quote(session_id)}" f"&cwd={urllib.parse.quote(cwd)}"
-    )
+    qs = f"session_id={urllib.parse.quote(session_id)}&cwd={urllib.parse.quote(cwd)}"
     data = _get(f"/api/handoffs/consume?{qs}", timeout=10.0)
     if isinstance(data, str):
         return data
@@ -1128,9 +1092,7 @@ async def session_consume_handoffs(session_id: str, cwd: str) -> str:
 
     lines: list[str] = []
     if owned:
-        lines.append(
-            f"📦 khimaira handoffs — {len(owned)} directive(s) you now OWN in {cwd}:"
-        )
+        lines.append(f"📦 khimaira handoffs — {len(owned)} directive(s) you now OWN in {cwd}:")
         lines.append("")
         for h in owned:
             from_id = (h.get("from_session_id") or "?")[:8]
@@ -1139,9 +1101,7 @@ async def session_consume_handoffs(session_id: str, cwd: str) -> str:
             parent = h.get("parent_id")
             target = h.get("target_session_id")
             if parent and target:
-                lines.append(
-                    f"- 🤝 [INVITE handoff {h['id'][:8]} · {ts} · from {from_id}]"
-                )
+                lines.append(f"- 🤝 [INVITE handoff {h['id'][:8]} · {ts} · from {from_id}]")
             else:
                 lines.append(f"- [handoff {h['id'][:8]} · {ts} · from {from_id}]")
             lines.append(f"  {text}")
@@ -1157,16 +1117,12 @@ async def session_consume_handoffs(session_id: str, cwd: str) -> str:
             lines.append("")
             lines.append("---")
             lines.append("")
-        lines.append(
-            f"👀 khimaira handoffs — {len(observed)} already-claimed handoff(s) in {cwd}:"
-        )
+        lines.append(f"👀 khimaira handoffs — {len(observed)} already-claimed handoff(s) in {cwd}:")
         for h in observed:
             from_id = (h.get("from_session_id") or "?")[:8]
             owner = (h.get("_owner_session_id") or "?")[:8]
             text = (h.get("text") or "").strip()
-            lines.append(
-                f"- [handoff {h['id'][:8]} · from {from_id} · OWNED BY {owner}]"
-            )
+            lines.append(f"- [handoff {h['id'][:8]} · from {from_id} · OWNED BY {owner}]")
             lines.append(f"  {text[:400]}{'…' if len(text) > 400 else ''}")
 
     return "\n".join(lines)
@@ -1204,11 +1160,20 @@ async def session_post_notice(
     target_session_id: str,
     text: str,
     from_session_id: str = "external",
+    scope_cwd: str | None = None,
 ) -> str:
-    """Drop a FYI/ack note in another session's inbox — no answer expected."""
+    """Drop a FYI/ack note in another session's inbox — no answer expected.
+
+    `scope_cwd`: when set, the notice is only surfaced to sessions whose
+    working directory matches (or is a child of) this path. Omit to broadcast
+    to all sessions regardless of project (backward-compatible default).
+    """
+    body: dict = {"text": text, "from_session_id": from_session_id}
+    if scope_cwd:
+        body["scope_cwd"] = scope_cwd
     data = _post(
         f"/api/sessions/{urllib.parse.quote(target_session_id)}/notice",
-        {"text": text, "from_session_id": from_session_id},
+        body,
         timeout=10.0,
     )
     if isinstance(data, str):
@@ -1250,10 +1215,7 @@ async def session_wait_for_answer(
     q = data.get("question", {})
     answer = q.get("answer", "")
     answered_by = (q.get("answered_by") or "")[:8]
-    return (
-        f"✅ answer received for q={question_id} "
-        f"(answered by {answered_by}):\n\n{answer}"
-    )
+    return f"✅ answer received for q={question_id} (answered by {answered_by}):\n\n{answer}"
 
 
 async def session_incoming_questions(session_id: str) -> str:
@@ -1412,9 +1374,7 @@ async def session_state(session_id: str, recent: int = 10) -> str:
                 if f.get("line_start") and f.get("line_end")
                 else ""
             )
-            parts.append(
-                f"- {f.get('file', '')}{range_str} — {f.get('summary', '')[:100]}"
-            )
+            parts.append(f"- {f.get('file', '')}{range_str} — {f.get('summary', '')[:100]}")
 
     return "\n".join(parts)
 
@@ -1491,9 +1451,7 @@ async def session_pending_notes(session_id: str, mark_read: bool = True) -> str:
             a_text = (n.get("answer") or n.get("text") or "").strip()
             if q_text:
                 parts.append(
-                    f"- [answer from {from_sid} · {ts}]\n"
-                    f"  re Q: {q_text[:200]}\n"
-                    f"  ➜ {a_text[:600]}"
+                    f"- [answer from {from_sid} · {ts}]\n  re Q: {q_text[:200]}\n  ➜ {a_text[:600]}"
                 )
             else:
                 parts.append(f"- [answer from {from_sid} · {ts}]\n  {a_text[:600]}")
@@ -1519,9 +1477,7 @@ async def session_recent_decisions(recent_per_session: int = 5) -> str:
 
     parts = [f"**{len(decisions)} recent decision(s):**\n"]
     for d in decisions[:30]:
-        parts.append(
-            f"- ({d.get('session_id')}, {d.get('ts')}): " f"{d.get('text', '')[:180]}"
-        )
+        parts.append(f"- ({d.get('session_id')}, {d.get('ts')}): {d.get('text', '')[:180]}")
     return "\n".join(parts)
 
 
@@ -1539,7 +1495,7 @@ async def session_list() -> str:
     for s in sessions:
         status = s.get("status", {}) or {}
         age_s = s.get("last_active_age_s") or 0
-        age_str = f"{age_s/60:.0f}m ago" if age_s < 3600 else f"{age_s/3600:.1f}h ago"
+        age_str = f"{age_s / 60:.0f}m ago" if age_s < 3600 else f"{age_s / 3600:.1f}h ago"
         name = s.get("name")
         ident = f"`{name}` (id: {s['session_id']})" if name else f"`{s['session_id']}`"
         parts.append(
@@ -1589,9 +1545,7 @@ async def schedule_task(
     )
 
 
-async def list_scheduled_tasks(
-    status: str | None = None, target: str | None = None
-) -> str:
+async def list_scheduled_tasks(status: str | None = None, target: str | None = None) -> str:
     """List scheduled tasks. status='scheduled,pending_retry' filters by status;
     target='<session-name-or-id>' filters by recipient."""
     params: list[str] = []

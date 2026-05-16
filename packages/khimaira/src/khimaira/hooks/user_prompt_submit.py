@@ -29,14 +29,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 _REMINDER_EVERY = int(os.environ.get("KHIMAIRA_HOOK_REMINDER_EVERY", "8"))
 _ENDPOINT = os.environ.get("KHIMAIRA_ENDPOINT", "http://127.0.0.1:8740").rstrip("/")
 _INBOX_TIMEOUT_S = 0.8
+
+# Compiled once at import time — used by _channel_event_response_level.
+_SYSREM_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+_CHANNEL_ONLY_RE = re.compile(
+    r'^\s*(?:<channel\s[^>]*source="khimaira-chat"[^>]*>.*?</channel>\s*)+\s*$',
+    re.DOTALL,
+)
+_CHANNEL_TAG_RE = re.compile(r"<channel\s([^>]*)>", re.DOTALL)
+_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 
 _COUNTER_DIR = (
     Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
@@ -63,7 +74,7 @@ def _write_count(path: Path, n: int) -> None:
         pass
 
 
-def _fetch_pending_notes(session_id: str) -> list[dict]:
+def _fetch_pending_notes(session_id: str, cwd: str | None = None) -> list[dict]:
     """Hit /api/sessions/{sid}/inbox/surface; return notes or [] on failure.
 
     Uses the surface endpoint (NOT /pending) so notes are NOT marked read
@@ -76,8 +87,12 @@ def _fetch_pending_notes(session_id: str) -> list[dict]:
     than being silently consumed by the hook (which was the v1 design's
     flaw — agents could ignore the injected block and the user would
     never see the message).
+
+    `cwd`: when provided, notices scoped to a different project are withheld.
     """
     url = f"{_ENDPOINT}/api/sessions/{session_id}/inbox/surface"
+    if cwd:
+        url += f"?cwd={urllib.parse.quote(cwd, safe='')}"
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=_INBOX_TIMEOUT_S) as resp:
@@ -140,9 +155,7 @@ def _sync_rename_to_khimaira(session_id: str) -> None:
                 #   {"type": "custom-title", "customTitle": "...", ...}
                 if rec.get("type") != "custom-title":
                     continue
-                title = (
-                    rec.get("title") or rec.get("customTitle") or rec.get("name") or ""
-                )
+                title = rec.get("title") or rec.get("customTitle") or rec.get("name") or ""
                 if title:
                     latest_title = title  # keep the last one (most recent)
 
@@ -290,12 +303,456 @@ def _format_incoming(questions: list[dict], my_session_id: str) -> str:
         lines.append(f"    {text}")
         lines.append(
             f"    ➜ answer with `session_post_answer(target_session_id="
-            f"\"{q.get('from_session_id')}\", question_id=\"{qid}\", answer=\"...\")`"
+            f'"{q.get("from_session_id")}", question_id="{qid}", answer="...")`'
         )
-    lines.append(
-        "(re-surfaces every turn until answered; address or withdraw to clear)"
-    )
+    lines.append("(re-surfaces every turn until answered; address or withdraw to clear)")
     return "\n".join(lines)
+
+
+def _discover_pending_assignments(session_id: str) -> list[dict]:
+    """Walk ~/.local/state/khimaira/chats/*.jsonl and return task assignments
+    targeted at session_id that have not yet been acked.
+
+    An assignment is a kind=msg record whose body starts with
+    '🔔 TASK ASSIGNMENT' and whose `to` list includes session_id. It's
+    acked when a later record in the same chat has sender_id==session_id and
+    body containing '✅ ready [task-id: <task_id>]'.
+
+    Returns list of dicts sorted newest-first:
+        {chat_id, chat_title, task_id, task_body, required_model,
+         required_effort, sender_name, ts}
+
+    Errors are silent — hook must never break on bad JSONL or missing dirs.
+    """
+    state_root = (
+        Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))) / "khimaira"
+    )
+    chats_dir = state_root / "chats"
+    if not chats_dir.exists():
+        return []
+
+    results: list[dict] = []
+
+    for path in sorted(chats_dir.glob("*.jsonl")):
+        try:
+            records: list[dict] = []
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    for raw_line in f:
+                        raw_line = raw_line.strip()
+                        if not raw_line:
+                            continue
+                        try:
+                            records.append(json.loads(raw_line))
+                        except json.JSONDecodeError:
+                            continue
+            except OSError:
+                continue
+
+            if not records:
+                continue
+
+            # Title from the latest meta record.
+            chat_id = path.stem
+            chat_title = ""
+            for r in reversed(records):
+                if r.get("kind") == "meta":
+                    chat_id = r.get("chat_id") or path.stem
+                    chat_title = (r.get("title") or "")[:50]
+                    break
+
+            # First pass: collect assignments, acks, and task statuses.
+            assignments: list[tuple[int, dict]] = []
+            acks: dict[str, int] = {}  # task_id → index of latest ack msg
+            task_statuses: dict[str, str] = {}  # task_id → current status
+
+            for i, r in enumerate(records):
+                k = r.get("kind")
+
+                if k == "task":
+                    tid = r.get("id")
+                    if tid:
+                        task_statuses[tid] = r.get("status") or "pending"
+
+                elif k == "task_update":
+                    tid = r.get("task_id")
+                    if tid and r.get("status"):
+                        task_statuses[tid] = r["status"]
+
+                elif k == "msg":
+                    body = r.get("body") or ""
+
+                    if body.startswith("🔔 TASK ASSIGNMENT"):
+                        to_list = r.get("to")
+                        if isinstance(to_list, list) and session_id in to_list:
+                            assignments.append((i, r))
+
+                    if r.get("sender_id") == session_id and "✅ ready [task-id:" in body:
+                        m = re.search(r"task-id:\s*(task-[a-f0-9]+)", body)
+                        if m:
+                            tid = m.group(1)
+                            if tid not in acks or i > acks[tid]:
+                                acks[tid] = i
+
+            # Second pass: emit only unacked, non-terminal assignments.
+            for idx, r in assignments:
+                body = r.get("body") or ""
+
+                m = re.search(r"task-id:\s*(task-[a-f0-9]+)", body)
+                if not m:
+                    continue
+                task_id = m.group(1)
+
+                # Skip if already done or approved via task lifecycle.
+                if task_statuses.get(task_id) in ("done", "approved"):
+                    continue
+
+                # Skip if a later ack exists for this task.
+                ack_idx = acks.get(task_id)
+                if ack_idx is not None and ack_idx > idx:
+                    continue
+
+                # Parse required_model + required_effort — only from the
+                # "Required budget" section to avoid matching prose references
+                # (e.g. "model/effort settings" in the body free-text).
+                required_model: str | None = None
+                required_effort: str | None = None
+                in_budget = False
+                for line in body.splitlines():
+                    if "Required budget" in line:
+                        in_budget = True
+                        continue
+                    if not in_budget:
+                        continue
+                    if not line.strip():
+                        break  # blank line ends the budget block
+                    if required_model is None:
+                        mm = re.search(r"/model\s+(\w+)", line)
+                        if mm:
+                            required_model = mm.group(1)
+                    if required_effort is None:
+                        em = re.search(r"/effort\s+(\w+)", line)
+                        if em:
+                            required_effort = em.group(1)
+                    if required_model and required_effort:
+                        break
+
+                # task_body: text after "Task: " on that line; if the suffix
+                # is empty (Task: on its own line), fall through to the next
+                # non-empty line — handles both inline and continuation forms.
+                task_body = ""
+                want_next = False
+                for line in body.splitlines():
+                    if line.startswith("Task: "):
+                        after = line[len("Task: ") :].strip()
+                        if after:
+                            task_body = after
+                            break
+                        want_next = True
+                        continue
+                    if want_next and line.strip():
+                        task_body = line.strip()
+                        break
+
+                results.append(
+                    {
+                        "chat_id": chat_id,
+                        "chat_title": chat_title,
+                        "task_id": task_id,
+                        "task_body": task_body,
+                        "required_model": required_model,
+                        "required_effort": required_effort,
+                        "sender_name": r.get("sender_name") or (r.get("sender_id") or "")[:8],
+                        "ts": r.get("ts") or "",
+                    }
+                )
+        except Exception:  # noqa: BLE001 — hook must never break
+            continue
+
+    results.sort(key=lambda x: x.get("ts") or "", reverse=True)
+    return results
+
+
+def _format_pending_assignments(assignments: list[dict]) -> str:
+    """Render pending (unacked) task assignments as a context block.
+
+    Mirrors the style of _format_chat_roles in session_start — bullet
+    list with task ID, truncated body, required budget, and a call to
+    action. Returns "" when assignments is empty so the caller can
+    test truthiness before including the block.
+    """
+    if not assignments:
+        return ""
+    lines = [
+        f"⏳ KHIMAIRA PENDING ASSIGNMENT(S) — {len(assignments)} unacked task(s) for this session:",
+        "",
+    ]
+    for a in assignments:
+        task_id = a.get("task_id") or "?"
+        task_body = (a.get("task_body") or "").strip()
+        if len(task_body) > 80:
+            task_body = task_body[:80] + "..."
+        required_model = a.get("required_model")
+        required_effort = a.get("required_effort")
+        sender_name = a.get("sender_name") or "?"
+        chat_id = (a.get("chat_id") or "")[:18]
+        lines.append(f"  [{task_id}] {task_body}")
+        if required_model or required_effort:
+            model_str = f"/model {required_model}" if required_model else ""
+            effort_str = f"/effort {required_effort}" if required_effort else ""
+            budget_parts = " ".join(p for p in (model_str, effort_str) if p)
+            lines.append(f"  Required: {budget_parts}")
+        lines.append(f"  From: {sender_name} ({chat_id})")
+        lines.append("")
+    lines += [
+        "⚠️ ENFORCEMENT GATE ACTIVE while pending — suppress default reflexes:",
+        "  - DO NOT pre-read files (settings.json, project files) — verification happens AT ready, not before",
+        "  - DO NOT pre-plan or gather reconnaissance state",
+        '  - Set /model + /effort, then run /agent-ready (auto-fills task-id) OR type "ready [task-id: <hex>]" manually',
+        "  - Hold silently until master fires the 🟢 begin signal",
+    ]
+    return "\n".join(lines).rstrip()
+
+
+def _check_stale_acks(session_id: str) -> list[dict]:
+    """Detect acked /khimaira-assign tasks whose budget has become stale.
+
+    Session-restart resets /model to the Opus default — model is not
+    persisted in settings.json. If an agent acked a task with model=sonnet
+    and the session restarts, the ack is stale: the agent is no longer
+    running at the promised budget.
+
+    Walk ~/.local/state/khimaira/chats/*.jsonl. For each ack from this
+    session matching ``✅ ready [task-id: …] | model=X effort=Y``, compare
+    the acked model/effort against current settings.json values. Exclude
+    tasks whose latest status is done or approved.
+
+    Returns newest-first list of dicts:
+        {chat_id, chat_title, task_id, task_body, acked_model,
+         acked_effort, current_model, current_effort, ack_ts}
+
+    Errors are silent — hook must never break.
+    """
+    settings_path = Path(os.path.expanduser("~/.claude/settings.json"))
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+
+    # /model is per-session runtime state (absent from settings.json after
+    # restart); default "opus" matches Claude Code's factory default.
+    # effortLevel persists; absent → "" means skip effort comparison.
+    current_model = (settings.get("model") or "opus").lower()
+    current_effort = (settings.get("effortLevel") or "").lower()
+
+    state_root = (
+        Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))) / "khimaira"
+    )
+    chats_dir = state_root / "chats"
+    if not chats_dir.exists():
+        return []
+
+    ack_re = re.compile(
+        r"✅ ready \[task-id:\s*(task-[a-f0-9]+)\]\s*\|\s*model=(\w+)\s+effort=(\w+)",
+        re.IGNORECASE,
+    )
+
+    results: list[dict] = []
+
+    for path in sorted(chats_dir.glob("*.jsonl")):
+        try:
+            records: list[dict] = []
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    for raw_line in f:
+                        raw_line = raw_line.strip()
+                        if not raw_line:
+                            continue
+                        try:
+                            records.append(json.loads(raw_line))
+                        except json.JSONDecodeError:
+                            continue
+            except OSError:
+                continue
+
+            if not records:
+                continue
+
+            chat_id = path.stem
+            chat_title = ""
+            for r in reversed(records):
+                if r.get("kind") == "meta":
+                    chat_id = r.get("chat_id") or path.stem
+                    chat_title = (r.get("title") or "")[:50]
+                    break
+
+            # Track latest task status (task_update wins over initial task record).
+            task_statuses: dict[str, str] = {}
+            for r in records:
+                kind = r.get("kind")
+                tid = r.get("task_id") or ""
+                if not tid:
+                    continue
+                if kind == "task" and tid not in task_statuses:
+                    task_statuses[tid] = r.get("status") or ""
+                elif kind == "task_update":
+                    task_statuses[tid] = r.get("status") or ""
+
+            # Collect assignment bodies for task_body context.
+            assignments: dict[str, str] = {}
+            for r in records:
+                if r.get("kind") != "msg":
+                    continue
+                body = r.get("body") or ""
+                if not body.startswith("🔔 TASK ASSIGNMENT"):
+                    continue
+                m = re.search(r"task-id:\s*(task-[a-f0-9]+)", body)
+                if not m:
+                    continue
+                tid = m.group(1)
+                if tid in assignments:
+                    continue
+                task_body = ""
+                want_next = False
+                for line in body.splitlines():
+                    if line.startswith("Task: "):
+                        after = line[len("Task: ") :].strip()
+                        if after:
+                            task_body = after
+                            break
+                        want_next = True
+                        continue
+                    if want_next and line.strip():
+                        task_body = line.strip()
+                        break
+                assignments[tid] = task_body
+
+            # Find the latest ack per task_id from this session.
+            latest_acks: dict[str, dict] = {}
+            for r in records:
+                if r.get("kind") != "msg" or r.get("sender_id") != session_id:
+                    continue
+                m = ack_re.search(r.get("body") or "")
+                if not m:
+                    continue
+                tid = m.group(1)
+                am = m.group(2).lower()
+                ae = m.group(3).lower()
+                existing = latest_acks.get(tid)
+                r_ts = r.get("ts") or ""
+                if existing is None or r_ts > (existing.get("ack_ts") or ""):
+                    latest_acks[tid] = {"acked_model": am, "acked_effort": ae, "ack_ts": r_ts}
+
+            for tid, ack in latest_acks.items():
+                if task_statuses.get(tid) in ("done", "approved"):
+                    continue
+                am = ack["acked_model"]
+                ae = ack["acked_effort"]
+                model_stale = current_model != am
+                effort_stale = bool(current_effort) and current_effort != ae
+                if not (model_stale or effort_stale):
+                    continue
+                results.append(
+                    {
+                        "chat_id": chat_id,
+                        "chat_title": chat_title,
+                        "task_id": tid,
+                        "task_body": assignments.get(tid, ""),
+                        "acked_model": am,
+                        "acked_effort": ae,
+                        "current_model": current_model,
+                        "current_effort": current_effort,
+                        "ack_ts": ack["ack_ts"],
+                    }
+                )
+        except Exception:  # noqa: BLE001 — hook must never break
+            continue
+
+    results.sort(key=lambda x: x.get("ack_ts") or "", reverse=True)
+    return results
+
+
+def _format_stale_acks(stale: list[dict]) -> str:
+    """Render stale-ack entries as a separate warning block.
+
+    A stale ack means this session previously confirmed budget compliance
+    for a task assignment, but the current session config no longer matches
+    — most commonly because /model reverts to Opus after a restart (model
+    is runtime state, not persisted in settings.json).
+
+    Kept separate from _format_pending_assignments: the required action
+    differs (re-apply budget and re-ack via /agent-ready, not a fresh gate).
+    Returns "" when stale is empty.
+    """
+    if not stale:
+        return ""
+    lines = [
+        f"⚠️ STALE TASK ACK(S) — {len(stale)} assignment(s) with budget drift (likely post-restart):",
+        "",
+    ]
+    for s in stale:
+        title = (s.get("chat_title") or s.get("chat_id", ""))[:18]
+        tid = s.get("task_id", "?")
+        task_body = (s.get("task_body") or "").strip()
+        am = s.get("acked_model", "?")
+        ae = s.get("acked_effort", "?")
+        cm = s.get("current_model", "?")
+        ce = s.get("current_effort") or "(unknown)"
+        lines.append(f"  [{tid}] {title}")
+        if task_body:
+            snippet = task_body[:80] + ("..." if len(task_body) > 80 else "")
+            lines.append(f"  Task: {snippet}")
+        lines.append(f"  Acked: model={am} effort={ae} | Now: model={cm} effort={ce}")
+        lines.append(f"  Re-apply: `/model {am}` + `/effort {ae}` then run /agent-ready")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _channel_event_response_level(prompt: str) -> str:
+    """Classify a channel-only prompt for response-suppression purposes.
+
+    Returns one of:
+        "minimal"  — status-only notification; 1-sentence ack is enough
+        "review"   — work completed or changes requested; master must engage
+        ""         — not channel-only, or event type needs a full response
+
+    Logic:
+        1. Strip <system-reminder> wrappers (injected by Claude Code).
+        2. If remainder isn't purely <channel source="khimaira-chat"> block(s),
+           return "" (user text present → full response, no suppression).
+        3. Parse kind= and status= attributes from each channel opening tag:
+             kind=task_update, status in {done, approved}         → "review"
+             kind=task_update, status=changes_requested           → "review"
+             kind=task                                            → "review"
+             kind=task_update, status in {in_progress, pending}   → "minimal"
+             kind=msg                                             → "minimal"
+             unknown kind / no kind                               → "minimal"
+        4. If multiple blocks: take highest level (review > minimal).
+    """
+    if not prompt or not prompt.strip():
+        return ""
+    stripped = _SYSREM_RE.sub("", prompt).strip()
+    if not stripped:
+        return ""
+    if not _CHANNEL_ONLY_RE.match(stripped):
+        return ""
+
+    level = "minimal"
+    for tag_attrs in _CHANNEL_TAG_RE.findall(stripped):
+        attrs = dict(_ATTR_RE.findall(tag_attrs))
+        kind = attrs.get("kind", "")
+        status = attrs.get("status", "")
+        if kind == "task":
+            level = "review"
+        elif kind == "task_update":
+            if status in ("done", "approved", "changes_requested"):
+                level = "review"
+            # in_progress/pending/unknown → stays "minimal"
+        # kind=msg or absent → stays "minimal"
+        if level == "review":
+            break  # can't go higher
+
+    return level
 
 
 def main() -> int:
@@ -311,6 +768,9 @@ def main() -> int:
     if not session_id:
         return 0
 
+    # cwd is provided by Claude Code in hook input; used for scope_cwd filtering.
+    session_cwd = data.get("cwd") or ""
+
     # --- Sync Claude Code's /rename → khimaira's session name (every turn) ---
     # Cheap idempotent check; only POSTs when the names differ. Closes the
     # gap where /rename in Claude Code is UI-only and other sessions can't
@@ -320,7 +780,7 @@ def main() -> int:
 
     # --- Inbox auto-read (every turn) -------------------------------------
     inbox_block = ""
-    notes = _fetch_pending_notes(session_id)
+    notes = _fetch_pending_notes(session_id, cwd=session_cwd or None)
     if notes:
         inbox_block = _format_inbox(notes, session_id)
 
@@ -365,11 +825,43 @@ def main() -> int:
                 _discover_chat_roles,
                 _format_chat_roles,
             )
+
             _roles = _discover_chat_roles(session_id)
             if _roles:
                 role_budget_block = _format_chat_roles(_roles)
         except Exception:  # noqa: BLE001 — hook must not break
             role_budget_block = ""
+
+    # --- Phase B v1.8: persistent banner — pending task assignments -------
+    # Solves the "in-window prompt gets lost in noisy sessions" UX gap:
+    # the agent's first-response prompt for a /khimaira-assign task can
+    # scroll past unnoticed. This banner re-surfaces every turn until the
+    # agent acks, so the prompt cannot be missed regardless of chat noise.
+    # Silent when no pending assignments. Opt-out: KHIMAIRA_ASSIGN_BANNER=0.
+    pending_assignments_block = ""
+    if os.environ.get("KHIMAIRA_ASSIGN_BANNER") not in ("0", "false", "no"):
+        try:
+            _pending = _discover_pending_assignments(session_id)
+            if _pending:
+                pending_assignments_block = _format_pending_assignments(_pending)
+        except Exception:  # noqa: BLE001 — hook must not break
+            pending_assignments_block = ""
+
+    # --- Phase B v1.8.1: stale-ack detection ------------------------------
+    # `/model` is per-session runtime state (not persisted in settings.json),
+    # so after a restart a previously-acked assignment can have stale
+    # compliance — the agent acked when settings matched, but post-restart
+    # the model reverted to Opus default. This banner catches that case and
+    # tells the user to re-set the budget. Distinct from pending_assignments
+    # (which is for unacked work). Opt-out: KHIMAIRA_STALE_ACK_BANNER=0.
+    stale_acks_block = ""
+    if os.environ.get("KHIMAIRA_STALE_ACK_BANNER") not in ("0", "false", "no"):
+        try:
+            _stale = _check_stale_acks(session_id)
+            if _stale:
+                stale_acks_block = _format_stale_acks(_stale)
+        except Exception:  # noqa: BLE001 — hook must not break
+            stale_acks_block = ""
 
     # --- Phase B v1.7.1: real-time bottleneck check (every turn) ----------
     # Mirrors khimaira-bottleneck-watch.sh's heuristic but runs synchronously
@@ -408,6 +900,42 @@ def main() -> int:
                 "architectural decisions, debugging that needs full context)."
             )
 
+    # --- Phase B v1.9: channel-event response-level prompt ------------------
+    # When the user's prompt is JUST a <channel source="khimaira-chat"> block,
+    # classify the event and inject the appropriate directive:
+    #   "minimal" (status-only, e.g. in_progress) → 🔇 suppress verbose reply
+    #   "review"  (done/changes_requested)         → 📋 master must engage
+    # Prevents Opus burn on pure status pings while ensuring completed work
+    # is never silently swallowed. Opt-out: KHIMAIRA_QUIET_CHANNEL_RESPONSES=0.
+    quiet_channel_block = ""
+    if os.environ.get("KHIMAIRA_QUIET_CHANNEL_RESPONSES") not in ("0", "false", "no"):
+        prompt_text = (data.get("prompt") or "").strip()
+        _ch_level = _channel_event_response_level(prompt_text)
+        if _ch_level == "minimal":
+            quiet_channel_block = (
+                "🔇 channel-only event — respond minimally:\n"
+                "This turn was triggered by an incoming khimaira-chat channel block, "
+                "not by user input.\n"
+                "Default behavior: acknowledge in 1 sentence (or stay silent if no "
+                "action required).\n"
+                "DO NOT synthesize, summarize, or write detailed responses unless the "
+                "channel content explicitly asks for action (e.g., a ready signal or "
+                "a consult request directed at you). Master saves Opus tokens; the "
+                "channel content is the record — your response is just acknowledgment."
+            )
+        elif _ch_level == "review":
+            quiet_channel_block = (
+                "📋 channel event — master review required:\n"
+                "This turn contains a task completion or change-request from an agent. "
+                "You MUST engage:\n"
+                "  1. Read the task_update status + any note in the channel block.\n"
+                "  2. Inspect the agent's work (file edits, chat messages, task notes).\n"
+                "  3. Approve (chat_task_update → approved) or request changes "
+                "(changes_requested + specific feedback).\n"
+                "DO NOT treat this as a status-only ping. A done task without master "
+                "review blocks the pipeline."
+            )
+
     if (
         not inbox_block
         and not incoming_block
@@ -415,14 +943,30 @@ def main() -> int:
         and not delegate_block
         and not bottleneck_block
         and not role_budget_block
+        and not pending_assignments_block
+        and not stale_acks_block
+        and not quiet_channel_block
     ):
         return 0
 
-    # Ordering: bottleneck (highest-priority, only fires on saturation) →
-    # role_budget (per-turn role + recommended /model + /effort reminder) →
-    # delegate nudge → inbox → incoming questions → periodic reminder.
+    # Ordering: quiet_channel (highest — fires on auto-triggered turns, short-
+    # circuits verbose response before other blocks even render) → bottleneck →
+    # pending_assignments → stale_acks → role_budget → delegate → inbox →
+    # incoming questions → periodic reminder.
     additional_context = "\n\n".join(
-        b for b in (bottleneck_block, role_budget_block, delegate_block, inbox_block, incoming_block, reminder_block) if b
+        b
+        for b in (
+            quiet_channel_block,
+            bottleneck_block,
+            pending_assignments_block,
+            stale_acks_block,
+            role_budget_block,
+            delegate_block,
+            inbox_block,
+            incoming_block,
+            reminder_block,
+        )
+        if b
     )
 
     output = {

@@ -652,12 +652,20 @@ def recent_decisions(
     return out
 
 
-def pending_notes(session_id: str, mark_read: bool = True) -> list[dict]:
+def pending_notes(
+    session_id: str,
+    mark_read: bool = True,
+    session_cwd: str | None = None,
+) -> list[dict]:
     """A reads its inbox — unread notes from other sessions.
 
     Called by /inbox skill (mark_read=true) and by old SessionStart hooks.
     The newer auto-inject UserPromptSubmit hook uses surface_inbox_for_hook
     (different path — peek + count, doesn't drain).
+
+    `session_cwd`: when provided, notices with a `scope_cwd` that does not
+    match (or is not a parent of) `session_cwd` are silently excluded. Notices
+    without `scope_cwd` always surface (backward-compatible broadcast).
 
     When mark_read=True, drained notes get moved to archive.jsonl (not
     just marked read in inbox.jsonl) so the inbox stays focused on
@@ -670,7 +678,16 @@ def pending_notes(session_id: str, mark_read: bool = True) -> list[dict]:
     inbox_path = sd / "inbox.jsonl"
     archive_path = sd / "archive.jsonl"
     notes = _read_jsonl(inbox_path)
-    pending = [n for n in notes if not n.get("read")]
+
+    cwd_abs = os.path.abspath(session_cwd) if session_cwd else None
+
+    def _cwd_matches(note: dict) -> bool:
+        scope = note.get("scope_cwd") or ""
+        if not scope or not cwd_abs:
+            return True  # no scope or no caller cwd → always surface
+        return cwd_abs == scope or cwd_abs.startswith(scope.rstrip("/") + "/")
+
+    pending = [n for n in notes if not n.get("read") and _cwd_matches(n)]
 
     if mark_read and pending:
         archived: list[dict] = []
@@ -1545,6 +1562,7 @@ def post_notice(
     *,
     from_session_id: str = "external",
     fire_desktop_notify: bool = True,
+    scope_cwd: str | None = None,
 ) -> dict:
     """Drop a "FYI" / "ack" note in another session's inbox. No question
     required, no answer expected.
@@ -1569,7 +1587,7 @@ def post_notice(
     """
     target_session_id = resolve_session_id(target_session_id)
     text = sanitize_agent_text(text)
-    note = {
+    note: dict = {
         "id": uuid.uuid4().hex[:12],
         "ts": _now_iso(),
         "kind": "notice",
@@ -1578,6 +1596,8 @@ def post_notice(
         "read": False,
         "surface_count": 0,
     }
+    if scope_cwd:
+        note["scope_cwd"] = scope_cwd
     _append_jsonl(_session_dir(target_session_id) / "inbox.jsonl", note)
     if fire_desktop_notify:
         desktop_notify.notify_notice(target_session_id, from_session_id, text)
@@ -1601,7 +1621,10 @@ when they've surfaced the content; this is the fallback.
 """
 
 
-def surface_inbox_for_hook(session_id: str) -> list[dict]:
+def surface_inbox_for_hook(
+    session_id: str,
+    session_cwd: str | None = None,
+) -> list[dict]:
     """Hook-only fetch path. Returns unread notes, increments surface_count.
 
     Differs from pending_notes: doesn't mark read on first fetch. Notes
@@ -1611,6 +1634,10 @@ def surface_inbox_for_hook(session_id: str) -> list[dict]:
 
     Each returned note carries a `_remaining_surfaces` field so the hook
     can render urgency info ("[2/3 surfaces remaining — call ack]").
+
+    `session_cwd`: when provided, notices whose `scope_cwd` doesn't match
+    are skipped (not incremented, not archived — left for matching sessions).
+    Notices without `scope_cwd` always surface (backward-compat broadcast).
     """
     session_id = resolve_session_id(session_id)
     sd = _session_dir(session_id)
@@ -1622,10 +1649,20 @@ def surface_inbox_for_hook(session_id: str) -> list[dict]:
     remaining: list[dict] = []
     modified = False
 
+    cwd_abs = os.path.abspath(session_cwd) if session_cwd else None
+
     for n in notes:
         if n.get("read"):
             archived.append(n)
             continue
+
+        # scope_cwd filter: leave note untouched if cwd doesn't match.
+        note_scope = n.get("scope_cwd") or ""
+        if note_scope and cwd_abs:
+            if cwd_abs != note_scope and not cwd_abs.startswith(note_scope.rstrip("/") + "/"):
+                remaining.append(n)
+                continue
+
         n["surface_count"] = int(n.get("surface_count") or 0) + 1
         modified = True
 

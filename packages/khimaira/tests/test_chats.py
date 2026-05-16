@@ -2189,3 +2189,316 @@ def test_non_creator_transfer_silently_ignores_as_deputize_marker(isolated_chats
         "as_deputize=True's skip-donor-out applies regardless of creator status"
     )
     assert fresh["members"]["vice"]["state"] == c.ACCEPTED
+
+
+# ---------------------------------------------------------------------------
+# v1.9 assign-batch coordinator
+# ---------------------------------------------------------------------------
+
+
+def _setup_batch_chat(c, sessions_mod):
+    """Create a chat with master + agent_a + agent_b, all accepted."""
+    for sid in ("master", "agent-a", "agent-b"):
+        _make_session(sessions_mod, sid, name=sid)
+    room = c.create_room("master", ["agent-a", "agent-b"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "agent-a")
+    c.accept(chat_id, "agent-b")
+    return chat_id
+
+
+def _agent_ack(c, chat_id, agent_id, task_id, model="sonnet", effort="medium"):
+    """Inject an ack message from agent_id for task_id directly into JSONL."""
+    c._append(
+        chat_id,
+        {
+            "kind": c.MSG,
+            "event_id": c._new_event_id(),
+            "id": "msg-ack-" + task_id[-8:],
+            "ts": c._now_iso(),
+            "chat_id": chat_id,
+            "sender_id": agent_id,
+            "sender_name": agent_id[:8],
+            "body": f"✅ ready [task-id: {task_id}] | model={model} effort={effort}",
+            "to": None,
+        },
+    )
+
+
+def test_assign_batch_fire_and_forget(isolated_chats):
+    """wait_for_acks=False: creates tasks + sends assignments, returns immediately
+    without polling or firing begin."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id = _setup_batch_chat(c, sessions_mod)
+
+    specs = [
+        {
+            "agent_session_id": "agent-a",
+            "task_body": "task A",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+        {
+            "agent_session_id": "agent-b",
+            "task_body": "task B",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+    ]
+    result = asyncio.run(c.assign_batch(chat_id, "master", specs, wait_for_acks=False))
+
+    assert not result["begin_fired"]
+    assert result["missing_acks"] == []  # not polled — unknown
+    assert result["elapsed_ms"] < 2000  # returns quickly
+    assert len(result["task_ids"]) == 2
+
+    records = c._read(chat_id)
+    task_records = [r for r in records if r.get("kind") == c.TASK]
+    assert len(task_records) == 2
+    assignment_records = [
+        r
+        for r in records
+        if r.get("kind") == c.MSG and "🔔 TASK ASSIGNMENT" in (r.get("body") or "")
+    ]
+    assert len(assignment_records) == 2
+
+
+def test_assign_batch_scan_acks_detects_acks(isolated_chats):
+    """_scan_acks returns all agents once ack messages are in the JSONL."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id = _setup_batch_chat(c, sessions_mod)
+    specs = [
+        {
+            "agent_session_id": "agent-a",
+            "task_body": "task A",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+        {
+            "agent_session_id": "agent-b",
+            "task_body": "task B",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+    ]
+    result = asyncio.run(c.assign_batch(chat_id, "master", specs, wait_for_acks=False))
+    task_ids = result["task_ids"]
+
+    assert c._scan_acks(chat_id, task_ids) == {}
+
+    for agent_id, tid in task_ids.items():
+        _agent_ack(c, chat_id, agent_id, tid)
+
+    found = c._scan_acks(chat_id, task_ids)
+    assert set(found.keys()) == set(task_ids.keys())
+    for info in found.values():
+        assert info["model"] == "sonnet"
+        assert info["effort"] == "medium"
+
+
+def test_assign_batch_fires_begin_when_all_acked(isolated_chats):
+    """When all agents ack during the poll window, begin block is sent."""
+    import unittest.mock
+
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id = _setup_batch_chat(c, sessions_mod)
+    specs = [
+        {
+            "agent_session_id": "agent-a",
+            "task_body": "task A",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+        {
+            "agent_session_id": "agent-b",
+            "task_body": "task B",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+    ]
+    acks_injected = [False]
+
+    async def fast_sleep(delay: float) -> None:
+        # On first call, inject acks; then return immediately (no recursion).
+        if not acks_injected[0]:
+            acks_injected[0] = True
+            for r in c._read(chat_id):
+                if r.get("kind") == c.TASK and r.get("assignee_id"):
+                    _agent_ack(c, chat_id, r["assignee_id"], r["id"])
+
+    async def run():
+        with unittest.mock.patch("asyncio.sleep", fast_sleep):
+            return await c.assign_batch(chat_id, "master", specs, timeout_s=30)
+
+    result = asyncio.run(run())
+
+    assert result["begin_fired"] is True
+    assert result["missing_acks"] == []
+    assert set(result["acks"].keys()) == {"agent-a", "agent-b"}
+    begin_msgs = [
+        r for r in c._read(chat_id) if (r.get("body") or "").startswith("🟢 ALL AGENTS CONFIRMED")
+    ]
+    assert len(begin_msgs) == 1
+
+
+def test_assign_batch_partial_timeout_no_begin(isolated_chats):
+    """With fire_begin_on_partial=False (default): if one agent never acks,
+    begin is not fired and missing_acks reports the absent agent."""
+    import unittest.mock
+
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id = _setup_batch_chat(c, sessions_mod)
+    specs = [
+        {
+            "agent_session_id": "agent-a",
+            "task_body": "task A",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+        {
+            "agent_session_id": "agent-b",
+            "task_body": "task B",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+    ]
+    acks_injected = [False]
+
+    async def fast_sleep(delay: float) -> None:
+        if not acks_injected[0]:
+            acks_injected[0] = True
+            for r in c._read(chat_id):
+                if r.get("kind") == c.TASK and r.get("assignee_id") == "agent-a":
+                    _agent_ack(c, chat_id, "agent-a", r["id"])
+
+    async def run():
+        with unittest.mock.patch("asyncio.sleep", fast_sleep):
+            return await c.assign_batch(
+                chat_id, "master", specs, timeout_s=1, fire_begin_on_partial=False
+            )
+
+    result = asyncio.run(run())
+
+    assert result["begin_fired"] is False
+    assert "agent-b" in result["missing_acks"]
+    assert "agent-a" in result["acks"]
+
+
+def test_assign_batch_unknown_agent_raises(isolated_chats):
+    """Assigning to a session not in the chat raises ValueError → 403."""
+    import pytest
+
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id = _setup_batch_chat(c, sessions_mod)
+    specs = [
+        {
+            "agent_session_id": "ghost-session",
+            "task_body": "task",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+    ]
+    with pytest.raises(ValueError):
+        asyncio.run(c.assign_batch(chat_id, "master", specs, wait_for_acks=False))
+
+
+# ---------------------------------------------------------------------------
+# v1.9.2: private=True visibility filter
+# ---------------------------------------------------------------------------
+
+
+def _setup_three_member_chat(c, sessions_mod):
+    master_id = "priv-master"
+    agent_id = "priv-agent"
+    observer_id = "priv-observer"
+    for sid in (master_id, agent_id, observer_id):
+        _make_session(sessions_mod, sid)
+    chat_id = c.create_room(master_id, [agent_id, observer_id], title="private test")["meta"]["chat_id"]
+    c.accept(chat_id, agent_id)
+    c.accept(chat_id, observer_id)
+    return chat_id, master_id, agent_id, observer_id
+
+
+def test_private_message_visible_to_recipient_and_sender(isolated_chats):
+    """Recipient and sender both see a private=True message; non-recipient does not."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(c, sessions_mod)
+    c.send_message(chat_id, master_id, "secret note", to=[agent_id], private=True)
+
+    # Sender (master) sees it
+    master_history = c.history(chat_id, master_id)
+    assert any(m.get("private") for m in master_history)
+
+    # Recipient (agent) sees it
+    agent_history = c.history(chat_id, agent_id)
+    assert any(m.get("private") for m in agent_history)
+
+    # Non-recipient (observer) does NOT see it
+    observer_history = c.history(chat_id, observer_id)
+    assert not any(m.get("private") for m in observer_history)
+
+
+def test_private_message_visible_to_master_for_audit(isolated_chats):
+    """Chat master always sees private messages for audit even when not a recipient."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(c, sessions_mod)
+    # agent sends a private message targeting observer (not master)
+    c.send_message(chat_id, agent_id, "agent whisper to observer", to=[observer_id], private=True)
+
+    master_history = c.history(chat_id, master_id)
+    assert any(m.get("private") for m in master_history), (
+        "master must see all private messages for audit"
+    )
+
+
+def test_private_message_requires_to_field(isolated_chats):
+    """private=True without `to` raises ValueError."""
+    import pytest
+
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id, master_id, agent_id, _ = _setup_three_member_chat(c, sessions_mod)
+    with pytest.raises(ValueError, match="non-empty `to` list"):
+        c.send_message(chat_id, master_id, "no recipients", private=True)
+
+
+def test_private_task_hidden_from_non_assignee(isolated_chats):
+    """A private task is visible to assignee and master, hidden from observer."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(c, sessions_mod)
+    c.create_task(
+        chat_id,
+        master_id,
+        "secret task body",
+        assignee_session_id=agent_id,
+        private=True,
+    )
+
+    # Assignee sees it
+    agent_history = c.history(chat_id, agent_id)
+    assert any(m.get("kind") == "task" and m.get("private") for m in agent_history)
+
+    # Non-assignee observer does NOT see it
+    observer_history = c.history(chat_id, observer_id)
+    assert not any(m.get("kind") == "task" and m.get("private") for m in observer_history)
+
+    # Master (sender + audit) sees it
+    master_history = c.history(chat_id, master_id)
+    assert any(m.get("kind") == "task" and m.get("private") for m in master_history)

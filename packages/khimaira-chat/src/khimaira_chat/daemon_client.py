@@ -156,6 +156,7 @@ def send_message(
     body: str,
     *,
     to: list[str] | None = None,
+    private: bool = False,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
     """Send a message to a chat.
@@ -163,10 +164,15 @@ def send_message(
     `to`: optional list of session ids/names. If provided and non-empty,
     only those members receive the channel push. Omit / pass None to
     broadcast to all accepted members as before.
+
+    `private=True`: message hidden from non-recipients in chat_history.
+    Requires `to` to be non-empty.
     """
     payload: dict[str, Any] = {"sender_session_id": sender_session_id, "body": body}
     if to:
         payload["to"] = to
+    if private:
+        payload["private"] = True
     resp = _request_with_retry(
         "POST",
         f"{base}/api/chats/{chat_id}/messages",
@@ -183,15 +189,22 @@ def create_task(
     body: str,
     *,
     assignee_session_id: str | None = None,
+    private: bool = False,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
     """Create a structured task in a chat. Sender must be an accepted
     member. Initial status is `pending`. If `assignee_session_id` is None
     the task is unassigned (the next-up worker can claim it by moving it
-    to `in_progress`)."""
+    to `in_progress`).
+
+    `private=True`: task hidden from non-assignee members in chat_history.
+    Requires assignee_session_id.
+    """
     payload: dict[str, Any] = {"sender_session_id": sender_session_id, "body": body}
     if assignee_session_id:
         payload["assignee_session_id"] = assignee_session_id
+    if private:
+        payload["private"] = True
     resp = _request_with_retry(
         "POST",
         f"{base}/api/chats/{chat_id}/tasks",
@@ -209,12 +222,19 @@ def update_task_status(
     new_status: str,
     *,
     note: str | None = None,
+    private: bool = False,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
-    """Move a task between lifecycle states."""
+    """Move a task between lifecycle states.
+
+    `private=True`: status update hidden from non-assignee members in
+    chat_history. Task must have an assignee.
+    """
     payload: dict[str, Any] = {"by_session_id": by_session_id, "new_status": new_status}
     if note is not None:
         payload["note"] = note
+    if private:
+        payload["private"] = True
     resp = _request_with_retry(
         "POST",
         f"{base}/api/chats/{chat_id}/tasks/{task_id}/status",

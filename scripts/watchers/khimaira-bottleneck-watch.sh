@@ -127,6 +127,27 @@ master_name=$(echo "$analysis" | python3 -c "import sys, json; print(json.load(s
 master_sid=$(echo "$analysis" | python3 -c "import sys, json; print(json.load(sys.stdin).get('master_sid') or '')")
 decision_age=$(echo "$analysis" | python3 -c "import sys, json; print(json.load(sys.stdin).get('master_decision_age_min') or '')")
 
+# Derive master's project cwd from their most recently touched file.
+# Used to scope T1 notices to the master's project only.
+master_cwd=""
+if [[ -n "$master_sid" ]]; then
+  master_cwd=$(python3 - "$DAEMON_URL" "$master_sid" <<'PYEOF'
+import json, os, sys, urllib.request
+daemon_url, sid = sys.argv[1], sys.argv[2]
+try:
+    with urllib.request.urlopen(f"{daemon_url}/api/sessions/{sid}", timeout=3) as r:
+        state = json.loads(r.read())
+    files = state.get("recent_files") or []
+    if files:
+        path = files[-1].get("path") or ""
+        if path:
+            print(os.path.dirname(os.path.abspath(path)))
+except Exception:
+    pass
+PYEOF
+)
+fi
+
 # --- T3: clear state if bottleneck has lifted ---
 if [[ "$bottlenecked" != "True" ]]; then
   if [[ -f "$FIRST_SEEN_FILE" ]] || [[ -f "$LAST_ALERT_FILE" ]] || [[ -f "$LAST_DEPUTIZE_FILE" ]]; then
@@ -248,7 +269,11 @@ PYEOF
         -d "$(python3 -c "
 import json, sys
 body = '''$notice_body'''
-print(json.dumps({'from_session_id': 'bottleneck-watch', 'text': body}))
+cwd = '''$master_cwd'''
+payload = {'from_session_id': 'bottleneck-watch', 'text': body}
+if cwd.strip():
+    payload['scope_cwd'] = cwd.strip()
+print(json.dumps(payload))
 ")" > /dev/null 2>&1; then
       notice_count=$(( notice_count + 1 ))
     fi

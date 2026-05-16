@@ -63,6 +63,7 @@ class AnswerReq(BaseModel):
 class NoticeReq(BaseModel):
     text: str
     from_session_id: str = "external"
+    scope_cwd: str | None = None
 
 
 class AckNotesReq(BaseModel):
@@ -100,9 +101,7 @@ def build_router():
         return {"sessions": sessions.list_sessions(workspace=workspace)}
 
     @router.get("/sessions/recent_decisions")
-    async def recent_decisions(
-        recent_per_session: int = 5, workspace: str | None = None
-    ) -> dict:
+    async def recent_decisions(recent_per_session: int = 5, workspace: str | None = None) -> dict:
         return {
             "decisions": sessions.recent_decisions(
                 recent_per_session=recent_per_session, workspace=workspace
@@ -110,9 +109,7 @@ def build_router():
         }
 
     @router.get("/sessions/{session_id}")
-    async def get_state(
-        session_id: str, recent: int = 10, workspace: str | None = None
-    ) -> dict:
+    async def get_state(session_id: str, recent: int = 10, workspace: str | None = None) -> dict:
         try:
             return sessions.state(session_id, recent=recent, workspace=workspace)
         except ValueError as e:
@@ -128,9 +125,15 @@ def build_router():
             raise fastapi.HTTPException(404, str(e))
 
     @router.get("/sessions/{session_id}/pending")
-    async def get_pending(session_id: str, mark_read: bool = True) -> dict:
+    async def get_pending(
+        session_id: str,
+        mark_read: bool = True,
+        cwd: str | None = None,
+    ) -> dict:
         try:
-            return {"notes": sessions.pending_notes(session_id, mark_read=mark_read)}
+            return {
+                "notes": sessions.pending_notes(session_id, mark_read=mark_read, session_cwd=cwd)
+            }
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e))
 
@@ -175,9 +178,7 @@ def build_router():
             raise fastapi.HTTPException(404, str(e))
 
     @router.get("/sessions/{session_id}/questions/{question_id}/wait")
-    async def wait_for_answer(
-        session_id: str, question_id: str, timeout: float = 900.0
-    ) -> dict:
+    async def wait_for_answer(session_id: str, question_id: str, timeout: float = 900.0) -> dict:
         """Long-poll: block until question_id is answered on session_id.
 
         session_id is the OWNER of the question (the asking session).
@@ -188,14 +189,10 @@ def build_router():
         Caller's HTTP timeout MUST be greater than `timeout` parameter.
         """
         try:
-            answered = await sessions.wait_for_answer(
-                session_id, question_id, timeout=timeout
-            )
+            answered = await sessions.wait_for_answer(session_id, question_id, timeout=timeout)
             return {"answered": True, "question": answered}
         except TimeoutError:
-            raise fastapi.HTTPException(
-                408, f"No answer to {question_id} within {timeout:.0f}s"
-            )
+            raise fastapi.HTTPException(408, f"No answer to {question_id} within {timeout:.0f}s")
         except ValueError as e:
             raise fastapi.HTTPException(410, str(e))
 
@@ -250,6 +247,7 @@ def build_router():
                 session_id,
                 req.text,
                 from_session_id=req.from_session_id,
+                scope_cwd=req.scope_cwd,
             )
         except ValueError as e:
             # Unknown session name/id — return 404 with the helpful message
@@ -257,16 +255,20 @@ def build_router():
             raise fastapi.HTTPException(404, str(e))
 
     @router.get("/sessions/{session_id}/inbox/surface")
-    async def surface_inbox(session_id: str) -> dict:
+    async def surface_inbox(session_id: str, cwd: str | None = None) -> dict:
         """Hook-only fetch path. Returns unread notes + increments
         surface_count. Notes auto-mark read after 3 surfaces (safety net).
 
         Distinct from /pending: doesn't drain on first fetch — caller is
         expected to surface the content to the user, then call /ack to
         explicitly clear.
+
+        `cwd`: caller's working directory. When provided, notices whose
+        `scope_cwd` doesn't match are withheld (not incremented, not
+        auto-expired — left for the right session to claim).
         """
         try:
-            return {"notes": sessions.surface_inbox_for_hook(session_id)}
+            return {"notes": sessions.surface_inbox_for_hook(session_id, session_cwd=cwd)}
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e))
 

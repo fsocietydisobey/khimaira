@@ -46,18 +46,21 @@ class SendReq(BaseModel):
     sender_session_id: str
     body: str
     to: list[str] | None = None  # Phase B: optional per-recipient addressing
+    private: bool = False  # v1.9.2: hide from non-recipients in chat_history
 
 
 class CreateTaskReq(BaseModel):
     sender_session_id: str
     body: str
     assignee_session_id: str | None = None
+    private: bool = False  # v1.9.2: hide from non-assignee in chat_history
 
 
 class UpdateTaskStatusReq(BaseModel):
     by_session_id: str
     new_status: str
     note: str | None = None
+    private: bool = False  # v1.9.2: hide from non-assignee in chat_history
 
 
 class SignalTaskStartReq(BaseModel):
@@ -99,6 +102,21 @@ class RejectReq(BaseModel):
 class RegisterPpidReq(BaseModel):
     ppid: int
     session_id: str
+
+
+class AssignmentSpec(BaseModel):
+    agent_session_id: str
+    task_body: str
+    required_model: str = "sonnet"
+    required_effort: str = "medium"
+
+
+class AssignBatchReq(BaseModel):
+    from_session_id: str
+    assignments: list[AssignmentSpec]
+    timeout_s: int = 600
+    wait_for_acks: bool = True
+    fire_begin_on_partial: bool = False
 
 
 def build_router():
@@ -220,7 +238,9 @@ def build_router():
     @router.post("/chats/{chat_id}/messages")
     async def send_message(chat_id: str, req: SendReq) -> dict:
         try:
-            return chats.send_message(chat_id, req.sender_session_id, req.body, to=req.to)
+            return chats.send_message(
+                chat_id, req.sender_session_id, req.body, to=req.to, private=req.private
+            )
         except ValueError as exc:
             raise fastapi.HTTPException(403, str(exc)) from exc
 
@@ -234,6 +254,7 @@ def build_router():
                 req.sender_session_id,
                 req.body,
                 assignee_session_id=req.assignee_session_id,
+                private=req.private,
             )
         except ValueError as exc:
             raise fastapi.HTTPException(403, str(exc)) from exc
@@ -242,7 +263,12 @@ def build_router():
     async def update_task_status(chat_id: str, task_id: str, req: UpdateTaskStatusReq) -> dict:
         try:
             return chats.update_task_status(
-                chat_id, task_id, req.by_session_id, req.new_status, note=req.note
+                chat_id,
+                task_id,
+                req.by_session_id,
+                req.new_status,
+                note=req.note,
+                private=req.private,
             )
         except ValueError as exc:
             # 403 for permission errors (master-only transitions); 404 for unknown task
@@ -269,6 +295,27 @@ def build_router():
     async def list_tasks(chat_id: str, session_id: str) -> dict:
         try:
             return {"tasks": chats.task_status(chat_id, session_id)}
+        except ValueError as exc:
+            raise fastapi.HTTPException(403, str(exc)) from exc
+
+    # ---- v1.9: assign-batch coordinator ----
+
+    @router.post("/chats/{chat_id}/assign-batch")
+    async def assign_batch(chat_id: str, req: AssignBatchReq) -> dict:
+        """v1.9 coordinator: fan-out assignments + collect acks + fire begin.
+
+        Collapses the master's 3N+K+2 call loop into one daemon HTTP call.
+        Long-running when wait_for_acks=True (up to timeout_s seconds).
+        """
+        try:
+            return await chats.assign_batch(
+                chat_id,
+                req.from_session_id,
+                [a.model_dump() for a in req.assignments],
+                timeout_s=req.timeout_s,
+                wait_for_acks=req.wait_for_acks,
+                fire_begin_on_partial=req.fire_begin_on_partial,
+            )
         except ValueError as exc:
             raise fastapi.HTTPException(403, str(exc)) from exc
 

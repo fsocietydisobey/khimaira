@@ -68,7 +68,11 @@ ROLE_MASTER = "master"
 ROLE_AGENT = "agent"
 ROLE_OBSERVER = "observer"
 ROLE_CRITIC = "critic"
-_VALID_ROLES: frozenset[str] = frozenset({ROLE_MASTER, ROLE_AGENT, ROLE_OBSERVER, ROLE_CRITIC})
+ROLE_ARCHITECT = "architect"
+ROLE_INTAKE = "intake"
+_VALID_ROLES: frozenset[str] = frozenset(
+    {ROLE_MASTER, ROLE_AGENT, ROLE_OBSERVER, ROLE_CRITIC, ROLE_ARCHITECT, ROLE_INTAKE}
+)
 
 # Phase B v1.5: recommended model + effort budget per role.
 # Used by `_emit_role_directive` to surface slash-command suggestions to the
@@ -80,6 +84,8 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
     ROLE_MASTER: {"model": "opus", "effort": "max"},
     ROLE_AGENT: {"model": "sonnet", "effort": "medium"},
     ROLE_OBSERVER: {"model": "haiku", "effort": "low"},
+    ROLE_ARCHITECT: {"model": "opus", "effort": "max"},  # synthesis/design sidecar
+    ROLE_INTAKE: {"model": "sonnet", "effort": "medium"},  # user-facing front-end
 }
 
 # (from_status, to_status) → roles allowed to perform the transition.
@@ -224,6 +230,13 @@ def _is_master(room: dict[str, Any], sid: str) -> bool:
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
+# Matches the canonical ack body that agents send when they confirm budget compliance:
+#   ✅ ready [task-id: task-<hex>] | model=<name> effort=<name>
+_ACK_RE = re.compile(
+    r"✅ ready \[task-id:\s*(task-[a-f0-9]+)\]\s*\|\s*model=(\w+)\s+effort=(\w+)",
+    re.IGNORECASE,
+)
+
 
 def _resolve_or_uuid(session_id_or_name: str) -> str:
     """Resolve a session name → UUID, OR accept a UUID verbatim.
@@ -288,7 +301,7 @@ def load_room(chat_id: str) -> dict[str, Any]:
                 }
             )
             members[sid] = existing
-        elif kind == MSG:
+        elif kind in (MSG, TASK, TASK_UPDATE, TASK_SIGNAL):
             messages.append(line)
     return {"meta": meta, "members": members, "messages": messages}
 
@@ -515,19 +528,26 @@ def send_message(
     body: str,
     *,
     to: list[str] | None = None,
+    private: bool = False,
 ) -> dict[str, Any]:
     """Append a message. Sender must be an accepted member.
 
     Optional `to`: list of session_ids/names. When set, real-time SSE
     broadcast goes only to those sessions (plus sender for echo-drop).
-    The message is still appended to the JSONL — chat_history shows it
-    for everyone. Private-in-real-time, public-in-record.
+
+    `private=True`: message is hidden from non-recipients in chat_history.
+    Requires `to` to be non-empty (private with no recipients is meaningless).
 
     Phase B v2: observers (member_roles[sid] == "observer") cannot send;
     raises ValueError. Critic role behaves identically to agent for write
     paths — opinion-only role, label visible in member listings.
     """
     sender_session_id = _resolve_or_uuid(sender_session_id)
+    if private and not to:
+        raise ValueError(
+            "private=True requires a non-empty `to` list — "
+            "a private message with no recipients is meaningless."
+        )
     room = load_room(chat_id)
     member = room["members"].get(sender_session_id)
     if not member or member["state"] != ACCEPTED:
@@ -562,9 +582,16 @@ def send_message(
         "sender_name": member.get("session_name") or sender_session_id[:8],
         "body": _sanitize_message_body(body),
         "to": resolved_to,
+        "private": private,
     }
     _append(chat_id, record)
-    log.info("chats: msg from %s to %s (to=%s)", sender_session_id, chat_id, resolved_to or "*")
+    log.info(
+        "chats: msg from %s to %s (to=%s private=%s)",
+        sender_session_id,
+        chat_id,
+        resolved_to or "*",
+        private,
+    )
     return record
 
 
@@ -578,13 +605,23 @@ def create_task(
     sender_session_id: str,
     body: str,
     assignee_session_id: str | None = None,
+    *,
+    private: bool = False,
 ) -> dict[str, Any]:
     """Append a TASK record (status=pending). Sender must be an accepted member;
     if assignee_session_id is set, that session must also be accepted.
 
+    `private=True`: task hidden from non-assignee members in chat_history.
+    Requires assignee_session_id (private task with no assignee is meaningless).
+
     Phase B v2: observers cannot create tasks.
     """
     sender_session_id = _resolve_or_uuid(sender_session_id)
+    if private and assignee_session_id is None:
+        raise ValueError(
+            "private=True requires assignee_session_id — "
+            "a private task with no assignee is meaningless."
+        )
     room = load_room(chat_id)
     member = room["members"].get(sender_session_id)
     if not member or member["state"] != ACCEPTED:
@@ -620,6 +657,10 @@ def create_task(
         "assignee_id": assignee_resolved,
         "assignee_name": assignee_name,
         "status": TASK_PENDING,
+        "private": private,
+        # to=[assignee] normalises the private filter path so history() can
+        # use a single check across all private record types.
+        "to": [assignee_resolved] if private and assignee_resolved else None,
     }
     _append(chat_id, record)
     log.info(
@@ -638,9 +679,15 @@ def update_task_status(
     by_session_id: str,
     new_status: str,
     note: str | None = None,
+    *,
+    private: bool = False,
 ) -> dict[str, Any]:
     """Append a TASK_UPDATE record. Validates the from→to transition and
     the caller's role (master vs assignee vs accepted-member).
+
+    `private=True`: update hidden from non-assignee members in chat_history.
+    Uses the task's assignee_id as the implicit recipient; raises ValueError
+    if the task has no assignee.
 
     Phase B v2: observers cannot update task status (no write paths for
     observer role).
@@ -697,6 +744,12 @@ def update_task_status(
             f"on task {task_id!r}. Required roles: {sorted(allowed_roles)}."
         )
 
+    if private and not assignee:
+        raise ValueError(
+            f"private=True on task_update requires the task to have an assignee — "
+            f"task {task_id!r} has no assignee_id."
+        )
+
     record = {
         "kind": TASK_UPDATE,
         "event_id": _new_event_id(),
@@ -707,6 +760,8 @@ def update_task_status(
         "by_session_id": by_session_id,
         "by_name": member.get("session_name") or by_session_id[:8],
         "note": note,
+        "private": private,
+        "to": [assignee] if private and assignee else None,
     }
     _append(chat_id, record)
     log.info(
@@ -960,6 +1015,18 @@ def history(
         idx = next((i for i, m in enumerate(msgs) if m.get("event_id") == since_event_id), None)
         if idx is not None:
             msgs = msgs[idx + 1 :]
+    # Private-message filter: records with private=True are only visible to
+    # the sender, their explicit recipients, and the chat master (audit).
+    # Non-private records and all non-msg/task/task_update records pass through.
+    is_req_master = _is_master(room, requester_session_id)
+    msgs = [
+        m
+        for m in msgs
+        if not m.get("private")
+        or m.get("sender_id") == requester_session_id
+        or requester_session_id in (m.get("to") or [])
+        or is_req_master
+    ]
     return msgs[-limit:]
 
 
@@ -1594,6 +1661,198 @@ def my_chats(session_id: str) -> list[dict[str, Any]]:
         )
     out.sort(key=lambda c: c["last_message_ts"] or "", reverse=True)
     return out
+
+
+# ---------------------------------------------------------------------------
+# v1.9 assign-batch coordinator
+# ---------------------------------------------------------------------------
+
+
+def _format_assignment_block(
+    task_id: str,
+    from_name: str,
+    task_body: str,
+    required_model: str,
+    required_effort: str,
+) -> str:
+    return (
+        f"🔔 TASK ASSIGNMENT [task-id: {task_id}]\n"
+        f"From: {from_name}\n"
+        f"Task: {task_body}\n"
+        f"\n"
+        f"⚠️ ENFORCEMENT GATE ACTIVE — suppress default reflexes:\n"
+        f"- DO NOT start work on the task body\n"
+        f"- DO NOT pre-read files (settings.json, project files, etc.) — verification happens AT ready, not before\n"
+        f"- DO NOT pre-plan or gather reconnaissance state\n"
+        f'- Override the "research before implementing" default for the duration of this gate\n'
+        f"- Hold silently; only respond if you have a question about the protocol itself\n"
+        f"\n"
+        f'The "ready" signal comes from the USER in your window (not from master).\n'
+        f"They will type `/model {required_model}` + `/effort {required_effort}`, then run `/agent-ready` (auto-fills task-id)"
+        f" — or type `ready [task-id: {task_id}]` manually as fallback.\n"
+        f"\n"
+        f'ON RECEIVING "ready" from the user (and ONLY then):\n'
+        f"  1. Read ~/.claude/settings.json\n"
+        f"  2. If model == {required_model} and effortLevel == {required_effort} → chat_send ack to master with"
+        f' "ready [task-id: {task_id}] | model={required_model} effort={required_effort}"\n'
+        f"  3. If non-compliant → DO NOT ack; tell user what's still wrong\n"
+        f"  4. Wait for master's 🟢 ALL AGENTS CONFIRMED — BEGIN signal\n"
+        f"\n"
+        f"Master fires begin once ALL agents ack. Do not start work until you receive 🟢.\n"
+        f"This message was delivered automatically via SSE — no typing was needed to receive it."
+    )
+
+
+def _format_begin_block(task_body: str) -> str:
+    return (
+        "🟢 ALL AGENTS CONFIRMED — BEGIN IMPLEMENTATION\n"
+        f"Task: {task_body}\n"
+        "\n"
+        "All agents have set their required budget. Start working on your assigned task now.\n"
+        "No further input from the user is needed — proceed autonomously and report progress\n"
+        "via chat when done or when blocked."
+    )
+
+
+def _scan_acks(chat_id: str, task_ids: dict[str, str]) -> dict[str, dict]:
+    """Scan chat JSONL for ack messages; return confirmed agents.
+
+    Args:
+        chat_id: chat to scan.
+        task_ids: {agent_session_id → task_id} mapping from the coordinator.
+
+    Returns:
+        {agent_session_id: {"model": str, "effort": str, "ts": str}}
+        Only includes agents whose ack was found. Keeps the LATEST ack per
+        task_id (handles re-ack after restart).
+    """
+    reverse: dict[str, str] = {tid: sid for sid, tid in task_ids.items()}
+    found: dict[str, dict] = {}
+    for r in _read(chat_id):
+        if r.get("kind") != MSG:
+            continue
+        m = _ACK_RE.search(r.get("body") or "")
+        if not m:
+            continue
+        tid = m.group(1)
+        agent_id = reverse.get(tid)
+        if not agent_id:
+            continue
+        found[agent_id] = {
+            "model": m.group(2).lower(),
+            "effort": m.group(3).lower(),
+            "ts": r.get("ts") or "",
+        }
+    return found
+
+
+async def assign_batch(
+    chat_id: str,
+    from_session_id: str,
+    assignments: list[dict],
+    *,
+    timeout_s: int = 600,
+    wait_for_acks: bool = True,
+    fire_begin_on_partial: bool = False,
+) -> dict:
+    """v1.9 coordinator: fan-out assignments + collect acks + fire begin.
+
+    Collapses the master's manual 3N+K+2 call loop into a single daemon
+    HTTP call. The daemon creates tasks, sends SSE assignment blocks,
+    polls for acks, and fires the begin signal — all server-side.
+
+    Args:
+        chat_id: the shared chat.
+        from_session_id: master session (must be an accepted member).
+        assignments: list of dicts with keys {agent_session_id, task_body,
+            required_model, required_effort}.
+        timeout_s: ack-poll deadline in seconds. 0 = fire-and-forget.
+        wait_for_acks: False → return immediately after fan-out (no polling).
+        fire_begin_on_partial: True → fire begin for acked subset on timeout.
+
+    Returns:
+        {task_ids, acks, missing_acks, begin_fired, elapsed_ms}
+    """
+    import time
+
+    t0 = time.monotonic()
+    from_session_id = _resolve_or_uuid(from_session_id)
+    room = load_room(chat_id)
+    member = room["members"].get(from_session_id)
+    if not member or member["state"] != ACCEPTED:
+        state = (member or {}).get("state", "non-member")
+        raise ValueError(
+            f"Session {from_session_id!r} is {state!r} in {chat_id!r}; "
+            f"only accepted members can coordinate assignments."
+        )
+
+    from_name = member.get("session_name") or from_session_id[:8]
+
+    # CREATE_TASKS — one tracking task per agent.
+    task_ids: dict[str, str] = {}  # agent_session_id → task_id
+    for spec in assignments:
+        agent_id = _resolve_or_uuid(spec["agent_session_id"])
+        task = create_task(
+            chat_id,
+            from_session_id,
+            spec.get("task_body") or "",
+            assignee_session_id=agent_id,
+        )
+        task_ids[agent_id] = task["id"]
+
+    # NOTIFY_AGENTS — SSE assignment block per agent.
+    for spec in assignments:
+        agent_id = _resolve_or_uuid(spec["agent_session_id"])
+        tid = task_ids[agent_id]
+        block = _format_assignment_block(
+            tid,
+            from_name,
+            spec.get("task_body") or "",
+            spec.get("required_model") or "sonnet",
+            spec.get("required_effort") or "medium",
+        )
+        send_message(chat_id, from_session_id, block, to=[agent_id])
+
+    # AWAIT_ACKS — poll every 2s until all acked or timeout.
+    # Skipped entirely for fire-and-forget (wait_for_acks=False or timeout_s==0).
+    acks: dict[str, dict] = {}
+    polled = False
+    if wait_for_acks and timeout_s > 0:
+        polled = True
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            acks = _scan_acks(chat_id, task_ids)
+            if len(acks) == len(assignments):
+                break
+            await asyncio.sleep(2.0)
+        if not acks:
+            acks = _scan_acks(chat_id, task_ids)
+
+    # FIRE_BEGIN — send begin block to confirmed agents (if any).
+    confirmed = set(acks.keys())
+    all_agent_ids = set(task_ids.keys())
+    # missing_acks is only meaningful when we actually polled; fire-and-forget = unknown.
+    missing = sorted(all_agent_ids - confirmed) if polled else []
+
+    begin_fired = False
+    if polled and (confirmed == all_agent_ids or (fire_begin_on_partial and confirmed)):
+        begin_body = (assignments[0].get("task_body") or "") if assignments else ""
+        send_message(
+            chat_id,
+            from_session_id,
+            _format_begin_block(begin_body),
+            to=sorted(confirmed),
+        )
+        begin_fired = True
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    return {
+        "task_ids": {sid: tid for sid, tid in task_ids.items()},
+        "acks": acks,
+        "missing_acks": missing,
+        "begin_fired": begin_fired,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 # ---------------------------------------------------------------------------

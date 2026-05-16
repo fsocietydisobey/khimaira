@@ -105,6 +105,51 @@ the closest correct primitive by name. Saves the next layer of
 
 ## Cross-session coordination
 
+### Default to delegating when other sessions are available
+
+**Before starting any non-trivial work, check the active session pool first.** The SessionStart
+hook surfaces the list of other active sessions automatically (`📋 khimaira — N other session(s)
+active`). If any are idle/listening and the work is parallelizable, default to delegating —
+don't burn master's context on tasks an agent can do.
+
+**Standard pattern at the start of a non-trivial task:**
+
+1. **Read the active-sessions block** from SessionStart context (already in your context window).
+   Look for sessions with `status: idle` or `status: listening` — those are immediately available.
+2. **Decide what's parallelizable**: research, implementation of independent functions, writing
+   tests for new code, verifying assumptions in parallel files. NOT parallelizable: linear edit
+   sequences where step N depends on step N-1's exact output.
+3. **Pick the assignment primitive**:
+   - **`/khimaira-assign <agent> "<task>" --model X --effort Y`** — when you need to coordinate
+     budget across multiple agents (master controls cost, fires begin signal once all confirmed)
+   - **`chat_task_create` + `chat_send_to`** — when agents are already at the right budget and
+     you just need to fan out work (lighter-weight than full assign gate)
+   - **`session_log_question(target_session_id=...)`** — when you need a one-shot answer from a
+     specific peer without launching a structured task
+   - **`session_post_handoff(scope_project=...)`** — when the work is for the NEXT session in
+     this project, not a currently-running peer
+4. **Coordinate via chat** for any work spanning multiple agents touching the same file. Tell
+   each agent who else is working on what so they can sequence edits.
+5. **Master's job during delegation**: integrate, review, decide. Don't duplicate agent work.
+   If you find yourself doing what an idle agent could do, stop and re-delegate.
+
+**Anti-patterns:**
+
+- Burning Opus context on grep / file-read / boilerplate-function-writing when an idle agent at
+  sonnet/medium could do it in parallel
+- Forgetting the active-sessions list exists and working solo when 3 agents are sitting idle
+- Delegating a task to an agent without telling them who else is working in the same file
+  (write conflicts)
+- Re-delegating the same thing that's already in_progress on an agent (check chat_history before
+  firing new tasks)
+
+**When to do it yourself instead of delegating:**
+
+- Tightly-coupled multi-step edits in one file (overhead of coordination > overhead of doing it)
+- Architectural decisions that need master's full context
+- Work that requires reading what JUST happened in this conversation (agent doesn't have it)
+- Single-line bug fixes where the round trip to an agent costs more than the fix
+
 ### Use the right primitive
 
 | Goal | Tool | Notes |

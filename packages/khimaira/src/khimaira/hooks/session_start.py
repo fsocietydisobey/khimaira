@@ -69,8 +69,15 @@ def _ensure_chat_mcp_registered() -> None:
     try:
         subprocess.run(
             [
-                "claude", "mcp", "add", "khimaira-chat", "-s", "user", "--",
-                "bash", "-lc",
+                "claude",
+                "mcp",
+                "add",
+                "khimaira-chat",
+                "-s",
+                "user",
+                "--",
+                "bash",
+                "-lc",
                 "uv --directory ~/dev/khimaira run khimaira-chat 2>>/tmp/khimaira-chat.log",
             ],
             capture_output=True,
@@ -141,7 +148,7 @@ def _read_jsonl(path: Path) -> list[dict]:
     return out
 
 
-def _consume_inbox(session_id: str) -> list[dict]:
+def _consume_inbox(session_id: str, cwd: str | None = None) -> list[dict]:
     """Read unread notes, mark them read, MOVE TO archive.jsonl, return the
     drained set.
 
@@ -151,11 +158,14 @@ def _consume_inbox(session_id: str) -> list[dict]:
     fallback preserves the safety net but is structurally identical to
     daemon code that has drifted twice in the last day (archive miss,
     claim miss). The drift class is eliminated on the happy path.
+
+    `cwd`: when provided, notices scoped to a different project are excluded
+    from the drained set. They remain unread in inbox.jsonl for the correct
+    session to claim.
     """
     # --- HTTP path (preferred) ---
-    payload = _http_get_json(
-        f"/api/sessions/{urllib.parse.quote(session_id)}/pending?mark_read=true"
-    )
+    qs = f"mark_read=true{('&cwd=' + urllib.parse.quote(cwd, safe='')) if cwd else ''}"
+    payload = _http_get_json(f"/api/sessions/{urllib.parse.quote(session_id)}/pending?{qs}")
     if payload is not None:
         notes = payload.get("notes", [])
         return notes if isinstance(notes, list) else []
@@ -323,6 +333,8 @@ _ROLE_BUDGET: dict[str, dict[str, str]] = {
     "master": {"model": "opus", "effort": "max"},
     "agent": {"model": "sonnet", "effort": "medium"},
     "observer": {"model": "haiku", "effort": "default"},
+    "architect": {"model": "opus", "effort": "max"},
+    "intake": {"model": "sonnet", "effort": "medium"},
     # critic intentionally absent — no default
 }
 
@@ -366,7 +378,15 @@ def _discover_chat_roles(session_id: str) -> list[dict]:
             if last_meta.get("created_by") == session_id:
                 role = "master"
             else:
-                continue  # not a member by either signal
+                # Not in explicit member_roles and not creator — walk member
+                # records; fall back to "agent" for accepted invites (v1.6.1.2)
+                for r in reversed(records):
+                    if r.get("kind") == "member" and r.get("session_id") == session_id:
+                        if r.get("state") == "accepted":
+                            role = "agent"
+                        break
+                if not role:
+                    continue  # genuinely not a member
         # Verify accepted membership by walking member records — pick the
         # latest member record for this session_id; skip if not accepted.
         latest_state = None
@@ -804,9 +824,9 @@ def main() -> int:
         "registered (the tool simply won't exist)."
     )
 
-    notes = _consume_inbox(session_id)
-    others = _discover_other_active_sessions(session_id, within_minutes=30)
     cwd = data.get("cwd") or os.getcwd()
+    notes = _consume_inbox(session_id, cwd=cwd or None)
+    others = _discover_other_active_sessions(session_id, within_minutes=30)
     handoffs = _consume_handoffs(session_id, cwd)
     tasks = _fetch_hook_safe_tasks()
     chat_roles = _discover_chat_roles(session_id)

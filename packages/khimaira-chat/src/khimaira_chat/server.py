@@ -446,6 +446,13 @@ def _build_server() -> Server:
                         "session_id": {"type": "string"},
                         "chat_id": {"type": "string"},
                         "body": {"type": "string"},
+                        "private": {
+                            "type": "boolean",
+                            "description": (
+                                "When True, message is hidden from non-recipients in "
+                                "chat_history. Requires `to` to be set."
+                            ),
+                        },
                     },
                     "required": ["session_id", "chat_id", "body"],
                 },
@@ -599,13 +606,13 @@ def _build_server() -> Server:
             types.Tool(
                 name="chat_send_to",
                 description=(
-                    "Send a private message to a subset of chat members. Like "
+                    "Send a message to a subset of chat members. Like "
                     "chat_send but only the sessions in `to` receive the channel "
                     "push. Use when you want to coordinate with a specific peer "
                     "inside a multi-party chat (e.g. master sidebars an agent on a "
-                    "task without broadcasting to siblings). Other members can "
-                    "still see the message via chat_history — `to` controls push "
-                    "delivery, not durable visibility."
+                    "task without broadcasting to siblings). Set `private=True` to "
+                    "also hide the message from non-recipients in chat_history "
+                    "(default: visible to all members in history, push-only to `to`)."
                 ),
                 inputSchema={
                     "type": "object",
@@ -617,6 +624,13 @@ def _build_server() -> Server:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Session ids/names that should receive the push",
+                        },
+                        "private": {
+                            "type": "boolean",
+                            "description": (
+                                "When True, message is also hidden from non-recipients "
+                                "in chat_history (not just push-only)."
+                            ),
                         },
                     },
                     "required": ["session_id", "chat_id", "body", "to"],
@@ -644,6 +658,13 @@ def _build_server() -> Server:
                         "assignee": {
                             "type": "string",
                             "description": "Optional session id or name to pre-assign",
+                        },
+                        "private": {
+                            "type": "boolean",
+                            "description": (
+                                "When True, task is hidden from non-assignee members "
+                                "in chat_history. Requires assignee to be set."
+                            ),
                         },
                     },
                     "required": ["session_id", "chat_id", "body"],
@@ -674,6 +695,13 @@ def _build_server() -> Server:
                         "note": {
                             "type": "string",
                             "description": "Optional human-readable context for the transition",
+                        },
+                        "private": {
+                            "type": "boolean",
+                            "description": (
+                                "When True, status update is hidden from non-assignee "
+                                "members in chat_history. Task must have an assignee."
+                            ),
                         },
                     },
                     "required": ["session_id", "chat_id", "task_id", "new_status"],
@@ -833,7 +861,9 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
                 return {"error": "no pending invites to reject"}
         return daemon_client.reject(chat_id, sid)
     if name == "chat_send":
-        return daemon_client.send_message(args["chat_id"], sid, args["body"])
+        return daemon_client.send_message(
+            args["chat_id"], sid, args["body"], private=args.get("private", False)
+        )
     if name == "chat_history":
         return daemon_client.history(
             args["chat_id"], sid, limit=args.get("limit", 50), since=args.get("since")
@@ -874,10 +904,20 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
         )
     # ---- Phase B ----
     if name == "chat_send_to":
-        return daemon_client.send_message(args["chat_id"], sid, args["body"], to=args["to"])
+        return daemon_client.send_message(
+            args["chat_id"],
+            sid,
+            args["body"],
+            to=args["to"],
+            private=args.get("private", False),
+        )
     if name == "chat_task_create":
         return daemon_client.create_task(
-            args["chat_id"], sid, args["body"], assignee_session_id=args.get("assignee")
+            args["chat_id"],
+            sid,
+            args["body"],
+            assignee_session_id=args.get("assignee"),
+            private=args.get("private", False),
         )
     if name == "chat_task_update":
         return daemon_client.update_task_status(
@@ -886,6 +926,7 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
             sid,
             args["new_status"],
             note=args.get("note"),
+            private=args.get("private", False),
         )
     if name == "chat_task_signal_start":
         return daemon_client.signal_task_start(
