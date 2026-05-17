@@ -1,9 +1,10 @@
 # khimaira
 
-> A multi-agent orchestration layer for Claude Code. Six roles,
-> real-time cross-session chat, automated cost routing, and a
-> four-tool perception stack — all wired through a single MCP
-> connection.
+**khimaira is a multi-agent orchestration layer for Claude Code that
+lets your Claude sessions talk to each other in real time, delegate
+structured tasks, and hand off context when one session's window fills
+up. It's been used to author its own multi-agent features through
+multiple rounds of dogfood collaboration.**
 
 **No API keys required to start. No editor plugin to install. No new
 UI to learn.**
