@@ -689,10 +689,10 @@ def _build_server() -> Server:
                     "Move a task between lifecycle states. Valid transitions: "
                     "pending→in_progress→done→approved|changes_requested. Master "
                     "(chat creator) is the only one who can approve / request "
-                    "changes; the assignee (or any accepted member if unassigned) "
-                    "moves it through pending→in_progress→done. Use `note` to "
-                    "attach context — especially on approve/changes_requested where "
-                    "the master should explain the verdict."
+                    "changes or cancel a task; the assignee (or any accepted member "
+                    "if unassigned) moves it through pending→in_progress→done. Use "
+                    "`note` to attach context — especially on approve/changes_requested "
+                    "where the master should explain the verdict."
                 ),
                 inputSchema={
                     "type": "object",
@@ -702,7 +702,7 @@ def _build_server() -> Server:
                         "task_id": {"type": "string"},
                         "new_status": {
                             "type": "string",
-                            "enum": ["in_progress", "done", "approved", "changes_requested"],
+                            "enum": ["in_progress", "done", "approved", "changes_requested", "cancelled"],
                             "description": "Target state",
                         },
                         "note": {

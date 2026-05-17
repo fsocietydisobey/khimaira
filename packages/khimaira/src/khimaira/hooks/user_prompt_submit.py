@@ -831,6 +831,108 @@ def _format_stale_acks(stale: list[dict]) -> str:
     return "\n".join(lines).rstrip()
 
 
+_WATERMARKS_PATH = (
+    Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
+    / "khimaira"
+    / "chat_poll_watermarks.json"
+)
+
+
+def _poll_missed_chat_events(session_id: str) -> str:
+    """Poll each accepted chat for messages that arrived while this session was idle.
+
+    Loads a per-chat watermark (last-seen event_id) from chat_poll_watermarks.json.
+    Fetches up to 20 messages since the watermark; skips own messages and any
+    message older than 10 minutes (staleness cap). Updates watermarks after each
+    successful fetch.
+
+    Returns a formatted block, or "" when nothing new.
+    Silently returns "" on daemon-down or any error.
+    Opt-out: KHIMAIRA_CHAT_POLL_BANNER=0.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    try:
+        watermarks: dict[str, str] = {}
+        if _WATERMARKS_PATH.exists():
+            watermarks = json.loads(_WATERMARKS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        watermarks = {}
+
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+
+    try:
+        url = f"{_ENDPOINT}/api/chats?session_id={urllib.parse.quote(session_id, safe='')}"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=_INBOX_TIMEOUT_S) as resp:
+            my_chats: list[dict] = json.loads(resp.read()).get("chats", [])
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return ""
+
+    new_watermarks = dict(watermarks)
+    all_new: list[tuple[str, str, list[dict]]] = []
+
+    for chat in my_chats:
+        if chat.get("my_state") != "accepted":
+            continue
+        chat_id = chat["chat_id"]
+        title = chat.get("title") or chat_id[:18]
+        watermark = watermarks.get(chat_id)
+
+        try:
+            url = (
+                f"{_ENDPOINT}/api/chats/{chat_id}/messages"
+                f"?session_id={urllib.parse.quote(session_id, safe='')}&limit=20"
+            )
+            if watermark:
+                url += f"&since={urllib.parse.quote(watermark, safe='')}"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=_INBOX_TIMEOUT_S) as resp:
+                messages: list[dict] = json.loads(resp.read()).get("messages", [])
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            continue
+
+        if messages:
+            last_eid = messages[-1].get("event_id")
+            if last_eid:
+                new_watermarks[chat_id] = last_eid
+
+        new_msgs = [
+            m for m in messages
+            if m.get("kind") == "msg"
+            and m.get("sender_id") != session_id
+            and (m.get("ts") or "") >= cutoff_iso
+        ]
+        if new_msgs:
+            all_new.append((chat_id, title, new_msgs))
+
+    try:
+        _WATERMARKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _WATERMARKS_PATH.write_text(json.dumps(new_watermarks), encoding="utf-8")
+    except OSError:
+        pass
+
+    if not all_new:
+        return ""
+
+    lines: list[str] = []
+    for chat_id, _title, msgs in all_new:
+        lines.append(f"💬 MISSED CHAT EVENTS — {chat_id} ({len(msgs)} new)")
+        for m in msgs:
+            sender = m.get("sender_name") or (m.get("sender_id") or "?")[:8]
+            ts_raw = m.get("ts") or ""
+            try:
+                dt = datetime.fromisoformat(ts_raw)
+                ts_fmt = dt.strftime("%H:%M")
+            except ValueError:
+                ts_fmt = ts_raw[:5]
+            body = (m.get("body") or "").replace("\n", " ")
+            if len(body) > 120:
+                body = body[:117] + "..."
+            lines.append(f"  [{sender} → {ts_fmt}]: {body}")
+    return "\n".join(lines)
+
+
 def _channel_event_response_level(prompt: str) -> str:
     """Classify a channel-only prompt for response-suppression purposes.
 
@@ -954,6 +1056,19 @@ def main() -> int:
                 role_budget_block = _format_chat_roles(_roles)
         except Exception:  # noqa: BLE001 — hook must not break
             role_budget_block = ""
+
+    # --- v1.9.7: missed chat events poll (every turn) ---------------------
+    # Fetches messages that arrived in accepted chats while this session was
+    # idle between turns. SSE delivery is turn-gated; this poll closes the
+    # gap. Block is injected FIRST — highest-priority context. Watermarks
+    # tracked in chat_poll_watermarks.json so each event surfaces once.
+    # Opt-out: KHIMAIRA_CHAT_POLL_BANNER=0.
+    missed_chat_block = ""
+    if os.environ.get("KHIMAIRA_CHAT_POLL_BANNER") not in ("0", "false", "no"):
+        try:
+            missed_chat_block = _poll_missed_chat_events(session_id)
+        except Exception:  # noqa: BLE001 — hook must not break
+            missed_chat_block = ""
 
     # --- Phase B v1.8: persistent banner — pending task assignments -------
     # Solves the "in-window prompt gets lost in noisy sessions" UX gap:
@@ -1084,16 +1199,17 @@ def main() -> int:
         and not unfired_acks_block
         and not stale_acks_block
         and not quiet_channel_block
+        and not missed_chat_block
     ):
         return 0
 
-    # Ordering: quiet_channel (highest — fires on auto-triggered turns, short-
-    # circuits verbose response before other blocks even render) → bottleneck →
-    # pending_assignments → unfired_acks → stale_acks → role_budget → delegate →
-    # inbox → incoming questions → periodic reminder.
+    # Ordering: missed_chat (highest — cross-session events that landed while
+    # idle) → quiet_channel → bottleneck → pending_assignments → unfired_acks →
+    # stale_acks → role_budget → delegate → inbox → incoming questions → reminder.
     additional_context = "\n\n".join(
         b
         for b in (
+            missed_chat_block,
             quiet_channel_block,
             bottleneck_block,
             pending_assignments_block,

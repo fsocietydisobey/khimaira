@@ -59,6 +59,7 @@ TASK_IN_PROGRESS = "in_progress"
 TASK_DONE = "done"
 TASK_APPROVED = "approved"
 TASK_CHANGES_REQUESTED = "changes_requested"
+TASK_CANCELLED = "cancelled"
 
 # Phase B v2: explicit member roles in room.meta.member_roles.
 # Single-master-with-delegation invariant (audit F2): exactly one session
@@ -106,6 +107,8 @@ _TASK_TRANSITIONS: dict[tuple[str, str], set[str]] = {
     (TASK_DONE, TASK_APPROVED): {"master"},
     (TASK_DONE, TASK_CHANGES_REQUESTED): {"master"},
     (TASK_CHANGES_REQUESTED, TASK_IN_PROGRESS): {"assignee_or_any"},
+    (TASK_PENDING, TASK_CANCELLED): {"master"},
+    (TASK_IN_PROGRESS, TASK_CANCELLED): {"master"},
 }
 
 

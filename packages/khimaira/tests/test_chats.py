@@ -2682,3 +2682,62 @@ def test_create_room_member_roles_stored(isolated_chats, tmp_path, monkeypatch):
     # Verify round-trip: load_room returns the stored roles
     reloaded = isolated_chats.load_room(room["meta"]["chat_id"])
     assert reloaded["meta"]["member_roles"] == roles
+
+
+# ---------------------------------------------------------------------------
+# Bug #6 fix: master can cancel pending/in_progress tasks
+# ---------------------------------------------------------------------------
+
+
+def test_master_can_cancel_pending_task(isolated_chats):
+    """Master cancels a task stuck in pending (stale/superseded)."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "master-uuid", "master")
+    _make_session(sessions_mod, "agent-uuid", "agent")
+    c.create_room("master-uuid", ["agent-uuid"], title="t")
+    chat_id = c.my_chats("master-uuid")[0]["chat_id"]
+    c.accept(chat_id, "agent-uuid")
+
+    task = c.create_task(chat_id, "master-uuid", "stale work", assignee_session_id="agent-uuid")
+    assert task["status"] == c.TASK_PENDING
+
+    result = c.update_task_status(chat_id, task["id"], "master-uuid", c.TASK_CANCELLED)
+    assert result["status"] == c.TASK_CANCELLED
+
+
+def test_master_can_cancel_in_progress_task(isolated_chats):
+    """Master cancels a task whose assignee went silent mid-task."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "master-uuid", "master")
+    _make_session(sessions_mod, "agent-uuid", "agent")
+    c.create_room("master-uuid", ["agent-uuid"], title="t")
+    chat_id = c.my_chats("master-uuid")[0]["chat_id"]
+    c.accept(chat_id, "agent-uuid")
+
+    task = c.create_task(chat_id, "master-uuid", "abandoned work", assignee_session_id="agent-uuid")
+    c.update_task_status(chat_id, task["id"], "agent-uuid", c.TASK_IN_PROGRESS)
+
+    result = c.update_task_status(chat_id, task["id"], "master-uuid", c.TASK_CANCELLED)
+    assert result["status"] == c.TASK_CANCELLED
+
+
+def test_assignee_cannot_cancel_task(isolated_chats):
+    """Assignee (non-master) cannot cancel a task — cancel is master-only."""
+    import pytest
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "master-uuid", "master")
+    _make_session(sessions_mod, "agent-uuid", "agent")
+    c.create_room("master-uuid", ["agent-uuid"], title="t")
+    chat_id = c.my_chats("master-uuid")[0]["chat_id"]
+    c.accept(chat_id, "agent-uuid")
+
+    task = c.create_task(chat_id, "master-uuid", "work", assignee_session_id="agent-uuid")
+
+    with pytest.raises(ValueError, match="not authorized"):
+        c.update_task_status(chat_id, task["id"], "agent-uuid", c.TASK_CANCELLED)
