@@ -25,10 +25,12 @@ khimaira composes three pillars over a pure-CLI substrate:
 ```
 khimaira/                              # monorepo root, uv workspace
 │
-├── packages/                         # 4 publishable packages
-│   ├── khimaira/                      # the orchestrator
+├── packages/                         # 6 publishable packages
+│   ├── khimaira/                      # the orchestrator + session coordination daemon
+│   ├── khimaira-chat/                 # real-time cross-session chat MCP server
 │   ├── scarlet/                      # codebase cartography
 │   ├── seance/                       # semantic search
+│   ├── sibyl/                        # meeting recording + transcription
 │   └── specter/                      # browser debug
 │
 ├── shared/
@@ -45,7 +47,9 @@ khimaira/                              # monorepo root, uv workspace
 
 Each perception package (`scarlet`, `seance`, `specter`) exposes BOTH a library API (`<pkg>.api.*` for in-process import by khimaira) AND an MCP server (`<pkg>.server.mcp` for direct shell use). Same logic, two transports — the model is "SDK or SQL, same engine."
 
-**NORTH_STAR Phase 0 (2026-05-13)**: each perception package's FastMCP tools are now also re-registered on khimaira's MCP server at boot under source-prefixed names (`seance_*`, `specter_*`, `scarlet_*`), so one MCP connection from any editor exposes the entire khimaira-family surface (~113 tools). The standalone `seance serve` / `specter serve` / `scarlet serve` paths remain for backward compatibility and isolation testing.
+**NORTH_STAR Phase 0 (2026-05-13)**: each perception package's FastMCP tools are now also re-registered on khimaira's MCP server at boot under source-prefixed names (`seance_*`, `specter_*`, `scarlet_*`, `sibyl_*`), so one MCP connection from any editor exposes the entire khimaira-family surface (~119 tools). The standalone `seance serve` / `specter serve` / `scarlet serve` / `sibyl serve` paths remain for backward compatibility and isolation testing.
+
+`khimaira-chat` is a **second MCP server** (registered separately as `khimaira-chat` in Claude Code's MCP config). It runs as a per-session stdio subprocess that subscribes to the `khimaira-monitor` daemon's SSE event stream and delivers incoming chat messages directly into each Claude Code session's context as `<channel>` blocks — enabling real-time multi-session coordination with sub-2s latency without polling.
 
 ## khimaira package internals
 

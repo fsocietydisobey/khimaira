@@ -1,8 +1,8 @@
 # khimaira — v1.9 Orchestration Session State
 
-> State-of-the-build for Phase B, covering v1.6.1.2 through v1.9.3.
+> State-of-the-build for Phase B, covering v1.6.1.2 through v1.9.7.
 > Reference chat: `chat-62166102f561` (Round 12 through Round 14+).
-> 507/507 tests pass. ~15+ commits worth of changes uncommitted on `main`.
+> 522/522 tests pass. HEAD: `179f729`.
 
 ---
 
@@ -10,9 +10,10 @@
 
 A complete multi-agent orchestration stack on top of the khimaira-chat primitive.
 Started with a working but rough chat system (v1.6) and ended with:
-a 6-role taxonomy with budget bindings, enforcement-gate task assignment,
+a 7-role taxonomy with budget bindings, enforcement-gate task assignment,
 persistent assignment banners, private DMs, burst-cost reduction, an assign-batch
-coordinator daemon endpoint, and full role + spawn skill coverage.
+coordinator daemon endpoint, role.md auto-loading at boot, task cancellation,
+SSE replay-on-resume, and full role + spawn skill coverage.
 
 ---
 
@@ -46,6 +47,10 @@ Joseph → [intake-1] ← user-facing (sonnet/medium)
 coordination. Routine orchestration is mechanical; architect at opus/max is
 consulted on-demand for synthesis questions. This cuts cost concentration
 from the coordination layer.
+
+The standard 7-session roster is: `intake-1`, `khimaira-0` (master), `agent-1`,
+`agent-2`, `observer-1`, `architect-1`, `critic-1`. Bootstrap via
+`/khimaira-bootstrap-roster`.
 
 ---
 
@@ -229,6 +234,126 @@ Budget: sonnet/medium.
 
 ---
 
+### v1.9.4 — Intake + private DM default for hierarchical topology
+
+Hierarchical topology chats default `private=True` for intake↔master DMs.
+Session spawn skills updated to set topology field on room creation.
+
+---
+
+### v1.9.5 — Chat topology field + `task_status` private leak fix
+
+**Topology field:** `create_room` now accepts `topology: str` parameter
+(`"flat"` / `"hierarchical"` / `"custom"`). Stored in room meta. Surfaces in
+`my_chats` list so clients can visually distinguish chat types.
+
+**task_status private leak:** `task_status()` previously read all JSONL records
+directly via `_read()`, bypassing the private-filter path. Private task metadata
+was visible to non-recipients. Fixed: `task_status()` now routes through
+`history()` (which applies the filter), then folds `kind=task` + `kind=task_update`
+records to compute the final status.
+
+---
+
+### v1.9.6 — Role.md auto-loading, `member_roles` in `create_room`, `infer_role_from_name`, 📊 inverse banner
+
+**Role.md auto-loading at boot:**
+`session_start.py` now reads `_ROLES_DIR/<role>.md` and injects its contents
+into the session's boot context as:
+```
+📖 ROLE FILE — <role>
+<contents of roles/<role>.md>
+```
+Requires a non-empty `chat_roles` from `_discover_chat_roles`. The file must
+exist at `packages/khimaira/src/khimaira/roles/<role>.md`. OSError guard: missing
+file skips silently. Block appears before the `🎚️ chat roles` budget reminder.
+
+**`member_roles` in `create_room`:**
+`create_room(creator_id, invitees, ..., member_roles: dict | None = None)` stores
+the role map in the room's META record. `_discover_chat_roles` can then resolve
+each member's role from the explicit map (vs. inferring from created_by/accepted
+records). `/khimaira-bootstrap-roster` uses this to wire roles at room creation
+time.
+
+**`infer_role_from_name`:**
+`infer_role_from_name(name: str) -> str | None` — checks the session's name
+prefix against the ROLE_BUDGET allowlist keys. `"agent-1"` → `"agent"`,
+`"architect-2"` → `"architect"`. Returns None for names that don't match any
+known role prefix (e.g. `"khimaira-0"`).
+
+**📊 ASSIGNMENTS AWAITING ACK banner (inverse of ⏳):**
+UserPromptSubmit hook now surfaces tasks that the current session created
+(as master) but that still have `status=pending`. Closes the gap where master
+lost track of pending assignments they fired but haven't received acks for yet.
+Opt-out: `KHIMAIRA_UNFIRED_ACK_BANNER=0`.
+
+---
+
+### v1.9.7 — SSE replay-on-resume, task TASK_CANCELLED, kind==msg filter
+
+**SSE replay-on-resume (💬 MISSED CHAT EVENTS banner):**
+UserPromptSubmit hook now polls `/api/chats/{id}/messages?since=<watermark>` for
+each accepted chat. Messages from other senders that arrived while the session was
+idle (not within the last 10 minutes, to avoid double-reporting live events) are
+surfaced as:
+```
+💬 MISSED CHAT EVENTS — <chat-title> (N new)
+  [sender → HH:MM]: <first 80 chars of body>
+  ...
+```
+Watermarks persist in `_WATERMARKS_PATH` so replay is idempotent across turns.
+Opt-out: `KHIMAIRA_CHAT_POLL_BANNER=0`.
+
+**TASK_CANCELLED terminal state:**
+`TASK_CANCELLED = "cancelled"` added to `monitor/chats.py`. Two new transitions
+in `_TASK_TRANSITIONS`:
+- `(TASK_PENDING, TASK_CANCELLED): {"master"}` — cancel stale/superseded pending task
+- `(TASK_IN_PROGRESS, TASK_CANCELLED): {"master"}` — cancel task whose agent went silent
+
+Assignees cannot cancel (`assignee_or_any` is NOT in the allowed set). `done →
+cancelled` is intentionally absent — use approve or changes_requested instead.
+
+`"cancelled"` added to `new_status` enum in `khimaira-chat/server.py` MCP tool schema.
+
+**kind==msg filter on missed-chat banner:**
+Private task records (`kind=task`, `kind=task_update`) have `sender_id` redacted
+for non-recipients. These leaked through the sender filter as blank entries in the
+missed-chat banner. Fixed: only `kind=msg` records are included.
+
+---
+
+## Hook context blocks injected per turn
+
+Each session receives a layered context injection from the SessionStart and
+UserPromptSubmit hooks. Here is the complete catalog:
+
+### SessionStart blocks (once per boot)
+
+| Block | Hook | Since | Notes |
+|---|---|---|---|
+| `🆔 khimaira session_id: ...` | SessionStart | v1.0 | Always emitted |
+| `💬 To enable real-time chat delivery...` | SessionStart | v1.3 | Nudges agent to call `chat_my_chats` |
+| `📬 khimaira inbox — N unread answer(s)` | SessionStart | v1.0 | Only when inbox non-empty |
+| `📦 khimaira handoffs` | SessionStart | v1.0 | Only when cwd-scoped handoffs exist |
+| `📋 khimaira tasks — N open assignment(s)` | SessionStart | v1.0 | Only when task sources configured |
+| `📖 ROLE FILE — <role>` | SessionStart | v1.9.6 | Only when session is in a chat with a resolved role |
+| `🎚️ khimaira chat roles + recommended budgets` | SessionStart | v1.6.1 | Only when session has accepted chat memberships |
+| `📋 khimaira — N other session(s) active` | SessionStart | v1.0 | Only when other sessions active in last 30min |
+
+### UserPromptSubmit blocks (every turn)
+
+| Block | Since | Condition |
+|---|---|---|
+| `💬 MISSED CHAT EVENTS — <chat>` | v1.9.7 | Messages from others arrived while idle; replayed from watermark |
+| `📊 ASSIGNMENTS AWAITING ACK` | v1.9.6 | Master has pending tasks not yet acked by assignee |
+| `⏳ KHIMAIRA PENDING ASSIGNMENT(S)` | v1.8 | Session has unacked task assignment |
+| `⚠️ STALE TASK ACK(S)` | v1.8 | Previously-acked task's budget drifted post-restart |
+| `🎚️ khimaira chat roles + recommended budgets` | v1.7 | Session is in at least one chat |
+| `🔇 channel-only event — respond minimally` | v1.9 | Turn triggered by SSE channel block (non-review event) |
+| `📋 channel event — master review required` | v1.9 | Turn triggered by SSE channel block (done/task event) |
+
+---
+
 ## All new skills (this session)
 
 | Skill | Description |
@@ -238,6 +363,7 @@ Budget: sonnet/medium.
 | `/khimaira-consult <deputy> "<question>"` | Fire opus-grade synthesis question to a named sidecar |
 | `/khimaira-spawn-architect [name]` | Spawn opus/max consult sidecar (default: `architect-1`) |
 | `/khimaira-spawn-intake [name]` | Spawn sonnet/medium user-facing front-end (default: `intake-1`) |
+| `/khimaira-bootstrap-roster [<map>]` | Onboard a fresh 7-role roster in one call |
 
 Deleted: `/khimaira-spawn-deputy`
 
@@ -255,14 +381,16 @@ Deleted: `/khimaira-spawn-deputy`
 | `roles/intake.md` | ✅ (v1.9.3) |
 
 All 6 have low-volume-events constraint in Constraints section.
+Role files are auto-injected at boot via `📖 ROLE FILE` block (v1.9.6).
 
 ---
 
 ## Test suite
 
-507/507 pass. No regressions.
+522/522 pass. No regressions.
 
-Key additions this session: +4 scope_cwd tests, +5 assign-batch tests, +4 private DM tests.
+Key additions this session: +4 scope_cwd tests, +5 assign-batch tests, +4 private DM
+tests, +3 task-cancel tests, +2 missed-chat banner tests.
 
 ---
 
@@ -270,32 +398,31 @@ Key additions this session: +4 scope_cwd tests, +5 assign-batch tests, +4 privat
 
 | File | Changes |
 |---|---|
-| `monitor/chats.py` | `ROLE_ARCHITECT`, `ROLE_INTAKE`, `ROLE_BUDGET`; `private` param on 3 functions; `history()` filter; `load_room` fix; `assign_batch` coordinator |
-| `monitor/api/chats.py` | `private` fields on 3 models; `AssignBatchReq`; route handlers |
+| `monitor/chats.py` | `ROLE_ARCHITECT`, `ROLE_INTAKE`, `ROLE_BUDGET`; `private` param on 3 functions; `history()` filter; `load_room` fix; `assign_batch` coordinator; `topology` field; `member_roles` param; `infer_role_from_name`; `TASK_CANCELLED` + 2 transitions |
+| `monitor/api/chats.py` | `private` fields on 3 models; `AssignBatchReq`; route handlers; `topology` field |
 | `monitor/sessions.py` | `scope_cwd` on `post_notice`; inbox filter |
 | `monitor/api/sessions.py` | `NoticeReq.scope_cwd`; `?cwd=` query params |
 | `server/monitor_tools.py` | `session_post_notice` MCP `scope_cwd` param |
-| `hooks/user_prompt_submit.py` | `_check_bottleneck`, persistent banner functions, `_channel_event_response_level`; `scope_cwd` pass-through |
-| `hooks/session_start.py` | `_ROLE_BUDGET` (architect, intake); implicit-agent fallback; `_consume_inbox(cwd=)` |
-| `packages/khimaira-chat/src/khimaira_chat/server.py` | 4 tool schemas + dispatch with `private` |
+| `hooks/user_prompt_submit.py` | `_check_bottleneck`, persistent banner functions, `_channel_event_response_level`; `scope_cwd` pass-through; `_discover_unfired_acks`; `_poll_missed_chat_events` |
+| `hooks/session_start.py` | `_ROLE_BUDGET` (architect, intake); implicit-agent fallback; `_consume_inbox(cwd=)`; `_ROLES_DIR`; role.md injection block |
+| `packages/khimaira-chat/src/khimaira_chat/server.py` | 4 tool schemas + dispatch with `private`; `"cancelled"` in `new_status` enum |
 | `packages/khimaira-chat/src/khimaira_chat/daemon_client.py` | 3 wrappers with `private` |
 | `packages/khimaira/src/khimaira/roles/` | 6 role docs |
-| `~/.claude/commands/` | 5 new skills; `khimaira-spawn-deputy.md` deleted |
-| `tests/test_chats.py` | +4 private DM tests; +5 assign-batch tests |
+| `~/.claude/commands/` | 6 new skills; `khimaira-spawn-deputy.md` deleted |
+| `tests/test_chats.py` | +4 private DM tests; +5 assign-batch tests; +3 cancel tests |
 | `tests/test_sessions_unit.py` | +4 scope_cwd tests |
+| `tests/test_user_prompt_submit.py` | +2 missed-chat banner tests |
 | `scripts/watchers/khimaira-bottleneck-watch.sh` | `scope_cwd` pass-through |
 | `tasks/v1.9-assign-batch/IMPLEMENTATION.md` | Assign-batch coordinator design spec |
 
 ---
 
-## Pending / not done
+## Known gaps
 
-| Item | Notes |
+| Gap | Notes |
 |---|---|
-| intake-1 session not yet spawned | Skill exists; needs Joseph to `/rename` a fresh window + `/model sonnet` + `/effort medium` |
-| Role.md auto-loading | Files exist but NOT injected into hook context yet — agents must read them manually |
-| v1.7.3 SSE replay-on-resume | Known gap; not fixed this session |
-| `task_status` private leak | `task_status()` reads all records via `_read()` directly; may expose private task metadata |
-| ~15+ commits uncommitted on `main` | |
+| SSE delivery during restart window | Events that arrive while Claude Code is restarting are not delivered. Missed-chat banner (v1.9.7) surfaces them on the next turn via polling — but the gap still exists; it's mitigated, not fixed. |
+| `-n` flag not syncing to `session_list` | `session_set_name` updates the daemon's in-memory state; if the daemon restarts, names are lost until the session sets them again on boot. |
+| Programmatic `/model` switching requires user action | Chat role directives are advisory. If a session is reassigned to a different role requiring a different model, the user must type the `/model` command manually in that window. No automated enforcement path exists. |
+| Intake-master private bootstrap enforcement | `intake.md` spec says `private=True` default; currently just a convention — not enforced at the API level. |
 | Anthropic GitHub issues #59499–#59502 outreach | Pending |
-| Intake-master private bootstrap | `intake.md` spec says `private=True` default; no enforcement yet |

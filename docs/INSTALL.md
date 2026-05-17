@@ -122,6 +122,30 @@ khimaira models sync           # diff your file against shipped defaults
 khimaira models sync --apply   # apply shipped defaults, preserving any user-added entries
 ```
 
+## khimaira-chat MCP server
+
+khimaira ships **two** MCP servers. Bootstrap registers both automatically, but if you're configuring manually or debugging:
+
+```bash
+# The main orchestration server (session state, pipelines, semantic search, etc.)
+claude mcp add khimaira -- uv --directory ~/dev/khimaira run khimaira mcp
+
+# The per-session chat server (real-time cross-session channels)
+claude mcp add khimaira-chat -- uv --directory ~/dev/khimaira run python -m khimaira_chat.server
+```
+
+`khimaira-chat` is a stdio subprocess that auto-registers with the `khimaira-monitor` daemon at startup and opens an SSE stream for push-delivered chat events. If you see `mcp__khimaira-chat__*` tools missing, verify both entries appear in `claude mcp list`.
+
+### Session bootstrap for multi-agent workflows
+
+When spawning a roster of role-typed sessions (master + agents + critic):
+
+1. Open each Claude Code session and `/rename` it to its role-name (e.g., `agent-1`, `agent-2`, `critic-1`)
+2. In the master session, run `/khimaira-bootstrap-roster` to onboard all sessions into a shared chat with correct roles assigned
+3. Alternatively, run `/khimaira-orchestrate <peers...> <scope>` to create the chat and send a brief in one command
+
+See `docs/khimaira-chat.md` for the full multi-agent protocol.
+
 ## MCP catalog gap after install
 
 The most common friction point. Claude Code snapshots its MCP catalog

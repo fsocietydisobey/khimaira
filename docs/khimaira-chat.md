@@ -547,14 +547,17 @@ A free-form `chat_send` message carries the request fine but loses lifecycle sta
 stateDiagram-v2
     [*] --> pending : chat_task_create
     pending --> in_progress : assignee_or_any
+    pending --> cancelled : master
     in_progress --> done : assignee_or_any
+    in_progress --> cancelled : master
     done --> approved : master
     done --> changes_requested : master
     changes_requested --> in_progress : assignee_or_any
     approved --> [*]
+    cancelled --> [*]
 ```
 
-`approved` is terminal in v1 — there is no re-open path. If post-approval rework is needed, create a fresh task. `changes_requested` loops back to `in_progress` so the assignee can pick up rework directly without an intermediate state.
+`approved` and `cancelled` are terminal — there is no re-open path. If post-approval rework is needed, create a fresh task. `changes_requested` loops back to `in_progress` so the assignee can pick up rework directly without an intermediate state. `cancelled` is master-only and can fire from `pending` or `in_progress` (e.g., scope changed, task superseded). Added v1.9.7.
 
 ### The role model
 
@@ -571,12 +574,14 @@ Authorization is checked **server-side** in `update_task_status`. The MCP tool's
 | From | To | Who |
 |---|---|---|
 | `pending` | `in_progress` | assignee (or any accepted member if unassigned) |
+| `pending` | `cancelled` | master only |
 | `in_progress` | `done` | assignee (or any accepted member if unassigned) |
+| `in_progress` | `cancelled` | master only |
 | `done` | `approved` | master only |
 | `done` | `changes_requested` | master only |
 | `changes_requested` | `in_progress` | assignee (or any accepted member if unassigned) |
 
-Any other transition raises `ValueError("Invalid transition ...")`.
+Any other transition raises `ValueError("Invalid transition ...")`. `cancelled` was added in v1.9.7.
 
 ### When to use `chat_task_create` vs `chat_send`
 
@@ -633,29 +638,31 @@ chat_task_status(chat_id) → [
 
 One call returns the folded current state of every task in the chat. Use it for *"what's blocking me"* (filter `status == "pending"`), *"what's awaiting my approval"* (`status == "done"` and you're the master), *"what got approved this week"* (`status == "approved"`, sort by `last_update_ts`). Cheap — it's a fold over the chat's JSONL, no separate index.
 
-### Known v1 limitation: task records don't push channel blocks
+### ~~Known v1 limitation: task records don't push channel blocks~~ ✅ Shipped Phase B v1.1
 
-`chat_task_create` and `chat_task_update` write `kind=task` and `kind=task_update` records to the JSONL and broadcast them on the daemon's SSE stream — but the chat MCP subprocess's `_proactive_sse_loop` currently filters on `kind=msg` when emitting channel notifications. Result: in v1, assignees won't see a channel block when a task is created or transitioned. They need to either poll `chat_task_status` or you need to send a heads-up `chat_send` alongside.
+`chat_task_create` and `chat_task_update` now emit `<channel>` blocks automatically. The chat MCP subprocess's `_proactive_sse_loop` was extended to handle `kind in {task, task_update}` alongside `kind=msg`. Routing:
 
-Planned for **Phase B v1.1** — see "Phase B v1.1 follow-ups" below.
+- `kind=task` → pushed to the assignee (or broadcast to all accepted members if unassigned)
+- `kind=task_update` → pushed to the task's assignee and the updater's counterpart (master sees agent's `done`; agent sees master's `approved`/`changes_requested`)
+
+Channel-block body format: `📋 task <id> [<status>] from <by_name>: <body or note>`. The `to=[...]` mechanism from Phase B's per-recipient routing is the implementation layer — the two features compose cleanly. See Phase B v1.1 follow-ups below for the full shipping record.
 
 ### Gotchas
 
-- **`approved` is terminal.** No re-open path in v1. Create a fresh task if you need to rework after approval.
+- **`approved` and `cancelled` are terminal.** No re-open path. Create a fresh task if you need to rework after approval. `cancelled` silently drops the task from active tracking — use `chat_task_status` to confirm.
+- **`cancelled` is master-only.** Assignees cannot cancel their own tasks. Master fires it from `pending` or `in_progress` (e.g., scope changed, task superseded). Added v1.9.7.
 - **Unassigned tasks are first-come-first-served.** No lock; whichever accepted member fires `pending → in_progress` first claims it. For exclusive work, set an assignee at create time.
 - **The MCP enum doesn't include `pending`.** It's a creation-only state — there's no transition *to* pending. The enum lists only valid `new_status` targets.
 - **Master is implicit, not declared.** v1 binds master = creator. If the creator leaves the chat (`chat_leave`), no other member inherits master powers in v1 — `done → approved` becomes unreachable until they re-join. Plan ownership accordingly.
 
 ## Phase B v1.1 follow-ups
 
-Two improvements are already designed and queued, both small in scope:
+Two improvements were designed and queued; both are now shipped:
 
-1. **Task records push channel notifications.** Extend the chat MCP subprocess's `_proactive_sse_loop` filter from `kind == "msg"` to `kind in {msg, task, task_update}`. Routing:
+1. **Task records push channel notifications** — ✅ shipped Phase B v1.1. Extended the chat MCP subprocess's `_proactive_sse_loop` filter from `kind == "msg"` to `kind in {msg, task, task_update}`. Routing:
    - `kind == "task"` → push channel block to `[assignee]` if set, else broadcast to accepted members.
    - `kind == "task_update"` → push to `[task.assignee, task.creator]` (or just creator if unassigned). Closes the inverse "did the agent finish?" polling gap on the master's side.
    - Channel-block body format: `📋 task <id> [<status>] from <by_name>: <body or note>` — concise enough to glance at without scrolling.
-
-   ~30 LOC + 2 tests. Once shipped, the `to=[...]` mechanism from Phase B becomes the natural implementation layer — the two features compose.
 
 2. **Wiring auto-accept across session reboots** — ✅ shipped 2026-05-15 in the same Phase B v1.1 commit. Named sessions now persist their allowlist at `~/.local/state/khimaira/chats/auto-accept-by-name-<name>.json` (durable across UUID churn). The chat MCP subprocess auto-applies the by-name file at boot, immediately after the dual-name auto-bridge calls `session_set_name`. Unnamed sessions fall back to UUID-keyed storage (legacy behavior). `get_auto_accept` prefers by-name when the session has a name. See `apply_auto_accept_by_name` in `khimaira.monitor.chats` and the `POST /api/sessions/{sid}/auto-accept/apply-by-name?name=…` endpoint.
 

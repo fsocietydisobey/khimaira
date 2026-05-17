@@ -1,14 +1,26 @@
 # khimaira
 
-> The orchestration layer that lives below any AI tool. One MCP config
-> line connects your editor — Claude Code, Cursor, Cline, Continue,
-> Neovim, aider — to a single khimaira server that routes every
-> prompt to the cheapest competent model, observes any LangGraph app,
-> coordinates parallel sessions, and tracks real savings against your
-> always-Opus baseline.
+> A multi-agent orchestration layer for Claude Code. Six roles,
+> real-time cross-session chat, automated cost routing, and a
+> four-tool perception stack — all wired through a single MCP
+> connection.
 
 **No API keys required to start. No editor plugin to install. No new
 UI to learn.**
+
+---
+
+## What it is
+
+khimaira gives you a structured way to run parallel Claude Code
+sessions as a coordinated team:
+
+- **6-role agent topology** — intake → master → agents / observers / architects / critics, each at the right model tier
+- **Cross-session real-time chat** via the `khimaira-chat` primitive (SSE delivery, task lifecycle, private DMs)
+- **Automated cost routing** — `mcp__khimaira__auto` classifies and routes every prompt to the cheapest competent model in your pool
+- **Enforcement-gate task assignment** — `/khimaira-assign` fans out tasks to N agents in one daemon round-trip; agents can't start until they've verified their budget settings
+- **LangGraph observability** — zero-touch venv injection, per-run cost/trace dashboards
+- **Perception tools** — Séance (semantic search), Specter (browser debug via CDP), Scarlet (codebase cartography), Sibyl (meeting transcription)
 
 ---
 
@@ -39,201 +51,285 @@ Two routes earn savings credit:
 - **`mode=auto`** — an agent or human called
   `mcp__khimaira__auto(prompt)`. The classifier (~$0.0004) picks a
   task tier; the pool router picks the cheapest model in that tier
-  from the enabled pool. Audit log in `~/.local/state/khimaira/khimaira.log`
-  shows pool size, top-2 candidates, and rejected reasons per dispatch.
+  from the enabled pool.
 - **`mode=subagent`** — Claude Code's auto-delegation routed the
   prompt to one of the `khimaira-*` subagents in `~/.claude/agents/`.
   Native model-swap; recorded by the `SubagentStop` hook. A single
   `khimaira-factual` dispatch on Haiku shows ~94.7% savings vs Opus.
 
-Override the baseline (e.g. compare against Sonnet) via
-`KHIMAIRA_USAGE_BASELINE_MODEL=claude-sonnet-4-6` or `baseline_model:`
-in `~/.khimaira/models.yaml`.
+The 6-role orchestration topology amplifies this further: routine
+coordination runs at sonnet/medium, observers at haiku, and architect
+(opus/max) only fires when you explicitly consult it.
+
+Override the baseline via `KHIMAIRA_USAGE_BASELINE_MODEL=claude-sonnet-4-6`
+or `baseline_model:` in `~/.khimaira/models.yaml`.
+
+---
+
+## The orchestration stack
+
+The biggest thing khimaira ships. Six roles, one hierarchical chat,
+one command to wire them all up.
+
+### Topology
+
+```
+Joseph → [intake-1]              ← you talk here (sonnet/medium)
+              │  🎯 INTAKE HANDOFF (private DM)
+              ▼
+          [master]                ← orchestrator (sonnet/medium)
+              │  /khimaira-assign    /khimaira-consult
+              ├─── [agent-1]         ← executor (sonnet/medium)
+              ├─── [agent-2]         ← executor (sonnet/medium)
+              ├─── [observer-1]      ← auditor (haiku/default)
+              ├─── [architect-1]     ← design sidecar (opus/max, on-demand)
+              └─── [critic ad-hoc]   ← challenger (orchestrator picks budget)
+```
+
+### Role taxonomy
+
+| Role | Model | Effort | Job |
+|---|---|---|---|
+| `intake` | sonnet | medium | User-facing front-end; parses intent → structured handoff to master |
+| `master` | sonnet | medium | Orchestrator; decomposes, delegates, integrates |
+| `agent` | sonnet | medium | Executor; runs assigned tasks via enforcement-gate protocol |
+| `observer` | haiku | default | Read-only auditor; surfaces anomalies |
+| `architect` | opus | max | Synthesis sidecar; consulted on-demand for design decisions |
+| `critic` | (caller picks) | (caller picks) | Constructive challenger; summoned ad-hoc for review |
+
+Master was moved from opus/max to sonnet/medium — routine coordination
+is mechanical. Architect at opus/max is reserved for synthesis
+questions where depth matters.
+
+### Bootstrap a roster in one command
+
+Open your role-prefixed windows (`agent-1`, `agent-2`, `observer-1`,
+`architect-1`, `intake-1`) then in master's window:
+
+```
+/khimaira-bootstrap-roster
+```
+
+This reads `session_list()`, infers roles from session names via
+`infer_role_from_name()` (any `agent-*` → agent, `observer-*` →
+observer, etc.), creates a hierarchical chat with all of them as
+accepted members, binds each to their role budget, and briefs each
+session with their role file. One command; roster is live.
+
+For non-default names or explicit mappings:
+
+```
+/khimaira-bootstrap-roster intake=front-desk agent=worker-a,worker-b
+```
+
+### How a task flows
+
+**1. You ask intake:**
+> "Can we add rate limiting to the auth endpoints?"
+
+Intake formats a structured handoff to master (private DM):
+```
+🎯 INTAKE HANDOFF [intake-id: 3f9a1b2c]
+Intent: Add rate limiting to auth endpoints
+Scope: auth/ directory; exclude public read endpoints
+Success criterion: 429 responses after N req/min, configurable
+Constraints: don't break existing tests
+```
+
+**2. Master decomposes and delegates:**
+```
+/khimaira-assign agent-1,agent-2 "implement rate limiting middleware" \
+    --model sonnet --effort medium
+```
+
+The daemon coordinator handles everything in **one round-trip**:
+task creation, SSE fan-out to all agents, ack collection, begin signal.
+
+**3. Agents go through the enforcement gate:**
+
+Each agent window shows:
+```
+⏳ KHIMAIRA PENDING ASSIGNMENT(S)
+  [task-abc] implement rate limiting middleware
+  Required: /model sonnet, /effort medium
+  From: master
+```
+
+Agent sets their budget, then:
+```
+/agent-ready
+```
+
+The skill reads `~/.claude/settings.json`, verifies compliance, and
+acks master automatically. After all agents ack, master fires the
+begin signal and work starts.
+
+**4. Master consults architect (when needed):**
+```
+/khimaira-consult architect-1 "Redis vs Postgres for rate-limit token
+bucket — 500k req/min peak, PG already in stack, no Redis today?"
+```
+
+Architect replies with one structured synthesis: context → options →
+recommendation → risks. Costs nothing between consults.
+
+**5. Completion:**
+
+Agents report `done` via `chat_task_update`. The `📋 channel event —
+master review required` block surfaces in master's next turn. Master
+reviews and approves or sends back with specific feedback.
+
+### Persistent context blocks
+
+Every turn, the UserPromptSubmit hook injects relevant context:
+
+| Block | When | Action |
+|---|---|---|
+| `🆔 khimaira session_id: ...` | On boot | Your ID for tool calls |
+| `🎚️ khimaira chat roles + recommended budgets` | Every turn | Set `/model` + `/effort` to match |
+| `⏳ KHIMAIRA PENDING ASSIGNMENT(S)` | Unacked task | Set budget → `/agent-ready` |
+| `⚠️ STALE TASK ACK(S)` | Budget drifted post-restart | Correct budget → `/agent-ready` |
+| `💬 MISSED CHAT EVENTS` | Messages arrived while idle | New context from other sessions |
+| `🔇 channel-only event` | Chat ping, no user input | Acknowledge in one sentence |
+| `📋 channel event — master review required` | Agent marked task done | Review and approve or push back |
+
+### Skill quick reference
+
+| Skill | Who | What |
+|---|---|---|
+| `/khimaira-bootstrap-roster [map]` | master | Wire up a named roster into a hierarchical chat in one call |
+| `/khimaira-assign <agents> <task>` | master | Enforce-gate task assignment; daemon handles fan-out |
+| `/agent-ready` | agent | Verify budget + ack master for pending assignment |
+| `/khimaira-consult <name> "<question>"` | master | Fire opus/max synthesis question to architect |
+| `/khimaira-spawn-architect [name]` | master | Request Joseph to open architect window |
+| `/khimaira-spawn-intake [name]` | master | Request Joseph to open intake window |
+| `/khimaira-deputize <vice>` | master | Pause-and-handoff master role to a fresh window |
+| `/khimaira-resume` | vice | Reclaim master role after deputize |
 
 ---
 
 ## Install
 
-**Quickest path — from PyPI** (live as of v0.1.0):
-
-```bash
-pip install khimaira
-```
-
-That gives you the ~65-tool native surface: orchestration, monitor,
-sessions, observer, dispatch, task sources. Then add khimaira as an
-MCP server in your editor:
-
-```jsonc
-{
-  "mcpServers": {
-    "khimaira": {
-      "command": "khimaira",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-Drop that into any MCP host's config (Claude Code, Cursor, Cline,
-Continue, custom). Restart the editor. khimaira self-configures on
-first connect — registers hooks, installs the supervisor, builds the
-dashboard.
-
-**Full surface (~119 tools, including Séance / Specter / Scarlet / Sibyl)**:
-the sibling packages are squatted on PyPI under their bare names, so
-v0.1.0 ships only the khimaira core. The full sibling surface needs
-the git install (sibling tools land on PyPI as `khimaira-seance` etc.
-in v0.2.0):
+**Quickest path — `uvx` one-shot:**
 
 ```bash
 uvx --from git+https://github.com/fsocietydisobey/khimaira khimaira bootstrap \
     --profile https://raw.githubusercontent.com/fsocietydisobey/khimaira/main/khimaira-profile.community.yaml
 ```
 
-Full guide: [`docs/INSTALL.md`](docs/INSTALL.md). Adapter authors
-integrating khimaira with a different editor: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+This clones the repo, runs `uv sync --all-packages`, registers khimaira
+as an MCP server in Claude Code, writes hooks to `~/.claude/settings.json`,
+and installs the systemd supervisor (Linux) or starts `khimaira monitor watch`
+(macOS). Re-running is idempotent.
 
----
+**Clone + bootstrap:**
 
-## Where khimaira sits
-
-```mermaid
-flowchart LR
-    User([You]) -->|terminal| Editor["Claude Code · Cursor · Cline · Continue<br/>Neovim · aider · any MCP host"]
-    Editor -->|MCP| Khimaira["⬢ khimaira<br/>orchestration layer"]
-    Khimaira -->|subprocess| Claude["claude"]
-    Khimaira -->|subprocess| Codex["codex"]
-    Khimaira -->|subprocess| Gemini["gemini"]
-    Khimaira -->|subprocess| Ollama["ollama (local — $0)"]
-    Khimaira -->|subprocess| LLM["llm + OpenRouter"]
-    Khimaira -.->|unified MCP| Scarlet["Scarlet<br/>cartography"]
-    Khimaira -.->|unified MCP| Seance["Séance<br/>semantic search"]
-    Khimaira -.->|unified MCP| Specter["Specter<br/>browser debug"]
-
-    style Khimaira fill:#1f6feb,stroke:#0d419d,color:#fff
-    style Ollama fill:#2da44e,stroke:#1a7f37,color:#fff
+```bash
+git clone https://github.com/fsocietydisobey/khimaira.git ~/dev/khimaira
+cd ~/dev/khimaira
+uv sync --all-packages
+uv run khimaira bootstrap --profile khimaira-profile.community.yaml
 ```
 
-Khimaira does NOT replace your editor, ship a TUI, or introduce a
-chat UI. It runs below the model-selection layer. Removing it leaves
-your editor working exactly as before.
+**Verify:**
 
-**Pure CLI substrate** — khimaira invokes your terminal AI tools as
-subprocesses; it never makes API calls of its own. No keys, no
-surprise bills, no provider SDK lock-in. Local-only via Ollama is a
-zero-marginal-cost backstop.
+```bash
+khimaira doctor          # daemon up? hooks current? supervisor active?
+khimaira tools           # all MCP tools + CLI commands + slash commands
+khimaira usage savings   # empty until you've dispatched something
+```
+
+In a fresh Claude Code session:
+```
+🆔 khimaira session_id: `...`
+```
+
+If `mcp__khimaira__*` tools don't appear, restart Claude Code — it
+snapshots the MCP catalog at session start.
+
+Full guide: [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ---
 
-## How a task flows through khimaira
+## Auto-routing
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant U as You
-    participant E as Editor
-    participant K as khimaira
-    participant CR as Context resolver
-    participant R as Pool router
-    participant Run as CLI runner
-    participant T as Usage tracker
-
-    U->>E: "fix the auth bug where ..."
-    E->>K: mcp__khimaira__auto(prompt)
-    K->>CR: resolve_context(task)
-    CR-->>K: ContextBundle (3 files, 2.1k tok)
-    K->>R: classify + route(task, context)
-    R-->>K: claude / haiku-4-5 (trivial: $0.005 ceiling)
-    K->>Run: run_claude(prompt, model=haiku-4-5)
-    Run-->>K: RunnerResult
-    K->>T: record(runner, model, tokens, cost, mode="auto")
-    K-->>E: result + cost summary
-    E-->>U: "fix applied. cost: $0.003"
+```bash
+# In any Claude Code session:
+mcp__khimaira__auto(prompt="rename all X to Y in the auth module")
+# → classifier picks "mechanical-edit" tier → pool router picks haiku → $0.003
 ```
 
 Every dispatch is **classify → route → run → record**. The classifier
-cost is dwarfed by the savings from routing trivial tasks down-tier.
+cost (~$0.0004) is dwarfed by the savings from routing trivial tasks
+down-tier.
 
----
-
-## What you get
-
-| Capability | One-liner |
-|---|---|
-| **Auto-routing** | `mcp__khimaira__auto(prompt)` picks the cheapest competent model from your pool. Real savings tracked. |
-| **Subagent library** | 8 curated Claude Code subagents at `~/.claude/agents/khimaira-*`, each pinned to the right model. Native auto-delegation; you don't think about it. |
-| **LangGraph observer** | `khimaira attach <app>` injects a zero-touch observer into any Python project's venv. Cost, slow calls, trace waterfalls in a local dashboard. |
-| **Multi-session coordination** | Sessions, inboxes, handoffs, decisions, transcripts. Parallel Claude/Cursor/Cline windows can ask each other questions, leave directives, see what stopped sessions said. |
-| **Process observability** | `wait_for_process(label, completion_signal=regex)` replaces 30 polling calls with one blocking MCP call. |
-| **Codebase cartography + browser debug** | Séance (semantic search via `seance_*`), Scarlet (CLAUDE.md + dep graphs via `scarlet_*`), Specter (browser debug via CDP, `specter_*`) — all re-registered under khimaira's MCP at boot. One connection, 113 tools. |
-| **Task sources** | SessionStart hook surfaces what's on your plate from any configured task source (JSONL, GitHub Issues, plug in your own via Protocol). |
-
-Full surface map: `khimaira tools`.
-
----
-
-## The model registry — `~/.khimaira/models.yaml`
-
-Which models are enabled for `auto`'s pool, at what cost-per-million,
-with what capabilities. User-editable YAML. Sensible defaults ship;
-override per-machine without forking khimaira.
+The model pool is user-editable YAML (`~/.khimaira/models.yaml`):
 
 ```yaml
-baseline_model: claude-opus-4-7   # for savings counterfactual
+baseline_model: claude-opus-4-7
 
 models:
   - id: claude-haiku-4-5
     runner: claude
-    input_per_m: 0.8
-    output_per_m: 4.0
     enabled_for_auto: true
     capabilities: [factual, syntax, simple-code, classification]
 
   - id: gemini-2.5-flash
     runner: gemini
-    input_per_m: 0.075
-    output_per_m: 0.30
     enabled_for_auto: true
     capabilities: [factual, syntax, simple-code, large-context]
 
   - id: claude-sonnet-4-6
     runner: claude
-    input_per_m: 3.0
-    output_per_m: 15.0
     enabled_for_auto: true
     capabilities: [multi-file-reasoning, code-review, refactor]
 ```
 
 `khimaira models sync` diffs your registry against shipped defaults
-and applies merges (with backup) when you want to pick up new models.
+and applies merges.
 
 ---
 
-## Subagent library — thinking-token interception
+## Subagent library
 
 8 curated Claude Code subagents at `~/.claude/agents/khimaira-*.md`,
-each pinned to the right model for its role. When Claude Code's
-auto-delegation matches a subagent's `description`, it routes the
-work there and **swaps the model for that turn**. Opus delegates
-trivial work to Haiku without you (or the parent agent) doing
-anything.
+each pinned to the right model. When Claude Code's auto-delegation
+matches a subagent's description, it routes the work there and swaps
+the model for that turn — Opus delegates trivial work to Haiku
+without you doing anything.
 
 | Agent | Model | Routes when… |
 |---|---|---|
-| `khimaira-factual` | haiku | definitional + syntax-lookup questions, no codebase reads |
-| `khimaira-code-fast` | haiku | mechanical edits (renames, formatting, one-line fixes) |
-| `khimaira-grep` | haiku | exact-symbol search, file pattern, known string lookup |
-| `khimaira-research` | sonnet | multi-file tracing, cross-file context for refactors |
-| `khimaira-code-deep` | sonnet | non-trivial code changes requiring judgment |
-| `khimaira-debug` | sonnet | first-pass debugging when symptom + repro available |
-| `khimaira-architect` | opus | non-trivial design decisions, module boundaries, trade-offs |
-| `khimaira-deep-debug` | opus | hypothesis-driven escalation when cheaper attempts got stuck |
+| `khimaira-factual` | haiku | Definitional + syntax-lookup questions |
+| `khimaira-code-fast` | haiku | Mechanical edits (renames, formatting, one-liners) |
+| `khimaira-grep` | haiku | Exact-symbol search, known string lookup |
+| `khimaira-research` | sonnet | Multi-file tracing, cross-file context |
+| `khimaira-code-deep` | sonnet | Non-trivial code changes requiring judgment |
+| `khimaira-debug` | sonnet | First-pass debugging, symptom + repro available |
+| `khimaira-architect` | opus | Non-trivial design decisions, trade-offs |
+| `khimaira-deep-debug` | opus | Hypothesis-driven escalation after cheaper attempts failed |
 
-Shipped via the bootstrap framework — `khimaira bootstrap` (or
-`khimaira sync`) symlinks `~/.claude/agents/` into your dotfiles. The
-`SubagentStop` hook records each dispatch to `usage.jsonl` so
-`khimaira usage savings` credits the routing.
+---
+
+## Multi-session coordination
+
+Khimaira externalizes session state so parallel sessions can collaborate
+and future sessions can pick up where stopped ones left off.
+
+| Goal | Primitive |
+|---|---|
+| Ask a peer, need answer this turn | `session_log_question(target_session_id=B)` + `session_wait_for_answer` |
+| FYI to another session, no reply expected | `session_post_notice(target_session_id=B, text=...)` |
+| Leave a directive for whoever opens this project next | `session_post_handoff(text=..., scope_cwd=...)` |
+| Read what a stopped session discussed | `session_query_transcript(session_id, query="X")` |
+| Delegate a handoff slice to a specific session | `session_invite_handoff(parent_id, owner, invitee, text)` |
+
+Two hooks install via `khimaira install-hooks`:
+
+- **SessionStart** — inbox + matched handoffs + other active sessions + pending assignments
+- **UserPromptSubmit** — inbox notes + incoming questions + missed chat events + role-budget reminder
+
+You never manually poll. See [`docs/INBOX-AND-HANDOFFS.md`](docs/INBOX-AND-HANDOFFS.md).
 
 ---
 
@@ -241,139 +337,70 @@ Shipped via the bootstrap framework — `khimaira bootstrap` (or
 
 `khimaira attach <app-path>` injects a zero-touch observer into any
 Python project's venv. No source changes, no env vars, no installed
-deps in the app's manifest. Restart the app — every LangGraph node,
-every LLM call, every external HTTP request streams to
-khimaira-monitor in real time.
+deps. Restart the app — every LangGraph node, every LLM call, every
+external HTTP request streams to the local dashboard.
 
 ```mermaid
 flowchart LR
-    App["your LangGraph app"] -->|venv-injected<br/>khimaira_observer.pth| Obs["observer<br/>BaseCallbackHandler<br/>+ httpx/requests<br/>monkey-patches"]
-    Obs -->|POST /api/heartbeat| Daemon["khimaira-monitor<br/>daemon"]
-    Daemon -->|in-memory<br/>buffer + SSE| UI["dashboard<br/>localhost:8740"]
-    Daemon -->|REST endpoints| CLI["khimaira observer<br/>trace · compare · slow"]
-
+    App["your LangGraph app"] -->|venv-injected| Obs["observer\nBaseCallbackHandler\n+ httpx monkey-patch"]
+    Obs -->|POST /api/heartbeat| Daemon["khimaira-monitor\ndaemon"]
+    Daemon -->|SSE| UI["dashboard\nlocalhost:8740"]
+    Daemon -->|REST| CLI["khimaira observer\ntrace · compare · slow"]
     style Obs fill:#1f6feb,color:#fff
     style Daemon fill:#1f6feb,color:#fff
 ```
 
 | Surface | What it shows |
 |---|---|
-| `/{project}` | Live LangGraph topology + node-by-node execution + replay |
-| `/{project}/cost` | Estimated USD spend by model, token counts, telemetry-overhead callout |
-| `/{project}/trace/{cid}` | Waterfall view of one run — chain / llm / tool / external bars on a time axis (proves `asyncio.gather` is actually concurrent) |
-| `khimaira observer trace <p> <cid>` | Full event timeline as text |
-| `khimaira observer compare <p> <cid-a> <cid-b>` | A/B per-node wall-time deltas with regression markers |
-| `khimaira observer slow <p> --llm 5 --external 30` | Recent calls past threshold + in-flight stuck detection |
-
-### Auto-correlation (zero app code changes)
-
-Every event the observer emits is auto-tagged with the LangGraph
-run's top-level `correlation_id`. The observer reads LangChain's
-`parent_run_id=None` signal on `on_chain_start`, sets a `ContextVar`,
-and propagates it through async + thread boundaries to every
-downstream event — including HTTP monkey-patch interceptors. Your
-app code: unchanged.
-
-```python
-result = graph.invoke(state)
-# Now queryable: GET /api/heartbeats/<project>/by-correlation/<run_id>
-# returns every chain/llm/tool/external event for this run
-```
-
-Override with `khimaira_observer.tag_run(my_id)` only when you want a
-domain-specific identifier (deliverable id, business txn id) instead
-of the auto UUID.
+| `/{project}` | Live topology + node-by-node execution |
+| `/{project}/cost` | Spend by model, token counts |
+| `/{project}/trace/{cid}` | Waterfall view of one run — proves async is actually concurrent |
+| `khimaira observer slow <p>` | Recent calls past threshold + stuck-run detection |
 
 ---
 
-## Multi-session coordination
+## The four perception tools
 
-When one Claude Code session is grinding on a task, you can't ask
-related questions in another window without losing context. Khimaira
-externalizes session state so parallel sessions can collaborate — and
-future sessions can pick up where stopped ones left off.
+All four re-register under khimaira's MCP at boot. One connection, ~119 tools.
 
-| Goal | Tool |
+| Tool | Primary use case |
 |---|---|
-| Ask an active session, need answer this turn | `session_log_question(target_session_id=B)` + `session_wait_for_answer(qid)` |
-| FYI / ack to another session, no reply | `session_post_notice(target_session_id=B, text=...)` |
-| Leave a directive for whoever opens this project next | `session_post_handoff(text=..., scope_cwd=...)` |
-| Read what a stopped session discussed about topic X | `session_query_transcript(session_id, query="X")` |
-| Heuristic digest of a stopped session, no LLM cost | `session_summarize_transcript(session_id)` |
-| Search past inbox notes (drained / acked / auto-expired) | `session_search_archive(session_id, query)` |
-| Delegate a slice of a handoff to a named session | `session_invite_handoff(parent_id, owner, invitee, text)` |
+| **Séance** (`seance_*`) | Semantic codebase search — "how does auth work?" not "grep for Auth" |
+| **Specter** (`specter_*`) | Browser verification + debugging via CDP. Screenshot after every UI change; inspect React component trees, Redux state, network logs |
+| **Scarlet** (`scarlet_*`) | Codebase cartography — feature maps, dep graphs, CLAUDE.md generation |
+| **Sibyl** (`sibyl_*`) | Meeting recording + transcription pipeline (record → transcribe → summarize + extract action items) |
 
-Two hooks ship with khimaira and install via `khimaira install-hooks`:
-
-- **SessionStart** — auto-reads inbox + matched handoffs + lists
-  other active sessions + open task assignments
-- **UserPromptSubmit** — auto-fetches new inbox notes + incoming
-  questions targeting this session, injects both every turn
-
-You never manually poll; the loop is closed structurally. See
-[`docs/INBOX-AND-HANDOFFS.md`](docs/INBOX-AND-HANDOFFS.md) for the
-mental model and intent → primitive map.
-
-### Example — real-time cross-session ask
-
-```python
-# Session A, mid-turn:
-qid = session_log_question(
-    session_id=ME,
-    text="Roboflow per-page parallelization look right?",
-    target_session_id="llm-piping-extension",
-)
-answer = session_wait_for_answer(ME, qid, timeout=300)
-# → A blocks. B's UserPromptSubmit hook surfaces the question on B's
-#   next turn. B answers via session_post_answer. A unblocks instantly
-#   and continues processing in the SAME turn.
-```
-
-User effort: one prompt to A, one prompt to B. No copy-paste relay.
-
-### Example — handoff to a future session
-
-```python
-session_post_handoff(
-    from_session_id=ME,
-    text="HANDOFF: shipped Phase 1.5 MVP. Pickup tasks/task-sources/IMPLEMENTATION.md "
-         "for the Linear adapter follow-up. 240/240 tests passing.",
-    scope_cwd="/home/_3ntropy/dev/khimaira",
-    expires_in_hours=168,
-)
-```
-
-Three days later, whoever boots in that cwd gets the directive
-surfaced in their SessionStart context. They own it; the prior
-session has moved on.
+Rules-of-thumb:
+- Conceptual question → `seance_semantic_search` before grep
+- Shipped a UI change → `specter_debug_snapshot` before reporting done
+- "What does this feature export?" → `scarlet_extract_feature_metadata`
+- Meeting just ended → `sibyl_process(audio_path)` for the full pipeline
 
 ---
 
 ## Process observability
 
-```mermaid
-flowchart LR
-    Old["agent: cat log.txt<br/>cat log.txt<br/>cat log.txt<br/>... 30× per run"] -.->|wasteful| OldCost[("30 MCP roundtrips<br/>burns context window")]
-    New["agent: wait_for_process(<br/>'tests',<br/>completion_signal=r'\\d+ passed'<br/>)"] -->|one call| NewCost[("1 blocking call<br/>returns when matched")]
+```
+# Old: 30 polling calls that burn context window
+agent: cat log.txt ... (×30)
 
-    style Old fill:#cf222e,color:#fff
-    style New fill:#2da44e,color:#fff
+# New: one blocking MCP call
+wait_for_process("tests", completion_signal=r"\d+ passed")
 ```
 
-The khimaira daemon tails the process internally; the agent makes
-one blocking MCP call. Single roundtrip replaces dozens of polls.
+The daemon tails the process internally. Single roundtrip replaces
+dozens of polls.
 
 ---
 
 ## Day-to-day commands
 
 ```bash
-khimaira doctor                 # diagnose: daemon? supervisor? hooks current?
+khimaira doctor                 # daemon up? hooks current? supervisor active?
 khimaira usage savings          # 30-day savings vs Opus baseline
 khimaira route "rename X to Y"  # classify-only — see what would happen
 khimaira task "rename X to Y"   # classify + dispatch
 khimaira monitor start          # observability daemon (or use supervisor)
-khimaira dev /path/to/project   # full dev stack: server + Chrome + monitor
 khimaira tools                  # everything khimaira exposes
 ```
 
@@ -381,75 +408,93 @@ khimaira tools                  # everything khimaira exposes
 
 ## Repository layout
 
-```mermaid
-flowchart TB
-    Root[khimaira/<br/>uv workspace]
-    Root --> P[packages/]
-    Root --> S[shared/]
-    Root --> A[apps/]
-    Root --> D[docs/]
-
-    P --> P1[khimaira<br/>orchestrator]
-    P --> P2[scarlet<br/>cartography]
-    P --> P3[seance<br/>semantic search]
-    P --> P4[specter<br/>browser debug]
-
-    S --> S1[khimaira-types]
-    S --> S2[khimaira-transport]
-
-    A --> A1[monitor-ui<br/>React dashboard]
-
-    style Root fill:#1f6feb,color:#fff
-    style P1 fill:#1f6feb,color:#fff
+```
+packages/
+  khimaira/          — orchestration core (~119 MCP tools, CLI, hooks, roles)
+  scarlet/           — codebase cartography
+  seance/            — semantic search
+  specter/           — browser debug via CDP
+  sibyl/             — meeting transcription
+apps/
+  monitor-ui/        — React dashboard (localhost:8740)
+docs/
+  INSTALL.md         — three install paths
+  PROTOCOL.md        — adapter integration contract
+  INBOX-AND-HANDOFFS.md
+  ARCHITECTURE.md
+tasks/
+  BUILD-PLAN.md      — phase status
+  v1.9-orchestration/
+    STATE.md         — what's built + version history
+    USAGE.md         — day-to-day operation guide
 ```
 
-Each `packages/<name>/` exposes both a library API for in-process use
-by khimaira and an MCP surface. Same logic, two transports — like an
-SDK and a SQL interface to the same engine.
+---
+
+## What's NOT here (honest accounting)
+
+- **`claude/channel` is a research preview.** The khimaira-chat SSE
+  delivery works in practice but depends on Claude Code surfacing
+  `<channel>` blocks in the model's context window — this isn't a
+  documented API contract. It could change.
+
+- **Programmatic `/model` and `/effort` switching isn't supported.**
+  Claude Code doesn't expose these as settable from hooks or MCP tools.
+  The enforcement-gate protocol (`/agent-ready`) works around this:
+  agents verify `~/.claude/settings.json` and pause for you to set
+  the budget manually before starting work. It's an extra step, not
+  an automated switch.
+
+- **`-n` session rename doesn't sync to khimaira.** Claude Code's
+  `--name` / `-n` flag is UI-only — the SessionStart hook only
+  receives `session_id`, not the display name. Use role-prefixed
+  window names (`agent-1`, `observer-1`) so `infer_role_from_name()`
+  auto-detects the role, or call `session_set_name(session_id, "slug")`
+  manually in the session.
 
 ---
 
 ## Status & roadmap
 
-Strategic source-of-truth: [`NORTH_STAR.md`](NORTH_STAR.md). Adapter
-contract: [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Live phase status:
-
 | Phase | Status |
 |---|---|
 | Routing engine (classifier, pool router, registry) | ✅ |
-| MCP surface (~61 tools across orchestration, sessions, observer, processes) | ✅ |
+| MCP surface (~119 tools: orchestration, sessions, observer, chat, perception) | ✅ |
 | Usage tracking + counterfactual savings command | ✅ |
 | Auto-mode (`mcp__khimaira__auto` + budget gate + multi-turn) | ✅ |
-| Subagent library — Phase 1.2 (8 agents, SubagentStop hook → usage.jsonl) | ✅ |
+| Subagent library — 8 agents, SubagentStop hook | ✅ |
 | LangGraph observer (zero-touch, auto-correlation, trace waterfall) | ✅ |
-| Cost dashboard + slow-call alerts + circuit breakers + rate-limit handling | ✅ |
-| Multi-session shared state + cross-session primitives + transcript query | ✅ |
+| Multi-session shared state + cross-session primitives | ✅ |
 | Process observability (`wait_for_process` regex completion signal) | ✅ |
+| 6-role orchestration stack (v1.9.x) | ✅ |
+| Enforcement-gate task assignment (`/khimaira-assign` + `/agent-ready`) | ✅ |
+| Private DMs + task privacy | ✅ |
+| Assign-batch coordinator (N assignments in 1 daemon round-trip) | ✅ |
+| Bootstrap roster (`/khimaira-bootstrap-roster`) | ✅ |
+| Role-file injection into SessionStart context (on boot, per chat role) | ✅ |
+| Missed-chat-events poll (cross-turn SSE replay) | ✅ |
 | Bootstrap framework + profile-driven cross-machine install | ✅ |
-| Phase 1.1 — Protocol docs (`docs/PROTOCOL.md`) | ✅ |
 | Phase 1.5 — Task-source Protocol + JSONL/GitHub reference adapters | ✅ MVP |
 | Phase 1.0 — MCP-first self-configuration (`setup_*` MCP tools) | ⬜ next |
-| Phase 1.3 — PreToolUse interceptor v1 (passive delegation suggester) | ⬜ |
-| Phase 2 — Cross-editor adapter configs in `contrib/` (Cursor, Neovim, Cline, aider) | ⬜ |
-| Phase 3 — OSS distribution (PyPI publish, README rewrite ← this doc, demo assets) | 🚧 |
-| Linear / Jira / Asana adapters (Phase 1.5 community follow-ups) | ⬜ |
+| Cross-editor adapter configs (Cursor, Neovim, Cline, aider) | ⬜ |
+| Linear / Jira / Asana task-source adapters | ⬜ |
+| Programmatic `/model` + `/effort` switching (needs Claude Code API) | ⬜ blocked |
 
-Open operational debt + known gaps tracked in `NORTH_STAR.md`.
+Strategic roadmap: [`NORTH_STAR.md`](NORTH_STAR.md).
 
 ---
 
 ## More docs
 
-- [`docs/INSTALL.md`](docs/INSTALL.md) — three install paths
+- [`docs/INSTALL.md`](docs/INSTALL.md) — three install paths, verifying the install, uninstalling
 - [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — adapter integration contract (HTTP / MCP / CLI)
 - [`docs/INBOX-AND-HANDOFFS.md`](docs/INBOX-AND-HANDOFFS.md) — cross-session coordination mental model
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — internal architecture
+- [`tasks/v1.9-orchestration/USAGE.md`](tasks/v1.9-orchestration/USAGE.md) — orchestration day-to-day operation guide
 - [`NORTH_STAR.md`](NORTH_STAR.md) — strategic roadmap + principles + anti-goals
 - [`CLAUDE.md`](CLAUDE.md) — engineering rules captured from real bugs in this codebase
 
 ---
-
-## Status
 
 Pre-alpha. Active development. Legacy version archived at
 [`fsocietydisobey/khimaira-legacy`](https://github.com/fsocietydisobey/khimaira-legacy).

@@ -282,10 +282,20 @@ chain_pipeline               ↔ mcp__khimaira__chain_pipeline
 This doc uses the prefixed form to match what an adapter author will
 see in their host's tool listing.
 
+### Two MCP servers
+
+khimaira registers **two** MCP servers with the host:
+
+| Server name | Command | Purpose |
+|---|---|---|
+| `khimaira` | `uv ... run khimaira mcp` | Orchestration, session state, perception tools, pipelines |
+| `khimaira-chat` | `uv ... run python -m khimaira_chat.server` | Real-time cross-session chat (per-session stdio subprocess, SSE-push delivery) |
+
+Both are registered by `khimaira bootstrap`. Tools from each appear under `mcp__khimaira__*` and `mcp__khimaira-chat__*` respectively. The chat server is NOT re-registered on the main khimaira server — it needs its own stdio process per session so each session gets its own SSE subscription.
+
 ### Tool categories
 
-~113 tools total after the NORTH_STAR Phase 0 unification (65 khimaira
-native + 48 re-registered from sibling packages). Counts in this
+~119 tools total across both servers (khimaira native + re-registered sibling packages). Counts in this
 table are approximate; the live install is authoritative —
 `khimaira tools --category mcp`.
 
