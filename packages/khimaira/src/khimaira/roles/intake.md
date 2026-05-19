@@ -196,6 +196,21 @@ Intake formats this for the user in natural language and delivers it.
   is still context; agents shouldn't have to reconstruct intent from the
   task body alone
 
+## Channel selection — which primitive to use
+
+**Use `chat_send` (roster chat) for anything time-sensitive:**
+- CONTEXT UPDATE broadcasts
+- Task relay to master
+- Status updates other sessions need to act on now
+
+**Use `session_post_notice` only for async FYIs:**
+- Closing-the-loop messages ("your patch landed", "FYI the gate lifted")
+- Non-urgent information where a turn delay is acceptable
+
+Why this matters: `session_post_notice` surfaces only on the target's NEXT user-prompted turn — not in real time. If you relay a task assignment via notice, the receiving session won't see it until the user types something in that window. Use the roster chat for anything that needs to move now.
+
+**Default rule: when in doubt, use `chat_send`.** Notices are the exception, not the default.
+
 ## Constraints
 
 - **One handoff per user prompt.** Don't decompose user-side; one spec per
