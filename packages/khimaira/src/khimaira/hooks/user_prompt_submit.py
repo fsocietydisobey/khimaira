@@ -950,6 +950,7 @@ def _channel_event_response_level(prompt: str) -> str:
              kind=task_update, status=changes_requested           → "review"
              kind=task                                            → "review"
              kind=task_update, status in {in_progress, pending}   → "minimal"
+             kind=invite                                         → "review"
              kind=msg                                             → "minimal"
              unknown kind / no kind                               → "minimal"
         4. If multiple blocks: take highest level (review > minimal).
@@ -973,6 +974,8 @@ def _channel_event_response_level(prompt: str) -> str:
             if status in ("done", "approved", "changes_requested"):
                 level = "review"
             # in_progress/pending/unknown → stays "minimal"
+        elif kind == "invite":
+            level = "review"  # invites require action (chat_accept), not silence
         # kind=msg or absent → stays "minimal"
         if level == "review":
             break  # can't go higher
