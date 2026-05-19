@@ -33,7 +33,6 @@ load_dotenv(_project_root / ".env")
 from khimaira.prompts.builder import build_prompt
 from khimaira.dispatch.runners import run_claude, run_gemini
 from khimaira.config import load_config
-from khimaira.config.router import Router
 from khimaira.graphs.components import build_components_graph
 from khimaira.graphs.deadcode import build_deadcode_graph
 from khimaira.graphs.hypervisor import build_hypervisor_graph
@@ -59,9 +58,7 @@ from khimaira.server.jobs import (
 
 log = get_logger("graph-server")
 
-# Load config (still needed for classify model via API)
 config = load_config()
-router = Router(config)
 
 # Graph and checkpointer are built lazily on first use
 _server_start_time = time.time()
@@ -426,19 +423,21 @@ async def brainstorm(topic: str, context: str = "", cwd: str = "") -> str:
 @mcp.tool()
 @logged_tool("classify")
 async def classify(task_description: str) -> str:
-    """Classify a task into a tier (research / architect / implement) and
-    recommend the right pipeline. Uses a fast, cheap API model.
+    """Classify a task into a tier and recommend the right runner/model.
+    Uses the AMR classifier (cheap CLI runner — no API billing).
 
     Args:
         task_description: Description of the task to classify.
     """
-    result = await router.classify(task_description)
-    tier = result.get("tier", "unknown")
-    confidence = result.get("confidence", 0)
-    reasoning = result.get("reasoning", "")
-    pipeline = " → ".join(result.get("pipeline", []))
+    from khimaira.dispatch.classifier import classify_task
 
-    return f"**Tier:** {tier} (confidence: {confidence:.0%})\n**Pipeline:** {pipeline}\n**Reasoning:** {reasoning}"
+    result = await classify_task(task_description)
+    return (
+        f"**Type:** {result.task_type}  **Complexity:** {result.complexity_tier}  "
+        f"(confidence: {result.confidence:.0%})\n"
+        f"**Runner:** {result.recommended_runner} / {result.recommended_model}\n"
+        f"**Reasoning:** {result.reasoning}"
+    )
 
 
 @mcp.tool()

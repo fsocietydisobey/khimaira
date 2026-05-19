@@ -26,7 +26,7 @@ from pathlib import Path
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from khimaira.config import OrchestratorConfig, get_classify_model
+from khimaira.config import OrchestratorConfig
 from khimaira.core.state import OrchestratorState
 from khimaira.log import get_logger
 from khimaira.nodes import (

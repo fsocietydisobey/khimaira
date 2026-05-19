@@ -76,15 +76,14 @@ def is_local_only_mode() -> bool:
 from .roots import ROOTS, ROOTS_FILE  # noqa: E402
 
 # Legacy config (OrchestratorConfig + RoleConfig + ProviderConfig) used by
-# the migrated graph nodes. Stays available until Phase 10 (API removal)
-# is complete and the patterns are rewritten to use AMR routing instead.
+# the migrated graph nodes. Stays available until graphs are rewritten to
+# use AMR routing instead.
 from .loader import (  # noqa: E402
     OrchestratorConfig,
     ProviderConfig,
     RoleConfig,
     load_config,
 )
-from .models import get_classify_model  # noqa: E402
 
 __all__ = [
     "load_routing_table",
@@ -96,5 +95,4 @@ __all__ = [
     "ProviderConfig",
     "RoleConfig",
     "load_config",
-    "get_classify_model",
 ]

@@ -9,7 +9,7 @@
 - ⏳ In progress — being built now
 - ⬜ Pending — not started
 
-**Last updated:** 2026-05-08 (session 1 — phases 0-3, 6-8 done; session shared-state idea added as Phase 11)
+**Last updated:** 2026-05-17 (Phase 14 orchestration stack added — v1.6.1.2 through v1.9.7 shipped)
 
 ---
 
@@ -284,44 +284,104 @@ new long-running services.
 
 ---
 
-## Phase 10 — API removal (the deprecation path)
+## Phase 10 — API removal ✅ DONE
 
-The dev-tool pitch requires "no API keys, no surprise bills." Migration sequence:
+All nodes migrated to CLI runners. No API SDK calls remain in the dispatch or pattern layer.
 
 | Step | Status | Notes |
 |---|---|---|
-| Flip every node default to CLI | ⬜ | API stays as opt-in (`KHIMAIRA_USE_API=true`) |
-| Build `run_structured` helper | ⏳ | (Phase 2) |
-| Migrate API-using nodes one at a time | ⬜ | watching parse-failure rate via usage tracker |
-| Delete API provider code | ⬜ | once parse-failures stabilize <1% |
-| Remove `langchain_anthropic` dep | ⬜ | |
+| `run_structured` helper | ✅ | `dispatch/structured.py` (Phase 2) |
+| All graph nodes migrated to CLI | ✅ | `supervisor`, `validator` and all others use `run_structured` / `run_claude` / `run_gemini` |
+| `classify` MCP tool migrated | ✅ | Now uses `dispatch.classifier.classify_task()` (AMR CLI) instead of `config.router.Router.classify()` (LangChain API) |
+| Deleted `config/router.py` | ✅ | `Router` class + `AnthropicProvider`/`GoogleProvider` chain removed |
+| Deleted `config/models.py` | ✅ | `get_classify_model` / `_build_model` (LangChain model factories) removed |
+| Deleted `config/providers/` | ✅ | `anthropic_provider.py`, `google_provider.py`, `base.py` all deleted |
+| Removed dead import `get_classify_model` from `graphs/supervisor.py` | ✅ | |
+| Removed `langchain-anthropic` dep from `pyproject.toml` | ✅ | |
+| Removed `langchain-google-genai` dep from `pyproject.toml` | ✅ | |
+| 522/522 tests pass post-cleanup | ✅ | |
 
-API-using nodes inventory (from legacy):
-- `validator`, `supervisor`, `critic`, `stress_tester`, `scope_analyzer`, `arbitrator`, `retry_controller`, `compliance`, `refiner/classifier`, `swarm/task_decomposer`, `hypervisor_dispatcher`, `toolbuilder/friction`, `toolbuilder/proposer`, `nodes/balanced/integration_gate`
+**Remaining:** `langchain-core` and LangGraph stay — they're the graph runtime, not API callers. `OrchestratorConfig` + `load_config` stay until the pattern graphs are rewritten to use AMR routing natively (not a Phase 10 goal).
+
+---
+
+## Phase 14 — Multi-agent Orchestration Stack ✅ DONE (v1.6.1.2 → v1.9.7)
+
+Full details: `tasks/v1.9-orchestration/STATE.md`. 522/522 tests pass. HEAD: `179f729`.
+
+### What shipped
+
+| Sub-version | Item | Status |
+|---|---|---|
+| v1.6.1.2 | `_discover_chat_roles` silent-skip fix (fallback to "agent" for unchanneled members) | ✅ |
+| v1.7 | `/khimaira-assign` enforcement-gate skill (hold gate, budget verify, begin signal) | ✅ |
+| v1.7 | `/agent-ready` skill (agent verifies settings.json + acks master) | ✅ |
+| v1.8 | Persistent `⏳ KHIMAIRA PENDING ASSIGNMENT(S)` banner in UserPromptSubmit hook | ✅ |
+| v1.8 | `⚠️ STALE TASK ACK(S)` banner — detects drift post-restart | ✅ |
+| v1.8.1 | `scope_cwd` on `session_post_notice` — notice scoping to a project tree (P0 bug fix) | ✅ |
+| v1.9 | `_channel_event_response_level` — minimal vs. review injection on channel-only turns | ✅ |
+| v1.9 | `assign-batch` coordinator (`POST /api/chats/{id}/assign-batch`) — collapses 3N+K+2 calls → 1 | ✅ |
+| v1.9.1 | `architect` role — opus/max synthesis sidecar; `/khimaira-spawn-architect` skill | ✅ |
+| v1.9.2 | `private=True` on `chat_send`/`chat_task_create`/etc.; `history()` filter; `load_room` fix | ✅ |
+| v1.9.3 | `intake` role — user-facing front-end; `🎯 INTAKE HANDOFF` protocol; `/khimaira-spawn-intake` | ✅ |
+| v1.9.4 | Hierarchical topology default `private=True` for intake↔master DMs | ✅ |
+| v1.9.5 | `topology` field on `create_room`; `task_status` private-leak fix | ✅ |
+| v1.9.6 | Role.md auto-injection at boot (`📖 ROLE FILE` block); `member_roles` in `create_room`; `infer_role_from_name` | ✅ |
+| v1.9.6 | `📊 ASSIGNMENTS AWAITING ACK` banner (master's inverse of ⏳) | ✅ |
+| v1.9.7 | `💬 MISSED CHAT EVENTS` banner — SSE replay-on-resume via watermark polling | ✅ |
+| v1.9.7 | `TASK_CANCELLED` terminal state (master-only; pending→cancelled + in_progress→cancelled) | ✅ |
+| v1.9.7 | `kind==msg` filter on missed-chat banner (fixes private task record leak) | ✅ |
+
+### Topology
+
+```
+Joseph → [intake-1]   (sonnet/medium — user-facing)
+              ↓ 🎯 INTAKE HANDOFF (private DM)
+       [khimaira-0]   (sonnet/medium — master/orchestrator)
+              ↓ /khimaira-assign + /khimaira-consult
+   ┌──────────┼────────────┬───────────────┐
+   ↓          ↓            ↓               ↓
+[agents×N] [observers×M] [architect-1] [critic ad-hoc]
+ (sonnet)   (haiku)       (opus/max)
+```
+
+Standard 7-session roster: `intake-1`, `khimaira-0`, `agent-1`, `agent-2`, `agent-3`, `observer-1`, `architect-1`, `critic-1`.
+Bootstrap: `/khimaira-bootstrap-roster`.
+
+### New skills shipped
+
+| Skill | Purpose |
+|---|---|
+| `/khimaira-assign <agent> <task>` | Assign with enforcement-gate via `assign-batch` daemon |
+| `/agent-ready` | Agent confirms budget + acks master |
+| `/khimaira-consult <deputy> "<question>"` | Opus-grade synthesis consult |
+| `/khimaira-spawn-architect [name]` | Spawn architect sidecar |
+| `/khimaira-spawn-intake [name]` | Spawn intake front-end |
+| `/khimaira-bootstrap-roster [<map>]` | One-call roster onboarding |
+| `/khimaira-chat-roles` | Show your role + budget per chat |
+
+Deleted: `/khimaira-spawn-deputy`
+
+### Role files (auto-injected at boot)
+
+All 6 role `.md` files in `packages/khimaira/src/khimaira/roles/`: `master`, `agent`, `observer`, `critic`, `architect`, `intake`.
+
+### Known gaps (as of v1.9.7)
+
+| Gap | Notes |
+|---|---|
+| SSE restart window | Events during Claude Code restart aren't delivered; missed-chat banner mitigates but doesn't fix |
+| `-n` flag not persisted | `session_set_name` is in-memory; lost on daemon restart until session re-sets on boot |
+| `/model` enforcement advisory only | Budget directives are recommendations; no automated enforcement path |
+| Intake-master `private=True` | Convention, not API-enforced |
 
 ---
 
 ## Known footguns (address before public release)
 
-### Monitor auto-scan kicks off Claude Opus on daemon startup
+### ~~Monitor auto-scan kicks off Claude Opus on daemon startup~~ ✅ FIXED
 
-When `khimaira monitor start` runs, the metadata scanner queues every
-discovered project for an LLM-driven scan. Defaults to **Claude Opus 4.7
-on a ~94k-char prompt = ~$1.40 per project, per fresh start.**
-
-For a dev-tool that's pitching "no surprise bills," this is a problem.
-First-run experience burns ~$3 on khimaira + 1 other project before the
-user has even queried anything.
-
-**Fix candidates (do one before public release):**
-1. Default `KHIMAIRA_MONITOR_SCAN_MODEL=gemini` — uses Gemini CLI (subscription) instead of Anthropic API (per-call billing).
-2. Make auto-scan opt-in: env var `KHIMAIRA_AUTO_SCAN=1` to enable; default off until user runs `khimaira monitor scan` manually.
-3. Skip scan entirely under `KHIMAIRA_LOCAL_ONLY=1`.
-4. Use AMR routing (Phase 3) for the scan call instead of hardcoded Opus — let the auto-router pick a cheaper model.
-
-**Recommendation:** option 4 once AMR's escalation path is solid; option 2
-as the conservative interim default (better UX surprise: "no scan ran, run
-this command" vs "$3 vanished without consent").
+`monitor/metadata/scan.py` defaults to `gemini` (Gemini CLI, subscription-billed) since the Phase 10 sweep. Override with `KHIMAIRA_MONITOR_SCAN_MODEL=claude` when API billing is acceptable. The $1.40/project Opus-on-startup footgun no longer exists by default.
 
 ---
 

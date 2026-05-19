@@ -424,5 +424,5 @@ tests, +3 task-cancel tests, +2 missed-chat banner tests.
 | SSE delivery during restart window | Events that arrive while Claude Code is restarting are not delivered. Missed-chat banner (v1.9.7) surfaces them on the next turn via polling — but the gap still exists; it's mitigated, not fixed. |
 | `-n` flag not syncing to `session_list` | `session_set_name` updates the daemon's in-memory state; if the daemon restarts, names are lost until the session sets them again on boot. |
 | Programmatic `/model` switching requires user action | Chat role directives are advisory. If a session is reassigned to a different role requiring a different model, the user must type the `/model` command manually in that window. No automated enforcement path exists. |
-| Intake-master private bootstrap enforcement | `intake.md` spec says `private=True` default; currently just a convention — not enforced at the API level. |
+| ~~Intake-master `private=True`~~ | ✅ API-enforced: hierarchical chats auto-default `private=True` for targeted messages since v1.9.5 (`chats.py:597-603`). Was mistakenly marked as convention-only. |
 | Anthropic GitHub issues #59499–#59502 outreach | Pending |
