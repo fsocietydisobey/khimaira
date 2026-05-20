@@ -1036,6 +1036,28 @@ def main() -> int:
             "Skip if nothing to log."
         )
 
+    # --- First-turn chat_my_chats reminder --------------------------------
+    # On turn 1 of a session (count == 0 before increment → new_count == 1),
+    # if this session is in any accepted chats, remind it to call
+    # chat_my_chats. SessionStart already nudges this, but agents skip the
+    # text during compacted-session resumption. Firing it again on the first
+    # actual prompt submission catches that gap. Silent after turn 1.
+    chat_register_block = ""
+    if new_count == 1:
+        try:
+            from khimaira.hooks.session_start import _discover_chat_roles
+
+            if _discover_chat_roles(session_id):
+                chat_register_block = (
+                    "⚡ FIRST TURN — call this NOW before anything else:\n"
+                    f'`mcp__khimaira-chat__chat_my_chats(session_id="{session_id}")`\n'
+                    "Registers the SSE subscriber for real-time chat delivery. "
+                    "Without it, chat_send messages from peers won't arrive until "
+                    "your next prompted turn — you're effectively offline to the roster."
+                )
+        except Exception:  # noqa: BLE001 — hook must not break
+            chat_register_block = ""
+
     # --- Phase B v1.7.2: per-turn role-budget reminder --------------------
     # Surfaces "you are role X in chat Y → /model A, /effort B" on every
     # prompt submission across every session. Closes the gap where v1.5's
@@ -1203,15 +1225,18 @@ def main() -> int:
         and not stale_acks_block
         and not quiet_channel_block
         and not missed_chat_block
+        and not chat_register_block
     ):
         return 0
 
-    # Ordering: missed_chat (highest — cross-session events that landed while
-    # idle) → quiet_channel → bottleneck → pending_assignments → unfired_acks →
-    # stale_acks → role_budget → delegate → inbox → incoming questions → reminder.
+    # Ordering: chat_register (turn-1 only, highest priority) →
+    # missed_chat → quiet_channel → bottleneck → pending_assignments →
+    # unfired_acks → stale_acks → role_budget → delegate → inbox →
+    # incoming questions → reminder.
     additional_context = "\n\n".join(
         b
         for b in (
+            chat_register_block,
             missed_chat_block,
             quiet_channel_block,
             bottleneck_block,

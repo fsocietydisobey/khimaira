@@ -811,20 +811,21 @@ def main() -> int:
         "after you call `session_set_name(...)`."
     )
 
-    # Chat MCP subprocess needs to know its session_id to subscribe to the
-    # daemon's SSE event stream. There's no CLAUDE_SESSION_ID env var, so
-    # the agent has to pass it via the first chat tool call. This block
-    # nudges the agent to make that call early — without it, channel-pushed
-    # chat messages won't arrive until the agent happens to use a chat
-    # tool. Tool-not-found errors (chat MCP not registered) are silently
-    # ignored by the agent, so emitting unconditionally is safe.
+    # Real-time chat registration — emitted immediately after identity block so
+    # it appears at the very top before inbox, handoffs, and role file content.
+    # Without this call the SSE subscriber never starts and chat_send messages
+    # queue until the next user-prompted turn. The soft nudge at line ~820 was
+    # being skipped in compacted-session resumptions; moving it to the top and
+    # making it ACTION REQUIRED makes it impossible to miss.
+    # Tool-not-found errors (chat MCP not registered) are silently ignored by
+    # the agent, so emitting unconditionally is safe.
     blocks.append(
-        "💬 To enable real-time chat delivery in this session, call "
-        f'`mcp__khimaira-chat__chat_my_chats(session_id="{session_id}")` '
-        "once now. This registers the chat subprocess + starts the SSE "
-        'subscriber so incoming `<channel source="khimaira-chat" ...>` '
-        "messages arrive automatically. Skip if `khimaira-chat` MCP isn't "
-        "registered (the tool simply won't exist)."
+        "⚡ ACTION REQUIRED — real-time chat registration:\n"
+        f'Call `mcp__khimaira-chat__chat_my_chats(session_id="{session_id}")` '
+        "NOW, before anything else. This starts the SSE subscriber so "
+        '`<channel source="khimaira-chat">` messages arrive in real time. '
+        "Without it you will NOT receive chat messages as they arrive — only "
+        "on your next prompted turn. One call per session; do it first."
     )
 
     cwd = data.get("cwd") or os.getcwd()
