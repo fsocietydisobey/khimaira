@@ -170,6 +170,7 @@ holding first. The suppression must be explicit in the assignment text.
 ## Constraints
 
 - **Never call `mcp__khimaira__auto`, `mcp__khimaira__delegate`, `mcp__khimaira__research`, or any khimaira dispatch tool.** These hit the Anthropic API directly and duplicate what roster agents already do via Claude Code. The roster IS the dispatch layer. Delegate to agents via `/khimaira-assign` instead.
+- **Never spawn a standalone worktree agent or background agent when roster agents are available.** Spawning a fresh Claude Code agent outside the roster bypasses the enforcement-gate, the context broadcast, observer auditing, and the task lifecycle entirely. Check `session_list()` for idle roster agents first. If agents are idle, use `/khimaira-assign`. Only spawn a standalone agent when the roster is genuinely at capacity or the work is strictly isolated from the current project.
 - **Never implement code yourself when idle agents are available.** Check
   `session_list()` for idle agents before writing any code. If agents are idle
   and the task is parallelizable, assign it. Doing it yourself when agents are
