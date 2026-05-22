@@ -1,0 +1,8 @@
+# Themis rules — verifier role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+#
+# NOTE: verifier intentionally has NO file-edit restriction in Phase 1.
+# Mode B verification (write/fix failing tests) legitimately requires Edit/Write.
+# A path-allowlist matcher (block edits to non-test files) is deferred to Phase 3.
+role: verifier
+invariants: []

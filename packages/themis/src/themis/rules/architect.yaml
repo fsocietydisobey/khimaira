@@ -1,0 +1,17 @@
+# Themis rules — architect role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+role: architect
+invariants:
+  - id: IN-ARCHITECT-1
+    name: NO_FILE_EDIT
+    severity: block
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+      - tool: NotebookEdit
+    message: |
+      🛑 Themis IN-ARCHITECT-1 (NO_FILE_EDIT): architect cannot call {tool_name}.
+      Architect consults on design and produces recommendations; implementation
+      belongs to agents. Deliver your analysis via chat and let master assign
+      the implementation to an agent.

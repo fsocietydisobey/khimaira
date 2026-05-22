@@ -1,0 +1,43 @@
+# Themis rules — master role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+role: master
+invariants:
+  - id: IN-MASTER-1
+    name: CHAT_MY_CHATS_FRESH
+    severity: block
+    matchers:
+      - tool: mcp__khimaira-chat__chat_send
+      - tool: mcp__khimaira-chat__chat_send_to
+      - tool: mcp__khimaira-chat__chat_history
+      - tool: mcp__khimaira-chat__chat_invite
+    conditions:
+      - check: chat_my_chats_not_called_this_turn
+    message: |
+      🛑 Themis IN-MASTER-1 (CHAT_MY_CHATS_FRESH): {tool_name} called without a
+      fresh chat_my_chats registration this turn. Call chat_my_chats(session_id=...)
+      first — without it, incoming messages are not delivered in real time.
+      Root cause of 2026-05-19 and 2026-05-21 incidents.
+
+  - id: IN-MASTER-2
+    name: NO_API_DISPATCH
+    severity: block
+    matchers:
+      - tool: mcp__khimaira__auto
+      - tool: mcp__khimaira__delegate
+      - tool: mcp__khimaira__research
+    message: |
+      🛑 Themis IN-MASTER-2 (NO_API_DISPATCH): {tool_name} bypasses the roster
+      dispatch model. Use chat_task_create + chat_send_to to assign work to
+      roster agents instead of spawning a standalone API call.
+
+  - id: IN-MASTER-3
+    name: NO_STANDALONE_AGENTS_WHEN_IDLE
+    severity: block
+    matchers:
+      - tool: Task
+    conditions:
+      - check: idle_agents_exist
+    message: |
+      🛑 Themis IN-MASTER-3 (NO_STANDALONE_AGENTS_WHEN_IDLE): cannot spawn a Task
+      agent while roster agents are idle. Assign work via /khimaira-assign or
+      chat_task_create to keep the enforcement gate, observer, and lifecycle intact.

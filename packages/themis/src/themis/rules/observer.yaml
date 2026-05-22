@@ -1,0 +1,26 @@
+# Themis rules — observer role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+role: observer
+invariants:
+  - id: IN-OBSERVER-1
+    name: READ_ONLY
+    severity: block
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+      - tool: NotebookEdit
+    message: |
+      🛑 Themis IN-OBSERVER-1 (READ_ONLY): observer cannot call {tool_name}.
+      Observer is read-only: it monitors, logs, and surfaces anomalies to master
+      but never modifies files. Hand edit tasks to an agent via master.
+
+  - id: IN-OBSERVER-2
+    name: NO_TASK_ASSIGNMENT
+    severity: block
+    matchers:
+      - tool: mcp__khimaira-chat__chat_task_create
+    message: |
+      🛑 Themis IN-OBSERVER-2 (NO_TASK_ASSIGNMENT): observer cannot create tasks.
+      Only master assigns work. If you observe a violation or blocker, surface it
+      via session_post_notice to master — do not self-dispatch remediation.

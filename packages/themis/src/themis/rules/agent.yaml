@@ -1,0 +1,47 @@
+# Themis rules — agent role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+role: agent
+invariants:
+  - id: IN-AGENT-1
+    name: LOAD_DOTENV_OVERRIDE
+    severity: block
+    matchers:
+      - tool: Edit
+        tool_input_field:
+          field: new_string
+          pattern: "os\\.getenv\\([\"'](?:ANTHROPIC|OPENAI|AZURE|GOOGLE|GEMINI)_"
+      - tool: Write
+        tool_input_field:
+          field: content
+          pattern: "os\\.getenv\\([\"'](?:ANTHROPIC|OPENAI|AZURE|GOOGLE|GEMINI)_"
+    message: |
+      🛑 Themis IN-AGENT-1 (LOAD_DOTENV_OVERRIDE): {tool_name} writes bare os.getenv()
+      on an API key without load_dotenv(override=True). This silently inherits shell
+      credentials instead of reading the project .env. Pattern: call
+      load_dotenv(override=True) before any os.getenv() on API keys.
+      See security rule: ~/.claude/rules/engineering/security.md.
+
+  - id: IN-AGENT-2
+    name: NO_NO_VERIFY
+    severity: block
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: "--no-verify\\b"
+    message: |
+      🛑 Themis IN-AGENT-2 (NO_NO_VERIFY): Bash command contains --no-verify.
+      Pre-commit hooks exist for a reason — bypassing them is how bugs slip into
+      main. Fix the hook failure instead of routing around it.
+
+  - id: IN-AGENT-3
+    name: NO_API_DISPATCH
+    severity: block
+    matchers:
+      - tool: mcp__khimaira__auto
+      - tool: mcp__khimaira__delegate
+      - tool: mcp__khimaira__research
+    message: |
+      🛑 Themis IN-AGENT-3 (NO_API_DISPATCH): {tool_name} spawns a standalone API
+      call outside the roster model. Agents implement; they do not orchestrate.
+      If you need research, ask master to assign a research sub-task.

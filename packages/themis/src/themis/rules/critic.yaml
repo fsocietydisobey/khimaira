@@ -1,0 +1,17 @@
+# Themis rules — critic role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+role: critic
+invariants:
+  - id: IN-CRITIC-1
+    name: NO_FILE_EDIT
+    severity: block
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+      - tool: NotebookEdit
+    message: |
+      🛑 Themis IN-CRITIC-1 (NO_FILE_EDIT): critic cannot call {tool_name}.
+      Critic reviews work and posts findings; it does not implement fixes.
+      Request changes via chat_task_update (changes_requested) and let the
+      original agent or a new agent handle the remediation.
