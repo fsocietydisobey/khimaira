@@ -33,6 +33,7 @@ from . import (
     observer,
     route,
     task,
+    themis as themis_cmd,
     tools as tools_cmd,
     usage as usage_cmd,
 )
@@ -65,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     heal.add_subparser(subparsers)
     usage_cmd.add_subparser(subparsers)
     models_cmd.add_subparser(subparsers)
+    themis_cmd.add_subparser(subparsers)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

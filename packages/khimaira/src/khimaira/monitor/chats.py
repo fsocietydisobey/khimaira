@@ -73,6 +73,7 @@ ROLE_ARCHITECT = "architect"
 ROLE_INTAKE = "intake"
 ROLE_ANALYST = "analyst"
 ROLE_VERIFIER = "verifier"
+ROLE_TRACKER = "tracker"
 _VALID_ROLES: frozenset[str] = frozenset(
     {ROLE_MASTER, ROLE_AGENT, ROLE_OBSERVER, ROLE_CRITIC, ROLE_ARCHITECT, ROLE_INTAKE}
 )
@@ -91,6 +92,7 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
     ROLE_INTAKE: {"model": "sonnet", "effort": "medium"},  # user-facing front-end
     ROLE_ANALYST: {"model": "opus", "effort": "max"},  # spec disambiguation, idle-by-default
     ROLE_VERIFIER: {"model": "opus", "effort": "max"},  # test coverage gate, idle-by-default
+    ROLE_TRACKER: {"model": "haiku", "effort": "medium"},  # checklist curator + Linear filer
 }
 
 

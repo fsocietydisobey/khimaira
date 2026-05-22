@@ -338,6 +338,7 @@ _ROLE_BUDGET: dict[str, dict[str, str]] = {
     "intake": {"model": "sonnet", "effort": "medium"},
     "analyst": {"model": "opus", "effort": "max"},
     "verifier": {"model": "opus", "effort": "max"},
+    "tracker": {"model": "haiku", "effort": "medium"},
     # critic intentionally absent — no default
 }
 

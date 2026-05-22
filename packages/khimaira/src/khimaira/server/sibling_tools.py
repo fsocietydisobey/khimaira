@@ -12,6 +12,7 @@ After this runs, hosts that connect to khimaira see:
   mcp__khimaira__seance_semantic_search    (from seance.server)
   mcp__khimaira__specter_take_screenshot   (from specter.server)
   mcp__khimaira__scarlet_analyze_project   (from scarlet.server)
+  mcp__khimaira__themis_check              (from themis.server)
   mcp__khimaira__auto / session_* / ...    (khimaira's own)
 
 Tool function bodies are unchanged — they execute through the same
@@ -27,7 +28,7 @@ import logging
 
 log = logging.getLogger(__name__)
 
-SIBLING_PACKAGES: tuple[str, ...] = ("seance", "specter", "scarlet", "sibyl")
+SIBLING_PACKAGES: tuple[str, ...] = ("seance", "specter", "scarlet", "sibyl", "themis")
 
 
 def register_sibling_tools(khimaira_mcp) -> int:

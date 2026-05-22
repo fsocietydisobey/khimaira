@@ -126,16 +126,30 @@ def build_router():
 
     router = fastapi.APIRouter()
 
+    # Lazy import: themis role cache invalidation. Fail-open — if themis router
+    # is not loaded (test environments), chat writes proceed unaffected.
+    def _inval(*session_ids: str) -> None:
+        try:
+            from .themis import invalidate_role_cache
+
+            for sid in session_ids:
+                invalidate_role_cache(sid)
+        except Exception:
+            pass  # fail-open: stale cache expires in 5 min (TTL safety net)
+
     @router.post("/chats")
     async def create_room(req: CreateRoomReq) -> dict:
         try:
-            return chats.create_room(
+            result = chats.create_room(
                 req.creator_session_id,
                 req.member_session_ids,
                 title=req.title,
                 fresh=req.fresh,
                 topology=req.topology,
             )
+            # Invalidate creator + all initial members — they may now have roles
+            _inval(req.creator_session_id, *req.member_session_ids)
+            return result
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
 
@@ -226,7 +240,9 @@ def build_router():
     @router.post("/chats/{chat_id}/accept")
     async def accept_invite(chat_id: str, req: AcceptReq) -> dict:
         try:
-            return chats.accept(chat_id, req.session_id)
+            result = chats.accept(chat_id, req.session_id)
+            _inval(req.session_id)
+            return result
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
 
@@ -361,19 +377,24 @@ def build_router():
     @router.post("/chats/{chat_id}/leave")
     async def leave_chat(chat_id: str, req: LeaveReq) -> dict:
         try:
-            return chats.leave(chat_id, req.session_id)
+            result = chats.leave(chat_id, req.session_id)
+            _inval(req.session_id)
+            return result
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
 
     @router.post("/chats/{chat_id}/transfer-membership")
     async def transfer_membership(chat_id: str, req: TransferMembershipReq) -> dict:
         try:
-            return chats.transfer_membership(
+            result = chats.transfer_membership(
                 chat_id,
                 req.from_session_id,
                 req.to_session_id,
                 as_deputize=req.as_deputize,
             )
+            # Both sessions swap roles — invalidate both
+            _inval(req.from_session_id, req.to_session_id)
+            return result
         except ValueError as exc:
             msg = str(exc)
             if "already accepted" in msg:
@@ -391,11 +412,21 @@ def build_router():
         /khimaira-resume on the skill side. See chats.chat_resume_master for
         semantics + invariants."""
         try:
-            return chats.chat_resume_master(
+            result = chats.chat_resume_master(
                 chat_id,
                 req.by_session_id,
                 demote_to=req.demote_to,
             )
+            # by_session_id reclaims master; the former vice's session_id is
+            # not in the request — clear entire cache so stale vice role
+            # doesn't persist beyond the TTL. Nuclear but correct.
+            try:
+                from .themis import clear_role_cache
+
+                clear_role_cache()
+            except Exception:
+                pass
+            return result
         except ValueError as exc:
             msg = str(exc)
             if "not currently deputized" in msg or "no deputized_original_master" in msg:

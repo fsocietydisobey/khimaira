@@ -32,6 +32,12 @@ from khimaira.attach import (
     record_detach,
 )
 from khimaira.attach.inject import VenvNotFound
+from khimaira.attach.settings_hooks import (
+    derive_matcher_pattern,
+    inject_hook_entry,
+    remove_hook_entry,
+    resolve_hook_command,
+)
 
 _STATE_DIR = (
     Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
@@ -131,6 +137,9 @@ def run_attach(args: argparse.Namespace) -> int:
         "\nThe app's LangGraph runs will now emit heartbeats to khimaira-monitor "
         "on its next start. Restart the app to pick up the observer."
     )
+
+    # Inject Themis PreToolUse hook into the project's settings.local.json
+    _inject_themis_hook(project)
 
     # First-attach onboarding — prompt about installing the systemd unit
     # so the daemon auto-restarts on crash + boot. Only fires once
@@ -315,6 +324,25 @@ def _maybe_prompt_supervisor_install() -> None:
     _write_setup_state(state)
 
 
+def _inject_themis_hook(project: Path) -> None:
+    """Inject the Themis PreToolUse hook into the project's settings.local.json.
+
+    Fail-open: if anything goes wrong, print a warning and continue.
+    The observer injection (the primary purpose of attach) already succeeded.
+    """
+    try:
+        settings_path = project / ".claude" / "settings.local.json"
+        matcher = derive_matcher_pattern()
+        command = resolve_hook_command(project)
+        inject_hook_entry(settings_path, matcher, command)
+        print(f"   Themis PreToolUse hook injected → {settings_path.relative_to(project)}")
+    except Exception as exc:
+        print(
+            f"   ⚠️  Themis hook injection skipped ({exc}). "
+            f"Run `khimaira themis sync` to retry after setup."
+        )
+
+
 def run_detach(args: argparse.Namespace) -> int:
     project = Path(args.project_path).expanduser().resolve()
     try:
@@ -332,6 +360,16 @@ def run_detach(args: argparse.Namespace) -> int:
         print(
             f"(nothing to remove — observer wasn't present at {result.site_packages})"
         )
+
+    # Remove Themis PreToolUse hook from settings.local.json
+    settings_path = project / ".claude" / "settings.local.json"
+    try:
+        removed = remove_hook_entry(settings_path)
+        if removed:
+            print(f"   Themis PreToolUse hook removed from {settings_path.relative_to(project)}")
+    except Exception as exc:
+        print(f"   ⚠️  Themis hook removal skipped ({exc}).")
+
     return 0
 
 

@@ -16,6 +16,7 @@ members = [
     "khimaira-seance",
     "khimaira-sibyl",
     "khimaira-specter",
+    "khimaira-themis",
     "khimaira-transport",
     "khimaira-types",
     "khimaira-workspace",
@@ -1143,6 +1144,23 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.0" },
     { name = "websockets", specifier = ">=13.0" },
+]
+
+[[package]]
+name = "khimaira-themis"
+version = "0.1.0"
+source = { editable = "packages/themis" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "mcp", extra = ["cli"] },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.111" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
 ]
 
 [[package]]
