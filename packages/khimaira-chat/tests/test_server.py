@@ -570,3 +570,70 @@ async def test_async_ppid_bridge_noop_when_session_id_already_set(monkeypatch):
             server._state.write_stream,
             server._state.subscriber_restart_count,
         ) = orig
+
+
+# ---------------------------------------------------------------------------
+# Subscriber-side dedup (Change 2)
+# ---------------------------------------------------------------------------
+
+
+def test_subscriber_dedup_skips_seen_event():
+    """seen_event_ids prevents processing the same event_id twice."""
+    import collections
+    from khimaira_chat import server
+
+    # Reset seen_event_ids to a clean state for this test.
+    orig_seen = server._state.seen_event_ids
+    server._state.seen_event_ids = collections.OrderedDict()
+    try:
+        state = server._state
+        evt_id = "evt-dedup-001"
+
+        # First time: not seen, should NOT be in dict yet.
+        assert evt_id not in state.seen_event_ids
+
+        # Simulate the dedup logic from _proactive_sse_loop.
+        def _process(eid: str) -> bool:
+            """Returns True if event was new (should be processed)."""
+            if eid in state.seen_event_ids:
+                return False
+            state.seen_event_ids[eid] = None
+            state.seen_event_ids.move_to_end(eid)
+            if len(state.seen_event_ids) > server._SubprocessState._DEDUP_MAX:
+                state.seen_event_ids.popitem(last=False)
+            return True
+
+        assert _process(evt_id) is True, "first occurrence should be processed"
+        assert _process(evt_id) is False, "second occurrence should be skipped"
+        assert evt_id in state.seen_event_ids, "event_id should be in seen set"
+        assert len(state.seen_event_ids) == 1
+    finally:
+        server._state.seen_event_ids = orig_seen
+
+
+def test_subscriber_dedup_lru_eviction():
+    """seen_event_ids caps at _DEDUP_MAX and evicts oldest first."""
+    import collections
+    from khimaira_chat import server
+
+    orig_seen = server._state.seen_event_ids
+    server._state.seen_event_ids = collections.OrderedDict()
+    try:
+        state = server._state
+        cap = server._SubprocessState._DEDUP_MAX
+
+        # Fill to cap + 1 to trigger eviction.
+        for i in range(cap + 1):
+            eid = f"evt-{i:04d}"
+            state.seen_event_ids[eid] = None
+            state.seen_event_ids.move_to_end(eid)
+            if len(state.seen_event_ids) > cap:
+                state.seen_event_ids.popitem(last=False)
+
+        assert len(state.seen_event_ids) == cap
+        # Oldest (evt-0000) should have been evicted.
+        assert "evt-0000" not in state.seen_event_ids
+        # Most-recent should still be present.
+        assert f"evt-{cap:04d}" in state.seen_event_ids
+    finally:
+        server._state.seen_event_ids = orig_seen

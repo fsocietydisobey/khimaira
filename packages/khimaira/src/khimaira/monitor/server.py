@@ -101,6 +101,34 @@ def build_app():
     app.include_router(chats_api.build_router(), prefix="/api")
     app.include_router(themis_api.build_router(), prefix="/api")
 
+    # SSE delivery cursor persistence — load cursors from disk at startup
+    # so reconnecting subscribers resume from their last yielded position.
+    @app.on_event("startup")
+    async def _load_chat_cursors() -> None:
+        from .chats import load_cursors
+        load_cursors()
+
+    @app.on_event("shutdown")
+    async def _save_chat_cursors() -> None:
+        from .chats import save_cursors
+        save_cursors()
+
+    # Periodic cursor persist — flush _CURSORS to disk every 8 seconds.
+    # Complements the on-disconnect flush in event_generator so a daemon
+    # restart doesn't lose more than ~8s of cursor advancement.
+    @app.on_event("startup")
+    async def _start_cursor_persist_loop() -> None:
+        from .chats import _CURSORS_DIRTY, save_cursors  # noqa: F401
+
+        async def _loop() -> None:
+            import khimaira.monitor.chats as _chats
+            while True:
+                await asyncio.sleep(8)
+                if _chats._CURSORS_DIRTY:
+                    _chats.save_cursors()
+
+        asyncio.create_task(_loop())
+
     # Expected-reply overdue watcher — fires session_post_notice to both sides
     # when a chat_send_to recipient hasn't replied within _REPLY_OVERDUE_S.
     @app.on_event("startup")

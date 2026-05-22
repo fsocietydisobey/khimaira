@@ -136,6 +136,103 @@ def _chat_path(chat_id: str) -> Path:
     return _chat_dir() / f"{chat_id}.jsonl"
 
 
+def _cursors_path() -> Path:
+    return _chat_dir() / "cursors.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Per-(session_id, chat_id) delivery cursors
+#
+# Each SSE subscriber tracks the last event_id it successfully yielded
+# per chat. On reconnect, backfill uses these cursors rather than the
+# client-supplied Last-Event-ID header, which is global (single value)
+# and therefore can't address per-chat positioning.
+#
+# Cursor advances AFTER the SSE yield succeeds (in api/chats.py's
+# event_generator) — not on enqueue. This means a ClientDisconnect during
+# yield leaves the cursor at the prior position, so the next reconnect
+# backfills from there with no loss.
+# ---------------------------------------------------------------------------
+
+_CURSORS: dict[tuple[str, str], str] = {}  # (session_id, chat_id) → last yielded event_id
+_CURSORS_DIRTY: bool = False               # true when _CURSORS has unsaved changes
+
+
+def _cursor_for(session_id: str, chat_id: str) -> str | None:
+    """Return the last yielded event_id for this (session, chat) pair, or None."""
+    return _CURSORS.get((session_id, chat_id))
+
+
+def _advance_cursor(session_id: str, chat_id: str, event_id: str) -> None:
+    """Update the cursor after a successful SSE yield. Call-site: api/chats.py event_generator."""
+    global _CURSORS_DIRTY
+    _CURSORS[(session_id, chat_id)] = event_id
+    _CURSORS_DIRTY = True
+
+
+def load_cursors() -> None:
+    """Read cursors.jsonl into _CURSORS at daemon startup.
+
+    Takes the last entry per (session_id, chat_id) so repeated daemon
+    restarts correctly restore the most-recently-advanced positions.
+    Silently ignores missing or corrupt files — fail-open is correct
+    (missing cursor → last-50 backfill, which is safe).
+    """
+    global _CURSORS_DIRTY
+    path = _cursors_path()
+    if not path.exists():
+        return
+    latest: dict[tuple[str, str], str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                sid = entry.get("session_id")
+                cid = entry.get("chat_id")
+                eid = entry.get("last_event_id")
+                if sid and cid and eid:
+                    latest[(sid, cid)] = eid
+            except (json.JSONDecodeError, KeyError):
+                continue
+    except OSError:
+        return
+    _CURSORS.update(latest)
+    _CURSORS_DIRTY = False
+    log.info("chats: loaded %d cursor(s) from disk", len(latest))
+
+
+def save_cursors() -> None:
+    """Persist _CURSORS to cursors.jsonl as a compact snapshot.
+
+    Each call writes exactly one line per (session_id, chat_id) key —
+    the current in-memory value. Atomic-rename ensures readers never
+    see a partial write.
+    """
+    global _CURSORS_DIRTY
+    if not _CURSORS:
+        return
+    path = _cursors_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    now_ts = datetime.now(UTC).isoformat()
+    lines = [
+        json.dumps({"session_id": sid, "chat_id": cid, "last_event_id": eid, "ts": now_ts},
+                   separators=(",", ":"))
+        for (sid, cid), eid in _CURSORS.items()
+    ]
+
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        _CURSORS_DIRTY = False
+    except OSError:
+        log.warning("chats: failed to persist cursors to %s", path)
+
+
 def _resolve_sender_name(session_id: str, fallback: str) -> str:
     """Return the session's CURRENT friendly name from status.json.
 
@@ -2041,12 +2138,24 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
             continue
         queues = _subscribers.get(sid)
         if not queues:
+            log.warning(
+                "chats: dropped event for disconnected subscriber sid=%s chat=%s "
+                "event_id=%s reason=no_subscriber",
+                sid,
+                chat_id,
+                record.get("event_id"),
+            )
             continue
         for q in queues:
             try:
                 q.put_nowait(record)
             except asyncio.QueueFull:
-                log.warning("chats: dropping event for %s (queue full)", sid)
+                log.warning(
+                    "chats: dropped event for sid=%s chat=%s event_id=%s reason=queue_full",
+                    sid,
+                    chat_id,
+                    record.get("event_id"),
+                )
 
 
 async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
@@ -2081,28 +2190,61 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
                     yield line
                     break  # only the most recent pending record per chat
 
-        if since_event_id:
-            # v1.1 follow-up: when since_event_id is unrecognized in any
-            # chat (cursor older than chat history, archived chat,
-            # cross-chat id confusion), we silently skip backfill for
-            # that chat. The JSONL is append-only so this *shouldn't*
-            # happen in practice, but the silent gap risks "phantom
-            # missing messages" with no signal. Add a sentinel record
-            # like {"kind": "backfill_gap", "chat_id": ...} so the
-            # subprocess can render "events older than your cursor were
-            # not found in this chat — call chat_history for full
-            # transcript" instead of just delivering nothing.
+        # Backfill phase: per-(session, chat) cursor positioning.
+        #
+        # For each accepted chat, use the daemon-side cursor (last yielded
+        # event_id for this session+chat) to replay missed events. Falls
+        # back to the Last-Event-ID header hint only when no cursor exists
+        # for that specific chat. Without per-chat cursors, the prior code
+        # used a single global since_event_id which silently skipped any
+        # chat whose JSONL didn't contain that event_id — the root cause
+        # of the 2026-05-22 jp roster jp-intake-1 message-loss incident.
+        #
+        # Fresh first-time connects (no cursor AND no since_event_id) skip
+        # backfill entirely — they should only receive real-time messages.
+        # The original behavior for fresh subscribes is preserved here.
+        has_reconnect_hint = since_event_id is not None
+        any_cursor = any(_cursor_for(session_id, m["chat_id"]) is not None
+                         for m in my_chats(session_id)
+                         if m.get("my_state") == ACCEPTED)
+        if has_reconnect_hint or any_cursor:
             for chat_meta in my_chats(session_id):
+                if chat_meta.get("my_state") != ACCEPTED:
+                    continue
                 chat_id = chat_meta["chat_id"]
                 lines = _read(chat_id)
-                idx = next(
-                    (i for i, line in enumerate(lines) if line.get("event_id") == since_event_id),
-                    None,
-                )
-                if idx is None:
-                    continue
-                for line in lines[idx + 1 :]:
-                    yield line
+
+                cursor = _cursor_for(session_id, chat_id)
+                if cursor is not None:
+                    # Daemon-side cursor wins. Events after the cursor position.
+                    idx = next(
+                        (i for i, line in enumerate(lines) if line.get("event_id") == cursor),
+                        None,
+                    )
+                    start = idx + 1 if idx is not None else max(0, len(lines) - 50)
+                    for line in lines[start:]:
+                        yield line
+                elif since_event_id:
+                    # No daemon-side cursor: treat Last-Event-ID as a per-chat hint.
+                    # If found in this chat → replay from there. If NOT found
+                    # (the prior bug: since_event_id belongs to a different chat)
+                    # → deliver last 50 instead of silently skipping.
+                    idx = next(
+                        (i for i, line in enumerate(lines) if line.get("event_id") == since_event_id),
+                        None,
+                    )
+                    if idx is not None:
+                        for line in lines[idx + 1:]:
+                            yield line
+                    else:
+                        for line in lines[-50:]:
+                            yield line
+                else:
+                    # Session IS reconnecting (other chats have cursors) but this
+                    # specific chat has neither cursor nor hint. Deliver last 50
+                    # so missed messages aren't silently dropped.
+                    for line in lines[-50:]:
+                        yield line
         while True:
             record = await queue.get()
             yield record

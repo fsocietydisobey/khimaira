@@ -967,3 +967,216 @@ def test_multi_recipient_partial_resolution(registry_client):
     )
     assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
     assert ("carol", "alice") in api_mod._EXPECTED_REPLIES
+
+
+# ---------------------------------------------------------------------------
+# Per-chat cursor delivery (Change 1+2)
+# ---------------------------------------------------------------------------
+
+
+def test_advance_cursor_and_cursor_for(chats_api_client):
+    """_advance_cursor updates _cursor_for for the correct (session, chat) key."""
+    _, chats_mod = chats_api_client
+    chats_mod._advance_cursor("alice", "chat-abc", "evt-001")
+    chats_mod._advance_cursor("alice", "chat-abc", "evt-002")  # overwrite
+    chats_mod._advance_cursor("bob", "chat-abc", "evt-003")   # different session
+    assert chats_mod._cursor_for("alice", "chat-abc") == "evt-002"
+    assert chats_mod._cursor_for("bob", "chat-abc") == "evt-003"
+    assert chats_mod._cursor_for("carol", "chat-abc") is None  # no entry
+
+
+def test_cursor_persists_across_daemon_restart(chats_api_client, tmp_path, monkeypatch):
+    """Cursors written by save_cursors() are read back by load_cursors() correctly."""
+    _, chats_mod = chats_api_client
+    # Advance two cursors.
+    chats_mod._advance_cursor("alice", "chat-x", "evt-100")
+    chats_mod._advance_cursor("bob", "chat-y", "evt-200")
+
+    # Persist to disk.
+    chats_mod.save_cursors()
+
+    # Simulate daemon restart: clear in-memory state and reload.
+    chats_mod._CURSORS.clear()
+    assert chats_mod._cursor_for("alice", "chat-x") is None
+
+    chats_mod.load_cursors()
+    assert chats_mod._cursor_for("alice", "chat-x") == "evt-100"
+    assert chats_mod._cursor_for("bob", "chat-y") == "evt-200"
+
+
+def _drain_backfill(subscribe_coro, max_events: int = 100, timeout_s: float = 0.3) -> list[dict]:
+    """Drain backfill events from an async generator using per-event timeouts.
+
+    Stops collecting when an event takes longer than timeout_s (meaning we've
+    crossed into the real-time queue phase, which blocks indefinitely in tests).
+    """
+    import asyncio
+
+    collected: list[dict] = []
+
+    async def _run(gen):
+        try:
+            while len(collected) < max_events:
+                try:
+                    record = await asyncio.wait_for(gen.__anext__(), timeout=timeout_s)
+                    collected.append(record)
+                except asyncio.TimeoutError:
+                    break
+                except StopAsyncIteration:
+                    break
+        finally:
+            await gen.aclose()
+
+    asyncio.run(_run(subscribe_coro))
+    return collected
+
+
+def test_multi_chat_backfill_uses_per_chat_cursors(chats_api_client):
+    """Session in chats A+B: event broadcast to B during disconnect → backfilled on reconnect."""
+    client, chats_mod = chats_api_client
+    from khimaira.monitor import sessions as sessions_mod
+
+    # Ensure carol session exists.
+    sd = sessions_mod._session_dir("carol")
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / "status.json").write_text(
+        json.dumps({"status": "idle", "name": "carol"}), encoding="utf-8"
+    )
+
+    # Create chat A (alice+bob) and chat B (alice+carol).
+    resp_a = client.post(
+        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["bob"]}
+    ).json()
+    chat_a = resp_a["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_a}/accept", json={"session_id": "bob"})
+
+    resp_b = client.post(
+        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["carol"]}
+    ).json()
+    chat_b = resp_b["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_b}/accept", json={"session_id": "carol"})
+
+    # Set alice's cursor for chat A at its last event (simulates prior session).
+    lines_a = chats_mod._read(chat_a)
+    last_a = next((l for l in reversed(lines_a) if l.get("event_id")), None)
+    if last_a:
+        chats_mod._advance_cursor("alice", chat_a, last_a["event_id"])
+
+    # Send a message in chat B while alice is "disconnected" (no cursor for B).
+    client.post(
+        f"/api/chats/{chat_b}/messages",
+        json={"sender_session_id": "carol", "body": "hello alice"},
+    )
+    lines_b = chats_mod._read(chat_b)
+    new_msg = next((l for l in reversed(lines_b) if l.get("kind") == "msg"), None)
+    assert new_msg is not None, "message should appear in chat B JSONL"
+
+    # Drain backfill events — chat B message should be present.
+    collected = _drain_backfill(chats_mod.subscribe("alice"))
+    msg_event_ids = {r.get("event_id") for r in collected}
+    assert new_msg["event_id"] in msg_event_ids, (
+        "expected new chat B message in backfill;\n"
+        f"  new_msg event_id: {new_msg['event_id']}\n"
+        f"  collected event_ids: {msg_event_ids}"
+    )
+
+
+def test_backfill_without_cursor_uses_last_50(chats_api_client):
+    """Reconnecting subscriber with no cursor delivers last ≤50 events per chat.
+
+    Fresh connects (no hint, no cursor) skip backfill. This test simulates
+    a reconnect by providing a since_event_id hint, then verifies the last-50
+    fallback triggers when the since_event_id isn't found in this chat.
+    """
+    client, chats_mod = chats_api_client
+
+    # Create two chats: A (where since_event_id will come from) and B (where backfill happens).
+    resp_a = client.post(
+        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["bob"]}
+    ).json()
+    chat_a = resp_a["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_a}/accept", json={"session_id": "bob"})
+    client.post(
+        f"/api/chats/{chat_a}/messages",
+        json={"sender_session_id": "alice", "body": "anchor"},
+    )
+    lines_a = [l for l in chats_mod._read(chat_a) if l.get("kind") == "msg"]
+    anchor_event_id = lines_a[0]["event_id"]
+
+    from khimaira.monitor import sessions as sessions_mod
+    sd = sessions_mod._session_dir("carol")
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / "status.json").write_text(json.dumps({"status": "idle", "name": "carol"}), "utf-8")
+
+    resp_b = client.post(
+        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["carol"]}
+    ).json()
+    chat_b = resp_b["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_b}/accept", json={"session_id": "carol"})
+    for i in range(5):
+        client.post(
+            f"/api/chats/{chat_b}/messages",
+            json={"sender_session_id": "carol", "body": f"msg {i}"},
+        )
+
+    # Subscribe with anchor from chat A as the since_event_id hint.
+    # Chat B has no cursor → falls to last-50 backfill.
+    collected = _drain_backfill(chats_mod.subscribe("alice", since_event_id=anchor_event_id))
+    chat_b_events = [r for r in collected if r.get("chat_id") == chat_b]
+    assert len(chat_b_events) > 0, "expected backfill events from chat B"
+    assert len(chat_b_events) <= 50, "backfill capped at 50"
+
+
+def test_broadcast_logs_warning_on_disconnected_subscriber(chats_api_client, caplog):
+    """_broadcast emits a warning when a member has no SSE subscriber queue."""
+    import logging
+
+    client, chats_mod = chats_api_client
+
+    # Create chat and accept.
+    resp = client.post(
+        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["bob"]}
+    ).json()
+    chat_id = resp["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+
+    # Send message — bob has no subscriber queue (not connected via SSE).
+    with caplog.at_level(logging.WARNING, logger="khimaira.monitor.chats"):
+        client.post(
+            f"/api/chats/{chat_id}/messages",
+            json={"sender_session_id": "alice", "body": "hi bob"},
+        )
+
+    warn_msgs = [r.message for r in caplog.records if "no_subscriber" in r.message]
+    assert warn_msgs, "expected warning for disconnected subscriber"
+    # Warnings may fire for alice (creator) AND bob — at least one must name the chat.
+    assert any(chat_id in m for m in warn_msgs), "warning should name the chat_id"
+
+
+def test_last_event_id_hint_used_when_no_cursor(chats_api_client):
+    """When no daemon-side cursor exists, Last-Event-ID header is used as hint."""
+    client, chats_mod = chats_api_client
+
+    # Create chat and post 3 messages.
+    resp = client.post(
+        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["bob"]}
+    ).json()
+    chat_id = resp["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+    for i in range(3):
+        client.post(
+            f"/api/chats/{chat_id}/messages",
+            json={"sender_session_id": "alice", "body": f"msg {i}"},
+        )
+
+    # Find the event_id of the second message.
+    lines = [l for l in chats_mod._read(chat_id) if l.get("kind") == "msg"]
+    assert len(lines) >= 2
+    pivot_event_id = lines[1]["event_id"]  # last-event-id hint
+
+    # No cursor set. Subscribe with since_event_id = pivot → only last msg delivered.
+    collected = _drain_backfill(chats_mod.subscribe("alice", since_event_id=pivot_event_id))
+    msg_bodies = [r["body"] for r in collected if r.get("kind") == "msg"]
+    # msg 2 should appear (it comes after the pivot), msg 0 should NOT (it's before the pivot).
+    assert "msg 2" in msg_bodies, f"expected 'msg 2' in backfill; got: {msg_bodies}"
+    assert "msg 0" not in msg_bodies, f"msg 0 predates the pivot and must not appear; got: {msg_bodies}"

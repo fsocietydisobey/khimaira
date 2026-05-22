@@ -283,6 +283,13 @@ def build_router():
                     "event": record.get("kind", "message"),
                     "data": json.dumps(record, separators=(",", ":")),
                 }
+                # Cursor advances AFTER successful yield — if yield raises
+                # (ClientDisconnect, transport error), this line doesn't run,
+                # so the next reconnect backfills from the prior position.
+                evt_id = record.get("event_id")
+                rec_chat_id = record.get("chat_id")
+                if evt_id and rec_chat_id:
+                    chats._advance_cursor(session_id, rec_chat_id, evt_id)
 
         # ping=15 makes sse_starlette emit a `: keepalive` comment line
         # every 15 seconds. SSE comments are valid keep-alives that don't

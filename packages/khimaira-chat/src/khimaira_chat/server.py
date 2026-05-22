@@ -17,6 +17,7 @@ need to be delivered.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import sys
@@ -81,10 +82,16 @@ class _SubprocessState:
     fails loudly rather than silently rewriting our identity.
     """
 
+    # Capacity of the seen-event dedup set. LRU OrderedDict pops oldest on overflow.
+    _DEDUP_MAX = 1000
+
     def __init__(self) -> None:
         self.session_id: str | None = None
         self.last_event_id: str | None = None
         self.subscriber_task: asyncio.Task | None = None
+        # Bounded dedup set — prevents reprocessing the same event_id after
+        # a subscriber reconnect during the cursor-advance race window.
+        self.seen_event_ids: collections.OrderedDict[str, None] = collections.OrderedDict()
         # Phase B v1.3: watchdog supervises subscriber_task. Restarts it
         # if it crashes; logs the crash reason via task.exception(). One
         # watchdog per subprocess lifetime, spawned in _serve().
@@ -1139,6 +1146,13 @@ async def _proactive_sse_loop() -> None:
             try:
                 evt_id = record.get("event_id")
                 if evt_id:
+                    # Dedup: skip events already processed (race window on reconnect).
+                    if evt_id in _state.seen_event_ids:
+                        log.debug("khimaira-chat: dedup skip event_id=%s", evt_id)
+                        continue
+                    _state.seen_event_ids[evt_id] = None  # new key → appended at end
+                    if len(_state.seen_event_ids) > _SubprocessState._DEDUP_MAX:
+                        _state.seen_event_ids.popitem(last=False)
                     _state.last_event_id = evt_id
                 decision = _route_record(record, _state.session_id)
                 if decision is None:
