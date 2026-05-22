@@ -58,3 +58,24 @@ invariants:
       If this is a user-preference question (which feature ships, which UI option, etc.)
       no consult is needed — proceed.
       Severity is warn (observation week 2026-05-22 → 2026-05-29); will flip to block.
+
+  - id: IN-MASTER-5
+    name: PARALLELIZE_INDEPENDENT_WORK
+    severity: warn
+    matchers:
+      - tool: mcp__khimaira-chat__chat_task_create
+      - tool: mcp__khimaira-chat__chat_send_to
+    conditions:
+      - check: idle_capacity_available
+      - check: no_recent_parallel_dispatch
+    message: |
+      ⚠️ Themis IN-MASTER-5 (PARALLELIZE_INDEPENDENT_WORK): dispatching serially
+      with idle roster capacity available.
+      Before proceeding, audit:
+        1. session_list() — how many idle agents are in this roster?
+        2. Is the next work composable into N independent slices?
+           (different files, different layers, no causal dependency)
+      If yes to both: send multiple chat_task_create calls in a single message
+      (parallel tool uses) instead of sequencing them.
+      If genuinely sequential (causal dependency), proceed — this warn is advisory.
+      Severity is warn (observation week 2026-05-22 → 2026-05-29); will flip to block.

@@ -10,8 +10,12 @@ from themis.conditions import (
     chat_my_chats_not_called_this_turn,
     evaluate_condition,
     idle_agents_exist,
+    idle_capacity_available,
+    no_recent_parallel_dispatch,
     no_recent_top_tier_consult,
 )
+from themis.data import Severity
+from themis.engine import evaluate
 
 
 class TestIdleAgentsExist:
@@ -182,6 +186,132 @@ class TestNoRecentTopTierConsult:
             ]
         }
         assert no_recent_top_tier_consult(payload) is False
+
+
+class TestIdleCapacityAvailable:
+    def _agent(self, name: str) -> dict:
+        return {"session_id": name, "name": name, "status": "idle"}
+
+    def test_returns_true_with_2_idle_agents(self):
+        payload = {"idle_agents": [self._agent("agent-1"), self._agent("agent-2")]}
+        assert idle_capacity_available(payload) is True
+
+    def test_returns_true_with_more_than_2_idle_agents(self):
+        payload = {
+            "idle_agents": [self._agent("agent-1"), self._agent("agent-2"), self._agent("agent-3")]
+        }
+        assert idle_capacity_available(payload) is True
+
+    def test_returns_false_with_1_idle_agent(self):
+        payload = {"idle_agents": [self._agent("agent-1")]}
+        assert idle_capacity_available(payload) is False
+
+    def test_returns_false_with_no_idle_agents(self):
+        assert idle_capacity_available({"idle_agents": []}) is False
+
+    def test_returns_false_when_key_absent(self):
+        assert idle_capacity_available({}) is False
+
+    def test_returns_false_when_none(self):
+        assert idle_capacity_available({"idle_agents": None}) is False
+
+
+class TestNoRecentParallelDispatch:
+    def _ts(self, seconds_ago: float = 0) -> str:
+        return (datetime.now(tz=timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+
+    def _dispatch_call(self, seconds_ago: float = 5, tool: str = "mcp__khimaira-chat__chat_task_create") -> dict:
+        return {"ts": self._ts(seconds_ago), "tool": tool, "params": {"body": "task"}}
+
+    def test_returns_true_when_no_recent_dispatch(self):
+        """No prior dispatch in recent_tool_calls → serial mode → violation fires."""
+        payload = {"recent_tool_calls": []}
+        assert no_recent_parallel_dispatch(payload) is True
+
+    def test_returns_true_when_only_non_dispatch_tools(self):
+        """Only non-dispatch tools in recent history → serial mode → violation fires."""
+        payload = {
+            "recent_tool_calls": [
+                {"ts": self._ts(10), "tool": "Read", "params": {}},
+                {"ts": self._ts(5), "tool": "AskUserQuestion", "params": {}},
+            ]
+        }
+        assert no_recent_parallel_dispatch(payload) is True
+
+    def test_returns_false_when_recent_chat_task_create(self):
+        """Prior chat_task_create within 30s → batch mode → no violation."""
+        payload = {"recent_tool_calls": [self._dispatch_call(seconds_ago=10)]}
+        assert no_recent_parallel_dispatch(payload) is False
+
+    def test_returns_false_when_recent_chat_send_to(self):
+        """Prior chat_send_to within 30s → batch mode → no violation."""
+        payload = {
+            "recent_tool_calls": [
+                self._dispatch_call(seconds_ago=8, tool="mcp__khimaira-chat__chat_send_to")
+            ]
+        }
+        assert no_recent_parallel_dispatch(payload) is False
+
+    def test_returns_true_when_dispatch_outside_window(self):
+        """Prior dispatch outside 30s window → treated as stale → violation fires."""
+        payload = {"recent_tool_calls": [self._dispatch_call(seconds_ago=60)]}
+        assert no_recent_parallel_dispatch(payload) is True
+
+    def test_returns_false_when_key_absent(self):
+        """Absent recent_tool_calls → fail-open → no violation."""
+        assert no_recent_parallel_dispatch({}) is False
+
+    def test_returns_false_when_recent_tool_calls_is_none(self):
+        """None value for recent_tool_calls → fail-open → no violation."""
+        assert no_recent_parallel_dispatch({"recent_tool_calls": None}) is False
+
+    def test_skips_entries_with_missing_ts(self):
+        """Entry missing ts field → skipped, no false positive."""
+        payload = {
+            "recent_tool_calls": [
+                {"tool": "mcp__khimaira-chat__chat_task_create", "params": {}}
+            ]
+        }
+        assert no_recent_parallel_dispatch(payload) is True
+
+
+class TestINMASTER5Integration:
+    """Integration: IN-MASTER-5 fires via evaluate() with real YAML + conditions."""
+
+    def _idle_agent(self, name: str) -> dict:
+        return {"session_id": name, "name": name, "status": "idle"}
+
+    def test_fires_when_serial_dispatch_with_idle_capacity(self):
+        """chat_task_create + 2 idle agents + no recent dispatch → IN-MASTER-5 warn."""
+        conditions_payload = {
+            "idle_agents": [self._idle_agent("agent-1"), self._idle_agent("agent-2")],
+            "recent_tool_calls": [],  # no prior dispatch in window
+        }
+        result = evaluate("master", "mcp__khimaira-chat__chat_task_create", {}, conditions_payload=conditions_payload)
+        assert result.ok is False
+        assert result.violation.rule_id == "IN-MASTER-5"
+        assert result.violation.severity == Severity.WARN
+
+    def test_does_not_fire_when_recent_parallel_dispatch(self):
+        """chat_task_create + prior dispatch within 30s → batch mode → no violation."""
+        recent_ts = (datetime.now(tz=timezone.utc) - timedelta(seconds=10)).isoformat()
+        conditions_payload = {
+            "idle_agents": [self._idle_agent("agent-1"), self._idle_agent("agent-2")],
+            "recent_tool_calls": [
+                {"ts": recent_ts, "tool": "mcp__khimaira-chat__chat_task_create", "params": {}}
+            ],
+        }
+        result = evaluate("master", "mcp__khimaira-chat__chat_task_create", {}, conditions_payload=conditions_payload)
+        assert result.ok is True
+
+    def test_does_not_fire_with_only_1_idle_agent(self):
+        """chat_task_create + only 1 idle agent → no spare capacity → no violation."""
+        conditions_payload = {
+            "idle_agents": [self._idle_agent("agent-1")],
+            "recent_tool_calls": [],
+        }
+        result = evaluate("master", "mcp__khimaira-chat__chat_task_create", {}, conditions_payload=conditions_payload)
+        assert result.ok is True
 
 
 class TestEvaluateCondition:

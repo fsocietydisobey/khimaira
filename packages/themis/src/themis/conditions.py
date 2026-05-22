@@ -6,9 +6,12 @@ AND-combined only — no OR/NOT support in Phase 1 (spec §"Condition shapes").
 Adding a new condition: add a function here and register it in _REGISTRY.
 The YAML references conditions by name (the dict key in _REGISTRY).
 
-Phase 1 ships with exactly 2 conditions:
+Phase 1 ships with 5 conditions:
   - idle_agents_exist
   - chat_my_chats_not_called_this_turn
+  - no_recent_top_tier_consult (IN-MASTER-4)
+  - idle_capacity_available (IN-MASTER-5)
+  - no_recent_parallel_dispatch (IN-MASTER-5)
 
 A DSL is deferred until 5+ named conditions OR a first OR/NOT need emerges.
 """
@@ -16,7 +19,7 @@ A DSL is deferred until 5+ named conditions OR a first OR/NOT need emerges.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -162,6 +165,79 @@ def no_recent_top_tier_consult(payload: dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# IN-MASTER-5 conditions (PARALLELIZE_INDEPENDENT_WORK)
+# ---------------------------------------------------------------------------
+
+# Minimum number of idle agents required to consider capacity "available".
+# With < 2 idle, the current serial dispatch consumes all available agents.
+_MIN_IDLE_FOR_CAPACITY = 2
+
+# Tool names that constitute a task dispatch (IN-MASTER-5 scope).
+_DISPATCH_TOOLS = frozenset(
+    ["mcp__khimaira-chat__chat_task_create", "mcp__khimaira-chat__chat_send_to"]
+)
+
+# Window in seconds for detecting "batch" (parallel) dispatch.
+_PARALLEL_WINDOW_S = 30
+
+
+def idle_capacity_available(payload: dict[str, Any]) -> bool:
+    """True if at least 2 idle agents exist in the master's current roster.
+
+    Requires at least 2 (not just 1) so that a single-agent dispatch still
+    leaves unused capacity — the scenario IN-MASTER-5 aims to flag.
+
+    Reuses payload["idle_agents"] populated by the daemon (same key as
+    idle_agents_exist). Fail-open: absent key returns False.
+    """
+    agents = payload.get("idle_agents")
+    if agents is None:
+        return False
+    return len(agents) >= _MIN_IDLE_FOR_CAPACITY
+
+
+def no_recent_parallel_dispatch(payload: dict[str, Any]) -> bool:
+    """True (violation) when no parallel dispatch occurred in the last 30s.
+
+    Inspects payload["recent_tool_calls"] for chat_task_create or chat_send_to
+    calls within the last _PARALLEL_WINDOW_S seconds. If a prior dispatch
+    exists in that window, master is already in batch mode — no violation.
+    If this is the first (and only) dispatch in the window, it's serial mode —
+    violation fires.
+
+    Each entry is shaped as {"ts": "<iso>", "tool": str, "params": dict}.
+
+    Fail-open: absent key returns False (can't confirm → don't fire).
+    """
+    recent = payload.get("recent_tool_calls")
+    if recent is None:
+        return False
+
+    now = datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(seconds=_PARALLEL_WINDOW_S)
+
+    for call in recent:
+        tool = call.get("tool", "")
+        if tool not in _DISPATCH_TOOLS:
+            continue
+        ts_str = call.get("ts", "")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if ts >= cutoff:
+            # Found a prior dispatch within the window — batch mode, no violation.
+            return False
+
+    # No prior dispatch found in the window — serial mode, violation fires.
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Registry — maps YAML condition name → function
 # ---------------------------------------------------------------------------
 
@@ -169,4 +245,6 @@ _REGISTRY: dict[str, Any] = {
     "idle_agents_exist": idle_agents_exist,
     "chat_my_chats_not_called_this_turn": chat_my_chats_not_called_this_turn,
     "no_recent_top_tier_consult": no_recent_top_tier_consult,
+    "idle_capacity_available": idle_capacity_available,
+    "no_recent_parallel_dispatch": no_recent_parallel_dispatch,
 }

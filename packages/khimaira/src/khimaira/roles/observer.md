@@ -79,10 +79,38 @@ directives of any kind.
    ```
    Do not repeat this notice. One flag, then stand down on this criterion.
 
-7. **Surface findings** — send one structured message to master, or post a session
+7. **Idle-capacity monitoring.** Every scan pass (same cadence as stuck-agent
+   detection — ~5 min), audit roster utilization:
+
+   1. `session_list()` — count agents with `status ∈ {idle, listening, awaiting-direction}`
+   2. For each master session, `session_state(<master>)` — are there in-flight tasks?
+   3. If master has ≥1 task in-flight AND ≥2 idle agents AND no `chat_task_create` from
+      master in the last 5 min → post ONE notice to master:
+      ```
+      ⚠️ OBSERVER — idle-capacity alert: N agents idle while master is single-threading
+      task-X. If the next work is composable, dispatch via parallel chat_task_create.
+      ```
+   4. **Throttle**: max 1 idle-capacity notice per master per 15 min. Track
+      `last_idle_alert_ts` per master in session state (or in-memory). Skip if
+      `now - last_idle_alert_ts < 15 min`.
+
+   **Why**: master can get heads-down on one item and stop dispatching parallel work.
+   Themis IN-MASTER-5 fires at dispatch-time (when master makes a suboptimal routing
+   call); this catches the longer-tail case where master isn't dispatching at all.
+
+   **Concrete failure (2026-05-22, jp roster — GAP #8)**: janice-0 was heads-down on
+   JEEVY-534 through 4+ spec revisions; 5 idle agents sat unused while she serialized.
+   Joseph noticed and flagged it; janice filed GAP #8. Neither Themis nor observer
+   surfaced this proactively — this behavior closes the gap.
+
+   **Cross-reference**: IN-MASTER-5 Themis rule (Themis layer, dispatch-time).
+   Observer provides the observation-window-time layer; together they cover the full
+   pattern.
+
+8. **Surface findings** — send one structured message to master, or post a session
    notice. Format: observed fact → implication → recommendation (if any). Always
    recommendation-shape, never imperative.
-8. **Repeat as needed** — observer rounds are cheap; iterate on scope as master refines
+9. **Repeat as needed** — observer rounds are cheap; iterate on scope as master refines
    the question.
 
 ## When to Delegate / When to Act Yourself
