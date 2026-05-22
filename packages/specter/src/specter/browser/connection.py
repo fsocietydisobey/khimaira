@@ -121,14 +121,23 @@ class CDPConnection:
             The connected Target.
 
         Raises:
-            ConnectionError: If the browser isn't reachable or no page targets.
+            ConnectionError: If the browser isn't reachable, no page targets exist,
+                or target_id is provided but not found (tab closed/refreshed — no
+                silent fallback; caller must re-anchor via list_tabs + connect_to_tab).
         """
         targets = await self.list_targets()
         if not targets:
             raise ConnectionError("No page targets found. Is a page open in the browser?")
 
         if target_id:
-            target = next((t for t in targets if t.id == target_id), targets[0])
+            target = next((t for t in targets if t.id == target_id), None)
+            if target is None:
+                raise ConnectionError(
+                    f"Specter target {target_id!r} not found in current targets. "
+                    f"The tab may have been closed, refreshed, or navigated away. "
+                    f"Call specter_list_tabs() to see available tabs, then "
+                    f"specter_connect_to_tab(<new_id>) to re-anchor Specter to the correct tab."
+                )
         else:
             # Filter out browser-internal pages
             app_tabs = [

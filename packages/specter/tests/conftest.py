@@ -122,7 +122,8 @@ def fixture_page():
     try:
         yield f"http://127.0.0.1:{port}"
     finally:
-        server.shutdown()
+        server.shutdown()    # stop serve_forever loop
+        server.server_close()  # release the socket
 
 
 # ---------------------------------------------------------------------------
