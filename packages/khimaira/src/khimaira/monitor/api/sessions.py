@@ -422,4 +422,22 @@ def build_router():
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e))
 
+    @router.delete("/sessions/{session_id}")
+    async def delete_session(session_id: str, force: bool = False) -> dict:
+        """Delete a session from the registry.
+
+        If the session has logged decisions and force=False (default), the
+        deletion is refused with a 409. Pass force=True to archive decisions
+        and proceed. Returns 404 if the session is unknown.
+        """
+        result = sessions.delete_session(session_id, force=force)
+        if "error" in result:
+            if "not found" in result["error"]:
+                raise fastapi.HTTPException(404, result["error"])
+            if "cannot delete the current session" in result["error"]:
+                raise fastapi.HTTPException(403, result["error"])
+            # decisions-guard (force required)
+            raise fastapi.HTTPException(409, result["error"])
+        return result
+
     return router

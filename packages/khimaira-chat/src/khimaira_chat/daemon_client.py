@@ -182,7 +182,7 @@ def send_message(
         "POST",
         f"{base}/api/chats/{chat_id}/messages",
         json=payload,
-        timeout=10.0,
+        timeout=35.0,  # server retries up to 30s for pending recipients
     )
     _raise_for_status(resp)
     return resp.json()

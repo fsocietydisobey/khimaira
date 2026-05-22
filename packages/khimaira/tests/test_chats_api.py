@@ -129,6 +129,134 @@ def test_accept_then_send_then_history(chats_api_client):
     assert user_msgs[0]["body"] == "hello"
 
 
+def test_sse_event_resolves_sender_name_at_publish_time(chats_api_client):
+    """SSE events (via _broadcast) show current name, not the stored snapshot."""
+    import asyncio
+
+    from khimaira.monitor import chats as chats_mod, sessions as sessions_mod
+
+    client, _ = chats_api_client
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+
+    # Register bob as a subscriber so _broadcast has a queue to push to.
+    import asyncio as _asyncio
+    q: asyncio.Queue = _asyncio.Queue()
+    chats_mod._subscribers.setdefault("bob", []).append(q)
+
+    # Rename alice to "alice-sse-name" BEFORE sending.
+    sessions_mod.set_name("alice", "alice-sse-name")
+
+    # alice sends a message — triggers _broadcast.
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "sse test"},
+    )
+
+    # Drain the queue — find alice's msg event.
+    events = []
+    while not q.empty():
+        events.append(q.get_nowait())
+
+    alice_events = [e for e in events if e.get("sender_id") == "alice"]
+    assert len(alice_events) == 1
+    assert alice_events[0]["sender_name"] == "alice-sse-name"
+
+    # Cleanup subscriber.
+    chats_mod._subscribers.get("bob", []).remove(q)
+
+
+def test_chat_history_shows_current_name_after_rename(chats_api_client):
+    """chat_history resolves sender_name from current status.json, not the stored snapshot."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    client, _ = chats_api_client
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+
+    # alice posts a message while named "alice".
+    client.post(f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": "hi"})
+
+    # Rename alice to "alice-renamed".
+    sessions_mod.set_name("alice", "alice-renamed")
+
+    history = client.get(f"/api/chats/{chat_id}/messages?session_id=bob").json()["messages"]
+    user_msgs = [m for m in history if m.get("sender_id") == "alice"]
+    assert len(user_msgs) == 1
+    assert user_msgs[0]["sender_name"] == "alice-renamed"
+
+
+def test_chat_history_falls_back_to_stored_name_for_deleted_session(chats_api_client):
+    """Deleted session messages don't crash history; fall back to the stored name snapshot."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    client, _ = chats_api_client
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+
+    # alice posts a message (stored sender_name="alice").
+    client.post(f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": "from alice"})
+
+    # Delete alice's session directory (simulate deleted session).
+    import shutil
+    shutil.rmtree(sessions_mod._session_dir("alice"), ignore_errors=True)
+
+    # History should not crash; fall back to stored snapshot name.
+    resp = client.get(f"/api/chats/{chat_id}/messages?session_id=bob")
+    assert resp.status_code == 200
+    msgs = resp.json()["messages"]
+    alice_msgs = [m for m in msgs if m.get("sender_id") == "alice"]
+    assert len(alice_msgs) == 1
+    assert alice_msgs[0]["sender_name"] == "alice"  # falls back to stored snapshot
+
+
+def test_chat_history_name_cache_per_request(chats_api_client, monkeypatch: pytest.MonkeyPatch):
+    """Per-request name cache: only 1 status.json read per unique sender per request."""
+    import importlib
+    from khimaira.monitor.api import chats as api_mod
+
+    importlib.reload(api_mod)
+    client, _ = chats_api_client
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+
+    # Post 5 messages from alice.
+    for i in range(5):
+        client.post(f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": f"msg{i}"})
+
+    lookup_count = [0]
+    original = api_mod._resolve_sender_name
+
+    def counting_resolve(session_id, fallback):
+        lookup_count[0] += 1
+        return original(session_id, fallback)
+
+    monkeypatch.setattr(api_mod, "_resolve_sender_name", counting_resolve)
+
+    resp = client.get(f"/api/chats/{chat_id}/messages?session_id=bob")
+    assert resp.status_code == 200
+    # alice sent 5 messages (+ 1 system msg); only 1 lookup for alice's session.
+    # System messages have sender_id="khimaira-system"; that's 1 more lookup.
+    # Total unique senders = 2 → at most 2 lookups regardless of message count.
+    assert lookup_count[0] <= 2
+
+
 def test_send_by_pending_member_returns_403(chats_api_client):
     client, _ = chats_api_client
     created = client.post(
@@ -142,6 +270,79 @@ def test_send_by_pending_member_returns_403(chats_api_client):
         json={"sender_session_id": "bob", "body": "premature"},
     )
     assert resp.status_code == 403
+
+
+def test_send_to_pending_recipient_retries_until_accepted(
+    chats_api_client, monkeypatch: pytest.MonkeyPatch
+):
+    """chat_send_to a pending recipient retries and succeeds once they accept."""
+    import importlib
+
+    from khimaira.monitor.api import chats as api_mod
+
+    importlib.reload(api_mod)
+    monkeypatch.setattr(api_mod, "_PENDING_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(api_mod, "_PENDING_WAIT_DEADLINE", 5.0)
+
+    client, chats_mod = chats_api_client
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+
+    # Accept bob so the real send can succeed on the 3rd attempt.
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+
+    # Patch send_message to simulate pending for first 2 calls, then call through.
+    original = chats_mod.send_message
+    attempts = [0]
+
+    def patched_send(*args, **kwargs):
+        attempts[0] += 1
+        if attempts[0] <= 2:
+            raise ValueError(
+                f"Recipient 'bob' is 'pending' in {chat_id!r}; "
+                "only accepted members can be `to` targets."
+            )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(chats_mod, "send_message", patched_send)
+
+    resp = client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "hi", "to": ["bob"]},
+    )
+    assert resp.status_code == 200
+    assert attempts[0] == 3
+
+
+def test_send_to_pending_recipient_times_out_with_408(
+    chats_api_client, monkeypatch: pytest.MonkeyPatch
+):
+    """chat_send_to returns 408 if recipient never accepts within the deadline."""
+    import importlib
+
+    from khimaira.monitor.api import chats as api_mod
+
+    importlib.reload(api_mod)
+    monkeypatch.setattr(api_mod, "_PENDING_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(api_mod, "_PENDING_WAIT_DEADLINE", 0.001)  # expires on first check
+
+    client, _ = chats_api_client
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    # bob never accepts
+
+    resp = client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "hi", "to": ["bob"]},
+    )
+    assert resp.status_code == 408
+    assert "timed out" in resp.json()["detail"].lower()
 
 
 def test_send_by_non_member_returns_403(chats_api_client):
@@ -487,3 +688,282 @@ def test_signal_task_start_unknown_task_returns_404(chats_api_client):
         json={"by_session_id": "alice"},
     )
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Expected-reply registry (Pattern 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def registry_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Fixture that provides a chats API client with a clean expected-reply registry."""
+    state_root = tmp_path / "state"
+    state_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_root))
+
+    from khimaira.monitor import sessions as sessions_mod
+
+    importlib.reload(sessions_mod)
+    from khimaira.monitor import chats as chats_mod
+
+    importlib.reload(chats_mod)
+    from khimaira.monitor.api import chats as api_mod
+
+    importlib.reload(api_mod)
+    # Clear module-level registry between tests.
+    monkeypatch.setattr(api_mod, "_EXPECTED_REPLIES", {})
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    app.include_router(api_mod.build_router(), prefix="/api")
+    client = TestClient(app)
+
+    for sid in ("alice", "bob", "carol"):
+        sd = sessions_mod._session_dir(sid)
+        (sd / "status.json").write_text(
+            json.dumps({"status": "implementing", "name": sid}), encoding="utf-8"
+        )
+    yield client, api_mod, chats_mod
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    importlib.reload(sessions_mod)
+    importlib.reload(chats_mod)
+    importlib.reload(api_mod)
+
+
+def _setup_chat_with_accepted_bob(client):
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+    return chat_id
+
+
+def test_register_expected_reply_on_send_to(registry_client):
+    """chat_send_to(alice→bob) registers (bob, alice) in the expected-reply registry."""
+    client, api_mod, _ = registry_client
+    chat_id = _setup_chat_with_accepted_bob(client)
+
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "hi", "to": ["bob"]},
+    )
+
+    assert ("bob", "alice") in api_mod._EXPECTED_REPLIES
+    entry = api_mod._EXPECTED_REPLIES[("bob", "alice")]
+    assert entry["from"] == "alice"
+    assert entry["to"] == "bob"
+
+
+def test_resolve_expected_reply_on_reply(registry_client):
+    """A→B followed by B→A resolves the (B, A) registry entry."""
+    client, api_mod, _ = registry_client
+    chat_id = _setup_chat_with_accepted_bob(client)
+
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "hey", "to": ["bob"]},
+    )
+    assert ("bob", "alice") in api_mod._EXPECTED_REPLIES
+
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "bob", "body": "hey back", "to": ["alice"]},
+    )
+    assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
+
+
+def test_overdue_watcher_fires_notice(
+    registry_client, monkeypatch: pytest.MonkeyPatch
+):
+    """Overdue entries trigger session_post_notice to both sides and are deleted."""
+    import asyncio
+
+    _, api_mod, _ = registry_client
+    notices_fired: list[tuple[str, str]] = []
+
+    def _mock_post_notice(target, text, *, from_session_id="external", **_kw):
+        notices_fired.append((target, text))
+        return {}
+
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice", _mock_post_notice
+    )
+
+    # Plant a stale entry (91s old).
+    api_mod._EXPECTED_REPLIES[("bob", "alice")] = {
+        "ts": __import__("time").monotonic() - 91.0,
+        "from": "alice",
+        "to": "bob",
+    }
+
+    asyncio.run(api_mod._check_overdue_once())
+
+    targets = {t for t, _ in notices_fired}
+    assert "alice" in targets
+    assert "bob" in targets
+    assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
+
+
+def test_overdue_watcher_one_shot(
+    registry_client, monkeypatch: pytest.MonkeyPatch
+):
+    """Overdue entry is deleted after first notice — watcher doesn't fire twice."""
+    import asyncio
+
+    _, api_mod, _ = registry_client
+    notices_fired: list = []
+
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices_fired.append(a) or {},
+    )
+
+    api_mod._EXPECTED_REPLIES[("bob", "alice")] = {
+        "ts": __import__("time").monotonic() - 91.0,
+        "from": "alice",
+        "to": "bob",
+    }
+
+    asyncio.run(api_mod._check_overdue_once())
+    first_count = len(notices_fired)
+
+    # Second iteration — entry should be gone, no new notices.
+    asyncio.run(api_mod._check_overdue_once())
+    assert len(notices_fired) == first_count
+
+
+def test_self_send_not_registered(registry_client):
+    """A→A (self-send) does not add anything to the registry."""
+    client, api_mod, _ = registry_client
+    # Alice sends a broadcast (no `to`) so she's the sole member auto-accepted.
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": []},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+
+    # Simulate a send where from == to (self-send via _register helper directly).
+    import asyncio
+
+    asyncio.run(api_mod._register_expected_reply("alice", ["alice"]))
+    assert ("alice", "alice") not in api_mod._EXPECTED_REPLIES
+
+
+def test_broadcast_send_not_registered(registry_client):
+    """chat_send (no `to`) does not register an expected reply."""
+    client, api_mod, _ = registry_client
+    chat_id = _setup_chat_with_accepted_bob(client)
+
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "broadcast", "to": None},
+    )
+
+    assert len(api_mod._EXPECTED_REPLIES) == 0
+
+
+def test_broadcast_resolves_expected_reply_from_peer(registry_client):
+    """Broadcast chat_send from a peer who owes a reply resolves the registry entry."""
+    client, api_mod, _ = registry_client
+    chat_id = _setup_chat_with_accepted_bob(client)
+
+    # alice sends targeted to bob → creates (bob, alice) entry.
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "hey", "to": ["bob"]},
+    )
+    assert ("bob", "alice") in api_mod._EXPECTED_REPLIES
+
+    # bob replies via broadcast (no `to`) → should resolve (bob, alice).
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "bob", "body": "broadcast reply", "to": None},
+    )
+    assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
+
+
+def test_broadcast_resolves_multiple_pending_replies(registry_client):
+    """Broadcast from a peer resolves all pending entries where that peer owes replies."""
+    import asyncio
+    from khimaira.monitor import sessions as sessions_mod
+
+    client, api_mod, _ = registry_client
+    # Plant carol session.
+    sessions_mod._session_dir("carol").mkdir(parents=True, exist_ok=True)
+    (sessions_mod._session_dir("carol") / "status.json").write_text(
+        json.dumps({"status": "idle", "name": "carol"}), encoding="utf-8"
+    )
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob", "carol"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "carol"})
+
+    # alice sends to bob; carol sends to bob — both create (bob, X) entries.
+    client.post(f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "q1", "to": ["bob"]})
+    client.post(f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "carol", "body": "q2", "to": ["bob"]})
+    assert ("bob", "alice") in api_mod._EXPECTED_REPLIES
+    assert ("bob", "carol") in api_mod._EXPECTED_REPLIES
+
+    # bob broadcasts → resolves both.
+    client.post(f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "bob", "body": "answer to all", "to": None})
+    assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
+    assert ("bob", "carol") not in api_mod._EXPECTED_REPLIES
+
+
+def test_broadcast_does_not_register_new_expectation(registry_client):
+    """Broadcast chat_send never creates new expected-reply entries."""
+    client, api_mod, _ = registry_client
+    chat_id = _setup_chat_with_accepted_bob(client)
+
+    initial_count = len(api_mod._EXPECTED_REPLIES)
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "broadcast", "to": None},
+    )
+    assert len(api_mod._EXPECTED_REPLIES) == initial_count
+
+
+def test_multi_recipient_partial_resolution(registry_client):
+    """A→[B, C] creates two entries; B's reply only resolves B's entry, C's stays."""
+    client, api_mod, chats_mod = registry_client
+    # Create chat with all three members.
+    from khimaira.monitor import sessions as sessions_mod
+
+    sessions_mod._session_dir("carol").mkdir(parents=True, exist_ok=True)
+    (sessions_mod._session_dir("carol") / "status.json").write_text(
+        json.dumps({"status": "idle", "name": "carol"}), encoding="utf-8"
+    )
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob", "carol"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "carol"})
+
+    # Alice sends to both bob and carol — creates two registry entries.
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "consult", "to": ["bob", "carol"]},
+    )
+    assert ("bob", "alice") in api_mod._EXPECTED_REPLIES
+    assert ("carol", "alice") in api_mod._EXPECTED_REPLIES
+
+    # Bob replies to alice — resolves only bob's entry, carol's stays.
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "bob", "body": "bob reply", "to": ["alice"]},
+    )
+    assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
+    assert ("carol", "alice") in api_mod._EXPECTED_REPLIES

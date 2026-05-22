@@ -14,8 +14,10 @@ Production builds strip the debug hooks.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from specter.browser.connection import CDPConnection
@@ -611,6 +613,99 @@ class ReactInspector:
         )
         return _parse_js_result(result)
 
+    async def render_reasons(
+        self,
+        connection: CDPConnection,
+        duration_s: float = 5.0,
+        component_filter: str | None = None,
+    ) -> list[dict]:
+        """Record which components re-rendered and why during a time window.
+
+        Hooks into React's commitFiberRoot to capture post-commit diffs.
+        Returns reasons ranked by commit order.
+
+        Args:
+            connection: Active CDP connection.
+            duration_s: How long to record (default 5 seconds).
+            component_filter: Optional substring to filter component paths.
+
+        Returns:
+            List of {component_path, reason, prev, next, commit_batch_id}.
+            Empty list if no re-renders occurred or React is in production mode.
+        """
+        install_result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": RENDER_REASONS_INSTALL_SCRIPT, "returnByValue": True, "awaitPromise": False},
+        )
+        parsed = _parse_js_result(install_result)
+        if "error" in parsed:
+            return [{"error": parsed["error"]}]
+
+        await asyncio.sleep(max(0.0, float(duration_s)))
+
+        read_result = await connection.send(
+            "Runtime.evaluate",
+            {"expression": RENDER_REASONS_READ_SCRIPT, "returnByValue": True, "awaitPromise": False},
+        )
+        reasons_raw = _parse_js_result(read_result)
+
+        # _parse_js_result may return a dict if the JS returned a list — handle both
+        if isinstance(reasons_raw, list):
+            reasons = reasons_raw
+        elif isinstance(reasons_raw, dict) and "error" in reasons_raw:
+            return [reasons_raw]
+        else:
+            # Wrap single dict in list for uniform return type
+            reasons = [reasons_raw] if reasons_raw else []
+
+        if component_filter:
+            reasons = [r for r in reasons if component_filter in r.get("component_path", "")]
+
+        return reasons
+
+    async def track_hooks(
+        self,
+        connection: CDPConnection,
+        component_selector: str,
+        duration_s: float = 5.0,
+        poll_interval_s: float = 0.5,
+    ) -> list[dict]:
+        """Record useState/useReducer/useRef values for one component over time.
+
+        Polls the component's fiber hook state at regular intervals.
+
+        Args:
+            connection: Active CDP connection.
+            component_selector: CSS selector for a DOM element inside the component.
+            duration_s: How long to record (default 5 seconds).
+            poll_interval_s: Snapshot interval (default 0.5 seconds).
+
+        Returns:
+            Timeline: [{ts, hook_index, hook_type, value}, ...] sorted by ts.
+        """
+        script = TRACK_HOOKS_SNAPSHOT_SCRIPT.replace(
+            "%SELECTOR%", component_selector.replace("'", "\\'")
+        )
+        timeline: list[dict] = []
+        end_time = time.monotonic() + max(0.0, float(duration_s))
+        poll_interval_s = max(0.1, float(poll_interval_s))
+
+        while time.monotonic() < end_time:
+            snap_result = await connection.send(
+                "Runtime.evaluate",
+                {"expression": script, "returnByValue": True, "awaitPromise": False},
+            )
+            parsed = _parse_js_result(snap_result)
+            if "error" in parsed:
+                return [parsed]
+            ts = int(time.time() * 1000)
+            if isinstance(parsed, list):
+                for hook in parsed:
+                    timeline.append({"ts": ts, **hook})
+            await asyncio.sleep(poll_interval_s)
+
+        return timeline
+
     async def check_react_available(self, connection: CDPConnection) -> dict:
         """Check if React DevTools hook is available and what version is running.
 
@@ -657,6 +752,225 @@ class ReactInspector:
         )
 
         return _parse_js_result(result)
+
+
+# ---------------------------------------------------------------------------
+# SLICE-A scripts — render_reasons, track_hooks
+# ---------------------------------------------------------------------------
+
+# Install a commitFiberRoot listener that records which components re-rendered
+# and why (props/state change). Results accumulate in window.__specter_commits.
+# Call RENDER_REASONS_INSTALL_SCRIPT, sleep duration_s, then RENDER_REASONS_READ_SCRIPT.
+RENDER_REASONS_INSTALL_SCRIPT = """
+(() => {
+  const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+  if (!hook || !hook.renderers || hook.renderers.size === 0) {
+    return JSON.stringify({ error: "React DevTools hook not found. Is React running in dev mode?" });
+  }
+
+  window.__specter_commits = [];
+  window.__specter_batch_id = 0;
+
+  function serializeSafe(val, depth) {
+    if (depth > 2) return '[nested]';
+    if (val === null || val === undefined) return val;
+    if (typeof val === 'function') return '[function]';
+    if (typeof val === 'symbol') return val.toString();
+    if (Array.isArray(val)) return val.length > 5 ? '[Array(' + val.length + ')]' : val.map(v => serializeSafe(v, depth + 1));
+    if (typeof val === 'object') {
+      if (val.$$typeof) return '[ReactElement]';
+      const keys = Object.keys(val);
+      if (keys.length > 10) return '[Object(' + keys.length + ' keys)]';
+      const out = {};
+      for (const k of keys) out[k] = serializeSafe(val[k], depth + 1);
+      return out;
+    }
+    return val;
+  }
+
+  function diffProps(prev, next) {
+    if (prev === next) return [];
+    const allKeys = new Set([...Object.keys(prev || {}), ...Object.keys(next || {})]);
+    const changed = [];
+    for (const k of allKeys) {
+      if ((prev || {})[k] !== (next || {})[k]) changed.push(k);
+    }
+    return changed;
+  }
+
+  function walkForReasons(fiber, batchId, parentPath, results) {
+    if (!fiber) return;
+    const name = fiber.type?.displayName || fiber.type?.name;
+    if (name && fiber.alternate) {
+      const path = parentPath ? parentPath + '>' + name : name;
+      const prevProps = fiber.alternate.memoizedProps;
+      const nextProps = fiber.memoizedProps;
+      const prevState = fiber.alternate.memoizedState;
+      const nextState = fiber.memoizedState;
+      const changedProps = diffProps(prevProps, nextProps);
+      const stateChanged = prevState !== nextState;
+      if (changedProps.length > 0) {
+        results.push({ component_path: path, reason: 'props.' + changedProps[0] + ' changed',
+          prev: serializeSafe((prevProps || {})[changedProps[0]], 0),
+          next: serializeSafe((nextProps || {})[changedProps[0]], 0),
+          commit_batch_id: batchId });
+      } else if (stateChanged) {
+        results.push({ component_path: path, reason: 'state changed',
+          prev: null, next: null, commit_batch_id: batchId });
+      } else {
+        // fiber.alternate exists (re-rendered) but no local prop/state change → parent triggered
+        results.push({ component_path: path, reason: 'parent re-rendered',
+          prev: null, next: null, commit_batch_id: batchId });
+      }
+    }
+    let child = fiber.child;
+    while (child) { walkForReasons(child, batchId, name || parentPath, results); child = child.sibling; }
+  }
+
+  const prevCommit = hook.onCommitFiberRoot;
+  hook.onCommitFiberRoot = function(rendererId, root, ...args) {
+    try {
+      const batchId = ++window.__specter_batch_id;
+      const results = [];
+      walkForReasons(root.current, batchId, '', results);
+      window.__specter_commits.push(...results);
+    } catch(e) {}
+    if (prevCommit) prevCommit.apply(this, [rendererId, root, ...args]);
+  };
+  window.__specter_prev_commit = prevCommit;
+  return JSON.stringify({ installed: true });
+})()
+"""
+
+RENDER_REASONS_READ_SCRIPT = """
+(() => {
+  const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+  const results = window.__specter_commits || [];
+  if (hook && window.__specter_prev_commit !== undefined) {
+    hook.onCommitFiberRoot = window.__specter_prev_commit;
+  }
+  delete window.__specter_commits;
+  delete window.__specter_batch_id;
+  delete window.__specter_prev_commit;
+  return JSON.stringify(results);
+})()
+"""
+
+# Snapshot one component's hook values at a single point in time.
+# %SELECTOR% is replaced with the CSS selector.
+TRACK_HOOKS_SNAPSHOT_SCRIPT = """
+((selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return JSON.stringify({ error: 'element not found: ' + selector });
+  const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+  if (!fiberKey) return JSON.stringify({ error: 'no React fiber on element' });
+  let fiber = el[fiberKey];
+  while (fiber && !(fiber.type?.name || fiber.type?.displayName)) { fiber = fiber.return; }
+  if (!fiber) return JSON.stringify({ error: 'no component fiber found' });
+
+  function serializeSafe(val, depth) {
+    if (depth > 2) return '[nested]';
+    if (val === null || val === undefined) return val;
+    if (typeof val === 'function') return '[function]';
+    if (typeof val === 'symbol') return val.toString();
+    if (Array.isArray(val)) return val.length > 5 ? '[Array(' + val.length + ')]' : val.map(v => serializeSafe(v, depth+1));
+    if (typeof val === 'object') {
+      const keys = Object.keys(val);
+      if (keys.length > 10) return '[Object(' + keys.length + ' keys)]';
+      const out = {};
+      for (const k of keys) out[k] = serializeSafe(val[k], depth+1);
+      return out;
+    }
+    return val;
+  }
+
+  const hooks = [];
+  let hookNode = fiber.memoizedState;
+  let index = 0;
+  while (hookNode && index < 20) {
+    const queue = hookNode.queue;
+    let type = 'unknown', value = null;
+    if (queue) {
+      type = (queue.lastRenderedReducer?.name === 'basicStateReducer') ? 'useState' : 'useReducer';
+      value = serializeSafe(hookNode.memoizedState, 0);
+    } else if (hookNode.memoizedState && 'current' in hookNode.memoizedState) {
+      type = 'useRef';
+      value = serializeSafe(hookNode.memoizedState.current, 0);
+    } else if (hookNode.memoizedState && hookNode.memoizedState.destroy !== undefined) {
+      type = 'useEffect';
+      value = null;
+    }
+    hooks.push({ hook_index: index, hook_type: type, value });
+    hookNode = hookNode.next;
+    index++;
+  }
+  return JSON.stringify(hooks);
+})('%SELECTOR%')
+"""
+
+
+def diff_component_tree(
+    snap_a: dict | list,
+    snap_b: dict | list,
+) -> dict:
+    """Diff two component-tree snapshots from get_component_tree().
+
+    Pure function — no CDP or Chrome interaction needed.
+
+    Args:
+        snap_a: First snapshot (before state).
+        snap_b: Second snapshot (after state).
+
+    Returns:
+        {added, removed, props_changed, unmounted} where each entry
+        contains the component path and relevant data.
+    """
+
+    def flatten(node: dict | list | None, path: str = "") -> dict[str, dict]:
+        """Walk a tree and return {path: node} mapping."""
+        out: dict[str, dict] = {}
+        if node is None:
+            return out
+        if isinstance(node, list):
+            for item in node:
+                out.update(flatten(item, path))
+            return out
+        if not isinstance(node, dict):
+            return out
+        name = node.get("name", "")
+        if not name:
+            for child in node.get("children", []):
+                out.update(flatten(child, path))
+            return out
+        full_path = f"{path}>{name}" if path else name
+        out[full_path] = node
+        for child in node.get("children", []):
+            out.update(flatten(child, full_path))
+        return out
+
+    a_flat = flatten(snap_a)
+    b_flat = flatten(snap_b)
+
+    a_paths = set(a_flat)
+    b_paths = set(b_flat)
+
+    added = [{"path": p, "node": b_flat[p]} for p in sorted(b_paths - a_paths)]
+    removed = [{"path": p} for p in sorted(a_paths - b_paths)]
+    unmounted = removed  # alias for clarity
+
+    props_changed = []
+    for path in sorted(a_paths & b_paths):
+        a_props = a_flat[path].get("props") or {}
+        b_props = b_flat[path].get("props") or {}
+        if a_props != b_props:
+            props_changed.append({"path": path, "prev_props": a_props, "next_props": b_props})
+
+    return {
+        "added": added,
+        "removed": removed,
+        "unmounted": unmounted,
+        "props_changed": props_changed,
+    }
 
 
 def _parse_js_result(result: dict) -> dict:

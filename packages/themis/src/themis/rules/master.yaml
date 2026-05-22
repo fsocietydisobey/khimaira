@@ -41,3 +41,20 @@ invariants:
       🛑 Themis IN-MASTER-3 (NO_STANDALONE_AGENTS_WHEN_IDLE): cannot spawn a Task
       agent while roster agents are idle. Assign work via /khimaira-assign or
       chat_task_create to keep the enforcement gate, observer, and lifecycle intact.
+
+  - id: IN-MASTER-4
+    name: CONSULT_BEFORE_USER
+    severity: warn
+    matchers:
+      - tool: AskUserQuestion
+    conditions:
+      - check: no_recent_top_tier_consult
+    message: |
+      ⚠️ Themis IN-MASTER-4 (CONSULT_BEFORE_USER): AskUserQuestion called with no
+      recent top-tier consult in the prior tool calls.
+      If this is a design/architecture/trade-off question, consult the relevant
+      top-tier agent first via /khimaira-consult:
+        design → architect-1, scope → analyst-1, correctness → critic-1, coverage → verifier-1
+      If this is a user-preference question (which feature ships, which UI option, etc.)
+      no consult is needed — proceed.
+      Severity is warn (observation week 2026-05-22 → 2026-05-29); will flip to block.

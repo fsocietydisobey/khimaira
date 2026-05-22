@@ -16,12 +16,17 @@ import logging
 
 from mcp.server.fastmcp import FastMCP
 
+from specter.browser.a11y import A11yAuditor
+from specter.browser.assertions import Asserter
 from specter.browser.connection import CDPConnection
 from specter.browser.console import ConsoleCapture
 from specter.browser.interact import Interactor
 from specter.browser.network import NetworkCapture
 from specter.browser.react import ReactInspector
+from specter.browser.react import diff_component_tree as _diff_component_tree_fn
+from specter.browser.record_replay import InteractionRecorder
 from specter.browser.runtime import Runtime
+from specter.browser.state_machine import StateMachineExtractor
 from specter.browser.structure import StructureAnalyzer
 from specter.config import load_config
 
@@ -131,6 +136,10 @@ _runtime: Runtime | None = None
 _react: ReactInspector | None = None
 _interact: Interactor | None = None
 _structure: StructureAnalyzer | None = None
+_recorder: InteractionRecorder = InteractionRecorder()
+_a11y: A11yAuditor = A11yAuditor()
+_asserter: Asserter = Asserter()
+_state_machine: StateMachineExtractor = StateMachineExtractor()
 
 
 async def _ensure_connected():
@@ -185,13 +194,17 @@ async def take_screenshot(
     """
     conn, _, _, runtime, _, _, _ = await _ensure_connected()
     try:
-        return await runtime.take_screenshot(conn, full_page=full_page, selector=selector)
+        return await runtime.take_screenshot(
+            conn, full_page=full_page, selector=selector
+        )
     except (RuntimeError, TimeoutError, OSError) as e:
         # Connection may have gone stale — force reconnect and retry once
         logger.warning("Screenshot failed (%s), reconnecting...", e)
         await _force_reconnect()
         conn, _, _, runtime, _, _, _ = await _ensure_connected()
-        return await runtime.take_screenshot(conn, full_page=full_page, selector=selector)
+        return await runtime.take_screenshot(
+            conn, full_page=full_page, selector=selector
+        )
 
 
 async def _force_reconnect() -> None:
@@ -268,7 +281,9 @@ async def get_network_errors(
         List of failed network entries with method, URL, status, error text, duration.
     """
     _, _, network, _, _, _, _ = await _ensure_connected()
-    return network.get_requests(errors_only=True, since=since, limit=limit, url_filter=url_filter)
+    return network.get_requests(
+        errors_only=True, since=since, limit=limit, url_filter=url_filter
+    )
 
 
 @mcp.tool()
@@ -291,7 +306,9 @@ async def get_network_log(
         List of all network entries with method, URL, status, duration.
     """
     _, _, network, _, _, _, _ = await _ensure_connected()
-    return network.get_requests(errors_only=False, since=since, limit=limit, url_filter=url_filter)
+    return network.get_requests(
+        errors_only=False, since=since, limit=limit, url_filter=url_filter
+    )
 
 
 @mcp.tool()
@@ -491,7 +508,9 @@ async def get_component_tree(max_depth: int = 15, max_children: int = 50) -> dic
         Nested component tree with names, source, props, hooks, children.
     """
     conn, _, _, _, react, _, _ = await _ensure_connected()
-    return await react.get_component_tree(conn, max_depth=max_depth, max_children=max_children)
+    return await react.get_component_tree(
+        conn, max_depth=max_depth, max_children=max_children
+    )
 
 
 @mcp.tool()
@@ -1003,3 +1022,275 @@ async def debug_snapshot() -> dict:
         "network_errors": network_errors,
         "page_structure": page_struct,
     }
+
+
+# ---------------------------------------------------------------------------
+# SLICE-A tools — render_reasons, diff_component_tree, track_hooks
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def render_reasons(
+    duration_s: float = 5.0,
+    component_filter: str | None = None,
+) -> list[dict]:
+    """Record which React components re-rendered and why during a time window.
+
+    Hooks into React's commitFiberRoot to capture post-commit diffs of
+    props and state. Returns a ranked list showing what caused each re-render.
+
+    Requires React running in development mode (production builds strip
+    the DevTools hook). Use after triggering the interaction you want to
+    analyze — e.g., click a button, then review why components re-rendered.
+
+    Args:
+        duration_s: How long to record re-renders (default 5 seconds).
+        component_filter: Optional substring to filter component paths
+            (e.g., "App" to only see App and its children).
+
+    Returns:
+        List of {component_path, reason, prev, next, commit_batch_id}.
+        commit_batch_id groups components that re-rendered in one React batch.
+    """
+    conn, _, _, _, react, _, _ = await _ensure_connected()
+    return await react.render_reasons(
+        conn, duration_s=duration_s, component_filter=component_filter
+    )
+
+
+@mcp.tool()
+async def diff_component_tree(
+    snap_a: dict | list,
+    snap_b: dict | list,
+) -> dict:
+    """Diff two React component-tree snapshots from get_component_tree().
+
+    Pure analysis — no Chrome connection required. Pass two snapshots
+    you captured before and after a state change to see exactly what
+    changed in the component tree.
+
+    Args:
+        snap_a: First snapshot (before state) from get_component_tree().
+        snap_b: Second snapshot (after state) from get_component_tree().
+
+    Returns:
+        {added, removed, unmounted, props_changed} — each entry contains
+        the component path and relevant props data.
+    """
+    return _diff_component_tree_fn(snap_a, snap_b)
+
+
+@mcp.tool()
+async def track_hooks(
+    component_selector: str,
+    duration_s: float = 5.0,
+) -> list[dict]:
+    """Record useState/useReducer/useRef values for one component over time.
+
+    Polls the component's fiber hook state at regular intervals to build
+    a timeline of how local state evolves during a user interaction.
+
+    Requires React running in development mode.
+
+    Args:
+        component_selector: CSS selector for a DOM element inside the component
+            you want to track (e.g., "#counter", ".my-component").
+        duration_s: How long to record (default 5 seconds).
+
+    Returns:
+        Timeline: [{ts, hook_index, hook_type, value}, ...] sorted by time.
+        hook_type is one of: useState, useReducer, useRef, useEffect, unknown.
+    """
+    conn, _, _, _, react, _, _ = await _ensure_connected()
+    return await react.track_hooks(
+        conn, component_selector=component_selector, duration_s=duration_s
+    )
+
+
+# ---------------------------------------------------------------------------
+# SLICE-C tools — record_interaction, replay_interaction
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def record_interaction(
+    label: str,
+    duration_s: float = 60.0,
+) -> dict:
+    """Record user interactions in the active browser tab for later replay.
+
+    Injects a lightweight DOM listener that captures clicks, key presses,
+    input changes, and page navigations. Events are written to a versioned
+    JSONL file at ~/.local/state/khimaira/specter/recordings/<label>.jsonl.
+
+    Captured event kinds: click, keydown (special keys only: Enter, Escape,
+    Tab, Arrow keys, Backspace, Delete, Space, Home, End), input_change,
+    select_change, navigate.
+
+    Determinism limits — replay may not be identical when the UI uses:
+      - CSS animations / transitions (timing-dependent state)
+      - Debounced input handlers (timing-dependent dispatch)
+      - Date.now() or Math.random() in business logic
+      - Network latency-dependent state (API responses during interaction)
+    Use this tool for deterministic flows (counter clicks, static form fills).
+    See specter.browser.record_replay module docstring for details.
+
+    Args:
+        label: Recording name (alphanumeric + hyphens recommended). Becomes
+            the filename: <label>.jsonl. Overwrites any prior recording with
+            the same label.
+        duration_s: Recording window in seconds (default 60). Recording stops
+            automatically after this timeout.
+
+    Returns:
+        Dict with label, recorded_event_count, file_path, duration_s_actual.
+    """
+    conn, _, _, _, _, _, _ = await _ensure_connected()
+    return await _recorder.record_interaction(conn, label=label, duration_s=duration_s)
+
+
+@mcp.tool()
+async def replay_interaction(label: str) -> dict:
+    """Replay a previously recorded interaction session.
+
+    Loads the JSONL recording, validates its schema version, then re-issues
+    each recorded event through CDP in order — respecting the original
+    inter-event timing.
+
+    The page should be in the same initial state as when the recording was
+    made (same URL, same data). Replay does not navigate to the recording's
+    start URL automatically.
+
+    Determinism limits: see record_interaction for full details.
+
+    Args:
+        label: Recording name to replay (must match a prior record_interaction call).
+
+    Returns:
+        On success: {label, replayed_event_count, end_state_snapshot}
+            end_state_snapshot = {url, title} after the last event fires.
+        On error: {error: "<description>", label: ...}
+            error cases: missing recording, unknown schema version, corrupted file.
+    """
+    conn, _, _, _, _, _, _ = await _ensure_connected()
+    return await _recorder.replay_interaction(conn, label=label)
+
+
+# ---------------------------------------------------------------------------
+# SLICE-B tools — a11y_audit, extract_state_machine, 3 assertion tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def a11y_audit(selector: str | None = None) -> dict:
+    """Run an axe-core accessibility audit against the active page.
+
+    Injects axe-core 4.10.2 (vendored, no CDN dependency) into the page and
+    runs a WCAG 2.1 AA audit. Injection is idempotent — calling twice is safe.
+
+    Large pages may take 5-15s. Pass a selector to scope to a subtree (faster
+    and reduces noise from irrelevant sections).
+
+    Args:
+        selector: Optional CSS selector to scope the audit. If None, audits
+            the full document.
+
+    Returns:
+        {violations, passes, inapplicable, incomplete, axe_version}
+        violations: list of {id, impact, description, nodes, helpUrl}
+        On error: {"error": "<reason>"}
+    """
+    conn, _, _, _, _, _, _ = await _ensure_connected()
+    return await _a11y.audit(conn, selector=selector)
+
+
+@mcp.tool()
+async def extract_state_machine(library: str = "redux") -> dict:
+    """Extract Redux store state or XState machine shape from the page.
+
+    For Redux: walks the React fiber tree to find the Redux store, then returns
+    the current state shape, top-level slice names, and dispatched action count
+    from Redux DevTools if available.
+
+    For XState: detects @xstate/inspect integration (initDevtools() must have
+    been called); returns machine IDs, known states, and current state per
+    service. Returns a structured error — not a Python exception — if XState
+    inspect is not present.
+
+    Args:
+        library: "redux" (default) or "xstate".
+
+    Returns:
+        For redux: {store_shape, slices, actions_history_count}
+        For xstate: {services: {<id>: {machine_id, current_state, states}}}
+        On error: {"error": "<reason>"}
+    """
+    conn, _, _, _, _, _, _ = await _ensure_connected()
+    return await _state_machine.extract(conn, library=library)  # type: ignore[arg-type]
+
+
+@mcp.tool()
+async def assert_no_console_errors(since_ms: int | None = None) -> dict:
+    """Assert no console errors or unhandled JS exceptions are buffered.
+
+    Wraps specter_get_errors + specter_get_console_logs(level='error').
+    Use after user interactions or page loads to confirm no regressions.
+
+    Args:
+        since_ms: Only check errors after this Unix timestamp in milliseconds.
+            If None, checks all buffered errors.
+
+    Returns:
+        {ok: True, errors: [], error_count: 0} if no errors.
+        {ok: False, errors: [...], error_count: N} if errors found.
+    """
+    _, console, _, _, _, _, _ = await _ensure_connected()
+    return _asserter.assert_no_console_errors(console, since_ms=since_ms)
+
+
+@mcp.tool()
+async def assert_no_network_errors(
+    since_ms: int | None = None,
+    url_filter: str | None = None,
+) -> dict:
+    """Assert no failed HTTP requests (4xx, 5xx, network failures) are buffered.
+
+    Wraps specter_get_network_errors. Use after API interactions to confirm
+    all requests succeeded.
+
+    Args:
+        since_ms: Only check errors after this Unix timestamp in milliseconds.
+            If None, checks all buffered errors.
+        url_filter: Only requests whose URL contains this substring.
+
+    Returns:
+        {ok: True, errors: [], error_count: 0} if no errors.
+        {ok: False, errors: [...], error_count: N} if errors found.
+    """
+    _, _, network, _, _, _, _ = await _ensure_connected()
+    return _asserter.assert_no_network_errors(
+        network, since_ms=since_ms, url_filter=url_filter
+    )
+
+
+@mcp.tool()
+async def assert_element_visible(
+    selector: str,
+    timeout_ms: int = 5000,
+) -> dict:
+    """Assert that an element exists and is visually visible within a timeout.
+
+    Uses in-browser JS polling (no asyncio.sleep). Checks: element exists,
+    offsetWidth > 0, offsetHeight > 0, visibility != 'hidden', display != 'none'.
+
+    Args:
+        selector: CSS selector for the element to check.
+        timeout_ms: Maximum time to wait in milliseconds (default 5000).
+
+    Returns:
+        {visible: True, found_after_ms: N} on success.
+        {visible: False, found_after_ms: N, element_exists: bool} on timeout.
+        {error: "..."} if CDP evaluation fails.
+    """
+    conn, _, _, _, _, _, _ = await _ensure_connected()
+    return await _asserter.assert_element_visible(conn, selector=selector, timeout_ms=timeout_ms)

@@ -101,6 +101,13 @@ def build_app():
     app.include_router(chats_api.build_router(), prefix="/api")
     app.include_router(themis_api.build_router(), prefix="/api")
 
+    # Expected-reply overdue watcher — fires session_post_notice to both sides
+    # when a chat_send_to recipient hasn't replied within _REPLY_OVERDUE_S.
+    @app.on_event("startup")
+    async def _start_overdue_watcher() -> None:
+        from .api.chats import _overdue_watcher
+        asyncio.create_task(_overdue_watcher())
+
     # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
     # Replay-on-boot recovers stuck-firing tasks; worker tick fires due tasks.
     @app.on_event("startup")

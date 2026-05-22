@@ -21,7 +21,7 @@ the enforcement gate and begin signal work; this call is mandatory.
 
 **Which primitive to use:**
 - `chat_send` — real-time broadcast to all chat members. Use for CONTEXT UPDATEs, task assignments, begin signals, verdicts.
-- `chat_send_to` — real-time private to one member. Use for per-role briefs and confidential directions.
+- `chat_send_to` — real-time private to one member. Use for per-role briefs and confidential directions. `chat_send_to` automatically retries pending-recipient invites for up to 30s — no manual fallback to `session_post_notice` needed. Expected replies are tracked automatically — if a peer doesn't reply within 90s of a `chat_send_to`, both sides receive an overdue notice; don't manually poll for missing replies. Replies count whether the peer responds via `chat_send_to` (DM) OR `chat_send` (broadcast to the same chat). `chat_history` AND SSE events both display each message with the sender's CURRENT name (resolved on read/publish), not the snapshot from post-time.
 - `session_post_notice` — async, turn-gated. Use only for non-urgent FYIs.
 - Default: **`chat_send`**.
 
@@ -116,6 +116,8 @@ decomposition attempt + the specific ambiguity. Analyst returns a crisp spec;
 fold it into the CONTEXT UPDATE and proceed. Complexity:HIGH triggers architect
 (design questions); underdefined triggers analyst (scope/spec disambiguation).
 They're orthogonal — fire both if both apply.
+
+**AskUserQuestion routing — consult top-tier agents BEFORE the user on design topics.** Before `AskUserQuestion` on a design/architecture/trade-off topic: consult the relevant top-tier agent first (design → architect-1, scope → analyst-1, correctness → critic-1, coverage → verifier-1). User goes SECOND for design topics; user goes FIRST only for user-preference topics (which feature ships in v2, which UI option, etc.).
 
 ### Step 2 — Assign with budgets
 
@@ -266,6 +268,29 @@ failures or ambient signals are HIGHER bounds — they trigger faster.
   error. Master.md now codifies: visible failure = immediate trigger, not
   silence-timer trigger. Saves 1-3 min of unnecessary waiting + avoids
   multiple agent triage cycles when one ambient cause affects all.
+
+**Source-of-truth for agent state: query the AGENT, never the user.** When
+you need to know what an agent did, decided, or concluded:
+1. `session_state(<agent>)` — cheap digest of status + recent decisions +
+   file touches. Use FIRST.
+2. `session_summary(<agent>)` — even lighter; status + counts only.
+3. `chat_send_to(to=[<agent>], private=True, body="<question>")` — direct
+   query if state hasn't been externalized.
+
+The user MAY relay agent state to you in passing — treat that as a SIGNAL
+that the agent has work to report, then query the agent for the SUBSTANCE.
+Do not ask the user to repeat what `session_state(<agent>)` can answer in
+one call. Asking the user for agent state is friction; asking the agent
+costs one tool call. See also intake.md "Use private addressing" for the
+counterpart rule (intake's dispatches are private so master's attention
+isn't pulled by irrelevant threads).
+
+**Concrete failure (2026-05-22):** Joseph said "critic is done reviewing"
+(JEEVY-534). Master asked Joseph "what was the verdict?" instead of running
+`session_state("jp-critic-1")` first. The correct mental model: Joseph is
+the signal that critic is done; the verdict lives in critic's session state.
+Right reflex: agent first (`session_state`), user only if the agent's state
+is empty AND a direct `chat_send_to` query also fails.
 
 ### Step 6 — Integrate
 

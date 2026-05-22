@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Specter Test Fixture</title>
+  <style>
+    body { font-family: sans-serif; padding: 24px; }
+    h1 { font-size: 1.4rem; }
+    #counter { font-size: 1.2rem; margin: 8px 0; }
+    button { margin: 4px; padding: 6px 12px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- React 18 development builds (CDN) — dev build required for fiber hooks -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+  <script>
+    // ---------------------------------------------------------------------------
+    // Minimal Redux-like store via useReducer so Redux state reads have something
+    // ---------------------------------------------------------------------------
+    const { useState, useReducer, useEffect } = React;
+
+    const initialState = { count: 0, inputValue: "" };
+
+    function reducer(state, action) {
+      switch (action.type) {
+        case "INCREMENT": return { ...state, count: state.count + 1 };
+        case "DECREMENT": return { ...state, count: state.count - 1 };
+        case "SET_INPUT":  return { ...state, inputValue: action.payload };
+        case "RESET":      return initialState;
+        default:           return state;
+      }
+    }
+
+    // Expose state on window so specter_get_redux_state() (and evaluate_js) can read it
+    // App + Counter: render_reasons integration test target — useReducer dispatch triggers commitFiberRoot
+    function App() {
+      const [state, dispatch] = useReducer(reducer, initialState);
+
+      // Expose dispatch + state for tests
+      useEffect(() => {
+        window.__appState = state;
+        window.__appDispatch = dispatch;
+      });
+
+      return React.createElement(
+        "div",
+        { id: "app" },
+        React.createElement("h1", null, "Specter Test Fixture"),
+        React.createElement("p", { id: "counter" }, "Count: ", state.count),
+        React.createElement(
+          "button",
+          { id: "btn-increment", onClick: () => dispatch({ type: "INCREMENT" }) },
+          "Increment"
+        ),
+        React.createElement(
+          "button",
+          { id: "btn-decrement", onClick: () => dispatch({ type: "DECREMENT" }) },
+          "Decrement"
+        ),
+        React.createElement(
+          "button",
+          { id: "btn-reset", onClick: () => dispatch({ type: "RESET" }) },
+          "Reset"
+        ),
+        React.createElement("br", null),
+        React.createElement("input", {
+          id: "text-input",
+          type: "text",
+          placeholder: "Type here…",
+          value: state.inputValue,
+          onChange: (e) => dispatch({ type: "SET_INPUT", payload: e.target.value }),
+        })
+      );
+    }
+
+    // Mount into #root
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(React.createElement(App));
+  </script>
+
+  <!-- a11y_audit integration test targets — DELIBERATE VIOLATIONS for axe-core detection -->
+  <!-- violation 1: <img> without alt attribute (image-alt rule) -->
+  <img id="a11y-bad-img" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEAAAAALAAAAAABAAEAAAI=" />
+  <!-- violation 2: <button> with no accessible name (button-name rule) -->
+  <button id="a11y-bad-button"></button>
+</body>
+</html>

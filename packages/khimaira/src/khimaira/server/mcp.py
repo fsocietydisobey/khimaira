@@ -2840,6 +2840,30 @@ async def session_list() -> str:
     return await _monitor_tools.session_list()
 
 
+@mcp.tool()
+@logged_tool("session_delete")
+async def session_delete(session_id: str, force: bool = False) -> str:
+    """Delete a stale or zombie session from the registry.
+
+    If the session has logged decisions and force=False (default), the
+    deletion is refused with a clear message. Set force=True to archive
+    the decisions to disk first, then delete.
+
+    Chat memberships: the deleted session is marked LEFT in every chat where
+    it holds ACCEPTED or PENDING state. Chats where it is the master are
+    skipped — transfer master role first via chat_transfer_membership, then
+    delete.
+
+    Safety guard: refuses if session_id matches the current session's own id
+    (no self-delete).
+
+    Args:
+        session_id: UUID or friendly name of the session to delete.
+        force: archive decisions and proceed even when decisions are present.
+    """
+    return await _monitor_tools.session_delete(session_id, force=force)
+
+
 # ---------------------------------------------------------------------------
 # Phase 13 — MCP call telemetry. Answers "is khimaira being used effectively?"
 # ---------------------------------------------------------------------------

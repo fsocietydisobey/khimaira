@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""khimaira PostToolUse hook — auto-log file touches to the session store.
+"""khimaira PostToolUse hook — auto-log file touches + tool calls to the session store.
 
-Runs after Edit / Write / MultiEdit / NotebookEdit. Reads the hook JSON
-from stdin, extracts file path + tool name, appends to the khimaira
-session's files_touched.jsonl directly (no HTTP roundtrip — same JSONL
-format the daemon reads).
+Runs after every tool call. Records:
+  - tool_calls.jsonl: every tool invocation (all tools), capped at _TOOL_CALL_CAP.
+    Used by the PreToolUse Themis hook to inspect recent activity (e.g. IN-MASTER-4).
+  - files_touched.jsonl: file-path mutations for Edit/Write/MultiEdit/NotebookEdit only.
 
 Hard rules:
   - Never block Claude Code. ANY failure → exit 0 silently.
@@ -26,6 +26,8 @@ _BASE_DIR = (
     / "sessions"
 )
 
+_TOOL_CALL_CAP = 100
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -36,6 +38,24 @@ def _session_dir(session_id: str) -> Path:
     d = _BASE_DIR / safe
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _append_tool_call(session_id: str, tool_name: str, tool_input: dict) -> None:
+    """Append one tool-call record and truncate to _TOOL_CALL_CAP if over cap."""
+    record = {"ts": _now_iso(), "tool": tool_name, "params": tool_input}
+    path = _session_dir(session_id) / "tool_calls.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    # Ring-buffer: drop oldest entries when over cap.
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if len(lines) > _TOOL_CALL_CAP:
+            tmp = path.with_suffix(".jsonl.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write("\n".join(lines[-_TOOL_CALL_CAP:]) + "\n")
+            tmp.replace(path)
+    except OSError:
+        pass
 
 
 def _append_touch(session_id: str, file_path: str, summary: str) -> None:
@@ -62,16 +82,21 @@ def main() -> int:
 
     session_id = data.get("session_id") or ""
     tool_name = data.get("tool_name") or ""
-    if not session_id or tool_name not in (
-        "Edit",
-        "Write",
-        "MultiEdit",
-        "NotebookEdit",
-    ):
+    if not session_id or not tool_name:
         return 0
 
     tool_input = data.get("tool_input") or {}
     if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    # Always capture tool call for Themis / history inspection.
+    try:
+        _append_tool_call(session_id, tool_name, tool_input)
+    except OSError:
+        pass
+
+    # Only log file touches for file-editing tools.
+    if tool_name not in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         return 0
 
     files: list[str] = []

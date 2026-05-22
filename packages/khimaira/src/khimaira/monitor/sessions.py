@@ -145,6 +145,42 @@ def log_decision(session_id: str, text: str, why: str = "") -> dict:
     return record
 
 
+_TOOL_CALL_CAP = 100
+"""Maximum entries kept in tool_calls.jsonl per session (ring-buffer cap)."""
+
+
+def log_tool_call(session_id: str, tool_name: str, params: dict) -> None:
+    """Record a tool invocation to the session's tool_calls.jsonl ring-buffer.
+
+    Capped at _TOOL_CALL_CAP (100) entries; oldest are dropped when the cap
+    is exceeded. Called from the PostToolUse hook for every tool call so the
+    PreToolUse Themis hook can inspect recent activity (e.g. IN-MASTER-4).
+
+    Params should be the raw tool_input dict — callers should not pre-filter.
+    """
+    sd = _session_dir(session_id)
+    path = sd / "tool_calls.jsonl"
+    record = {"ts": _now_iso(), "tool": tool_name, "params": params}
+    _append_jsonl(path, record)
+    entries = _read_jsonl(path)
+    if len(entries) > _TOOL_CALL_CAP:
+        tmp = path.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            for e in entries[-_TOOL_CALL_CAP:]:
+                f.write(json.dumps(e, separators=(",", ":")) + "\n")
+        tmp.replace(path)
+
+
+def recent_tool_calls(session_id: str, limit: int = 20) -> list[dict]:
+    """Return the last `limit` tool calls for this session.
+
+    Returns [] for a fresh session with no tool_calls.jsonl.
+    Used by the PreToolUse Themis hook to check for recent top-tier consults.
+    """
+    path = _session_dir(session_id) / "tool_calls.jsonl"
+    return _read_jsonl(path)[-limit:]
+
+
 def log_touch(
     session_id: str,
     file: str,
@@ -1998,3 +2034,133 @@ def _invalidate_list_sessions_cache() -> None:
     UI updates feel instant even though most reads are cached."""
     global _list_sessions_cache
     _list_sessions_cache = None
+
+
+# ---------------------------------------------------------------------------
+# Session deletion
+# ---------------------------------------------------------------------------
+
+_ARCHIVE_DIR = _BASE_DIR.parent / "sessions_archive"
+
+
+def delete_session(session_id: str, force: bool = False) -> dict:
+    """Remove a session from the registry.
+
+    Guards:
+    - If session has decisions and force=False: refuse with structured error.
+    - If session has decisions and force=True: archive before deletion.
+    - If session_id matches the env var CLAUDE_CODE_SESSION_ID: refuse (no self-delete).
+    - If session_id is already gone: return structured error (idempotent-safe).
+
+    Chat memberships: the session is marked as LEFT in every chat where it
+    holds ACCEPTED or PENDING state (skips chats where it's master — those
+    require an explicit hand-off first).
+
+    Returns:
+        {"deleted": True, "session_id": ..., "name": ..., "had_decisions": bool,
+         "archived_to": path or None, "chats_left": [...], "chats_skipped_master": [...]}
+    """
+    from datetime import datetime
+
+    # Self-delete guard
+    self_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if self_id and session_id == self_id:
+        return {"error": "cannot delete the current session", "session_id": session_id}
+
+    # Resolve name→id and check existence
+    try:
+        resolved = resolve_session_id(session_id)
+    except ValueError:
+        return {"error": f"session not found: {session_id!r}", "session_id": session_id}
+
+    session_dir = _BASE_DIR / resolved
+
+    # Idempotent: already deleted
+    if not session_dir.exists():
+        return {"error": f"session not found: {resolved!r}", "session_id": resolved}
+
+    # Read decision count and name before touching anything
+    decisions = _read_jsonl(session_dir / "decisions.jsonl")
+    decision_count = len(decisions)
+    status_path = session_dir / "status.json"
+    name: str | None = None
+    if status_path.exists():
+        try:
+            name = json.loads(status_path.read_text()).get("name")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Guard: decisions present without force
+    if decision_count > 0 and not force:
+        return {
+            "error": (
+                f"session {resolved!r} has {decision_count} decision(s); "
+                "pass force=True to delete anyway"
+            ),
+            "session_id": resolved,
+            "decision_count": decision_count,
+        }
+
+    # Archive decisions before deletion
+    archived_to: str | None = None
+    if decision_count > 0 and force:
+        _ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        ts_slug = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        archive_path = _ARCHIVE_DIR / f"{resolved}.deleted.{ts_slug}.json"
+        archive_data = {
+            "session_id": resolved,
+            "name": name,
+            "deleted_at": _now_iso(),
+            "decisions": decisions,
+        }
+        archive_path.write_text(json.dumps(archive_data, indent=2))
+        archived_to = str(archive_path)
+
+    # Leave active chat memberships
+    chats_left: list[str] = []
+    chats_skipped_master: list[str] = []
+    try:
+        from khimaira.monitor import chats as chats_mod
+
+        chat_dir = chats_mod._chat_dir()
+        if chat_dir.exists():
+            for chat_file in chat_dir.glob("chat-*.jsonl"):
+                chat_id = chat_file.stem
+                try:
+                    room = chats_mod.load_room(chat_id)
+                    member = room["members"].get(resolved)
+                    if not member or member["state"] not in (chats_mod.PENDING, chats_mod.ACCEPTED):
+                        continue
+                    if chats_mod._is_master(room, resolved):
+                        chats_skipped_master.append(chat_id)
+                        continue
+                    chats_mod.leave(chat_id, resolved)
+                    chats_left.append(chat_id)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Delete session directory (atomic: rename to tmp then rmtree)
+    import shutil
+    import tempfile
+
+    tmp_dir = session_dir.parent / f"_deleting_{resolved}"
+    try:
+        session_dir.rename(tmp_dir)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except OSError:
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+    _invalidate_list_sessions_cache()
+    log.info("session %s (%s) deleted (had_decisions=%s)", resolved, name, decision_count > 0)
+
+    return {
+        "deleted": True,
+        "session_id": resolved,
+        "name": name,
+        "had_decisions": decision_count > 0,
+        "archived_to": archived_to,
+        "chats_left": chats_left,
+        "chats_skipped_master": chats_skipped_master,
+    }

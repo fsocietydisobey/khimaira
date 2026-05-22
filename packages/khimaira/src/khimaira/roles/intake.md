@@ -327,6 +327,46 @@ parallel — never one without the other.
   responses back through intake" rule — together they keep the
   user ↔ intake ↔ master triangle consistent.
 
+- **Use private addressing when dispatching parallel research tasks.** When you
+  spin up a multi-agent research task (e.g. "ask analyst + architect about X"),
+  use `chat_send_to(chat_id=..., to=["<agent-1>", "<agent-2>"], private=True,
+  body=...)` — NOT broadcast `chat_send`. Why: broadcast dispatches land in
+  master's chat history and pull master off its own primary work. Master scopes
+  attention to messages it OWNS — your research dispatches and their replies
+  belong to intake, not master. Use `private=True` so replies thread back to
+  intake only; relay the synthesized answer to master via your normal HANDOFF
+  spec only if it's actionable for master. See also master.md
+  "Source-of-truth for agent state" for the receiver-side rule (master queries
+  agents directly, not through intake, for status updates).
+
+  **Concrete failure (2026-05-22, jp roster):** jp-intake-1 dispatched a Fast
+  Mode product/architecture review to jp-analyst-1 + jp-architect-1 via
+  broadcast addressing in the roster chat. Responses landed in roster chat;
+  janice-0 (master, heads-down on JEEVY-534) picked them up + started
+  synthesizing, scattering attention across two parallel threads. Fix: intake's
+  parallel research goes through `chat_send_to(to=[<agents>], private=True)`
+  so master never sees the thread.
+
+- **Do NOT file Linear issues yourself.** Bug reports, feature requests, and
+  tech-debt callouts are tracker's responsibility. When the user reports a
+  bug/feature/follow-up:
+  1. Acknowledge the user briefly
+  2. `session_post_notice(target_session_id="<roster-tracker-name>", text="<bug/feature description, link to user's message if relevant>")`
+  3. Let tracker handle dedup against existing Linear issues + filing per their
+     `## Linear integration` section in tracker.md
+
+  **Why:** tracker has the Linear team_id cache, dedup logic, and
+  project-selection rules. Intake filing creates duplicates, lands issues in
+  the wrong project, and bypasses the dedup gate.
+
+  **Concrete failure (2026-05-22, jp roster):** jp-intake-1 filed JEEVY-539
+  directly after Joseph reported an InstanceGrouping HITL thumbnail bug. The
+  correct action was to relay to jp-tracker-1 via notice and let tracker file.
+  Default-drift happened because Linear-filing was well-established in intake's
+  context; the role boundary wasn't explicit. Pairs with tracker.md's
+  `## You do NOT` section (tracker's equivalent guardrail) and tracker.md's
+  `## Linear integration` section (canonical Linear-filing protocol, line ~146).
+
 ## Interaction With Other Roles
 
 | Role | Your interaction |

@@ -16,12 +16,88 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 from fastapi import Request
 from pydantic import BaseModel
 
+_PENDING_POLL_INTERVAL = 5.0   # seconds between polls when a `to` recipient is pending
+_PENDING_WAIT_DEADLINE = 30.0  # total seconds to wait for recipient to accept
+
+# Expected-reply registry — tracks targeted sends that expect a reply back.
+# Key: (to_id, from_id) meaning "to_id owes a reply to from_id".
+# Value: {"ts": monotonic_time, "from": from_id, "to": to_id}
+_EXPECTED_REPLIES: dict[tuple[str, str], dict] = {}
+_REPLY_OVERDUE_S = 90.0    # seconds before a missing reply is flagged
+_REPLY_WATCH_INTERVAL = 30.0  # seconds between watcher scans
+_REGISTRY_LOCK = asyncio.Lock()
+
+
+async def _register_expected_reply(from_id: str, to_ids: list[str]) -> None:
+    async with _REGISTRY_LOCK:
+        ts = time.monotonic()
+        for to_id in to_ids:
+            if to_id == from_id:
+                continue
+            _EXPECTED_REPLIES[(to_id, from_id)] = {"ts": ts, "from": from_id, "to": to_id}
+
+
+async def _resolve_expected_reply(from_id: str, to_ids: list[str]) -> None:
+    async with _REGISTRY_LOCK:
+        for to_id in to_ids:
+            _EXPECTED_REPLIES.pop((from_id, to_id), None)
+
+
+def _fire_overdue_notice(from_id: str, to_id: str, elapsed_s: float) -> None:
+    from khimaira.monitor import sessions as _sessions
+    try:
+        _sessions.post_notice(
+            to_id,
+            f"⏰ OVERDUE REPLY — you haven't replied to {from_id!r}'s "
+            f"chat_send_to after {elapsed_s:.0f}s. Check the chat.",
+            from_session_id="khimaira-daemon",
+        )
+    except Exception:
+        pass
+    try:
+        _sessions.post_notice(
+            from_id,
+            f"⏰ OVERDUE REPLY — {to_id!r} hasn't replied to your "
+            f"chat_send_to after {elapsed_s:.0f}s.",
+            from_session_id="khimaira-daemon",
+        )
+    except Exception:
+        pass
+
+
+async def _check_overdue_once() -> None:
+    now = time.monotonic()
+    async with _REGISTRY_LOCK:
+        overdue = [
+            (key, entry)
+            for key, entry in list(_EXPECTED_REPLIES.items())
+            if now - entry["ts"] > _REPLY_OVERDUE_S
+        ]
+        for key, entry in overdue:
+            _EXPECTED_REPLIES.pop(key, None)
+    for _, entry in overdue:
+        _fire_overdue_notice(entry["from"], entry["to"], now - entry["ts"])
+
+
+async def _overdue_watcher() -> None:
+    import logging
+    _log = logging.getLogger(__name__)
+    while True:
+        await asyncio.sleep(_REPLY_WATCH_INTERVAL)
+        try:
+            await _check_overdue_once()
+        except Exception as exc:
+            _log.warning("overdue-reply watcher error: %s", exc)
+
 from khimaira.monitor import chats
+from khimaira.monitor.chats import _resolve_sender_name  # shared with _broadcast
 
 from .._optional import require
 
@@ -255,12 +331,44 @@ def build_router():
 
     @router.post("/chats/{chat_id}/messages")
     async def send_message(chat_id: str, req: SendReq) -> dict:
-        try:
-            return chats.send_message(
-                chat_id, req.sender_session_id, req.body, to=req.to, private=req.private
-            )
-        except ValueError as exc:
-            raise fastapi.HTTPException(403, str(exc)) from exc
+        # Resolve: this send counts as a reply to any peer awaiting a response.
+        if req.to:
+            # Targeted send: resolve only named recipients.
+            await _resolve_expected_reply(req.sender_session_id, req.to)
+        else:
+            # Broadcast: resolve for ALL accepted chat members (critic/verifier
+            # conventionally reply via broadcast, not DM).
+            try:
+                room = chats.load_room(chat_id)
+                member_ids = [
+                    sid for sid, m in room["members"].items()
+                    if m.get("state") == chats.ACCEPTED and sid != req.sender_session_id
+                ]
+                if member_ids:
+                    await _resolve_expected_reply(req.sender_session_id, member_ids)
+            except Exception:
+                pass  # fail-open: don't block the send if room lookup fails
+        deadline = time.monotonic() + _PENDING_WAIT_DEADLINE
+        while True:
+            try:
+                result = chats.send_message(
+                    chat_id, req.sender_session_id, req.body, to=req.to, private=req.private
+                )
+                # Register only for targeted sends — broadcasts don't expect a reply.
+                if req.to:
+                    await _register_expected_reply(req.sender_session_id, req.to)
+                return result
+            except ValueError as exc:
+                msg = str(exc)
+                if req.to and "pending" in msg:
+                    if time.monotonic() >= deadline:
+                        raise fastapi.HTTPException(
+                            408,
+                            f"Timed out after {_PENDING_WAIT_DEADLINE:.0f}s waiting for recipient to accept invite.",
+                        ) from exc
+                    await asyncio.sleep(_PENDING_POLL_INTERVAL)
+                    continue
+                raise fastapi.HTTPException(403, msg) from exc
 
     # ---- Phase B: tasks ----
 
@@ -368,11 +476,20 @@ def build_router():
         since: str | None = None,
     ) -> dict:
         try:
-            return {
-                "messages": chats.history(chat_id, session_id, limit=limit, since_event_id=since)
-            }
+            msgs = chats.history(chat_id, session_id, limit=limit, since_event_id=since)
         except ValueError as exc:
             raise fastapi.HTTPException(403, str(exc)) from exc
+        # Option A: resolve each sender's CURRENT name at read-time.
+        # Per-request cache prevents N lookups for N messages from same sender.
+        name_cache: dict[str, str] = {}
+        for msg in msgs:
+            sid = msg.get("sender_id")
+            if not sid:
+                continue
+            if sid not in name_cache:
+                name_cache[sid] = _resolve_sender_name(sid, msg.get("sender_name", sid[:8]))
+            msg["sender_name"] = name_cache[sid]
+        return {"messages": msgs}
 
     @router.post("/chats/{chat_id}/leave")
     async def leave_chat(chat_id: str, req: LeaveReq) -> dict:

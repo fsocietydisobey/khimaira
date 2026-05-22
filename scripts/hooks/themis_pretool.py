@@ -68,7 +68,22 @@ def main() -> None:
         _fail_open(f"missing session_id or tool_name — session_id={session_id!r} tool={tool_name!r}")
         return
 
-    # ── 3. POST /api/themis/check ─────────────────────────────────────────
+    # ── 3. Load recent tool calls from disk (no daemon round-trip) ────────
+    # Disk-read approach keeps us well under the 100ms hook deadline.
+    # Fail-open: any I/O error → empty list (condition remains fail-open too).
+    _state_base = Path(
+        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+    ) / "khimaira" / "sessions"
+    try:
+        _log_path = _state_base / session_id / "tool_calls.jsonl"
+        _lines = _log_path.read_text(encoding="utf-8").splitlines()
+        recent_tool_calls: list = [
+            json.loads(ln) for ln in _lines[-20:] if ln.strip()
+        ]
+    except Exception:
+        recent_tool_calls = []
+
+    # ── 4. POST /api/themis/check ─────────────────────────────────────────
     try:
         body = json.dumps(
             {
@@ -76,6 +91,7 @@ def main() -> None:
                 "tool_name": tool_name,
                 "tool_input": tool_input,
                 "cwd": cwd,
+                "recent_tool_calls": recent_tool_calls,
             }
         ).encode()
         req = Request(
@@ -98,7 +114,7 @@ def main() -> None:
         _fail_open(f"daemon /api/themis/check failed: {exc}")
         return
 
-    # ── 4. Act on verdict ─────────────────────────────────────────────────
+    # ── 5. Act on verdict ─────────────────────────────────────────────────
     try:
         ok = verdict.get("ok")
     except AttributeError:

@@ -136,6 +136,22 @@ def _chat_path(chat_id: str) -> Path:
     return _chat_dir() / f"{chat_id}.jsonl"
 
 
+def _resolve_sender_name(session_id: str, fallback: str) -> str:
+    """Return the session's CURRENT friendly name from status.json.
+
+    Reads only the status.json file for speed. Falls back to `fallback`
+    (typically the stored sender_name snapshot) if the session is deleted
+    or the file is unreadable. Used at both SSE publish-time (_broadcast)
+    and read-time (api/chats.get_history) so names stay current after renames.
+    """
+    try:
+        status_path = sessions_mod._session_dir(session_id) / "status.json"
+        data = json.loads(status_path.read_text())
+        return data.get("name") or fallback
+    except Exception:
+        return fallback
+
+
 def _ensure_dir() -> None:
     _chat_dir().mkdir(parents=True, exist_ok=True)
     _archive_dir().mkdir(parents=True, exist_ok=True)
@@ -1994,6 +2010,13 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
         room = load_room(chat_id)
     except ValueError:
         return
+
+    # Resolve sender_name to current value at publish-time so subscribers
+    # see renames immediately rather than stale snapshots. JSONL is already
+    # written before _broadcast is called, so mutating here is safe.
+    sid = record.get("sender_id")
+    if sid and record.get("sender_name"):
+        record["sender_name"] = _resolve_sender_name(sid, record["sender_name"])
 
     # Invite-targeted broadcast: deliver to invitee only.
     if record.get("kind") == MEMBER and record.get("state") == PENDING:

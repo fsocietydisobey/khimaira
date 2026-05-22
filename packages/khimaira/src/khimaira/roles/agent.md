@@ -174,6 +174,14 @@ signal.
   angle, or revise the brief. Two consecutive rework cycles on the same
   task indicate the brief or your understanding is wrong; a third attempt
   without intervention compounds the error.
+- **UI-no-effect bugs: Specter Redux state first.** When debugging a
+  "click/toggle/selection produces no visible result" symptom in any
+  browser-based feature, the FIRST tool call is
+  `specter_get_redux_state(<slice-name>)` — not debug_snapshot, not source
+  reading. The slice is ground truth; the code is just the theory. See
+  `~/dotfiles/claude/rules/personal/khimaira-tools.md` Specter debugging
+  workflow for the full rule + the 2026-05-22 jp roster `__bootstrap__`
+  incident that motivated it.
 
 ## Interaction With Other Roles
 

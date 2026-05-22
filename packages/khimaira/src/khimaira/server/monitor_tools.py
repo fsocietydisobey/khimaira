@@ -116,6 +116,47 @@ def _post(
         return f"khimaira-monitor query failed ({url}): {exc}"
 
 
+def _delete(
+    path: str,
+    *,
+    params: dict[str, str] | None = None,
+    base: str = _DEFAULT_BASE,
+    timeout: float = 5.0,
+) -> dict[str, Any] | str:
+    """DELETE request → parsed JSON, or friendly error string."""
+    import urllib.parse as _urllib_parse
+
+    url = f"{base}{path}"
+    if params:
+        url = f"{url}?{_urllib_parse.urlencode(params)}"
+    req = urllib.request.Request(url, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            payload = e.read().decode("utf-8")
+            try:
+                detail = json.loads(payload).get("detail", payload)
+            except (json.JSONDecodeError, AttributeError):
+                detail = payload
+            return f"khimaira-monitor {url} → HTTP {e.code}: {detail[:400]}"
+        except Exception:
+            return f"khimaira-monitor {url} → HTTP {e.code}"
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, ConnectionRefusedError):
+            return _DAEMON_DOWN_HINT.format(base=base)
+        return (
+            f"khimaira-monitor {url} → transient connection error: {reason or e}. "
+            "Retry once; if it persists, check `khimaira monitor status`."
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return f"khimaira-monitor returned non-JSON from {url}: {exc}"
+    except Exception as exc:
+        return f"khimaira-monitor query failed ({url}): {exc}"
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations — kept thin so Claude reads the daemon's data
 # directly. Output is markdown-formatted for chat readability.
@@ -1510,6 +1551,43 @@ async def session_list() -> str:
         "`session_summary`, `session_post_notice`, etc. — they resolve "
         "names internally, no need to list-then-filter._"
     )
+    return "\n".join(parts)
+
+
+async def session_delete(session_id: str, force: bool = False) -> str:
+    """Delete a stale or zombie session from the registry.
+
+    If the session has logged decisions and force=False, deletion is refused
+    with a clear message. Pass force=True to archive decisions first, then delete.
+
+    Chat memberships: the deleted session is marked LEFT in all chats where it
+    holds ACCEPTED or PENDING state. Chats where it's the master are skipped
+    (transfer first via chat_transfer_membership, then delete).
+
+    Refuses with an error if you try to delete your own session.
+    """
+    data = _delete(
+        f"/api/sessions/{urllib.parse.quote(session_id)}",
+        params={"force": "true" if force else "false"},
+        timeout=15.0,
+    )
+    if isinstance(data, str):
+        return data
+    if not data.get("deleted"):
+        err = data.get("error", "unknown error")
+        return f"⚠️ session_delete failed: {err}"
+    name = data.get("name")
+    ident = f"`{name}` ({data['session_id']})" if name else f"`{data['session_id']}`"
+    parts = [f"🗑️ session {ident} deleted"]
+    if data.get("had_decisions") and data.get("archived_to"):
+        parts.append(f"  📦 decisions archived to `{data['archived_to']}`")
+    if data.get("chats_left"):
+        parts.append(f"  💬 left chats: {', '.join(data['chats_left'])}")
+    if data.get("chats_skipped_master"):
+        parts.append(
+            f"  ⚠️  still master of (requires hand-off first): "
+            f"{', '.join(data['chats_skipped_master'])}"
+        )
     return "\n".join(parts)
 
 

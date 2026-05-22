@@ -92,6 +92,75 @@ def chat_my_chats_not_called_this_turn(payload: dict[str, Any]) -> bool:
         return False
 
 
+# Top-tier role prefixes for CONSULT_BEFORE_USER (IN-MASTER-4).
+# Heuristic: session names starting with these prefixes are top-tier agents.
+_TOP_TIER_PREFIXES = ("architect", "analyst", "critic", "verifier")
+# Tool names that constitute a "consult" for top-tier detection purposes.
+_CONSULT_TOOLS = frozenset(
+    ["mcp__khimaira-chat__chat_send_to", "mcp__khimaira__session_log_question"]
+)
+# How many recent tool calls to inspect for top-tier consults.
+_HISTORY_WINDOW = 10
+
+
+def _is_top_tier_session(name: str) -> bool:
+    """True if session name maps to a top-tier role.
+
+    Handles bare names ("architect-1"), roster-prefixed names ("jp-architect-1"),
+    and any depth of prefix (e.g. "acme-corp-analyst-2"). The rule: any segment
+    of the dash-separated name that matches a top-tier role prefix is enough.
+    """
+    lower = name.lower()
+    parts = lower.split("-")
+    return any(part in _TOP_TIER_PREFIXES for part in parts)
+
+
+def no_recent_top_tier_consult(payload: dict[str, Any]) -> bool:
+    """True (violation) when no top-tier consult appears in recent tool calls.
+
+    Inspects payload["recent_tool_calls"] — a list of recent tool-call dicts
+    (up to the last _HISTORY_WINDOW entries), each shaped as:
+      {"tool": str, "params": dict}
+
+    For chat_send_to, params["to"] may be a str OR list[str] (production shape
+    is list). For session_log_question, params["target_session_id"] is a str.
+
+    Top-tier detection is segment-based: any dash-separated segment of the
+    target name that matches a top-tier role prefix counts. This handles both
+    bare names ("architect-1") and roster-prefixed names ("jp-architect-1").
+
+    Fail-open: if the key is absent, returns False (can't confirm → don't fire).
+    This preserves the invariant that missing payload never triggers a violation.
+
+    Limitation: detection is name-based, not role-binding-based. A session with
+    an opaque UUID will not be detected as top-tier.
+    """
+    recent = payload.get("recent_tool_calls")
+    if recent is None:
+        # Fail-open: no payload means we can't confirm the condition; don't fire.
+        return False
+
+    for call in recent[-_HISTORY_WINDOW:]:
+        tool = call.get("tool", "")
+        if tool not in _CONSULT_TOOLS:
+            continue
+        params = call.get("params", {})
+
+        # Collect all target names from the call params.
+        # chat_send_to: params["to"] is list[str] in production, str in some tests.
+        # session_log_question: params["target_session_id"] is str.
+        raw_to = params.get("to") or params.get("target_session_id") or ""
+        if isinstance(raw_to, list):
+            targets = [str(t) for t in raw_to if t]
+        else:
+            targets = [str(raw_to)] if raw_to else []
+
+        if any(_is_top_tier_session(t) for t in targets):
+            return False  # found a recent top-tier consult — condition not met
+
+    return True  # no top-tier consult found — condition met, rule fires
+
+
 # ---------------------------------------------------------------------------
 # Registry — maps YAML condition name → function
 # ---------------------------------------------------------------------------
@@ -99,4 +168,5 @@ def chat_my_chats_not_called_this_turn(payload: dict[str, Any]) -> bool:
 _REGISTRY: dict[str, Any] = {
     "idle_agents_exist": idle_agents_exist,
     "chat_my_chats_not_called_this_turn": chat_my_chats_not_called_this_turn,
+    "no_recent_top_tier_consult": no_recent_top_tier_consult,
 }
