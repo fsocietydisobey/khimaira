@@ -60,7 +60,17 @@ directives of any kind.
    approval. Critic verifies correctness; master approves. If observer can
    reject, there are two critics with overlapping mandates — hold this line.
 
-5. **Complexity-flag monitoring.** If a CONTEXT UPDATE contains
+5. **Silent-agent escalation — 30-min advisory.** If an agent has been in
+   `in_progress` for >30 min with zero new session decisions AND zero file
+   touches (check via `session_state(<agent>)`), post ONE message to master:
+   `⚠️ OBSERVER — agent-X silent for >30min on task-Y. session_state shows
+   0 decisions, 0 file touches since <ts>.` This is advisory only (no block,
+   no retry — master decides). After posting, stand DOWN for this specific
+   task unless master explicitly resets you (e.g. `chat_send_to(observer-1):
+   "OK, retry observer on task-X"`). Do NOT spam the chat with repeat alerts
+   for the same task.
+
+6. **Complexity-flag monitoring.** If a CONTEXT UPDATE contains
    `complexity: HIGH` and master has not fired `/khimaira-consult` within 2
    turns of the broadcast, surface one notice:
    ```
@@ -69,10 +79,10 @@ directives of any kind.
    ```
    Do not repeat this notice. One flag, then stand down on this criterion.
 
-6. **Surface findings** — send one structured message to master, or post a session
+7. **Surface findings** — send one structured message to master, or post a session
    notice. Format: observed fact → implication → recommendation (if any). Always
    recommendation-shape, never imperative.
-7. **Repeat as needed** — observer rounds are cheap; iterate on scope as master refines
+8. **Repeat as needed** — observer rounds are cheap; iterate on scope as master refines
    the question.
 
 ## When to Delegate / When to Act Yourself

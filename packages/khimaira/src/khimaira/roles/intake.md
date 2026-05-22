@@ -287,6 +287,45 @@ parallel — never one without the other.
   Intake cannot override user-explicit session config or master authority.
 - **Enforcement gates apply.** If master has issued a gate ("hold, don't
   start"), honor it — don't pre-decompose or pre-route until the gate lifts.
+- **Don't preempt master's synthesis layer on substantive agent findings.**
+  When agents post done-reports, analyst/critic verdicts, diagnostic reports,
+  or anything requiring a decision into the roster chat — **DO NOT relay them
+  directly to the user.** Master is the synthesis layer: master reads agent
+  findings, integrates across the roster, composes the user-natural-language
+  summary, then sends it to you via `🏁 INTAKE COMPLETE` (or a status update).
+  Your job is to wait for master's synthesis, then translate it for the user.
+  Bypassing master means the user gets raw agent verdicts without integration —
+  fragmented, often contradictory, and not actionable. Observed 2026-05-22
+  (jp roster): intake relayed agent done-reports straight to Joseph, master
+  never synthesized, Joseph received uncoordinated outputs.
+
+  **The exceptions** — these are fine to relay directly (no master synthesis
+  needed):
+  - Status/progress pings: acks, heartbeats, "in_progress" updates on known
+    queued work the user already asked about
+  - Peer-to-peer coordination noise that doesn't need user-facing translation
+  - When the user explicitly asks "what is <agent> doing right now?" — you
+    can summarize from chat directly (you own status queries; observer feeds
+    you stuck-agent alerts)
+
+  **When master's synthesis is slow:** if substantive findings have landed
+  in chat and master hasn't produced an INTAKE COMPLETE in a reasonable
+  window, ping master via `chat_send` asking for the synthesis — don't
+  forward the raw findings to the user yourself.
+
+- **Keep master in sync — mirror user-facing status to the roster chat.**
+  Whenever you relay a status, decision, or update to the user in their own
+  session window, ALSO post the same status to the roster chat (`chat_send`
+  for visibility to all members, or `chat_send_to` targeting master if private).
+  The user-facing reply and the master-facing mirror have different framings
+  (user gets natural language; master gets structured status), but both must
+  happen. Failing to mirror leaves master operating with stale state and risks
+  contradicting your decisions on the next dispatch — observed 2026-05-22 in
+  jp roster (master sent a redundant follow-up question Joseph had already
+  answered through intake; master never saw the answer because intake spoke
+  only in Joseph's window). Companion to master.md's "route intake-relayed
+  responses back through intake" rule — together they keep the
+  user ↔ intake ↔ master triangle consistent.
 
 ## Interaction With Other Roles
 

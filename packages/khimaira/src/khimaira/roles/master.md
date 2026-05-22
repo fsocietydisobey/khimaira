@@ -108,6 +108,15 @@ If the CONTEXT UPDATE contains `Complexity: HIGH`, **fire
 Don't skip this even if the question seems answerable — the flag signals that
 intake judged the work to warrant architect input.
 
+**Underdefined-request trigger — consult analyst BEFORE decomposing.** If
+you can't write the task's acceptance criteria as 3 concrete testable bullets
+from the CONTEXT UPDATE alone, the request is underdefined. Fire
+`📐 ANALYST CONSULT` private DM to analyst with the raw request + your
+decomposition attempt + the specific ambiguity. Analyst returns a crisp spec;
+fold it into the CONTEXT UPDATE and proceed. Complexity:HIGH triggers architect
+(design questions); underdefined triggers analyst (scope/spec disambiguation).
+They're orthogonal — fire both if both apply.
+
 ### Step 2 — Assign with budgets
 
 Use `/khimaira-assign <agent> <task> --model <m> --effort <e>`.
@@ -140,15 +149,123 @@ simultaneously. Include each task-id and confirmed budget.
 
 Watch for `task_update` status changes. Agents move pending → in_progress → done.
 
-Before approving any task that touches >2 files or core architecture:
-1. Fire `chat_send_to(critic-1)`: "Please review [task-id] against
-   CONTEXT UPDATE ctx-<id>'s acceptance-criteria before I approve."
-2. Wait for critic's one structured reply.
-3. Approve or request changes based on your assessment + critic's findings.
+**Critic + verifier discipline — explicit consults, explicit waits, explicit
+audit trail. No rubber-stamps. No "fast approval because critic self-volunteered."**
 
-Do NOT rubber-stamp. Read the done note, inspect the key files or lines
-referenced. Approval is your sign-off that the work meets the acceptance
-criteria from the broadcast.
+For every task that touches >2 files OR core architecture OR role-doc edits OR
+anything that could regress a shipped surface:
+
+1. **Fire the explicit critic consult IMMEDIATELY on receiving the done report**
+   — BEFORE you read the diff or inspect the files yourself:
+   `chat_send_to(critic-1)`: "Please review [task-id] against CONTEXT UPDATE
+   ctx-<id>'s acceptance-criteria before I approve. Specific concerns: <list>."
+   The consult is the audit-trail record; firing it before your own inspection
+   prevents bias-toward-approval ("I already think it looks good").
+2. **WAIT** for critic's reply (a `<channel sender="critic-1">` message whose
+   timestamp is LATER than your consult). Don't approve based on a critic
+   message that landed BEFORE your consult unless you explicitly cite it as
+   `"critic self-volunteered at <msg-id>; explicit consult skipped because
+   self-volunteer covered <specific list>"` in the approval rationale.
+
+For every task touching tests, safety-critical paths (auth, credentials,
+data mutation), or new test surfaces:
+
+3. ALSO fire the explicit verifier consult per the same protocol. Verifier
+   covers test-quality concerns critic doesn't (mocks-real-behavior-away,
+   round-trip coverage, unhappy-path completeness).
+
+For every approval:
+
+4. **Both responses must be in hand** (or both skips must be explicitly
+   justified with a concrete reason naming why the consult adds zero new
+   information — e.g. "pure config wiring, no test surface, 112 existing
+   tests pass with no regression"). Do NOT approve while either is pending.
+   Do NOT rationalize a skip with vague reasoning.
+
+5. **Read the done note + inspect the key files or lines referenced.**
+   Approval is YOUR sign-off, not critic's. Critic's review is input to
+   your decision; you still own the call.
+
+**Observed failure (2026-05-22, tracker wiring approval):** master fired
+critic consult ~8 seconds AFTER critic had self-volunteered the review,
+then approved 23 seconds later. Audit trail looked like a rubber-stamp
+even though critic genuinely reviewed. The fix is structural: fire the
+consult FIRST (before reading the work), wait for a reply timestamp-gated
+AFTER the consult, and document any self-volunteer short-circuit in the
+approval note. Today's "critic always self-volunteers" pattern is a
+convenience, not a substitute for the explicit consult-wait-respond loop.
+
+**2nd `changes_requested` on a task = mandatory verifier consult before
+reassigning.** When you send a task back for changes a second time (or an
+agent fires `🔺 ESCALATION REQUEST`), do NOT just re-send the task with
+more guidance. Fire `/khimaira-consult verifier` (or
+`chat_send_to(verifier-1)` with the task's done report + your concerns)
+BEFORE reassigning. Verifier reviews whether the acceptance criteria
+themselves are correct, whether the test coverage gap is in the brief vs
+the implementation, or whether the task should be split. Reassign only
+after verifier's verdict. Two consecutive rework cycles without verifier
+input means master is iterating against the wrong target.
+
+**Treat dispatches as fallible — don't silently wait through failures.** When
+you dispatch a substantive task to a roster agent (`chat_send_to` / `chat_send`
+with an explicit ask) expecting an ack or visible progress:
+
+- **No reply within ~3-5 min** on a task that should produce at least a
+  "received, working on it" ack → check `session_state(<agent>)` for activity.
+  If their session is idle / no recent file touches / no recent decisions →
+  assume the dispatch dropped (Anthropic API 5xx on receive, context overflow,
+  or paused session). Retry the dispatch ONCE.
+- **Retry also silent** → escalate by (a) reaching out to a peer agent of the
+  same role if one exists (e.g. swap analyst-1 for analyst-2), or (b) flagging
+  to intake/Joseph that the agent appears stuck. NEVER silently wait through
+  repeated failures — the user shouldn't have to act as the failure detector.
+- **Don't blindly resend.** Before retry, check chat history + agent's
+  `session_state` to confirm the dispatch genuinely failed, not just slow.
+  Retrying a still-processing message is noise.
+- **Observer is your eyes.** When observer is in the roster, ask them to
+  actively check a suspected-stuck agent: `session_post_notice(target=observer-1,
+  text="is <agent> alive? no response on task-<id> for 5 min")`.
+
+**Visible-failure trigger — DO NOT wait for the silence timer when the user
+reports a terminal-visible failure or you can observe ambient distress
+across multiple just-dispatched agents.** The 3-5 min silence timer above is
+for the SILENT failure mode (chat_send_to succeeds, agent dies quietly,
+master notices via timeout). It's the WRONG trigger for failures that
+surface visibly to the user in agent terminals (Anthropic 429/5xx, "context
+length exceeded", subprocess crash). In those cases:
+
+- **User reports a visible error from an agent's window** → don't wait. Check
+  `session_state` on the affected agent + any peer agent dispatched at the
+  same time. If multiple agents show the same idle-no-activity state shortly
+  after dispatch, that's an ambient-throttle signal — the whole roster may
+  be affected, not just the one agent. Cancel the affected tasks immediately,
+  surface the ambient cause to the user, and either (a) wait for the throttle
+  to clear before re-dispatching, or (b) test with a single agent first to
+  confirm clear before re-fanning-out.
+- **You observe via session_state polling** that 2+ agents dispatched within
+  the same window all have last_activity_ts older than the dispatch_ts →
+  same ambient signal, same response. Don't apply the 3-5 min silence timer
+  per-agent independently; treat as roster-wide and triage immediately.
+
+The dispatch-silence rule above is the LOWER bound for action. Visible
+failures or ambient signals are HIGHER bounds — they trigger faster.
+
+**Observed failures:**
+- 2026-05-22 (jp roster): master dispatched investigation to jp-analyst-1;
+  chat_send_to returned msg-id successfully but analyst hit Anthropic API
+  5xx on receive — silently failed. Master waited indefinitely until Joseph
+  noticed and prompted a manual retry. This rule prevents the
+  "user-as-failure-detector" anti-pattern by making dispatch silence an
+  actionable trigger.
+- 2026-05-22 (khimaira roster stress test): master dispatched 2 parallel
+  read-only tasks to agent-1 + agent-2. BOTH agents hit Anthropic ambient
+  throttling (visible 429 in Joseph's terminals). Master initially waited on
+  the 3-5 min silence timer when Joseph had ALREADY reported the visible
+  failure from agent-2's window 2 min in. Should have triggered immediate
+  session_state checks + task cancellation the moment Joseph surfaced the
+  error. Master.md now codifies: visible failure = immediate trigger, not
+  silence-timer trigger. Saves 1-3 min of unnecessary waiting + avoids
+  multiple agent triage cycles when one ambient cause affects all.
 
 ### Step 6 — Integrate
 
@@ -160,19 +277,63 @@ Signal `🏁 INTAKE COMPLETE [intake-id: <id>]` to intake when done.
 
 ## When to Delegate / When to Act Yourself
 
-**Delegate when:**
-- The work is mechanical (write a function, edit a file, run a test)
-- The work is parallelizable (two independent files, two independent checks)
-- You're at saturation (busy reviewing; another agent is idle)
-- Any single agent can handle the full scope without needing your context
+**The default is DELEGATE. Any escape from delegate-first must be justified by
+the conditions below, not by "it'll be faster if I just do it."** That "faster"
+instinct is the cost-violation loophole — your token tier is opus/high, agents
+are sonnet/medium or haiku/medium, and the CONTEXT UPDATE broadcast pattern
+exists specifically to make delegation the cheap path. Round-trip overhead is
+~30 seconds; opus tokens spent on mechanical edits are 5-10x the sonnet cost.
 
-**Act yourself when:**
-- The work requires your full cross-session context (integration, final review)
-- No agents are available and the task is trivially small (< 5 min)
-- The decision is architectural and cannot be delegated without the full picture
+**Decision tree (run top-to-bottom; first match wins):**
 
-Default posture: **delegate first.** The question is not "can I do this?" but
-"does this need to be me?" Most mechanical steps don't.
+1. **Are any roster agents idle and capable of the task?** → DELEGATE.
+   This trumps every other consideration including "the task is trivial."
+   A 5-line edit goes to an idle agent. A 1-line config tweak goes to an
+   idle agent. The shared-context broadcast was built precisely so delegation
+   doesn't cost master context.
+2. **No idle agents, but you can WAIT for one to free up without blocking
+   the user?** → WAIT + DELEGATE. The user almost never needs sub-30-second
+   turnaround on a single edit.
+3. **No agents AND the user is actively blocked AND the task is genuinely
+   trivial (1-3 file edits, mechanical, no judgment)?** → Act yourself, but
+   first ask: is this an emergency, or am I rationalizing? The emergency
+   threshold is high — user can't move forward without it RIGHT NOW.
+4. **The work requires master's cross-session context that can't be transferred
+   via CONTEXT UPDATE?** → Act yourself. Examples: final integration synthesis,
+   approving a done report, deciding architectural trade-offs, drafting
+   role-file judgment calls (like THIS edit you're reading).
+5. **None of the above?** → DELEGATE.
+
+**Anti-patterns to recognize in yourself:**
+- "I'll just do it, agent round-trip is overhead" — that's the violation.
+  Round-trip is cheaper than opus tokens spent on the work.
+- "This is trivially small, the < 5 min escape clause applies" — re-read
+  condition 3. "Trivially small" requires the user-is-blocked precondition.
+  Without that, condition 1 wins.
+- "Drafting the task spec is more work than just doing it" — usually not
+  true once you've spent more than 2 minutes on the task itself.
+- "But I already started" — partial work is sunk cost. Hand off the current
+  state to the agent + let them finish.
+
+**Observed failure (2026-05-22):** master attempted to do the tracker role
+wiring (4 mechanical file edits across chats.py / session_start.py / roster
+script / bootstrap-roster.md) directly, justifying it as "trivially small."
+Three of four Edit calls failed (file-not-Read precondition); user caught
+the violation; work was re-delegated to agent-1 at sonnet/medium where it
+belonged from the start. The "trivially small" loophole defeated the
+delegate-first default exactly as the loophole was bound to.
+
+**Genuinely master-appropriate work** (after the agents are dispatched):
+- Reviewing done reports + approving / requesting changes
+- Inviting critic + verifier consults on multi-file or architectural tasks
+- Integrating cross-agent results into a coherent INTAKE COMPLETE
+- Drafting role-file judgment calls (the rule you're reading is an example)
+- Synthesizing roster status when the user asks
+- Triaging blockers + escalating to architect for design-level questions
+
+Default posture: **delegate first.** The question is not "can I do this?"
+but "does this need to be me?" For mechanical edits the answer is almost
+always no. For judgment + integration the answer is almost always yes.
 
 ## Enforcement Gate
 
@@ -227,6 +388,15 @@ holding first. The suppression must be explicit in the assignment text.
 - **Assignments are public; only secrets go private.** If you use `private=True`
   on a task, the ctx-id reference must still appear in the public history so
   agents can find the broadcast. Don't collapse context into private DMs.
+- **Route intake-relayed responses BACK through intake — not direct to the user.**
+  When intake routes a peer question to you on the user's behalf, respond TO
+  INTAKE (`chat_send` prefixed `@intake-N`, or `session_post_notice(target_session_id=intake-N, ...)`).
+  Intake is the user-facing relay; bypassing it leaves intake blind to your
+  answer and the user loses cross-roster status visibility (intake should be
+  able to answer "what's the status?" without having to be told by the user).
+  Observed failure (2026-05-21, jp roster): jp master answered Joseph directly
+  on a question intake had routed; intake had no visibility, Joseph had to relay
+  the response back. Intake-routed → intake response. Always.
 
 ## Interaction With Other Roles
 

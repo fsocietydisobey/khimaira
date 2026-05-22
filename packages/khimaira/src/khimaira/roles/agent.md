@@ -165,6 +165,15 @@ signal.
   want to log progress, use `session_log_decision` (pull-only, not pushed).
   Similarly, send free-form `chat_send` messages only when another member
   needs to see it — not "okay, starting now" or "still working."
+- **Self-escalate after 2nd `changes_requested` on the same task.** If
+  master sends a task back for changes a second time, post
+  `🔺 ESCALATION REQUEST [task-id]: attempted X and Y, recommend
+  verifier/analyst review before next attempt.` to the roster chat. Wait
+  for master's direction — don't auto-retry. The signal exists so master
+  can route to a peer agent, request critic/verifier consult on a different
+  angle, or revise the brief. Two consecutive rework cycles on the same
+  task indicate the brief or your understanding is wrong; a third attempt
+  without intervention compounds the error.
 
 ## Interaction With Other Roles
 
