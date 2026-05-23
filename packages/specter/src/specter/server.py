@@ -140,11 +140,22 @@ _recorder: InteractionRecorder = InteractionRecorder()
 _a11y: A11yAuditor = A11yAuditor()
 _asserter: Asserter = Asserter()
 _state_machine: StateMachineExtractor = StateMachineExtractor()
+# Remembers the last successfully connected target so reconnects re-anchor
+# to the same tab instead of auto-picking. None = first-ever connect.
+_last_target_id: str | None = None
 
 
 async def _ensure_connected():
-    """Ensure we have a live CDP connection, reconnecting if needed."""
-    global _connection, _console, _network, _runtime, _react, _interact, _structure
+    """Ensure we have a live CDP connection, reconnecting if needed.
+
+    On reconnect (connection dropped after a prior successful connect),
+    re-anchors to the previously connected target via _last_target_id.
+    If that target is gone, raises ConnectionError with guidance — does NOT
+    silently auto-pick a different tab (that's the bug this prevents).
+
+    First-ever connect (_last_target_id is None) uses auto-pick as before.
+    """
+    global _connection, _console, _network, _runtime, _react, _interact, _structure, _last_target_id
 
     config = load_config()
 
@@ -162,7 +173,16 @@ async def _ensure_connected():
     _console.register(_connection)
     _network.register(_connection)
 
-    target = await _connection.connect()
+    # Re-anchor to the previous target on reconnect; auto-pick only on first connect.
+    try:
+        target = await _connection.connect(target_id=_last_target_id)
+    except ConnectionError:
+        # Previous target is gone. Clear memory so the agent can explicitly
+        # re-anchor via specter_connect_to_tab(<id>) — don't silently auto-pick.
+        _last_target_id = None
+        raise
+
+    _last_target_id = target.id
 
     # Enable all CDP domains we need
     await _console.enable(_connection)  # Runtime domain
@@ -404,7 +424,7 @@ async def connect_to_tab(tab_id: str) -> dict:
     Returns:
         Dict with the connected tab's title and URL.
     """
-    global _connection, _console, _network, _runtime, _react, _interact, _structure
+    global _connection, _console, _network, _runtime, _react, _interact, _structure, _last_target_id
 
     config = load_config()
 
@@ -425,6 +445,7 @@ async def connect_to_tab(tab_id: str) -> dict:
     _network.register(_connection)
 
     target = await _connection.connect(target_id=tab_id)
+    _last_target_id = target.id  # remember for auto-reconnect
     await _console.enable(_connection)
     await _network.enable(_connection)
 
