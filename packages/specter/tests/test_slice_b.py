@@ -364,7 +364,10 @@ class TestA11yAuditIntegration:
         from specter.config import load_config
 
         conn = CDPConnection(load_config())
-        await conn.connect()
+        targets = await conn.list_targets()
+        if not targets:
+            pytest.skip("No browser targets available")
+        await conn.connect(target_id=targets[0].id)
 
         try:
             # TAB SAFETY: fixture_page is always a local 127.0.0.1 URL on a random port
@@ -404,7 +407,10 @@ class TestExtractStateMachineIntegration:
         from specter.config import load_config
 
         conn = CDPConnection(load_config())
-        await conn.connect()
+        targets = await conn.list_targets()
+        if not targets:
+            pytest.skip("No browser targets available")
+        await conn.connect(target_id=targets[0].id)
 
         try:
             assert is_safe_to_clean(fixture_page)
@@ -443,7 +449,10 @@ class TestAssertionToolsIntegration:
         from specter.config import load_config
 
         conn = CDPConnection(load_config())
-        await conn.connect()
+        targets = await conn.list_targets()
+        if not targets:
+            pytest.skip("No browser targets available")
+        await conn.connect(target_id=targets[0].id)
 
         try:
             assert is_safe_to_clean(fixture_page)
@@ -484,7 +493,10 @@ class TestAssertionToolsIntegration:
         try:
             assert is_safe_to_clean(fixture_page)
 
-            await conn.connect()
+            targets = await conn.list_targets()
+            if not targets:
+                pytest.skip("No browser targets available")
+            await conn.connect(target_id=targets[0].id)
             await console.enable(conn)
             await conn.send("Page.enable", {})
             await conn.send("Page.navigate", {"url": fixture_page})
@@ -522,7 +534,10 @@ class TestAssertionToolsIntegration:
         try:
             assert is_safe_to_clean(fixture_page)
 
-            await conn.connect()
+            targets = await conn.list_targets()
+            if not targets:
+                pytest.skip("No browser targets available")
+            await conn.connect(target_id=targets[0].id)
             await network.enable(conn)
             await conn.send("Page.enable", {})
             await conn.send("Page.navigate", {"url": fixture_page})

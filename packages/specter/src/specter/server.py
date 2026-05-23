@@ -148,12 +148,14 @@ _last_target_id: str | None = None
 async def _ensure_connected():
     """Ensure we have a live CDP connection, reconnecting if needed.
 
+    Raises ConnectionError if no tab has been explicitly anchored yet
+    (_last_target_id is None). The agent must call specter_list_tabs()
+    then specter_connect_to_tab(<id>) before any other tool works.
+    This prevents Specter from silently auto-picking any tab.
+
     On reconnect (connection dropped after a prior successful connect),
     re-anchors to the previously connected target via _last_target_id.
-    If that target is gone, raises ConnectionError with guidance — does NOT
-    silently auto-pick a different tab (that's the bug this prevents).
-
-    First-ever connect (_last_target_id is None) uses auto-pick as before.
+    If that target is gone, raises ConnectionError with guidance.
     """
     global _connection, _console, _network, _runtime, _react, _interact, _structure, _last_target_id
 
@@ -161,6 +163,13 @@ async def _ensure_connected():
 
     if _connection is not None and _connection.is_connected:
         return _connection, _console, _network, _runtime, _react, _interact, _structure
+
+    if _last_target_id is None:
+        raise ConnectionError(
+            "Specter has no anchored target. "
+            "Call specter_list_tabs() to see available tabs, then "
+            "specter_connect_to_tab(<id>) to anchor Specter to the correct tab."
+        )
 
     _connection = CDPConnection(config)
     _console = ConsoleCapture(config)
@@ -173,12 +182,12 @@ async def _ensure_connected():
     _console.register(_connection)
     _network.register(_connection)
 
-    # Re-anchor to the previous target on reconnect; auto-pick only on first connect.
+    # Re-anchor to the previously connected target.
     try:
         target = await _connection.connect(target_id=_last_target_id)
-    except ConnectionError:
-        # Previous target is gone. Clear memory so the agent can explicitly
-        # re-anchor via specter_connect_to_tab(<id>) — don't silently auto-pick.
+    except (ConnectionError, ValueError):
+        # Previous target is gone or ID is invalid. Clear memory so the agent
+        # must re-anchor explicitly via specter_connect_to_tab(<id>).
         _last_target_id = None
         raise
 
@@ -392,19 +401,27 @@ async def list_tabs() -> list[dict]:
     """List all open browser tabs.
 
     Returns tab IDs, titles, and URLs. Call this first, then use
-    connect_to_tab(id) to switch to the correct app tab.
+    connect_to_tab(id) to anchor Specter to the correct tab.
+
+    This tool works WITHOUT a prior specter_connect_to_tab call — it
+    intentionally bypasses the no-anchor guard so the agent can always
+    discover available tabs and choose one explicitly.
 
     Returns:
         List of tab dicts with id, title, url, and which one is
         currently connected (if any).
     """
-    conn, _, _, _, _, _, _ = await _ensure_connected()
-    targets = await conn.list_targets()
-    current = conn.current_target
+    config = load_config()
+    # Use a temporary connection for tab discovery only — do NOT call
+    # _ensure_connected() because that raises when no anchor is set,
+    # which would prevent the agent from ever discovering tabs.
+    temp_conn = CDPConnection(config)
+    targets = await temp_conn.list_targets()
+    current_id = _last_target_id
     result = []
     for t in targets:
         d = t.to_dict()
-        d["connected"] = current is not None and t.id == current.id
+        d["connected"] = current_id is not None and t.id == current_id
         result.append(d)
     return result
 

@@ -272,7 +272,10 @@ async def test_render_reasons_on_counter_click(chrome_or_skip, fixture_page):
     config_obj = load_config()
 
     conn = CDPConnection(config_obj)
-    await conn.connect()
+    targets = await conn.list_targets()
+    if not targets:
+        pytest.skip("No browser targets available")
+    await conn.connect(target_id=targets[0].id)
     try:
         runtime = Runtime(config_obj)
         await runtime.navigate_to(conn, fixture_page)
@@ -326,7 +329,10 @@ async def test_track_hooks_captures_counter_value(chrome_or_skip, fixture_page):
 
     config_obj = load_config()
     conn = CDPConnection(config_obj)
-    await conn.connect()
+    targets = await conn.list_targets()
+    if not targets:
+        pytest.skip("No browser targets available")
+    await conn.connect(target_id=targets[0].id)
     try:
         runtime = Runtime(config_obj)
         await runtime.navigate_to(conn, fixture_page)
@@ -378,7 +384,10 @@ async def test_diff_component_tree_round_trip(chrome_or_skip, fixture_page):
 
     config_obj = load_config()
     conn = CDPConnection(config_obj)
-    await conn.connect()
+    targets = await conn.list_targets()
+    if not targets:
+        pytest.skip("No browser targets available")
+    await conn.connect(target_id=targets[0].id)
     try:
         runtime = Runtime(config_obj)
         await runtime.navigate_to(conn, fixture_page)

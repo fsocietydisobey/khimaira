@@ -106,45 +106,46 @@ class CDPConnection:
                 )
         return targets
 
-    async def connect(self, target_id: str | None = None) -> Target:
-        """Connect to a browser target.
+    async def connect(self, target_id: str) -> Target:
+        """Connect to a specific browser target. target_id is REQUIRED.
 
-        When target_id is not given, picks the first non-browser-internal tab
-        (filters out devtools://, chrome://, etc.). If multiple app tabs
-        remain, picks the first one. Claude can call list_tabs() to see all
-        tabs and then connect_to_tab(id) to switch.
+        There is no auto-pick. Call list_targets() first to discover available
+        tab IDs, then pass the chosen id explicitly. This prevents Specter from
+        silently anchoring to whichever tab happens to be first in the list.
 
         Args:
-            target_id: Specific target ID. If None, picks the first app tab.
+            target_id: The specific target ID to connect to.
 
         Returns:
             The connected Target.
 
         Raises:
+            ValueError: target_id is None or empty — Specter never decides which
+                tab to operate on; the caller always does.
             ConnectionError: If the browser isn't reachable, no page targets exist,
-                or target_id is provided but not found (tab closed/refreshed — no
-                silent fallback; caller must re-anchor via list_tabs + connect_to_tab).
+                or target_id is not found (tab closed/refreshed — caller must
+                re-anchor via specter_list_tabs + specter_connect_to_tab).
         """
+        if not target_id:
+            raise ValueError(
+                "Specter requires an explicit target_id. "
+                "Call specter_list_tabs() to see available tabs, then "
+                "specter_connect_to_tab(<id>) to anchor Specter to the correct tab. "
+                "There is no auto-pick — Specter never decides which tab to operate on."
+            )
+
         targets = await self.list_targets()
         if not targets:
             raise ConnectionError("No page targets found. Is a page open in the browser?")
 
-        if target_id:
-            target = next((t for t in targets if t.id == target_id), None)
-            if target is None:
-                raise ConnectionError(
-                    f"Specter target {target_id!r} not found in current targets. "
-                    f"The tab may have been closed, refreshed, or navigated away. "
-                    f"Call specter_list_tabs() to see available tabs, then "
-                    f"specter_connect_to_tab(<new_id>) to re-anchor Specter to the correct tab."
-                )
-        else:
-            # Filter out browser-internal pages
-            app_tabs = [
-                t for t in targets
-                if not any(t.url.startswith(prefix) for prefix in self._config.browser_internal_urls)
-            ]
-            target = app_tabs[0] if app_tabs else targets[0]
+        target = next((t for t in targets if t.id == target_id), None)
+        if target is None:
+            raise ConnectionError(
+                f"Specter target {target_id!r} not found in current targets. "
+                f"The tab may have been closed, refreshed, or navigated away. "
+                f"Call specter_list_tabs() to see available tabs, then "
+                f"specter_connect_to_tab(<new_id>) to re-anchor Specter to the correct tab."
+            )
 
         if not target.ws_url:
             raise ConnectionError(f"Target '{target.title}' has no WebSocket URL.")

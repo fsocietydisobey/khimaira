@@ -88,3 +88,4 @@ Specter connects to this port via CDP WebSocket. If Firefox isn't running with t
 - Don't capture screenshots too frequently (each one is a full page render + encode + disk write).
 - Don't buffer unlimited events — always use bounded deques.
 - Don't send CDP commands without checking `is_connected` first.
+- **Don't expect Specter to auto-pick a tab.** The first call in any MCP session MUST be `specter_list_tabs()` followed by `specter_connect_to_tab(<id>)`. There is no auto-pick — Specter never decides which tab to operate on; the caller always does. Any tool call before `specter_connect_to_tab` raises ConnectionError with this guidance.

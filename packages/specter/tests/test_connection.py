@@ -74,24 +74,17 @@ async def test_connect_to_unknown_target_id_does_not_jump_to_first_tab():
 
 
 @pytest.mark.asyncio
-async def test_connect_with_none_target_id_auto_picks_first_app_tab():
-    """target_id=None auto-picks the first non-internal tab — behavior unchanged."""
+async def test_connect_with_none_target_id_raises_value_error():
+    """connect(target_id=None) raises ValueError — no auto-pick after removing that path."""
     config = load_config()
     conn = CDPConnection(config)
 
-    app_target = _make_target("app-tab-id", url="http://localhost:3000/app")
-    mock_ws = AsyncMock()
+    with pytest.raises(ValueError) as exc_info:
+        await conn.connect(target_id=None)
 
-    with (
-        patch.object(conn, "list_targets", new=AsyncMock(return_value=[app_target])),
-        patch("specter.browser.connection.websockets.connect", new=AsyncMock(return_value=mock_ws)),
-        patch("asyncio.create_task"),
-    ):
-        result = await conn.connect(target_id=None)
-
-    assert result.id == "app-tab-id"
-    assert conn._connected_target is not None
-    assert conn._connected_target.id == "app-tab-id"
+    msg = str(exc_info.value)
+    assert "specter_list_tabs" in msg
+    assert "specter_connect_to_tab" in msg
 
 
 def test_fixture_page_binds_localhost_only(fixture_page: str):
@@ -113,6 +106,111 @@ def _make_connected_mock(target_id: str, url: str = "http://localhost:3000/app")
     target = _make_target(target_id, url)
     mock = AsyncMock(return_value=target)
     return mock
+
+
+# ---------------------------------------------------------------------------
+# connection.py no-auto-pick tests (task-6e23555f7f3b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_raises_value_error_when_no_target_id():
+    """connect(target_id=None) and connect(target_id='') both raise ValueError."""
+    config = load_config()
+    conn = CDPConnection(config)
+
+    with pytest.raises(ValueError) as exc_info:
+        await conn.connect(target_id=None)
+    assert "specter_list_tabs" in str(exc_info.value)
+    assert "specter_connect_to_tab" in str(exc_info.value)
+
+    with pytest.raises(ValueError):
+        await conn.connect(target_id="")
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_raises_when_no_anchor(monkeypatch):
+    """_ensure_connected() raises ConnectionError with guidance when _last_target_id is None."""
+    monkeypatch.setattr(server_mod, "_last_target_id", None)
+    monkeypatch.setattr(server_mod, "_connection", None)
+
+    with pytest.raises(ConnectionError) as exc_info:
+        await server_mod._ensure_connected()
+
+    msg = str(exc_info.value)
+    assert "specter_list_tabs" in msg
+    assert "specter_connect_to_tab" in msg
+
+
+@pytest.mark.asyncio
+async def test_list_tabs_works_without_anchor(monkeypatch):
+    """list_tabs() bypasses _ensure_connected and works even with no anchor."""
+    monkeypatch.setattr(server_mod, "_last_target_id", None)
+    monkeypatch.setattr(server_mod, "_connection", None)
+
+    tab_a = _make_target("tab-a", url="http://localhost:3000/app")
+
+    mock_temp_conn = MagicMock()
+    mock_temp_conn.list_targets = AsyncMock(return_value=[tab_a])
+
+    with patch("specter.server.CDPConnection", return_value=mock_temp_conn):
+        result = await server_mod.list_tabs()
+
+    assert len(result) == 1
+    assert result[0]["id"] == "tab-a"
+    assert result[0]["connected"] is False  # no anchor set
+
+
+@pytest.mark.asyncio
+async def test_connect_to_tab_sets_anchor_and_unblocks_subsequent_calls(monkeypatch):
+    """After connect_to_tab succeeds, _last_target_id is set and _ensure_connected works."""
+    monkeypatch.setattr(server_mod, "_last_target_id", None)
+    monkeypatch.setattr(server_mod, "_connection", None)
+
+    # _ensure_connected must fail before connect_to_tab
+    with pytest.raises(ConnectionError):
+        await server_mod._ensure_connected()
+
+    # connect_to_tab should succeed and set the anchor
+    tab_a = _make_target("tab-a")
+    mock_conn = MagicMock()
+    mock_conn.is_connected = True
+
+    async def mock_connect(target_id):
+        return tab_a
+
+    mock_conn.connect = mock_connect
+    mock_conn.register = MagicMock()
+
+    async def mock_enable(conn):
+        pass
+
+    mock_console = MagicMock()
+    mock_console.register = MagicMock()
+    mock_console.enable = mock_enable
+    mock_network = MagicMock()
+    mock_network.register = MagicMock()
+    mock_network.enable = mock_enable
+
+    with (
+        patch("specter.server.CDPConnection", return_value=mock_conn),
+        patch("specter.server.ConsoleCapture", return_value=mock_console),
+        patch("specter.server.NetworkCapture", return_value=mock_network),
+        patch("specter.server.Runtime"),
+        patch("specter.server.ReactInspector"),
+        patch("specter.server.Interactor"),
+        patch("specter.server.StructureAnalyzer"),
+    ):
+        await server_mod.connect_to_tab("tab-a")
+
+    # Anchor is now set
+    assert server_mod._last_target_id == "tab-a"
+
+    # _ensure_connected should now return without error (connection is live)
+    mock_conn.is_connected = True
+    monkeypatch.setattr(server_mod, "_connection", mock_conn)
+    result = await server_mod._ensure_connected()
+    assert result is not None
 
 
 @pytest.mark.asyncio
@@ -197,46 +295,18 @@ async def test_reconnect_raises_when_previous_target_gone(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_first_connect_uses_auto_pick(monkeypatch):
-    """Fresh state (_last_target_id=None) → _ensure_connected uses auto-pick (target_id=None)."""
+async def test_no_anchor_raises_before_any_connection(monkeypatch):
+    """Fresh state (_last_target_id=None) → _ensure_connected raises ConnectionError.
+
+    Replaces the old auto-pick test. Auto-pick is removed; fresh sessions must
+    call specter_list_tabs + specter_connect_to_tab before any tool works.
+    """
     monkeypatch.setattr(server_mod, "_last_target_id", None)
     monkeypatch.setattr(server_mod, "_connection", None)
 
-    auto_pick_target = _make_target("auto-picked-id", url="http://localhost:3000/app")
-    received_target_id = []
-
-    mock_conn = MagicMock()
-    mock_conn.is_connected = False
-
-    async def mock_connect(target_id=None):
-        received_target_id.append(target_id)
-        return auto_pick_target
-
-    mock_conn.connect = mock_connect
-    mock_conn.register = MagicMock()
-
-    async def mock_enable(conn):
-        pass
-
-    mock_console = MagicMock()
-    mock_console.register = MagicMock()
-    mock_console.enable = mock_enable
-    mock_network = MagicMock()
-    mock_network.register = MagicMock()
-    mock_network.enable = mock_enable
-
-    with (
-        patch("specter.server.CDPConnection", return_value=mock_conn),
-        patch("specter.server.ConsoleCapture", return_value=mock_console),
-        patch("specter.server.NetworkCapture", return_value=mock_network),
-        patch("specter.server.Runtime"),
-        patch("specter.server.ReactInspector"),
-        patch("specter.server.Interactor"),
-        patch("specter.server.StructureAnalyzer"),
-        patch.object(mock_conn, "send", new=AsyncMock()),
-    ):
+    with pytest.raises(ConnectionError) as exc_info:
         await server_mod._ensure_connected()
 
-    # target_id=None means auto-pick path
-    assert received_target_id == [None]
-    assert server_mod._last_target_id == "auto-picked-id"
+    msg = str(exc_info.value)
+    assert "specter_list_tabs" in msg
+    assert "specter_connect_to_tab" in msg

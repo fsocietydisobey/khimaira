@@ -635,7 +635,10 @@ class TestRoundTrip:
 
         config = load_config()
         conn = CDPConnection(config)
-        await conn.connect()
+        targets = await conn.list_targets()
+        if not targets:
+            pytest.skip("No browser targets available")
+        await conn.connect(target_id=targets[0].id)
         recorder = InteractionRecorder()
         label = "round-trip-test-rc"
 

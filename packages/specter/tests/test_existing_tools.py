@@ -118,7 +118,10 @@ async def test_debug_snapshot_returns_populated_result(chrome_or_skip, fixture_p
 
     config = load_config()
     conn = CDPConnection(config)
-    await conn.connect()
+    targets = await conn.list_targets()
+    if not targets:
+        pytest.skip("No browser targets available")
+    await conn.connect(target_id=targets[0].id)
 
     try:
         # Navigate to fixture page
@@ -150,7 +153,10 @@ async def test_get_component_tree_returns_components(chrome_or_skip, fixture_pag
 
     config = load_config()
     conn = CDPConnection(config)
-    await conn.connect()
+    targets = await conn.list_targets()
+    if not targets:
+        pytest.skip("No browser targets available")
+    await conn.connect(target_id=targets[0].id)
 
     try:
         runtime = Runtime(config)
@@ -182,7 +188,10 @@ async def test_click_element_increments_counter(chrome_or_skip, fixture_page):
 
     config = load_config()
     conn = CDPConnection(config)
-    await conn.connect()
+    targets = await conn.list_targets()
+    if not targets:
+        pytest.skip("No browser targets available")
+    await conn.connect(target_id=targets[0].id)
 
     try:
         runtime = Runtime(config)
