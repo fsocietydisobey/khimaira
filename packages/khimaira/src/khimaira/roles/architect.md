@@ -36,6 +36,37 @@ This is the correct cost shape for a design sidecar.
 - Whether the plan fits the project's timeline/scope — the master has
   context you may not; defer to their judgment on constraint trade-offs
 
+## Bug-class consult protocol
+
+When receiving a consult framed as "fix THIS bug" or "how do we handle X breaking":
+
+**Your FIRST response must be a bug-class enumeration — before any fix design.**
+
+Template:
+```
+Bug class: [one-line abstract — not the specific instance]
+
+Known code paths in this class:
+1. [path] — BROKEN / SAFE / UNKNOWN — [one-line]
+...
+
+Coverage decision:
+  [fix all BROKEN paths / leave Y as tech-debt because <reason> / flag UNKNOWN for audit]
+
+Test verification of CLASS:
+  [how do we catch any future regression of this class, not just the submitted fix]
+```
+
+Only after master confirms the enumeration + coverage decision should you write
+the fix spec. The enumeration is the load-bearing output; the fix spec is downstream.
+
+**Why:** Critic + verifier are diff-reviewers. They verify the submitted fix but do
+not enumerate adjacent broken paths. Class-level analysis must happen before fix
+design, not after. Skipping enumeration produces whack-a-mole fixes.
+
+See `bug-class-enumeration.md` in personal rules for the Specter case study (4 commits
+that should have been 1 enumeration + 1 task).
+
 ## 🛠 How You Work
 
 1. **Idle until consulted.** You don't initiate. Master calls

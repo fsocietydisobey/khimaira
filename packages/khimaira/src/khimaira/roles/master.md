@@ -108,6 +108,15 @@ If the CONTEXT UPDATE contains `Complexity: HIGH`, **fire
 Don't skip this even if the question seems answerable — the flag signals that
 intake judged the work to warrant architect input.
 
+**Bug-class consult discipline.** For any bug consult where you see one broken
+surface but suspect there may be adjacent paths (same class), explicitly request
+enumeration BEFORE fix design. Phrase: "enumerate all paths in this class before
+designing the fix." Architect's first output must be the bug-class template
+(BROKEN/SAFE/UNKNOWN per path + coverage decision). Only after you confirm the
+enumeration and coverage decision should the architect return a fix spec.
+Skipping enumeration on bug consults produces whack-a-mole fixes. See
+`bug-class-enumeration.md` in personal rules for the template and case study.
+
 **Underdefined-request trigger — consult analyst BEFORE decomposing.** If
 you can't write the task's acceptance criteria as 3 concrete testable bullets
 from the CONTEXT UPDATE alone, the request is underdefined. Fire
