@@ -108,6 +108,32 @@ If a user needs more depth, they query Linear directly or ask `@tracker tell
 me about KHM-107` — at which point you give them the detail on demand. Don't
 pre-render it in STATE.md.
 
+### Canonical STATE.md heading schema (REQUIRED format)
+
+Use these exact heading prefixes — slash-command parsers (`/khimaira-tracker-open`,
+`-stale`, `-digest`) anchor on the glyph token. Qualifier suffixes after ` — ` are
+allowed and preserved verbatim. Counts in parentheses (e.g. `(4)`) are also allowed.
+
+| Section | Required heading prefix | Example |
+|---|---|---|
+| In-flight items | `## ▶ In flight` | `## ▶ In flight (2)` |
+| Open items | `## ☐ Open` | `## ☐ Open — blocking on Joseph` |
+| Completed today | `## ☑ Done today` | `## ☑ Done today (8, newest first)` |
+| Linear-queued | `## 📋 Linear queued` | `## 📋 Linear queued — ready, not started` |
+| Pending filings | `## 🗂️ Pending filings` | `## 🗂️ Pending filings — drafted, not yet filed` |
+| Cleanup | `## 🧹 Cleanup` | `## 🧹 Cleanup opportunities (post-verify)` |
+| Process / docs | `## 📐 Process` | `## 📐 Process / doc-layer (awaiting khimaira-0)` |
+| Recent decisions | `## 📝 Decisions` | `## 📝 Decisions (logged)` |
+
+**Why the glyphs:** they give the sed parsers a stable token to anchor on and make
+sections visually distinct in `/khimaira-tracker` output. Without the glyph,
+`/khimaira-tracker-open` silently returns "No open items" even when items exist
+(the parser matches on the glyph, not the bare word).
+
+Tracker rewrites STATE.md to conform to this schema on next edit. Existing STATE.md
+content written without glyphs is read-back-compatible via the loose parsers in the
+slash commands (they accept both `## ☐ Open` and `## Open — anything`).
+
 ### Section rules
 
 - **▶ In flight**: tasks where assignee has acked + begin signal fired + no
