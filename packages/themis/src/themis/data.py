@@ -24,7 +24,7 @@ import yaml
 _RULES_DIR = Path(__file__).parent / "rules"
 
 VALID_ROLES = frozenset(
-    ["intake", "master", "agent", "observer", "architect", "analyst", "verifier", "critic"]
+    ["intake", "master", "agent", "observer", "architect", "analyst", "verifier", "critic", "tracker"]
 )
 
 

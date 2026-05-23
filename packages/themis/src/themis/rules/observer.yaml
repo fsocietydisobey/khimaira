@@ -24,3 +24,37 @@ invariants:
       🛑 Themis IN-OBSERVER-2 (NO_TASK_ASSIGNMENT): observer cannot create tasks.
       Only master assigns work. If you observe a violation or blocker, surface it
       via session_post_notice to master — do not self-dispatch remediation.
+
+  - id: IN-OBSERVER-3
+    name: NO_BASH_MUTATING
+    severity: block
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+(commit|push|merge|rebase|reset|checkout\s+-|stash\s+pop|tag\s+-)'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\b(rm|mv|cp|mkdir|touch|chmod|chown)\s+'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>\s*[^/]'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>>\s*[^/]'
+    message: |
+      🛑 Themis IN-OBSERVER-3 (NO_BASH_MUTATING): observer is read-only.
+      Mutating Bash is a role-boundary violation. Surface findings via chat,
+      do not act on them.
+
+  - id: IN-OBSERVER-4
+    name: NO_STANDALONE_AGENTS
+    severity: block
+    matchers:
+      - tool: Task
+    message: |
+      🛑 Themis IN-OBSERVER-4 (NO_STANDALONE_AGENTS): observer does not spawn
+      sub-agents. Surface findings to master via chat_send; let master dispatch.

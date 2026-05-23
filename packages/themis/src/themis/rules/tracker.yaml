@@ -1,0 +1,74 @@
+# Themis rules — tracker role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+#
+# Scope: tracker is read-only EXCEPT for STATE.md curation. Any operation
+# that mutates source files, runs Bash, spawns sub-agents, or hits the
+# API dispatcher is a role-boundary violation.
+#
+# Known limitation: Bash matchers use regex on the command string.
+# Bypass vectors (`bash -c '...'`, base64-encoded commands, env-var
+# indirection) are NOT detected. Acceptable for a discipline-focused
+# system; not adversarial-grade. Phase 3+ tightening deferred.
+#
+# Driven by: jp-tracker-1 incident 2026-05-23 (commit 1ae73fed —
+# tracker session directly committed .env.example for JEEVY-541,
+# bypassing the agent-dispatch boundary).
+role: tracker
+invariants:
+  - id: IN-TRACKER-1
+    name: NO_FILE_EDIT_OUTSIDE_STATE_MD
+    severity: block
+    matchers:
+      - tool: Edit
+        tool_input_field:
+          field: file_path
+          # Allow Edit on STATE.md (tracker's only write surface);
+          # block Edit on any other path. Pattern matches filename != STATE.md.
+          # Edge case: filenames like MYSTATE.md would also be allowed —
+          # acceptable for the use case (anyone naming a file MYSTATE.md
+          # is intentionally creating ambiguity).
+          pattern: '^(?!.*STATE\.md$).+'
+      - tool: Write
+        tool_input_field:
+          field: file_path
+          pattern: '^(?!.*STATE\.md$).+'
+      - tool: MultiEdit
+        tool_input_field:
+          field: file_path
+          pattern: '^(?!.*STATE\.md$).+'
+      - tool: NotebookEdit
+    message: |
+      🛑 Themis IN-TRACKER-1 (NO_FILE_EDIT_OUTSIDE_STATE_MD): tracker may only
+      edit STATE.md. File mutation outside STATE.md is a role-boundary violation.
+      Hand off to an agent via chat_task_create instead.
+
+  - id: IN-TRACKER-2
+    name: NO_BASH
+    severity: block
+    matchers:
+      - tool: Bash
+    message: |
+      🛑 Themis IN-TRACKER-2 (NO_BASH): tracker does not execute shell commands.
+      Use Read, Glob, Grep for file inspection. Hand off git commits + filesystem
+      changes to an agent via chat_task_create. The jp-tracker-1 incident
+      (2026-05-23 commit 1ae73fed) confirmed this hard boundary.
+
+  - id: IN-TRACKER-3
+    name: NO_STANDALONE_AGENTS
+    severity: block
+    matchers:
+      - tool: Task
+    message: |
+      🛑 Themis IN-TRACKER-3 (NO_STANDALONE_AGENTS): tracker does not spawn
+      sub-agents. Use chat_task_create to dispatch via the roster.
+
+  - id: IN-TRACKER-4
+    name: NO_API_DISPATCH
+    severity: block
+    matchers:
+      - tool: mcp__khimaira__auto
+      - tool: mcp__khimaira__delegate
+      - tool: mcp__khimaira__research
+    message: |
+      🛑 Themis IN-TRACKER-4 (NO_API_DISPATCH): these tools hit the Anthropic
+      API and duplicate the roster's dispatch layer. Use chat_task_create instead.

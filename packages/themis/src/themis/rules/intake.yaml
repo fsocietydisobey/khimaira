@@ -37,3 +37,29 @@ invariants:
       background Claude Code agents. Check session_list() — if agents are idle,
       use /khimaira-assign. Standalone agents bypass the enforcement gate,
       context broadcast, observer, and task lifecycle.
+
+  - id: IN-INTAKE-4
+    name: NO_BASH_MUTATING
+    severity: block
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+(commit|push|merge|rebase|reset|checkout\s+-|stash\s+pop|tag\s+-)'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\b(rm|mv|cp|mkdir|touch|chmod|chown)\s+'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>\s*[^/]'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>>\s*[^/]'
+    message: |
+      🛑 Themis IN-INTAKE-4 (NO_BASH_MUTATING): this Bash command mutates state
+      (git commit/push, rm/mv/cp/mkdir, or shell output redirect outside /tmp).
+      Intake is a non-executor role — read-only Bash (wc, find, grep, ls) is
+      allowed; mutating operations are not. Hand off via chat_task_create.

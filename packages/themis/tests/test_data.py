@@ -131,9 +131,9 @@ class TestLoadRules:
         rs = load_rules("verifier")
         assert rs.invariants == []
 
-    def test_intake_has_three_invariants(self):
+    def test_intake_has_four_invariants(self):
         rs = load_rules("intake")
-        assert len(rs.invariants) == 3
+        assert len(rs.invariants) == 4
 
     def test_intake_in_intake_1_severity_is_block(self):
         rs = load_rules("intake")

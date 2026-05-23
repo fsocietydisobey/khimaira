@@ -15,3 +15,37 @@ invariants:
       Architect consults on design and produces recommendations; implementation
       belongs to agents. Deliver your analysis via chat and let master assign
       the implementation to an agent.
+
+  - id: IN-ARCHITECT-2
+    name: NO_BASH_MUTATING
+    severity: block
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+(commit|push|merge|rebase|reset|checkout\s+-|stash\s+pop|tag\s+-)'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\b(rm|mv|cp|mkdir|touch|chmod|chown)\s+'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>\s*[^/]'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>>\s*[^/]'
+    message: |
+      🛑 Themis IN-ARCHITECT-2 (NO_BASH_MUTATING): architect produces design
+      recommendations, not executor operations. Mutating Bash is a role-boundary
+      violation. Return your recommendation; let master dispatch the fix.
+
+  - id: IN-ARCHITECT-3
+    name: NO_STANDALONE_AGENTS
+    severity: block
+    matchers:
+      - tool: Task
+    message: |
+      🛑 Themis IN-ARCHITECT-3 (NO_STANDALONE_AGENTS): architect does not
+      spawn sub-agents. Use chat_send to consult; let master dispatch agents.

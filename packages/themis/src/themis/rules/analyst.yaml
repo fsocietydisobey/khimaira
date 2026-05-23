@@ -15,3 +15,37 @@ invariants:
       Analyst audits, surveys, and produces findings; it does not implement.
       Deliver findings via chat — master decides whether remediation is needed
       and assigns it to an agent.
+
+  - id: IN-ANALYST-2
+    name: NO_BASH_MUTATING
+    severity: block
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+(commit|push|merge|rebase|reset|checkout\s+-|stash\s+pop|tag\s+-)'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\b(rm|mv|cp|mkdir|touch|chmod|chown)\s+'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>\s*[^/]'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>>\s*[^/]'
+    message: |
+      🛑 Themis IN-ANALYST-2 (NO_BASH_MUTATING): analyst is read-only.
+      Mutating Bash is a role-boundary violation. Return analysis via chat;
+      let master dispatch.
+
+  - id: IN-ANALYST-3
+    name: NO_STANDALONE_AGENTS
+    severity: block
+    matchers:
+      - tool: Task
+    message: |
+      🛑 Themis IN-ANALYST-3 (NO_STANDALONE_AGENTS): analyst does not spawn
+      sub-agents. Return analysis via chat_send; let master dispatch.
