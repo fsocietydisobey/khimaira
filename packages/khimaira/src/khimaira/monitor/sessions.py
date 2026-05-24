@@ -201,6 +201,15 @@ def log_touch(
     return record
 
 
+def recent_touches(session_id: str, limit: int = 20) -> list[dict]:
+    """Return the last `limit` file-touch entries for this session.
+
+    Returns [] for a fresh session with no files_touched.jsonl.
+    """
+    path = _session_dir(session_id) / "files_touched.jsonl"
+    return _read_jsonl(path)[-limit:] if path.exists() else []
+
+
 def log_question(
     session_id: str,
     text: str,

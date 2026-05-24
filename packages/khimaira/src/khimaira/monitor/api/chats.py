@@ -23,25 +23,101 @@ import time
 from fastapi import Request
 from pydantic import BaseModel
 
-_PENDING_POLL_INTERVAL = 5.0   # seconds between polls when a `to` recipient is pending
+_PENDING_POLL_INTERVAL = 5.0  # seconds between polls when a `to` recipient is pending
 _PENDING_WAIT_DEADLINE = 30.0  # total seconds to wait for recipient to accept
 
 # Expected-reply registry — tracks targeted sends that expect a reply back.
 # Key: (to_id, from_id) meaning "to_id owes a reply to from_id".
-# Value: {"ts": monotonic_time, "from": from_id, "to": to_id}
+# Value: {"ts": wall_clock_time, "from": from_id, "to": to_id,
+#          "chat_id": str, "threshold_s": float}
 _EXPECTED_REPLIES: dict[tuple[str, str], dict] = {}
-_REPLY_OVERDUE_S = 90.0    # seconds before a missing reply is flagged
+_REPLY_OVERDUE_DEFAULT_S = 90.0  # default threshold before a missing reply is diagnosed
 _REPLY_WATCH_INTERVAL = 30.0  # seconds between watcher scans
 _REGISTRY_LOCK = asyncio.Lock()
 
+# Per-role thresholds — known-long-work roles get more time before presumed-dead.
+_REPLY_OVERDUE_BY_ROLE: dict[str, float] = {
+    "architect": 180.0,
+    "analyst": 180.0,
+    "verifier": 300.0,
+    "critic": 120.0,
+}
+_LIVENESS_WINDOW_S = 60.0  # activity within this window = session is alive
 
-async def _register_expected_reply(from_id: str, to_ids: list[str]) -> None:
+
+def _threshold_for_session(to_id: str, chat_id: str) -> float:
+    """Per-role threshold lookup. Falls back to default when role unknown."""
+    try:
+        room = chats.load_room(chat_id)
+        role = (room.get("meta", {}).get("member_roles") or {}).get(to_id)
+        if role and role in _REPLY_OVERDUE_BY_ROLE:
+            return _REPLY_OVERDUE_BY_ROLE[role]
+    except Exception:
+        pass
+    return _REPLY_OVERDUE_DEFAULT_S
+
+
+def _session_active_within(session_id: str, window_s: float) -> bool:
+    """Liveness check: True if session logged any tool_call or file_touch
+    within the last window_s seconds.
+    Fail-open: any error returns False (treat as silent — conservative).
+    """
+    try:
+        from datetime import datetime
+        from khimaira.monitor import sessions as sessions_mod
+
+        def _ts_float(iso_str: str) -> float:
+            return datetime.fromisoformat(iso_str).timestamp()
+
+        now = time.time()
+        recent = sessions_mod.recent_tool_calls(session_id, limit=1)
+        if (
+            recent
+            and (now - _ts_float(recent[0].get("ts", "1970-01-01T00:00:00+00:00"))) < window_s
+        ):
+            return True
+        touches = (
+            sessions_mod.recent_touches(session_id, limit=1)
+            if hasattr(sessions_mod, "recent_touches")
+            else []
+        )
+        if (
+            touches
+            and (now - _ts_float(touches[0].get("ts", "1970-01-01T00:00:00+00:00"))) < window_s
+        ):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _resolve_master_session_id(chat_id: str) -> str | None:
+    """Find the session_id with role=master in this chat. None if not found."""
+    try:
+        room = chats.load_room(chat_id)
+        member_roles = room.get("meta", {}).get("member_roles") or {}
+        for sid, role in member_roles.items():
+            if role == chats.ROLE_MASTER:
+                return sid
+    except Exception:
+        pass
+    return None
+
+
+async def _register_expected_reply(from_id: str, to_ids: list[str], chat_id: str = "") -> None:
     async with _REGISTRY_LOCK:
-        ts = time.monotonic()
+        ts = time.time()
         for to_id in to_ids:
             if to_id == from_id:
                 continue
-            _EXPECTED_REPLIES[(to_id, from_id)] = {"ts": ts, "from": from_id, "to": to_id}
+            threshold = _threshold_for_session(to_id, chat_id)
+            _EXPECTED_REPLIES[(to_id, from_id)] = {
+                "ts": ts,
+                "from": from_id,
+                "to": to_id,
+                "chat_id": chat_id,
+                "threshold_s": threshold,
+            }
 
 
 async def _resolve_expected_reply(from_id: str, to_ids: list[str]) -> None:
@@ -50,44 +126,65 @@ async def _resolve_expected_reply(from_id: str, to_ids: list[str]) -> None:
             _EXPECTED_REPLIES.pop((from_id, to_id), None)
 
 
-def _fire_overdue_notice(from_id: str, to_id: str, elapsed_s: float) -> None:
-    from khimaira.monitor import sessions as _sessions
-    try:
-        _sessions.post_notice(
-            to_id,
-            f"⏰ OVERDUE REPLY — you haven't replied to {from_id!r}'s "
-            f"chat_send_to after {elapsed_s:.0f}s. Check the chat.",
-            from_session_id="khimaira-daemon",
+async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:
+    """Diagnostic phase: liveness check + branching disposition.
+
+    Alive (recent tool/touch activity within _LIVENESS_WINDOW_S): reschedule.
+    Silent (no recent activity): pop entry, fire presumed-dead notice to master.
+    """
+    to_id = entry["to"]
+    from_id = entry["from"]
+    chat_id = entry.get("chat_id", "")
+    elapsed_s = ts_now - entry["ts"]
+    threshold = entry.get("threshold_s", _REPLY_OVERDUE_DEFAULT_S)
+
+    if _session_active_within(to_id, _LIVENESS_WINDOW_S):
+        async with _REGISTRY_LOCK:
+            existing = _EXPECTED_REPLIES.get(key)
+            if existing is not None:
+                existing["ts"] = ts_now
+        return
+
+    async with _REGISTRY_LOCK:
+        _EXPECTED_REPLIES.pop(key, None)
+
+    master_sid = _resolve_master_session_id(chat_id)
+    if master_sid:
+        body = (
+            f"🚨 PRESUMED-DEAD SESSION — `{to_id}` has not responded to "
+            f"chat_send_to from `{from_id}` after {elapsed_s:.0f}s "
+            f"(role-threshold: {threshold:.0f}s) AND session_state shows "
+            f"no tool activity in the last {_LIVENESS_WINDOW_S:.0f}s. "
+            f"Decide: re-dispatch / retry / investigate. "
+            f"chat_id={chat_id}"
         )
-    except Exception:
-        pass
-    try:
-        _sessions.post_notice(
-            from_id,
-            f"⏰ OVERDUE REPLY — {to_id!r} hasn't replied to your "
-            f"chat_send_to after {elapsed_s:.0f}s.",
-            from_session_id="khimaira-daemon",
-        )
-    except Exception:
-        pass
+        try:
+            from khimaira.monitor import sessions as sessions_mod
+
+            sessions_mod.post_notice(
+                target_session_id=master_sid,
+                text=body,
+                from_session_id="khimaira-daemon",
+            )
+        except Exception:
+            pass
 
 
 async def _check_overdue_once() -> None:
-    now = time.monotonic()
+    now = time.time()
+    candidates = []
     async with _REGISTRY_LOCK:
-        overdue = [
-            (key, entry)
-            for key, entry in list(_EXPECTED_REPLIES.items())
-            if now - entry["ts"] > _REPLY_OVERDUE_S
-        ]
-        for key, entry in overdue:
-            _EXPECTED_REPLIES.pop(key, None)
-    for _, entry in overdue:
-        _fire_overdue_notice(entry["from"], entry["to"], now - entry["ts"])
+        for key, entry in list(_EXPECTED_REPLIES.items()):
+            threshold = entry.get("threshold_s", _REPLY_OVERDUE_DEFAULT_S)
+            if now - entry["ts"] > threshold:
+                candidates.append((key, entry))
+    for key, entry in candidates:
+        await _diagnose_and_dispose(key, entry, now)
 
 
 async def _overdue_watcher() -> None:
     import logging
+
     _log = logging.getLogger(__name__)
     while True:
         await asyncio.sleep(_REPLY_WATCH_INTERVAL)
@@ -95,6 +192,7 @@ async def _overdue_watcher() -> None:
             await _check_overdue_once()
         except Exception as exc:
             _log.warning("overdue-reply watcher error: %s", exc)
+
 
 from khimaira.monitor import chats
 from khimaira.monitor.chats import _resolve_sender_name  # shared with _broadcast
@@ -348,7 +446,8 @@ def build_router():
             try:
                 room = chats.load_room(chat_id)
                 member_ids = [
-                    sid for sid, m in room["members"].items()
+                    sid
+                    for sid, m in room["members"].items()
                     if m.get("state") == chats.ACCEPTED and sid != req.sender_session_id
                 ]
                 if member_ids:
@@ -363,7 +462,7 @@ def build_router():
                 )
                 # Register only for targeted sends — broadcasts don't expect a reply.
                 if req.to:
-                    await _register_expected_reply(req.sender_session_id, req.to)
+                    await _register_expected_reply(req.sender_session_id, req.to, chat_id)
                 return result
             except ValueError as exc:
                 msg = str(exc)

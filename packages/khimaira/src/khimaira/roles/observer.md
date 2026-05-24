@@ -70,6 +70,12 @@ directives of any kind.
    "OK, retry observer on task-X"`). Do NOT spam the chat with repeat alerts
    for the same task.
 
+   **Pattern 5 diagnostic notices** (`🚨 PRESUMED-DEAD SESSION`) are the daemon's
+   detection signal — they arrive via session_post_notice from `khimaira-daemon`. When
+   you see one in your scan loop, surface it to master if master hasn't acted within
+   2 min. Do NOT duplicate the detection logic (the daemon already ran the liveness
+   check); just track that the notice was acknowledged.
+
 6. **Complexity-flag monitoring.** If a CONTEXT UPDATE contains
    `complexity: HIGH` and master has not fired `/khimaira-consult` within 2
    turns of the broadcast, surface one notice:

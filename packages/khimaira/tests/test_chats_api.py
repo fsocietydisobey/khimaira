@@ -145,6 +145,7 @@ def test_sse_event_resolves_sender_name_at_publish_time(chats_api_client):
 
     # Register bob as a subscriber so _broadcast has a queue to push to.
     import asyncio as _asyncio
+
     q: asyncio.Queue = _asyncio.Queue()
     chats_mod._subscribers.setdefault("bob", []).append(q)
 
@@ -207,10 +208,13 @@ def test_chat_history_falls_back_to_stored_name_for_deleted_session(chats_api_cl
     client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
 
     # alice posts a message (stored sender_name="alice").
-    client.post(f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": "from alice"})
+    client.post(
+        f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": "from alice"}
+    )
 
     # Delete alice's session directory (simulate deleted session).
     import shutil
+
     shutil.rmtree(sessions_mod._session_dir("alice"), ignore_errors=True)
 
     # History should not crash; fall back to stored snapshot name.
@@ -238,7 +242,9 @@ def test_chat_history_name_cache_per_request(chats_api_client, monkeypatch: pyte
 
     # Post 5 messages from alice.
     for i in range(5):
-        client.post(f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": f"msg{i}"})
+        client.post(
+            f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": f"msg{i}"}
+        )
 
     lookup_count = [0]
     original = api_mod._resolve_sender_name
@@ -777,43 +783,46 @@ def test_resolve_expected_reply_on_reply(registry_client):
     assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
 
 
-def test_overdue_watcher_fires_notice(
-    registry_client, monkeypatch: pytest.MonkeyPatch
-):
-    """Overdue entries trigger session_post_notice to both sides and are deleted."""
+def test_overdue_watcher_fires_notice(registry_client, monkeypatch: pytest.MonkeyPatch):
+    """Overdue + silent entries trigger PRESUMED-DEAD notice to master and are deleted."""
     import asyncio
+    import time
 
     _, api_mod, _ = registry_client
     notices_fired: list[tuple[str, str]] = []
 
-    def _mock_post_notice(target, text, *, from_session_id="external", **_kw):
-        notices_fired.append((target, text))
+    def _mock_post_notice(target_session_id, text, *, from_session_id="external", **_kw):
+        notices_fired.append((target_session_id, text))
         return {}
 
-    monkeypatch.setattr(
-        "khimaira.monitor.sessions.post_notice", _mock_post_notice
-    )
+    monkeypatch.setattr("khimaira.monitor.sessions.post_notice", _mock_post_notice)
+    # Bob shows no recent activity → presumed dead.
+    monkeypatch.setattr(api_mod, "_session_active_within", lambda sid, w: False)
+    # Resolve master to alice.
+    monkeypatch.setattr(api_mod, "_resolve_master_session_id", lambda chat_id: "alice")
 
-    # Plant a stale entry (91s old).
+    # Plant a stale entry (91s old) in new format.
     api_mod._EXPECTED_REPLIES[("bob", "alice")] = {
-        "ts": __import__("time").monotonic() - 91.0,
+        "ts": time.time() - 91.0,
         "from": "alice",
         "to": "bob",
+        "chat_id": "chat-test",
+        "threshold_s": 90.0,
     }
 
     asyncio.run(api_mod._check_overdue_once())
 
+    # Notice goes to master (alice); body contains PRESUMED-DEAD + bob.
     targets = {t for t, _ in notices_fired}
     assert "alice" in targets
-    assert "bob" in targets
+    assert any("PRESUMED-DEAD" in txt and "bob" in txt for _, txt in notices_fired)
     assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
 
 
-def test_overdue_watcher_one_shot(
-    registry_client, monkeypatch: pytest.MonkeyPatch
-):
-    """Overdue entry is deleted after first notice — watcher doesn't fire twice."""
+def test_overdue_watcher_one_shot(registry_client, monkeypatch: pytest.MonkeyPatch):
+    """Overdue silent entry is deleted after first notice — watcher doesn't fire twice."""
     import asyncio
+    import time
 
     _, api_mod, _ = registry_client
     notices_fired: list = []
@@ -822,11 +831,15 @@ def test_overdue_watcher_one_shot(
         "khimaira.monitor.sessions.post_notice",
         lambda *a, **kw: notices_fired.append(a) or {},
     )
+    monkeypatch.setattr(api_mod, "_session_active_within", lambda sid, w: False)
+    monkeypatch.setattr(api_mod, "_resolve_master_session_id", lambda chat_id: "alice")
 
     api_mod._EXPECTED_REPLIES[("bob", "alice")] = {
-        "ts": __import__("time").monotonic() - 91.0,
+        "ts": time.time() - 91.0,
         "from": "alice",
         "to": "bob",
+        "chat_id": "chat-test",
+        "threshold_s": 90.0,
     }
 
     asyncio.run(api_mod._check_overdue_once())
@@ -850,7 +863,7 @@ def test_self_send_not_registered(registry_client):
     # Simulate a send where from == to (self-send via _register helper directly).
     import asyncio
 
-    asyncio.run(api_mod._register_expected_reply("alice", ["alice"]))
+    asyncio.run(api_mod._register_expected_reply("alice", ["alice"], ""))
     assert ("alice", "alice") not in api_mod._EXPECTED_REPLIES
 
 
@@ -907,16 +920,22 @@ def test_broadcast_resolves_multiple_pending_replies(registry_client):
     client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "carol"})
 
     # alice sends to bob; carol sends to bob — both create (bob, X) entries.
-    client.post(f"/api/chats/{chat_id}/messages",
-        json={"sender_session_id": "alice", "body": "q1", "to": ["bob"]})
-    client.post(f"/api/chats/{chat_id}/messages",
-        json={"sender_session_id": "carol", "body": "q2", "to": ["bob"]})
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "q1", "to": ["bob"]},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "carol", "body": "q2", "to": ["bob"]},
+    )
     assert ("bob", "alice") in api_mod._EXPECTED_REPLIES
     assert ("bob", "carol") in api_mod._EXPECTED_REPLIES
 
     # bob broadcasts → resolves both.
-    client.post(f"/api/chats/{chat_id}/messages",
-        json={"sender_session_id": "bob", "body": "answer to all", "to": None})
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "bob", "body": "answer to all", "to": None},
+    )
     assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
     assert ("bob", "carol") not in api_mod._EXPECTED_REPLIES
 
@@ -979,7 +998,7 @@ def test_advance_cursor_and_cursor_for(chats_api_client):
     _, chats_mod = chats_api_client
     chats_mod._advance_cursor("alice", "chat-abc", "evt-001")
     chats_mod._advance_cursor("alice", "chat-abc", "evt-002")  # overwrite
-    chats_mod._advance_cursor("bob", "chat-abc", "evt-003")   # different session
+    chats_mod._advance_cursor("bob", "chat-abc", "evt-003")  # different session
     assert chats_mod._cursor_for("alice", "chat-abc") == "evt-002"
     assert chats_mod._cursor_for("bob", "chat-abc") == "evt-003"
     assert chats_mod._cursor_for("carol", "chat-abc") is None  # no entry
@@ -1104,6 +1123,7 @@ def test_backfill_without_cursor_uses_last_50(chats_api_client):
     anchor_event_id = lines_a[0]["event_id"]
 
     from khimaira.monitor import sessions as sessions_mod
+
     sd = sessions_mod._session_dir("carol")
     sd.mkdir(parents=True, exist_ok=True)
     (sd / "status.json").write_text(json.dumps({"status": "idle", "name": "carol"}), "utf-8")
@@ -1179,4 +1199,6 @@ def test_last_event_id_hint_used_when_no_cursor(chats_api_client):
     msg_bodies = [r["body"] for r in collected if r.get("kind") == "msg"]
     # msg 2 should appear (it comes after the pivot), msg 0 should NOT (it's before the pivot).
     assert "msg 2" in msg_bodies, f"expected 'msg 2' in backfill; got: {msg_bodies}"
-    assert "msg 0" not in msg_bodies, f"msg 0 predates the pivot and must not appear; got: {msg_bodies}"
+    assert "msg 0" not in msg_bodies, (
+        f"msg 0 predates the pivot and must not appear; got: {msg_bodies}"
+    )
