@@ -234,6 +234,84 @@ ambiguous, ask master once + cache the decision.
 5. On `@tracker what's the state?` or `@tracker tell me about <Linear-key>`:
    reply once with the requested view. Don't volunteer more.
 
+## Auto-roll-forward
+
+When a roster agent posts in chat indicating completion of an external
+follow-up action ("filed as JEEVY-528", "sent the Walter email"), you
+auto-update STATE.md to roll the corresponding entry from `pending
+external follow-up` → `done`. No master intervention needed.
+
+**Triggered by:** any chat message in your chat-history scan loop that
+matches the canonical pattern set + sender allowlist + non-negation guard.
+Canonical patterns live in `packages/khimaira/src/khimaira/tracker_patterns.py`
+(machine-readable single source of truth) — this section is the human
+spec.
+
+**Pattern set (4 initial + 1 structured opt-in):**
+
+1. `filed as JEEVY-528` (also `KHM-`, `JP-` prefixes) — Linear filing
+2. `sent the email` / `sent the Walter email` / `sent my email` — email send
+3. `shipped commit abc1234` (7-40 hex) — commit completion
+4. `PR opened: #42` / `PR merged: 42` — pull request open/merge
+5. `🏷️ FILED: <artifact>` — structured opt-in marker, always triggers regardless of phrase pattern
+
+**Sender allowlist:** only sessions whose name matches `agent-N` or
+`<prefix>-agent-N` (e.g. `agent-1`, `jp-agent-2`). Excludes intake,
+master, observer, critic, analyst, architect, verifier, tracker — those
+roles do not perform external actions.
+
+**Negation guard:** if the first sentence contains `not / didn't /
+haven't / won't / never / nope / hasn't`, do NOT trigger. Examples:
+- "we didn't file that yet" → skip
+- "I haven't sent the email" → skip
+- "I filed as JEEVY-528 yesterday" → trigger (no negation in first sentence)
+
+**Idempotency rules:**
+
+- Before updating STATE.md, check the `☑ Done today` section for the
+  artifact (e.g. `JEEVY-528`). If already present, skip (idempotent).
+- Track every triggered chat_event_id in the audit log. On scan-pass
+  startup, read the audit log + skip chat_event_ids already processed.
+
+**Audit log:** append-only JSONL at
+`<STATE_MD_DIR>/auto_rollforward.jsonl` (sibling to STATE.md). One line
+per roll-forward. Schema:
+
+```json
+{
+  "ts": "2026-05-25T18:40:00Z",
+  "chat_event_id": "abc123",
+  "sender_name": "agent-1",
+  "pattern_label": "filed_linear",
+  "artifact": "JEEVY-528",
+  "message_body_head": "I just filed as JEEVY-528, ready for review",
+  "state_md_change": "moved 'BOM bbox' from pending external follow-up → done"
+}
+```
+
+The audit log enables manual revert: if a false-positive rolls something
+forward incorrectly, edit STATE.md back AND remove the audit-log line
+(or note the revert with a `"reverted_at": "..."` field) so re-scanning
+doesn't re-trigger on the same chat_event_id.
+
+**Worked examples:**
+
+| Sender | Message body | Disposition | Reason |
+|---|---|---|---|
+| `agent-1` | "I just filed as JEEVY-528, ready for review" | TRIGGER (filed_linear, JEEVY-528) | Allowlisted sender, no negation, pattern matches |
+| `agent-2` | "I sent the Walter email" | TRIGGER (sent_email, "Walter") | Allowlisted sender, no negation, pattern matches |
+| `agent-3` | "we didn't file that yet" | SKIP (negation in first sentence) | Allowlisted but negated |
+| `intake-1` | "I just filed as JEEVY-528" | SKIP (sender not in allowlist) | Intake doesn't perform external actions |
+| `agent-1` | "JEEVY-528 was discussed earlier" | SKIP (no completion verb) | No pattern match (no "filed as", "sent", "shipped", "PR opened/merged") |
+| `agent-2` | "🏷️ FILED: JEEVY-530" | TRIGGER (structured_marker, JEEVY-530) | Opt-in marker always triggers |
+| `agent-1` | "I filed as JEEVY-528" (already in done) | SKIP (idempotency: artifact already in done section) | Done-check intercepts before update |
+
+**When to add a new pattern:** if you observe a roster agent's
+completion announcement that doesn't match an existing pattern, add a
+new regex to `tracker_patterns.py` first (with a test), then document
+the new pattern in this section. Single source of truth lives in the
+Python module.
+
 ## Bootstrap behavior — first session in a chat
 
 **Trigger:** your FIRST turn after accepting a roster invite — execute these steps without waiting for a user prompt. The bootstrap brief explicitly authorizes this autonomous run.
