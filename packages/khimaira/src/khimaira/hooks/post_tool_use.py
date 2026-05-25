@@ -71,6 +71,27 @@ def _append_touch(session_id: str, file_path: str, summary: str) -> None:
         f.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
+def _write_sse_heartbeat(session_id: str) -> None:
+    """Minimal heartbeat writer — avoids importing khimaira.monitor.sessions.
+
+    Writes last_sse_heartbeat timestamp into status.json so daemon can detect
+    subscribers whose subprocess is alive but SSE connection died.
+    """
+    d = _session_dir(session_id)
+    status_path = d / "status.json"
+    existing: dict = {}
+    if status_path.exists():
+        try:
+            existing = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    existing["last_sse_heartbeat"] = datetime.now(timezone.utc).isoformat()
+    try:
+        status_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -88,6 +109,12 @@ def main() -> int:
     tool_input = data.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         tool_input = {}
+
+    # Write SSE heartbeat to mark session as alive
+    try:
+        _write_sse_heartbeat(session_id)
+    except OSError:
+        pass
 
     # Always capture tool call for Themis / history inspection.
     try:

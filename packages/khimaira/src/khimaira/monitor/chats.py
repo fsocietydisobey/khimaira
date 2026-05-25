@@ -748,6 +748,34 @@ def send_message(
         "private": effective_private,
     }
     _append(chat_id, record)
+
+    # Loud-fail: surface target reachability for `to`-targeted sends.
+    if resolved_to:
+        target_states = []
+        for rid in resolved_to:
+            try:
+                ts = sessions_mod.state(rid)
+                ts_status = ts.get("status") or {}
+                target_states.append(
+                    {
+                        "session_id": rid,
+                        "target_reachable": ts_status.get("effective_status")
+                        in sessions_mod._USABLE_STATUSES,
+                        "target_status": ts_status.get("effective_status", "unknown"),
+                        "reason_if_not_ok": ts_status.get("demoted_reason"),
+                    }
+                )
+            except (ValueError, OSError):
+                target_states.append(
+                    {
+                        "session_id": rid,
+                        "target_reachable": False,
+                        "target_status": "unknown",
+                        "reason_if_not_ok": "could not resolve target state",
+                    }
+                )
+        record["targets_reachability"] = target_states
+
     log.info(
         "chats: msg from %s to %s (to=%s private=%s topology=%s)",
         sender_session_id,

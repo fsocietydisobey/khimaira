@@ -37,7 +37,7 @@ import os
 import re
 import time
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any  # noqa: F401  (used in helper signatures)
 
@@ -181,6 +181,25 @@ def recent_tool_calls(session_id: str, limit: int = 20) -> list[dict]:
     return _read_jsonl(path)[-limit:]
 
 
+def write_sse_heartbeat(session_id: str) -> None:
+    """Subscriber-side heartbeat. Called from the PostToolUse hook on every tool
+    call. Stamps `last_sse_heartbeat` into status.json so daemon can detect
+    subscribers whose subprocess is alive but SSE connection died.
+
+    Cheap: one status.json read + write per tool call. Idempotent.
+    """
+    path = _session_dir(session_id) / "status.json"
+    existing: dict = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    existing["last_sse_heartbeat"] = _now_iso()
+    path.write_text(json.dumps(existing, indent=2))
+    _invalidate_list_sessions_cache()
+
+
 def log_touch(
     session_id: str,
     file: str,
@@ -314,18 +333,34 @@ def set_status(session_id: str, status: str, detail: str = "") -> dict:
 _UUID_DRIFT_STALE_THRESHOLD_S = 30 * 60
 
 
+def _is_stub_session(status: dict | None, decisions: int) -> bool:
+    """A 'stub' is a session record with a name but no proof of life.
+
+    Excluded from name-resolution tiebreakers when a live competitor exists.
+    Heuristic: never emitted SSE heartbeat AND no decisions logged.
+    Pure status.json + name + zero activity → stub.
+    """
+    if not isinstance(status, dict):
+        return True
+    if status.get("last_sse_heartbeat"):
+        return False
+    if decisions > 0:
+        return False
+    return True
+
+
 def _find_active_session_with_name(name: str, exclude_session_id: str) -> dict | None:
     """Scan every session's status.json for `name == name` (excluding self).
     Returns the most-recently-active match if any, else None.
 
     Used by set_name() UUID-drift detection. Cheap — one status.json read
     per session; not on a hot path.
-    """
-    import time
 
+    Tiebreaker prefers live sessions over stubs: (has_heartbeat, decisions, mtime).
+    """
     if not _BASE_DIR.exists():
         return None
-    candidates: list[tuple[float, str]] = []
+    candidates: list[tuple[int, int, float, str]] = []
     for d in _BASE_DIR.iterdir():
         if not d.is_dir() or d.name == exclude_session_id:
             continue
@@ -345,11 +380,18 @@ def _find_active_session_with_name(name: str, exclude_session_id: str) -> dict |
             )
         except OSError:
             mtime = 0.0
-        candidates.append((mtime, d.name))
+        decisions_path = d / "decisions.jsonl"
+        decisions = (
+            sum(1 for ln in decisions_path.open() if ln.strip())
+            if decisions_path.exists()
+            else 0
+        )
+        has_heartbeat = 1 if s.get("last_sse_heartbeat") else 0
+        candidates.append((has_heartbeat, decisions, mtime, d.name))
     if not candidates:
         return None
     candidates.sort(reverse=True)
-    mtime, sid = candidates[0]
+    _hb, _dec, mtime, sid = candidates[0]
     return {"session_id": sid, "last_active": mtime, "age_s": time.time() - mtime}
 
 
@@ -482,7 +524,9 @@ def resolve_session_id(query: str) -> str:
     if not _BASE_DIR.exists():
         raise ValueError(f"No session named or id'd {query!r} (no sessions exist yet).")
 
-    candidates: list[tuple[float, str]] = []
+    # Tuple: (has_heartbeat, decisions, mtime, session_id)
+    # Sorts descending — live sessions (heartbeat + decisions) outrank stubs.
+    candidates: list[tuple[int, int, float, str]] = []
     for d in _BASE_DIR.iterdir():
         if not d.is_dir():
             continue
@@ -501,16 +545,32 @@ def resolve_session_id(query: str) -> str:
                 )
             except OSError:
                 mtime = 0.0
-            candidates.append((mtime, d.name))
+            decisions_path = d / "decisions.jsonl"
+            decisions = (
+                sum(1 for ln in decisions_path.open() if ln.strip())
+                if decisions_path.exists()
+                else 0
+            )
+            has_heartbeat = 1 if s.get("last_sse_heartbeat") else 0
+            candidates.append((has_heartbeat, decisions, mtime, d.name))
 
     if not candidates:
         raise ValueError(
             f"No session named or id'd {query!r}. Use session_list() to see available sessions."
         )
 
-    # Most-recently-active wins on name collision
+    # Prefer live over stub; among equal liveness, prefer most-recently-active.
     candidates.sort(reverse=True)
-    return candidates[0][1]
+    _hb, _dec, _mtime, winner = candidates[0]
+    if _hb == 0 and _dec == 0 and len(candidates) > 1:
+        log.warning(
+            "resolve_session_id(%r): all %d candidates are stubs (no heartbeat, no decisions); "
+            "returning %r — may be a ghost session",
+            query,
+            len(candidates),
+            winner,
+        )
+    return winner
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +649,53 @@ def post_answer(
 # ---------------------------------------------------------------------------
 
 
+_USABLE_STATUSES = frozenset(
+    {"listening", "working", "idle", "researching", "implementing"}
+)
+
+
+def _compute_effective_status(status: dict | None, last_tool_call_ts: float | None) -> dict:
+    """Return status dict with `effective_status` field added.
+
+    Reads KHIMAIRA_DEMOTE_THRESHOLD_S at call time (not module-level) so
+    test fixtures can monkeypatch the env var without needing importlib.reload.
+
+    effective_status == status["status"] when subscriber is alive
+    (last_sse_heartbeat OR last_tool_call within threshold). Otherwise
+    effective_status = "unreachable" + adds `demoted_at` + `demoted_reason`.
+    """
+    demote_threshold_s = int(os.environ.get("KHIMAIRA_DEMOTE_THRESHOLD_S", 20 * 60))
+
+    if not isinstance(status, dict):
+        return {"effective_status": "unknown"}
+
+    out = dict(status)
+    raw_status = status.get("status", "unknown")
+    out["effective_status"] = raw_status  # default: trust the field
+
+    now = time.time()
+    last_hb_iso = status.get("last_sse_heartbeat")
+    last_hb_ts: float | None = None
+    if last_hb_iso:
+        try:
+            last_hb_ts = datetime.fromisoformat(
+                last_hb_iso.replace("Z", "+00:00")
+            ).timestamp()
+        except (ValueError, AttributeError):
+            pass
+
+    candidates = [ts for ts in (last_hb_ts, last_tool_call_ts) if ts is not None]
+    most_recent: float | None = max(candidates) if candidates else None
+
+    if most_recent is None or (now - most_recent) > demote_threshold_s:
+        out["effective_status"] = "unreachable"
+        out["demoted_at"] = _now_iso()
+        out["demoted_reason"] = (
+            f"no SSE heartbeat or tool activity in last {demote_threshold_s}s"
+        )
+    return out
+
+
 def state(session_id: str, recent: int = 10, *, workspace: str | None = None) -> dict:
     """Full digest of session_id's externalized state. The 'what is session A
     up to right now' query.
@@ -614,7 +721,18 @@ def state(session_id: str, recent: int = 10, *, workspace: str | None = None) ->
     files = _read_jsonl(d / "files_touched.jsonl")
     questions = _read_jsonl(d / "questions.jsonl")
     status_path = d / "status.json"
-    status = json.loads(status_path.read_text()) if status_path.exists() else None
+    status_raw = json.loads(status_path.read_text()) if status_path.exists() else None
+
+    recent_calls = recent_tool_calls(session_id, limit=1)
+    last_tool_ts: float | None = None
+    if recent_calls:
+        try:
+            last_tool_ts = datetime.fromisoformat(
+                recent_calls[0]["ts"].replace("Z", "+00:00")
+            ).timestamp()
+        except (ValueError, KeyError):
+            pass
+    status = _compute_effective_status(status_raw, last_tool_ts)
 
     return {
         "session_id": session_id,
@@ -1644,6 +1762,27 @@ def post_notice(
     if scope_cwd:
         note["scope_cwd"] = scope_cwd
     _append_jsonl(_session_dir(target_session_id) / "inbox.jsonl", note)
+
+    # Loud-fail: surface target reachability so callers know if the notice
+    # landed in a session that's likely unreachable.
+    try:
+        target_state = state(target_session_id)
+        target_status = target_state.get("status") or {}
+        effective = target_status.get("effective_status", "unknown")
+        note["target_reachable"] = effective in _USABLE_STATUSES
+        note["target_status"] = effective
+        note["target_last_active_iso"] = target_status.get("updated_at") or target_status.get(
+            "last_sse_heartbeat"
+        )
+        if not note["target_reachable"]:
+            note["reason_if_not_ok"] = target_status.get("demoted_reason") or (
+                f"target status: {effective}"
+            )
+    except (ValueError, OSError):
+        note["target_reachable"] = False
+        note["target_status"] = "unknown"
+        note["reason_if_not_ok"] = "could not resolve target state"
+
     if fire_desktop_notify:
         desktop_notify.notify_notice(target_session_id, from_session_id, text)
     log.info(
@@ -1998,20 +2137,32 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
             questions = _read_jsonl(sd / "questions.jsonl")
             open_q = sum(1 for q in questions if q.get("status") == "open")
             status_path = sd / "status.json"
-            status = json.loads(status_path.read_text()) if status_path.exists() else None
+            status_raw = json.loads(status_path.read_text()) if status_path.exists() else None
+
+            # Compute effective_status for this row (lazy demote).
+            recent_calls = recent_tool_calls(sd.name, limit=1)
+            last_tool_ts: float | None = None
+            if recent_calls:
+                try:
+                    last_tool_ts = datetime.fromisoformat(
+                        recent_calls[0]["ts"].replace("Z", "+00:00")
+                    ).timestamp()
+                except (ValueError, KeyError):
+                    pass
+            status = _compute_effective_status(status_raw, last_tool_ts)
 
             # Resolve workspace from status.json once + surface in the row
             # so cached lookups don't need to re-stat status.json.
             ws_value = DEFAULT_WORKSPACE
-            if isinstance(status, dict):
-                raw = status.get("workspace")
+            if isinstance(status_raw, dict):
+                raw = status_raw.get("workspace")
                 if isinstance(raw, str) and raw:
                     ws_value = raw
 
             out.append(
                 {
                     "session_id": sd.name,
-                    "name": (status.get("name") if isinstance(status, dict) else None),
+                    "name": (status_raw.get("name") if isinstance(status_raw, dict) else None),
                     "workspace": ws_value,
                     "last_active": last_mtime,
                     "last_active_age_s": (time.time() - last_mtime if last_mtime else None),
