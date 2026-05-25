@@ -108,3 +108,45 @@ def test_intake_md_contains_roster_fan_out_checkpoint():
     assert "signal-conditional" in lowered or "signal conditional" in lowered, (
         "intake.md missing 'signal-conditional' framing — risks over-enumeration"
     )
+
+
+def test_domain_topology_rfc_doc_exists_and_has_key_sections():
+    """Regression guard: domain-topology RFC must exist + contain key sections.
+
+    Phase 0 RFC per architect-1 enumeration msg-2a44845324d2. Joseph reviews
+    this doc before Phase 1 implementation briefs are authored. Removing
+    sections silently would regress the sign-off contract.
+    """
+    rfc_path = REPO_ROOT / "docs" / "khimaira-roster-topology-rfc.md"
+    assert rfc_path.exists(), f"RFC doc missing at {rfc_path}"
+    content = rfc_path.read_text()
+    lowered = content.lower()
+
+    # Executive summary up-front (Joseph signs without re-reading enumeration)
+    assert "executive summary" in lowered, "RFC missing 'Executive Summary' section"
+
+    # T7 chosen topology
+    assert "T7" in content, "RFC missing T7 topology reference"
+    assert "leads as workers and decomposers" in lowered, "RFC missing T7 description"
+
+    # Role definitions
+    assert "domain lead" in lowered, "RFC missing domain lead role definition"
+
+    # Per-roster differentiation
+    assert "khimaira-dev" in content and "jeevy-product" in content, (
+        "RFC missing per-roster lead selection"
+    )
+
+    # Phased migration plan
+    assert "phase 0" in lowered and "phase 1" in lowered, "RFC missing phased migration plan"
+
+    # Cross-cut with discipline fixes (today's work)
+    assert "discipline fix" in lowered or "complementary" in lowered, (
+        "RFC missing cross-cut section with discipline fixes"
+    )
+
+    # Open questions for Joseph
+    assert "open questions" in lowered, "RFC missing 'Open Questions' section for Joseph review"
+
+    # Sign-off block
+    assert "sign-off" in lowered, "RFC missing sign-off block"
