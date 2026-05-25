@@ -130,25 +130,9 @@ def fixture_page():
 # chrome_or_skip — gate for integration tests
 # ---------------------------------------------------------------------------
 
-# TODO(2026-05-30): flip SPECTER_TEST_PORT fallback to a hard skip.
-# When SPECTER_TEST_PORT is not set, currently emits DeprecationWarning and
-# falls back to port 9222. After 2026-05-30, change the else branch to
-# pytest.skip("SPECTER_TEST_PORT not set...") to make isolation mandatory.
-_DEPRECATION_CUTOFF = "2026-05-30"
-
-
 def _chrome_reachable() -> bool:
-    """Return True if a CDP debug port is reachable.
-
-    Uses SPECTER_TEST_PORT if set (dedicated test Chrome, recommended).
-    Falls back to SPECTER_DEBUG_PORT / CHROME_DEBUGGING_PORT / 9222 with
-    a DeprecationWarning until 2026-05-30.
-    """
-    test_port = os.environ.get("SPECTER_TEST_PORT")
-    if test_port:
-        port = int(test_port)
-    else:
-        port = int(os.environ.get("SPECTER_DEBUG_PORT", os.environ.get("CHROME_DEBUGGING_PORT", "9222")))
+    """Return True if SPECTER_TEST_PORT is reachable."""
+    port = int(os.environ["SPECTER_TEST_PORT"])
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.5):
             return True
@@ -165,28 +149,22 @@ def chrome_or_skip():
         def test_something(chrome_or_skip):
             ...
 
-    **Preferred path:** start a dedicated test Chrome and set SPECTER_TEST_PORT:
+    **Required:** start a dedicated test Chrome and set SPECTER_TEST_PORT:
 
-        SPECTER_TEST_PORT=9223 bin/specter-test-chrome &
+        bin/specter-test-chrome &
         SPECTER_TEST_PORT=9223 uv run pytest packages/specter/tests/ ...
 
     The dedicated Chrome uses a separate --user-data-dir (no shared cookies,
     history, or tabs with your real browser). This prevents Specter integration
     tests from mutating Joseph's active tabs.
 
-    **Deprecated path (until 2026-05-30):** if SPECTER_TEST_PORT is not set,
-    falls back to the default port (9222 / Joseph's Chrome) with a warning.
-    After 2026-05-30 this path becomes a hard skip.
+    Without SPECTER_TEST_PORT, integration tests are skipped.
     """
-    test_port = os.environ.get("SPECTER_TEST_PORT")
-    if not test_port:
-        import warnings
-        warnings.warn(
-            "Running Specter integration tests against the default Chrome (port 9222) is "
-            "deprecated. Start a dedicated Chrome via `bin/specter-test-chrome` and set "
-            f"SPECTER_TEST_PORT=9223. This fallback will become a hard skip on {_DEPRECATION_CUTOFF}.",
-            DeprecationWarning,
-            stacklevel=2,
+    if not os.environ.get("SPECTER_TEST_PORT"):
+        pytest.skip(
+            "SPECTER_TEST_PORT not set — start a dedicated Chrome via "
+            "`bin/specter-test-chrome` and set SPECTER_TEST_PORT=9223. "
+            "Integration tests are skipped without this isolation."
         )
     if not _chrome_reachable():
         pytest.skip("Chrome/Firefox not running with remote debugging enabled")

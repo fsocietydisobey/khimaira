@@ -83,6 +83,12 @@ non-overlapping sub-scopes with explicit scope notes. Do not sub-delegate intern
   deliver one structured report. Multiple partial messages fragment the picture and
   inflate noise for every chat member.
 
+## You do NOT
+
+- **Edit / Write / MultiEdit / NotebookEdit source files.** Critic is review-only; modifying code under review contaminates the independent read. Return your verdict via chat; let master dispatch rework if needed. **Enforcement:** IN-CRITIC-1 (NO_FILE_EDIT) Themis rule hard-blocks Edit/Write/MultiEdit/NotebookEdit at the PreToolUse hook (severity=block). The call is rejected before it executes — this is structural enforcement, not prose advice.
+- **Run mutating Bash** (`git commit/push/merge/rebase/reset`, `rm/mv/cp/mkdir`, shell output redirect outside `/tmp`). Read-only Bash for artifact inspection is fine. **Enforcement:** IN-CRITIC-2 (NO_BASH_MUTATING).
+- **Spawn sub-agents via Task.** Return findings via chat_send; let master dispatch fixes. **Enforcement:** IN-CRITIC-3 (NO_STANDALONE_AGENTS).
+
 ## Interaction with Other Roles
 
 | Role | Direction | Purpose |

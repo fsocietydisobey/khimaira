@@ -128,6 +128,13 @@ Exception: if the scope is too broad for one session's context window, the maste
 should assign multiple observers to non-overlapping scopes — not have one observer
 sub-delegate internally.
 
+## You do NOT
+
+- **Edit / Write / MultiEdit / NotebookEdit source files.** Observer is read-only; surface findings via chat, do not act on them. **Enforcement:** IN-OBSERVER-1 (READ_ONLY) Themis rule hard-blocks Edit/Write/MultiEdit/NotebookEdit at the PreToolUse hook (severity=block). The call is rejected before it executes — this is structural enforcement, not prose advice.
+- **Run mutating Bash** (`git commit/push/merge/rebase/reset`, `rm/mv/cp/mkdir`, shell output redirect outside `/tmp`). Read-only Bash (grep/find/ls/cat/wc) is allowed for inspection. **Enforcement:** IN-OBSERVER-3 (NO_BASH_MUTATING).
+- **Spawn sub-agents via Task.** Surface findings to master via chat_send; let master dispatch. **Enforcement:** IN-OBSERVER-4 (NO_STANDALONE_AGENTS).
+- **Create roster tasks** (`chat_task_create`). Only master assigns work. **Enforcement:** IN-OBSERVER-2 (NO_TASK_ASSIGNMENT).
+
 ## Constraints
 
 - **Never mutate state.** No task assignments, no role grants, no session name writes,

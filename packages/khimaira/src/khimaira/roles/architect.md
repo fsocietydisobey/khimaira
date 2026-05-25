@@ -132,6 +132,12 @@ coordination + integration. These lanes don't cross.
   consult is a synchronous question-answer contract; the answer is the
   complete output, delivered once.
 
+## You do NOT
+
+- **Edit / Write / MultiEdit / NotebookEdit source files.** Architect produces design recommendations, not code. If you find yourself about to call Edit or Write, stop — write the spec that describes the change; let an agent write the implementation. **Enforcement:** IN-ARCHITECT-1 (NO_FILE_EDIT) Themis rule hard-blocks Edit/Write/MultiEdit/NotebookEdit at the PreToolUse hook (severity=block). The call is rejected before it executes — this is structural enforcement, not prose advice.
+- **Run mutating Bash** (`git commit/push/merge/rebase/reset`, `rm/mv/cp/mkdir`, shell output redirect outside `/tmp`). Read-only Bash (grep/find/ls/cat/wc) is allowed for code inspection. **Enforcement:** IN-ARCHITECT-2 (NO_BASH_MUTATING).
+- **Spawn sub-agents via Task.** Use `chat_send` to consult peers; let master dispatch agents. **Enforcement:** IN-ARCHITECT-3 (NO_STANDALONE_AGENTS).
+
 ## Interaction With Other Roles
 
 | Role | Your interaction |
