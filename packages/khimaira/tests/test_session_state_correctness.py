@@ -186,3 +186,40 @@ def test_send_message_includes_targets_reachability(isolated_state, fast_thresho
     # Broadcast (no `to`) should NOT have targets_reachability
     broadcast = send_message(chat_id, master, "hello all")
     assert "targets_reachability" not in broadcast
+
+
+def test_heartbeat_fires_for_non_file_edit_tools(isolated_state, monkeypatch):
+    """Regression guard: heartbeat must fire for ALL tool calls (chat_send / Read / Grep /
+    etc.), not only for Edit/Write file-edit tools. Class B-fix-loud relies on this.
+
+    Structural check: confirms the heartbeat call site is NOT inside a tool_name conditional
+    branch in post_tool_use.py. If a future refactor moves it inside the Edit/Write guard,
+    this test fails immediately.
+    """
+    from pathlib import Path
+
+    hook_src = Path(
+        "packages/khimaira/src/khimaira/hooks/post_tool_use.py"
+    ).read_text()
+    lines = hook_src.split("\n")
+
+    # Find all call sites (not the def line)
+    heartbeat_lines = [
+        i for i, ln in enumerate(lines)
+        if "_write_sse_heartbeat" in ln and "def " not in ln
+    ]
+    assert heartbeat_lines, "heartbeat call missing from post_tool_use.py"
+
+    for line_idx in heartbeat_lines:
+        call_indent = len(lines[line_idx]) - len(lines[line_idx].lstrip())
+        for back_idx in range(line_idx - 1, -1, -1):
+            ln = lines[back_idx]
+            if not ln.strip():
+                continue
+            ln_indent = len(ln) - len(ln.lstrip())
+            if ln_indent < call_indent:
+                assert "tool_name" not in ln, (
+                    f"heartbeat call at line {line_idx + 1} is inside a "
+                    f"tool_name conditional at line {back_idx + 1}: {ln.strip()}"
+                )
+                break
