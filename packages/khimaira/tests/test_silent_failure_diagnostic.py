@@ -54,6 +54,7 @@ async def test_silent_failure_disposition(monkeypatch, cause_id, last_activity_s
             or {}
         ),
     )
+
     # Stub probe so it doesn't try to call the real _post_synthetic_message.
     async def _fake_probe(chat_id, to_id, from_id, elapsed_s):
         return True
@@ -138,3 +139,24 @@ def test_threshold_falls_back_when_room_lookup_fails(monkeypatch):
     monkeypatch.setattr(chats_mod, "load_room", _raise)
     threshold = api_chats._threshold_for_session("to-sid", "chat-abc")
     assert threshold == 90.0
+
+
+def test_threshold_falls_back_to_name_inference(monkeypatch):
+    """When chat.member_roles is empty (pre-v1.9.6 chat), threshold inferred from session name."""
+    from khimaira.monitor import chats as chats_mod
+
+    monkeypatch.setattr(chats_mod, "load_room", lambda chat_id: {"meta": {}})
+    fake_state = {"status": {"name": "architect-1"}}
+    monkeypatch.setattr("khimaira.monitor.sessions.state", lambda sid: fake_state)
+    threshold = api_chats._threshold_for_session("some-uuid", "chat-abc")
+    assert threshold == 180.0, f"expected 180s for architect, got {threshold}"
+
+
+def test_threshold_inference_works_for_prefixed_names(monkeypatch):
+    """Name inference handles jp-architect-1 / khimaira-architect-1 style prefixes."""
+    from khimaira.monitor import chats as chats_mod
+
+    monkeypatch.setattr(chats_mod, "load_room", lambda cid: {"meta": {}})
+    fake_state = {"status": {"name": "jp-architect-1"}}
+    monkeypatch.setattr("khimaira.monitor.sessions.state", lambda sid: fake_state)
+    assert api_chats._threshold_for_session("uuid", "chat-abc") == 180.0

@@ -49,12 +49,29 @@ _PRESUMED_DEAD_TTL_S = 300.0  # 5 minutes for late-reply supersede
 
 
 def _threshold_for_session(to_id: str, chat_id: str) -> float:
-    """Per-role threshold lookup. Falls back to default when role unknown."""
+    """Per-role threshold lookup.
+
+    Lookup order:
+    1. chat.meta.member_roles[to_id] — canonical (set by chat_create_room v1.9.6+)
+    2. infer_role_from_name(session_name) — fallback for chats created before
+       member_roles was a chat param, or sessions added without role binding
+    3. _REPLY_OVERDUE_DEFAULT_S (90s) — last resort
+    """
     try:
         room = chats.load_room(chat_id)
         role = (room.get("meta", {}).get("member_roles") or {}).get(to_id)
         if role and role in _REPLY_OVERDUE_BY_ROLE:
             return _REPLY_OVERDUE_BY_ROLE[role]
+
+        # Fallback: infer role from session name. Scan each dash-segment left-to-right
+        # so both "architect-1" and prefixed forms like "jp-architect-1" match.
+        from khimaira.monitor import sessions as sessions_mod
+
+        session_state = sessions_mod.state(to_id)
+        name = (session_state.get("status") or {}).get("name") or ""
+        for segment in name.split("-"):
+            if segment in _REPLY_OVERDUE_BY_ROLE:
+                return _REPLY_OVERDUE_BY_ROLE[segment]
     except Exception:
         pass
     return _REPLY_OVERDUE_DEFAULT_S
