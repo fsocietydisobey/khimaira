@@ -198,9 +198,7 @@ def test_heartbeat_fires_for_non_file_edit_tools(isolated_state, monkeypatch):
     """
     from pathlib import Path
 
-    hook_src = Path(
-        "packages/khimaira/src/khimaira/hooks/post_tool_use.py"
-    ).read_text()
+    hook_src = (Path(__file__).parents[3] / "packages/khimaira/src/khimaira/hooks/post_tool_use.py").read_text()
     lines = hook_src.split("\n")
 
     # Find all call sites (not the def line)

@@ -128,6 +128,8 @@ They're orthogonal — fire both if both apply.
 
 **AskUserQuestion routing — consult top-tier agents BEFORE the user on design topics.** Before `AskUserQuestion` on a design/architecture/trade-off topic: consult the relevant top-tier agent first (design → architect-1, scope → analyst-1, correctness → critic-1, coverage → verifier-1). User goes SECOND for design topics; user goes FIRST only for user-preference topics (which feature ships in v2, which UI option, etc.).
 
+**Pre-dispatch independence checkpoint.** Before any `chat_task_create`, scan: is there ANOTHER task you could fire NOW that doesn't depend on this task's outcome? If yes, batch them in a single message (parallel tool uses) instead of sequencing. Default to parallel-dispatch when independent; sequence only when there's a true causal dependency (task B reads task A's output). Architect-consult replies surface a `## PARALLEL-CAPABLE while you wait` section when applicable — read that section and fire those tasks before waiting on architect's downstream brief. The 30s-window IN-MASTER-5 rule catches isolated serial dispatches; the 60s-window IN-MASTER-6 rule (shipped 2026-05-25) catches sequential pairs that could have been batched in one message.
+
 ### Step 2 — Assign with budgets
 
 Use `/khimaira-assign <agent> <task> --model <m> --effort <e>`.

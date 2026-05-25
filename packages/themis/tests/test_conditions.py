@@ -13,6 +13,7 @@ from themis.conditions import (
     idle_capacity_available,
     no_recent_parallel_dispatch,
     no_recent_top_tier_consult,
+    recent_dispatch_different_ctx,
 )
 from themis.data import Severity
 from themis.engine import evaluate
@@ -326,3 +327,47 @@ class TestEvaluateCondition:
         # Deliberately pass a non-dict payload to trigger an internal error
         # (chat_my_chats_not_called_this_turn will try .get() on None)
         assert evaluate_condition("idle_agents_exist", None) is False  # type: ignore[arg-type]
+
+
+class TestRecentDispatchDifferentCtx:
+    def test_fires_on_pair_with_different_ctx(self):
+        """Two chat_task_create within 60s with different ctx-ids → fires."""
+        payload = {
+            "tool_input": {"body": "ctx-id: ctx-bar\nsome other content"},
+            "recent_tool_calls": [
+                {
+                    "ts": (datetime.now(tz=timezone.utc) - timedelta(seconds=10)).isoformat(),
+                    "tool": "mcp__khimaira-chat__chat_task_create",
+                    "params": {"body": "ctx-id: ctx-foo\nprior content"},
+                }
+            ],
+        }
+        assert recent_dispatch_different_ctx(payload) is True
+
+    def test_skips_same_ctx(self):
+        """Two chat_task_create with SAME ctx-id (retry) → does not fire."""
+        payload = {
+            "tool_input": {"body": "ctx-id: ctx-foo\nretry attempt"},
+            "recent_tool_calls": [
+                {
+                    "ts": (datetime.now(tz=timezone.utc) - timedelta(seconds=10)).isoformat(),
+                    "tool": "mcp__khimaira-chat__chat_task_create",
+                    "params": {"body": "ctx-id: ctx-foo\noriginal"},
+                }
+            ],
+        }
+        assert recent_dispatch_different_ctx(payload) is False
+
+    def test_skips_outside_window(self):
+        """Prior dispatch >60s ago → does not fire."""
+        payload = {
+            "tool_input": {"body": "ctx-id: ctx-bar"},
+            "recent_tool_calls": [
+                {
+                    "ts": (datetime.now(tz=timezone.utc) - timedelta(seconds=90)).isoformat(),
+                    "tool": "mcp__khimaira-chat__chat_task_create",
+                    "params": {"body": "ctx-id: ctx-foo"},
+                }
+            ],
+        }
+        assert recent_dispatch_different_ctx(payload) is False

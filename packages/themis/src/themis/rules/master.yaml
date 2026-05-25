@@ -79,3 +79,21 @@ invariants:
       (parallel tool uses) instead of sequencing them.
       If genuinely sequential (causal dependency), proceed — this warn is advisory.
       Severity is warn (observation week 2026-05-22 → 2026-05-29); will flip to block.
+
+  - id: IN-MASTER-6
+    name: CONSIDER_BATCHING_RECENT_DISPATCH
+    severity: warn
+    matchers:
+      - tool: mcp__khimaira-chat__chat_task_create
+    conditions:
+      - check: recent_dispatch_different_ctx
+    message: |
+      ⚠️ Themis IN-MASTER-6 (CONSIDER_BATCHING_RECENT_DISPATCH): chat_task_create
+      called within 60s of a prior chat_task_create with a different ctx-id.
+      These tasks may be candidates for batching — sending them in a single
+      message (parallel tool uses) saves wall-clock and groups the BEGIN
+      signal cleanly. Audit the prior dispatch:
+        1. Different ctx-id → not a retry; genuine new task
+        2. Different files / no causal dependency → can run in parallel
+      If sequential (task B reads task A's output), proceed — this warn is advisory.
+      Severity is warn; will stay warn (this is a behavioral nudge, not a hard rule).

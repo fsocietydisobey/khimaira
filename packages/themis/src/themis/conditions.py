@@ -6,12 +6,13 @@ AND-combined only — no OR/NOT support in Phase 1 (spec §"Condition shapes").
 Adding a new condition: add a function here and register it in _REGISTRY.
 The YAML references conditions by name (the dict key in _REGISTRY).
 
-Phase 1 ships with 5 conditions:
+Phase 1 ships with 6 conditions:
   - idle_agents_exist
   - chat_my_chats_not_called_this_turn
   - no_recent_top_tier_consult (IN-MASTER-4)
   - idle_capacity_available (IN-MASTER-5)
   - no_recent_parallel_dispatch (IN-MASTER-5)
+  - recent_dispatch_different_ctx (IN-MASTER-6)
 
 A DSL is deferred until 5+ named conditions OR a first OR/NOT need emerges.
 """
@@ -19,6 +20,7 @@ A DSL is deferred until 5+ named conditions OR a first OR/NOT need emerges.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -237,6 +239,62 @@ def no_recent_parallel_dispatch(payload: dict[str, Any]) -> bool:
     return True
 
 
+_BATCH_WINDOW_S = 60
+_CTX_ID_RE = re.compile(r"ctx-id:\s*(ctx-\S+)")
+
+
+def recent_dispatch_different_ctx(payload: dict[str, Any]) -> bool:
+    """True (violation) when a prior chat_task_create within _BATCH_WINDOW_S
+    targets a different ctx-id than the current call.
+
+    Catches the 'serial when could parallel' pattern: master fires task A
+    (ctx-id ctx-foo), then within 60s fires task B (ctx-id ctx-bar). Same
+    window of activity, different work units — could have been one parallel
+    message. Distinct from IN-MASTER-5's no_recent_parallel_dispatch (which
+    detects 'isolated single dispatch with no recent siblings').
+
+    Body-parse approach: chat_task_create body is a markdown spec with a
+    `ctx-id:` line near the top. Both calls must declare ctx-id for this
+    check to fire — fail-open on absence.
+
+    Fail-open: absent recent_tool_calls OR missing ctx-ids returns False.
+    """
+    recent = payload.get("recent_tool_calls")
+    if recent is None:
+        return False
+
+    current_params = payload.get("tool_input", {}) or {}
+    current_body = current_params.get("body", "") or ""
+    m_cur = _CTX_ID_RE.search(current_body)
+    if not m_cur:
+        return False
+    current_ctx = m_cur.group(1)
+
+    now = datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(seconds=_BATCH_WINDOW_S)
+
+    for call in recent:
+        if call.get("tool") != "mcp__khimaira-chat__chat_task_create":
+            continue
+        ts_str = call.get("ts", "")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        prior_body = (call.get("params") or {}).get("body", "") or ""
+        m_prior = _CTX_ID_RE.search(prior_body)
+        if m_prior and m_prior.group(1) != current_ctx:
+            return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Registry — maps YAML condition name → function
 # ---------------------------------------------------------------------------
@@ -247,4 +305,5 @@ _REGISTRY: dict[str, Any] = {
     "no_recent_top_tier_consult": no_recent_top_tier_consult,
     "idle_capacity_available": idle_capacity_available,
     "no_recent_parallel_dispatch": no_recent_parallel_dispatch,
+    "recent_dispatch_different_ctx": recent_dispatch_different_ctx,
 }
