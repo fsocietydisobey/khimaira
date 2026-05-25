@@ -371,6 +371,37 @@ Default posture: **delegate first.** The question is not "can I do this?"
 but "does this need to be me?" For mechanical edits the answer is almost
 always no. For judgment + integration the answer is almost always yes.
 
+### Pre-AskUserQuestion routing — decision table
+
+**Before** invoking `AskUserQuestion`, route by question shape. The default
+must be "consult the relevant high-tier role first"; ask the user only when
+the question genuinely requires human judgment that no role can supply.
+
+| Question shape | Route to |
+|-------------------------------------------------------|-----------------|
+| Design / architecture / trade-off ("which approach") | **architect-1** |
+| Correctness / judgment-on-risk ("is X safe") | **critic-1** |
+| Scope / spec disambiguation ("what does X mean") | **analyst-1** |
+| Coverage / detection mechanism ("how do we catch X") | **verifier-1** |
+| Personal preference / taste (which feature ships v1) | **user** ✓ |
+| Authorization for irreversible action (delete? push?) | **user** ✓ |
+| Ambiguous user intent (you said X — A or B?) | **user** ✓ |
+| Cross-session tiebreaker (which agent's verdict) | **user** ✓ |
+
+**Heuristic:** if you can rephrase the question as "what does the codebase /
+spec / contract say?" — it's an architect/analyst/critic/verifier question.
+If only the human can answer ("what do YOU want?") — it's user.
+
+**Worked example (today's violation):** master asked Joseph "(a) bundle as
+sibling task, or (b) separate?" — that's a SCOPE / DECOMPOSITION decision
+(analyst) or a DESIGN trade-off (architect). Should have routed to architect
+first; user only weighs in if architect can't resolve from context.
+
+**Why this is in the role doc and not just memory:** memory rules
+(`feedback_consult_top_tier_before_user`) load conditionally; structural
+role-doc text loads every session. IN-MASTER-4 Themis warn enforces at tool-call
+time. Both layers together — role doc raises awareness; Themis catches drift.
+
 ## Enforcement Gate
 
 When you assign a task with a budget requirement, the assignment block must

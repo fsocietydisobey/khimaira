@@ -49,15 +49,17 @@ invariants:
       - tool: AskUserQuestion
     conditions:
       - check: no_recent_top_tier_consult
+      - check: question_text_is_design_shaped
     message: |
-      ⚠️ Themis IN-MASTER-4 (CONSULT_BEFORE_USER): AskUserQuestion called with no
-      recent top-tier consult in the prior tool calls.
-      If this is a design/architecture/trade-off question, consult the relevant
-      top-tier agent first via /khimaira-consult:
-        design → architect-1, scope → analyst-1, correctness → critic-1, coverage → verifier-1
-      If this is a user-preference question (which feature ships, which UI option, etc.)
-      no consult is needed — proceed.
-      Severity is warn (observation week 2026-05-22 → 2026-05-29); will flip to block.
+      ⚠️ Themis IN-MASTER-4 (CONSULT_BEFORE_USER): AskUserQuestion called with a
+      design-shape question text AND no recent top-tier consult.
+      Question shape: design / architecture / scope / coverage / risk → consult first:
+        architect-1 (design), analyst-1 (scope), critic-1 (risk), verifier-1 (coverage)
+      If this is a user-preference question (which feature ships, which UI option,
+      authorization for irreversible action), it correctly bypassed the design-shape
+      check — proceed.
+      Severity is warn (observation week 2026-05-22 → 2026-05-29); flip-to-block
+      scheduled. See master.md "Pre-AskUserQuestion routing" decision table.
 
   - id: IN-MASTER-5
     name: PARALLELIZE_INDEPENDENT_WORK

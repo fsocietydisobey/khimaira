@@ -138,6 +138,54 @@ signal the user's request is actually two separate requests.
 `(supersedes ctx-<older>)` in the header. Don't delete the old one — append-only
 history is load-bearing for postmortems. Agents seeing both use the newer.
 
+### Pre-HANDOFF roster-fan-out checkpoint
+
+**Before** writing the HANDOFF, scan the user's request for explicit fan-out
+signals. If detected, enumerate the FULL roster mapping in the FIRST handoff —
+no drip-feeding agent-1 then waiting to be reminded about agents 2/3/4.
+
+**Explicit fan-out signals:**
+
+- **"use all agents" / "use all sessions"** — fan-out to every available roster agent (load-bearing per Joseph 2026-05-25)
+- **"use N agents"** / **"use 3 agents"** — fan-out to exactly N agents
+- **"use agents X and Y"** / **"use agent-2 and agent-3"** — fan-out to named subset
+- **"in parallel" / "simultaneously" / "at the same time"** — generic parallelization request
+- **`@<role>` mentions** in user's message (e.g. "have @verifier and @critic look at this") — explicit role-targeting
+
+**Response shape when fan-out is signaled:**
+
+1. Call `session_list()` to see available roster agents
+2. Map every available agent to a phase/slice in the HANDOFF (see ROSTER MAPPING template below)
+3. Send ONE handoff containing the full multi-agent decomposition — not N sequential handoffs
+
+**When fan-out is NOT signaled:** default single-agent dispatch is correct. This
+checkpoint is signal-conditional; don't over-enumerate when the user said "fix X"
+without parallelization cues.
+
+**ROSTER MAPPING template** (use in INTAKE HANDOFF when fan-out is signaled):
+
+```
+ROSTER MAPPING:
+- agent-1 → phase A: <one-line>
+- agent-2 → phase B: <one-line>
+- agent-3 → phase C: <one-line>
+- <unassigned agents, if any>: idle / reserved for review (critic, verifier)
+```
+
+The mapping is intake's structured proposal; master may refine assignments at
+dispatch time. The point is intake DOES NOT drip-feed — full enumeration upfront,
+master orchestrates the actual dispatch.
+
+**Cross-reference:** see master.md "Pre-dispatch independence checkpoint" — that
+catches drip-feed errors at dispatch time; this catches them at HANDOFF time.
+Both layers compose; intake-side is upfront, master-side is in-flight.
+
+**Future:** Category 2's potential `chat_task_create_batch` primitive (deferred 2
+weeks pending observation) would let intake's HANDOFF declare the batch spec
+inline; master would dispatch the full batch atomically rather than receiving
+the mapping + serializing the calls. Don't change intake's convention to depend
+on this primitive yet — convention works without it.
+
 ### Step 2: Send the private INTAKE HANDOFF to master
 
 Use `chat_send_to(chat_id, to=[master_session_id], body=<spec>, private=True)`.

@@ -6,10 +6,11 @@ AND-combined only — no OR/NOT support in Phase 1 (spec §"Condition shapes").
 Adding a new condition: add a function here and register it in _REGISTRY.
 The YAML references conditions by name (the dict key in _REGISTRY).
 
-Phase 1 ships with 6 conditions:
+Phase 1 ships with 7 conditions:
   - idle_agents_exist
   - chat_my_chats_not_called_this_turn
   - no_recent_top_tier_consult (IN-MASTER-4)
+  - question_text_is_design_shaped (IN-MASTER-4 refinement)
   - idle_capacity_available (IN-MASTER-5)
   - no_recent_parallel_dispatch (IN-MASTER-5)
   - recent_dispatch_different_ctx (IN-MASTER-6)
@@ -167,6 +168,65 @@ def no_recent_top_tier_consult(payload: dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# IN-MASTER-4 refinement: question-shape detection
+# ---------------------------------------------------------------------------
+
+# Design-shape patterns — conservative (high-confidence only, prefer false negatives
+# over false positives to preserve trust in the warn).
+_DESIGN_SHAPE_PATTERNS = [
+    re.compile(r"\bwhich approach\b", re.IGNORECASE),
+    re.compile(r"\bshould (?:i|we) (?:use|adopt|pick|choose|implement)\b", re.IGNORECASE),
+    re.compile(r"\b(?:option|approach)\s+(?:[Aa]|[Bb]|1|2)\s+(?:or|vs\.?|versus)\s+(?:[Aa]|[Bb]|1|2)\b", re.IGNORECASE),
+    re.compile(r"\(\s*[Aa]\s*\)\s+.*\(\s*[Bb]\s*\)", re.IGNORECASE),
+    re.compile(r"\b(?:trade.?off|architecture|scoping|coverage|design)\b.*\?", re.IGNORECASE),
+    re.compile(r"\b(?:atomic|bundled|sibling|separate)\s+(?:task|fix|change)\b", re.IGNORECASE),
+]
+
+# Preference negation patterns — explicit user-preference signals that must NOT trigger.
+_USER_PREFERENCE_PATTERNS = [
+    re.compile(r"\b(?:which|what) (?:feature|color|theme|name|priority|task) (?:should|do you|would you)\b", re.IGNORECASE),
+    re.compile(r"\b(?:do you want|would you prefer|what's your preference)\b", re.IGNORECASE),
+    re.compile(r"\bauthor(?:ize|ization)\b", re.IGNORECASE),
+    re.compile(r"\bdelete|remove|drop|push to (?:main|master|prod)", re.IGNORECASE),
+]
+
+
+def question_text_is_design_shaped(payload: dict[str, Any]) -> bool:
+    """True (violation candidate) when the AskUserQuestion's question text matches
+    design/architecture/scope/coverage patterns AND does NOT match user-preference
+    or irreversible-authorization patterns.
+
+    Conservative bias: false positives erode trust in IN-MASTER-4 warn faster than
+    false negatives. Only high-confidence design-shape phrases match.
+
+    Reads payload["tool_input"]["question"] (Claude Code AskUserQuestion schema).
+    For multi-question calls (the schema supports a questions list), checks the
+    first question's text only.
+
+    Fail-open: absent question text returns False.
+    """
+    tool_input = payload.get("tool_input") or {}
+    questions = tool_input.get("questions")
+    if isinstance(questions, list) and questions:
+        question_text = (questions[0] or {}).get("question", "") or ""
+    else:
+        question_text = tool_input.get("question", "") or ""
+
+    if not question_text:
+        return False
+
+    for pat in _USER_PREFERENCE_PATTERNS:
+        if pat.search(question_text):
+            return False
+
+    for pat in _DESIGN_SHAPE_PATTERNS:
+        if pat.search(question_text):
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # IN-MASTER-5 conditions (PARALLELIZE_INDEPENDENT_WORK)
 # ---------------------------------------------------------------------------
 
@@ -306,4 +366,5 @@ _REGISTRY: dict[str, Any] = {
     "idle_capacity_available": idle_capacity_available,
     "no_recent_parallel_dispatch": no_recent_parallel_dispatch,
     "recent_dispatch_different_ctx": recent_dispatch_different_ctx,
+    "question_text_is_design_shaped": question_text_is_design_shaped,
 }
