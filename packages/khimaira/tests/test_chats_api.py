@@ -784,7 +784,7 @@ def test_resolve_expected_reply_on_reply(registry_client):
 
 
 def test_overdue_watcher_fires_notice(registry_client, monkeypatch: pytest.MonkeyPatch):
-    """Overdue + silent entries trigger PRESUMED-DEAD notice to master and are deleted."""
+    """Overdue + silent entries trigger PRESUMED-DEAD notice to master after probe tick."""
     import asyncio
     import time
 
@@ -800,6 +800,10 @@ def test_overdue_watcher_fires_notice(registry_client, monkeypatch: pytest.Monke
     monkeypatch.setattr(api_mod, "_session_active_within", lambda sid, w: False)
     # Resolve master to alice.
     monkeypatch.setattr(api_mod, "_resolve_master_session_id", lambda chat_id: "alice")
+    # Stub probe — no real SSE write needed.
+    async def _fake_probe(chat_id, to_id, from_id, elapsed_s):
+        return True
+    monkeypatch.setattr(api_mod, "_send_diagnostic_probe", _fake_probe)
 
     # Plant a stale entry (91s old) in new format.
     api_mod._EXPECTED_REPLIES[("bob", "alice")] = {
@@ -810,6 +814,12 @@ def test_overdue_watcher_fires_notice(registry_client, monkeypatch: pytest.Monke
         "threshold_s": 90.0,
     }
 
+    # Tick 1: probe sent, no notice yet.
+    asyncio.run(api_mod._check_overdue_once())
+    assert len(notices_fired) == 0
+    assert ("bob", "alice") in api_mod._EXPECTED_REPLIES
+
+    # Tick 2: probe already sent, X still silent → PRESUMED-DEAD notice.
     asyncio.run(api_mod._check_overdue_once())
 
     # Notice goes to master (alice); body contains PRESUMED-DEAD + bob.
@@ -817,10 +827,11 @@ def test_overdue_watcher_fires_notice(registry_client, monkeypatch: pytest.Monke
     assert "alice" in targets
     assert any("PRESUMED-DEAD" in txt and "bob" in txt for _, txt in notices_fired)
     assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
+    api_mod._RECENTLY_PRESUMED_DEAD.clear()
 
 
 def test_overdue_watcher_one_shot(registry_client, monkeypatch: pytest.MonkeyPatch):
-    """Overdue silent entry is deleted after first notice — watcher doesn't fire twice."""
+    """Overdue silent entry is deleted after presumed-dead notice — watcher doesn't re-fire."""
     import asyncio
     import time
 
@@ -833,6 +844,9 @@ def test_overdue_watcher_one_shot(registry_client, monkeypatch: pytest.MonkeyPat
     )
     monkeypatch.setattr(api_mod, "_session_active_within", lambda sid, w: False)
     monkeypatch.setattr(api_mod, "_resolve_master_session_id", lambda chat_id: "alice")
+    async def _fake_probe(chat_id, to_id, from_id, elapsed_s):
+        return True
+    monkeypatch.setattr(api_mod, "_send_diagnostic_probe", _fake_probe)
 
     api_mod._EXPECTED_REPLIES[("bob", "alice")] = {
         "ts": time.time() - 91.0,
@@ -842,12 +856,19 @@ def test_overdue_watcher_one_shot(registry_client, monkeypatch: pytest.MonkeyPat
         "threshold_s": 90.0,
     }
 
+    # Tick 1: probe (0 notices).
+    asyncio.run(api_mod._check_overdue_once())
+    assert len(notices_fired) == 0
+
+    # Tick 2: presumed-dead notice fires (1 notice).
     asyncio.run(api_mod._check_overdue_once())
     first_count = len(notices_fired)
+    assert first_count == 1
 
-    # Second iteration — entry should be gone, no new notices.
+    # Tick 3: entry is gone — no new notices.
     asyncio.run(api_mod._check_overdue_once())
     assert len(notices_fired) == first_count
+    api_mod._RECENTLY_PRESUMED_DEAD.clear()
 
 
 def test_self_send_not_registered(registry_client):

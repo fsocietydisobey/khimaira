@@ -44,6 +44,9 @@ _REPLY_OVERDUE_BY_ROLE: dict[str, float] = {
 }
 _LIVENESS_WINDOW_S = 60.0  # activity within this window = session is alive
 
+_RECENTLY_PRESUMED_DEAD: dict[tuple[str, str], dict] = {}
+_PRESUMED_DEAD_TTL_S = 300.0  # 5 minutes for late-reply supersede
+
 
 def _threshold_for_session(to_id: str, chat_id: str) -> float:
     """Per-role threshold lookup. Falls back to default when role unknown."""
@@ -104,6 +107,81 @@ def _resolve_master_session_id(chat_id: str) -> str | None:
     return None
 
 
+async def _send_diagnostic_probe(
+    chat_id: str,
+    to_id: str,
+    from_id: str,
+    elapsed_s: float,
+) -> bool:
+    """Send a synthetic ping via daemon-internal primitive.
+
+    Returns True on success; False on error (fail-open — caller proceeds
+    to presumed-dead path on next tick regardless).
+    """
+    body = (
+        f"🩺 ping from diagnostic — `{from_id}` has been waiting since "
+        f"T+{elapsed_s:.0f}s. Please broadcast any message to confirm you're alive."
+    )
+    try:
+        from khimaira.monitor.chats import _post_synthetic_message
+
+        result = await _post_synthetic_message(chat_id, body)
+        return result is not None
+    except Exception:
+        return False
+
+
+def _sweep_presumed_dead(now: float) -> None:
+    """Drop _RECENTLY_PRESUMED_DEAD entries older than TTL.
+    Called opportunistically from _check_overdue_once.
+    """
+    expired = [
+        key
+        for key, entry in _RECENTLY_PRESUMED_DEAD.items()
+        if now - entry["notice_ts"] > _PRESUMED_DEAD_TTL_S
+    ]
+    for key in expired:
+        _RECENTLY_PRESUMED_DEAD.pop(key, None)
+
+
+async def _maybe_supersede_presumed_dead(sender_id: str) -> None:
+    """If sender was recently presumed-dead, fire supersede notice to master.
+
+    Called from _resolve_expected_reply and broadcast-resolve paths when a
+    session sends ANY message. Clears matching entries from _RECENTLY_PRESUMED_DEAD.
+    """
+    matched_keys = [
+        key
+        for key in list(_RECENTLY_PRESUMED_DEAD.keys())
+        if key[0] == sender_id  # to_id (the previously-silent session) == sender now
+    ]
+    for key in matched_keys:
+        entry = _RECENTLY_PRESUMED_DEAD.pop(key, None)
+        if entry is None:
+            continue
+        master_sid = _resolve_master_session_id(entry.get("chat_id", ""))
+        if master_sid is None:
+            continue
+        elapsed_since_notice = time.time() - entry["notice_ts"]
+        body = (
+            f"♻️ SUPERSEDE: session `{sender_id}` replied {elapsed_since_notice:.0f}s "
+            f"after presumed-dead notice fired. Original wait was "
+            f"{entry['elapsed_s']:.0f}s on chat_send_to from `{entry['from_id']}`. "
+            f"`{sender_id}` is alive after all — original notice was a false-positive. "
+            f"Recommend retracting any re-dispatch decision based on the prior notice."
+        )
+        try:
+            from khimaira.monitor import sessions as sessions_mod
+
+            sessions_mod.post_notice(
+                target_session_id=master_sid,
+                text=body,
+                from_session_id="khimaira-daemon",
+            )
+        except Exception:
+            pass
+
+
 async def _register_expected_reply(from_id: str, to_ids: list[str], chat_id: str = "") -> None:
     async with _REGISTRY_LOCK:
         ts = time.time()
@@ -120,17 +198,21 @@ async def _register_expected_reply(from_id: str, to_ids: list[str], chat_id: str
             }
 
 
-async def _resolve_expected_reply(from_id: str, to_ids: list[str]) -> None:
+async def _resolve_expected_reply(from_id: str, to_ids: list[str], chat_id: str = "") -> None:
     async with _REGISTRY_LOCK:
         for to_id in to_ids:
             _EXPECTED_REPLIES.pop((from_id, to_id), None)
+    # Supersede check: from_id just sent — if it was previously presumed-dead,
+    # master gets a retraction notice.
+    await _maybe_supersede_presumed_dead(from_id)
 
 
 async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:
-    """Diagnostic phase: liveness check + branching disposition.
+    """Diagnostic phase: liveness check → probe → presumed-dead.
 
-    Alive (recent tool/touch activity within _LIVENESS_WINDOW_S): reschedule.
-    Silent (no recent activity): pop entry, fire presumed-dead notice to master.
+    Phase 1 (liveness): if X has recent tool/touch activity, reschedule.
+    Phase 2 (probe): if no activity AND no probe sent yet, send probe + reschedule.
+    Phase 3 (presumed-dead): if probe already sent and X still silent, fire master notice.
     """
     to_id = entry["to"]
     from_id = entry["from"]
@@ -138,40 +220,67 @@ async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:
     elapsed_s = ts_now - entry["ts"]
     threshold = entry.get("threshold_s", _REPLY_OVERDUE_DEFAULT_S)
 
+    # Phase 1: liveness check
     if _session_active_within(to_id, _LIVENESS_WINDOW_S):
         async with _REGISTRY_LOCK:
             existing = _EXPECTED_REPLIES.get(key)
             if existing is not None:
                 existing["ts"] = ts_now
+                existing["probe_sent_at"] = None  # reset probe state on reschedule
         return
 
+    # Phase 2: probe (only if not yet probed)
+    probe_sent_at = entry.get("probe_sent_at")
+    if probe_sent_at is None:
+        await _send_diagnostic_probe(chat_id, to_id, from_id, elapsed_s)
+        async with _REGISTRY_LOCK:
+            existing = _EXPECTED_REPLIES.get(key)
+            if existing is not None:
+                existing["probe_sent_at"] = ts_now
+        # Don't fire presumed-dead notice yet — wait one tick for probe response
+        return
+
+    # Phase 3: presumed dead (probe was sent on prior tick, X still silent)
     async with _REGISTRY_LOCK:
         _EXPECTED_REPLIES.pop(key, None)
 
     master_sid = _resolve_master_session_id(chat_id)
-    if master_sid:
-        body = (
-            f"🚨 PRESUMED-DEAD SESSION — `{to_id}` has not responded to "
-            f"chat_send_to from `{from_id}` after {elapsed_s:.0f}s "
-            f"(role-threshold: {threshold:.0f}s) AND session_state shows "
-            f"no tool activity in the last {_LIVENESS_WINDOW_S:.0f}s. "
-            f"Decide: re-dispatch / retry / investigate. "
-            f"chat_id={chat_id}"
-        )
-        try:
-            from khimaira.monitor import sessions as sessions_mod
+    if master_sid is None:
+        return
 
-            sessions_mod.post_notice(
-                target_session_id=master_sid,
-                text=body,
-                from_session_id="khimaira-daemon",
-            )
-        except Exception:
-            pass
+    # Record for late-reply supersede tracking
+    _RECENTLY_PRESUMED_DEAD[(to_id, from_id)] = {
+        "notice_ts": ts_now,
+        "chat_id": chat_id,
+        "from_id": from_id,
+        "to_id": to_id,
+        "elapsed_s": elapsed_s,
+    }
+
+    probe_age_s = ts_now - probe_sent_at
+    body = (
+        f"🚨 PRESUMED-DEAD SESSION — `{to_id}` has not responded to "
+        f"chat_send_to from `{from_id}` after {elapsed_s:.0f}s "
+        f"(role-threshold: {threshold:.0f}s). Diagnostic probe sent "
+        f"{probe_age_s:.0f}s ago also received no reply. session_state shows "
+        f"no tool activity in the last {_LIVENESS_WINDOW_S:.0f}s. "
+        f"Decide: re-dispatch / retry / investigate. chat_id={chat_id}"
+    )
+    try:
+        from khimaira.monitor import sessions as sessions_mod
+
+        sessions_mod.post_notice(
+            target_session_id=master_sid,
+            text=body,
+            from_session_id="khimaira-daemon",
+        )
+    except Exception:
+        pass
 
 
 async def _check_overdue_once() -> None:
     now = time.time()
+    _sweep_presumed_dead(now)  # opportunistic cleanup of late-reply tracking
     candidates = []
     async with _REGISTRY_LOCK:
         for key, entry in list(_EXPECTED_REPLIES.items()):

@@ -2086,6 +2086,52 @@ def _gc_pending_sessions() -> None:
         _pending_session_by_ppid.pop(ppid, None)
 
 
+_DAEMON_SENDER_ID = "khimaira-daemon"
+_DAEMON_SENDER_NAME = "🩺 khimaira-daemon"
+
+
+async def _post_synthetic_message(
+    chat_id: str,
+    body: str,
+    kind: str = MSG,
+) -> "dict[str, Any] | None":
+    """Write a synthetic message into chat JSONL + broadcast via SSE.
+
+    Daemon-internal only. NOT exposed via MCP — no FastMCP decorator, no
+    @mcp.tool registration. Used for diagnostic probes that need to elicit
+    agent response without a real sender session.
+
+    The agent receiving this message processes it via the same SSE/hook
+    path as any normal chat message. Agent's reply (any broadcast in the
+    chat) is observed by Pattern 5's existing broadcast-resolve mechanism
+    (broadcast-resolve clears (sender, *) entries on any chat broadcast).
+
+    Returns the record dict on success; None on error (fail-open).
+    """
+    try:
+        path = _chat_path(chat_id)
+        if not path.exists():
+            return None
+        record: dict[str, Any] = {
+            "kind": kind,
+            "event_id": _new_event_id(),
+            "id": "msg-" + uuid.uuid4().hex[:12],
+            "ts": _now_iso(),
+            "chat_id": chat_id,
+            "sender_id": _DAEMON_SENDER_ID,
+            "sender_name": _DAEMON_SENDER_NAME,
+            "body": body,
+            "to": None,
+            "private": False,
+        }
+        _ensure_dir()
+        sessions_mod._append_jsonl(path, record)
+        _broadcast(chat_id, record)
+        return record
+    except Exception:
+        return None
+
+
 def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
     """Push a new chat event to the right subscribers.
 

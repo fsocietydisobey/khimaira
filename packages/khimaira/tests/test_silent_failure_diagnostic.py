@@ -31,7 +31,11 @@ _CAUSES = [
 )
 @pytest.mark.asyncio
 async def test_silent_failure_disposition(monkeypatch, cause_id, last_activity_s_ago, expected):
-    """For each documented cause: assert correct disposition."""
+    """For each documented cause: assert correct disposition.
+
+    presumed_dead cases require two _diagnose_and_dispose ticks: first tick
+    sends probe (Phase 2), second tick fires presumed-dead notice (Phase 3).
+    """
     monkeypatch.setattr(
         api_chats,
         "_session_active_within",
@@ -50,6 +54,11 @@ async def test_silent_failure_disposition(monkeypatch, cause_id, last_activity_s
             or {}
         ),
     )
+    # Stub probe so it doesn't try to call the real _post_synthetic_message.
+    async def _fake_probe(chat_id, to_id, from_id, elapsed_s):
+        return True
+
+    monkeypatch.setattr(api_chats, "_send_diagnostic_probe", _fake_probe)
 
     ts_now = time.time()
     entry = {
@@ -63,6 +72,7 @@ async def test_silent_failure_disposition(monkeypatch, cause_id, last_activity_s
     async with api_chats._REGISTRY_LOCK:
         api_chats._EXPECTED_REPLIES[key] = entry
 
+    # Tick 1
     await api_chats._diagnose_and_dispose(key, entry, ts_now)
 
     if expected == "reschedule":
@@ -70,6 +80,16 @@ async def test_silent_failure_disposition(monkeypatch, cause_id, last_activity_s
         assert api_chats._EXPECTED_REPLIES[key]["ts"] == ts_now
         assert len(notices) == 0
     elif expected == "presumed_dead":
+        # After tick 1: probe sent, entry still in registry with probe_sent_at set.
+        assert key in api_chats._EXPECTED_REPLIES
+        assert api_chats._EXPECTED_REPLIES[key].get("probe_sent_at") is not None
+        assert len(notices) == 0
+
+        # Tick 2: probe already sent, X still silent → presumed-dead.
+        entry2 = api_chats._EXPECTED_REPLIES[key]
+        ts_next = ts_now + 30
+        await api_chats._diagnose_and_dispose(key, entry2, ts_next)
+
         assert key not in api_chats._EXPECTED_REPLIES
         assert len(notices) == 1
         assert notices[0]["target"] == "master-sid"
@@ -79,6 +99,7 @@ async def test_silent_failure_disposition(monkeypatch, cause_id, last_activity_s
 
     async with api_chats._REGISTRY_LOCK:
         api_chats._EXPECTED_REPLIES.pop(key, None)
+    api_chats._RECENTLY_PRESUMED_DEAD.clear()
 
 
 _ROLE_THRESHOLDS = [
