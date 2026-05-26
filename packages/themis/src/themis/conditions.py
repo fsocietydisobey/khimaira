@@ -355,6 +355,41 @@ def recent_dispatch_different_ctx(payload: dict[str, Any]) -> bool:
     return False
 
 
+def done_report_missing_branch_declaration(payload: dict[str, Any]) -> bool:
+    """True (violation) when chat_task_update with status=done has a note
+    missing required branch declaration fields.
+
+    Required fields per agent.md done-report template (2026-05-26):
+    - branch:
+    - worktree:
+    - merge_intent:
+
+    Catches the JEEVY-543 silent-strand failure mode: agent posts done
+    without declaring git state; master can't audit arc-end coherence.
+
+    Note-parse approach: chat_task_update note is markdown with field lines
+    like `branch: foo`. All three field labels must appear.
+
+    Fail-open: absent note, status != done, or non-task-update tool → False.
+    """
+    tool_name = payload.get("tool_name", "")
+    if tool_name != "mcp__khimaira-chat__chat_task_update":
+        return False
+
+    tool_input = payload.get("tool_input") or {}
+    status = tool_input.get("new_status", "") or tool_input.get("status", "")
+    if status != "done":
+        return False
+
+    note = tool_input.get("note", "") or ""
+    if not note:
+        return False
+
+    # All three labels must appear (case-sensitive — these are conventional)
+    required_labels = ["branch:", "worktree:", "merge_intent:"]
+    return not all(label in note for label in required_labels)
+
+
 # ---------------------------------------------------------------------------
 # Registry — maps YAML condition name → function
 # ---------------------------------------------------------------------------
@@ -367,4 +402,5 @@ _REGISTRY: dict[str, Any] = {
     "no_recent_parallel_dispatch": no_recent_parallel_dispatch,
     "recent_dispatch_different_ctx": recent_dispatch_different_ctx,
     "question_text_is_design_shaped": question_text_is_design_shaped,
+    "done_report_missing_branch_declaration": done_report_missing_branch_declaration,
 }

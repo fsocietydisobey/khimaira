@@ -138,6 +138,13 @@ signal the user's request is actually two separate requests.
 `(supersedes ctx-<older>)` in the header. Don't delete the old one — append-only
 history is load-bearing for postmortems. Agents seeing both use the newer.
 
+**`ctx-id` is also the arc-id (2026-05-26).** When the CONTEXT UPDATE covers
+a multi-task arc (intake's decomposition spans ≥2 tasks), all tasks within
+the arc share the same `ctx-id`. Master uses ctx-id to group done-reports
+for the arc-end reconciliation audit (see master.md Step 7 — Reconcile).
+No separate arc-id metadata; ctx-id IS the arc-id. Single-task arcs are
+degenerate — their ctx-id is the arc-id.
+
 ### Pre-HANDOFF roster-fan-out checkpoint
 
 **Before** writing the HANDOFF, scan the user's request for explicit fan-out

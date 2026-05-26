@@ -45,3 +45,22 @@ invariants:
       🛑 Themis IN-AGENT-3 (NO_API_DISPATCH): {tool_name} spawns a standalone API
       call outside the roster model. Agents implement; they do not orchestrate.
       If you need research, ask master to assign a research sub-task.
+
+  - id: IN-AGENT-4
+    name: DONE_REPORT_BRANCH_DECLARATION
+    severity: warn
+    matchers:
+      - tool: mcp__khimaira-chat__chat_task_update
+    conditions:
+      - check: done_report_missing_branch_declaration
+    message: |
+      ⚠️ Themis IN-AGENT-4 (DONE_REPORT_BRANCH_DECLARATION): chat_task_update
+      with status=done is missing one or more required git-state declarations.
+      Required fields (per agent.md done-report template, 2026-05-26):
+        branch: <branch name>
+        worktree: <path or "none">
+        merge_intent: <merge-to-main | keep-isolated | drop | defer-to-arc-<id>>
+      Without these, master can't audit arc-end coherence (Step 7 — Reconcile)
+      and silent worktree strands recur (JEEVY-543 failure mode).
+      Severity is warn permanently (heuristic nudge; legitimate edge cases
+      may omit, e.g. trivial single-task ack — master verifies at Step 7).

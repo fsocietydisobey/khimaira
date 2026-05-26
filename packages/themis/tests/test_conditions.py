@@ -8,6 +8,7 @@ import pytest
 
 from themis.conditions import (
     chat_my_chats_not_called_this_turn,
+    done_report_missing_branch_declaration,
     evaluate_condition,
     idle_agents_exist,
     idle_capacity_available,
@@ -371,3 +372,54 @@ class TestRecentDispatchDifferentCtx:
             ],
         }
         assert recent_dispatch_different_ctx(payload) is False
+
+
+class TestDoneReportMissingBranchDeclaration:
+    """IN-AGENT-4 condition: fires when done-report note is missing git-state fields."""
+
+    def _payload(self, note: str) -> dict:
+        return {
+            "tool_name": "mcp__khimaira-chat__chat_task_update",
+            "tool_input": {"new_status": "done", "note": note},
+        }
+
+    def test_fires_when_all_fields_missing(self):
+        """Done-report with no branch declaration fires the condition."""
+        payload = self._payload("What I did: fixed the bug\nFiles changed: foo.py")
+        assert done_report_missing_branch_declaration(payload) is True
+
+    def test_fires_when_partial_fields_present(self):
+        """Done-report with only some fields still fires."""
+        payload = self._payload("branch: main\nWhat I did: work")
+        assert done_report_missing_branch_declaration(payload) is True
+
+    def test_silent_when_all_fields_declared(self):
+        """Done-report with all three fields does NOT fire."""
+        payload = self._payload(
+            "What I did: work\nbranch: main\nworktree: none\nmerge_intent: merge-to-main"
+        )
+        assert done_report_missing_branch_declaration(payload) is False
+
+    def test_silent_when_status_not_done(self):
+        """Non-done status (e.g. in_progress) does not fire."""
+        payload = {
+            "tool_name": "mcp__khimaira-chat__chat_task_update",
+            "tool_input": {"new_status": "in_progress", "note": "starting"},
+        }
+        assert done_report_missing_branch_declaration(payload) is False
+
+    def test_silent_when_wrong_tool(self):
+        """Non-task-update tool does not fire."""
+        payload = {
+            "tool_name": "chat_send",
+            "tool_input": {"new_status": "done", "note": "no fields"},
+        }
+        assert done_report_missing_branch_declaration(payload) is False
+
+    def test_silent_when_note_empty(self):
+        """Empty note → fail-open (False)."""
+        payload = {
+            "tool_name": "mcp__khimaira-chat__chat_task_update",
+            "tool_input": {"new_status": "done", "note": ""},
+        }
+        assert done_report_missing_branch_declaration(payload) is False

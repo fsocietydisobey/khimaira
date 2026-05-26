@@ -112,7 +112,26 @@ have assigned sonnet deliberately.
    Files changed: <list with file:line for key changes>
    Acceptance criteria met: <yes/no per criterion from CONTEXT UPDATE>
    Anything unexpected: <or "none">
+   branch: <branch name where work landed, e.g. main, feature/foo, agent-XXX>
+   worktree: <absolute path if isolation:worktree was used, else "none">
+   merge_intent: <one of: merge-to-main | keep-isolated | drop | defer-to-arc-<id>>
    ```
+
+   **branch / worktree / merge_intent are REQUIRED (2026-05-26 — see
+   master.md Step 7 — Reconcile + Themis IN-AGENT-4).** Master uses these
+   to audit arc-end coherence before declaring INTAKE COMPLETE. Default
+   `merge_intent: merge-to-main` when work landed on the project's main
+   branch. Use `keep-isolated` ONLY for spike/exploratory work that should
+   NOT integrate; master validates each keep-isolated declaration. Use
+   `drop` if your branch was abandoned (e.g. you rebased onto another
+   agent's branch). Use `defer-to-arc-<id>` if your work depends on a
+   future arc and intentionally strands until then.
+
+   **Common failure mode:** working in `isolation: "worktree"` and forgetting
+   to declare merge_intent — JEEVY-543 phases B/C/E silently stranded their
+   worktree branches; Joseph hit 404s on main because backend endpoints
+   existed only in unmerged worktrees. Themis IN-AGENT-4 hint catches
+   missing declaration at done-time.
 
    After posting to chat, send: `session_post_notice(target_session_id="<intake-name>",
    text="✅ Done [ctx-id: ctx-<8hex>] — <one-line summary>")`

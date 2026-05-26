@@ -309,7 +309,52 @@ When all agents report done, integrate results. Check cross-agent consistency:
 do the outputs compose correctly? Are there naming conflicts, API boundary
 mismatches, or test regressions? Fix these yourself or assign a cleanup agent.
 
-Signal `🏁 INTAKE COMPLETE [intake-id: <id>]` to intake when done.
+### Step 7 — Reconcile
+
+Before declaring the arc complete with `🏁 INTAKE COMPLETE`, audit branch
+coherence across all agent done-reports for this ctx-id (arc-id):
+
+**Reconciliation checklist:**
+
+1. **Collect declarations.** For each approved task in this arc (matching
+   ctx-id), read the agent's done-report `branch:` / `worktree:` /
+   `merge_intent:` fields.
+2. **Validate each `merge_intent`:**
+   - `merge-to-main` — verify the branch is actually merged. Run
+     `git log main --oneline | grep <commit>` or `git branch --merged main`.
+     If unmerged: master either merges now or requests changes.
+   - `keep-isolated` — REQUIRES master validation: this is a footgun. Confirm
+     the agent INTENDED isolation (e.g. spike branch, exploratory work). If
+     the agent ran in worktree-isolation by accident and meant to merge:
+     request a re-do.
+   - `drop` — confirm branch is abandoned (no longer in `git branch -a`).
+     If still present: clean up.
+   - `defer-to-arc-<id>` — confirm referenced arc exists or is queued. The
+     defer creates a forward dependency that another arc must resolve.
+3. **Cross-task contract check:** if Phase A references Phase B's exports,
+   verify both phases' branches are reconciled to the same target before
+   declaring done. Mismatch = silent strand.
+4. **Stranded-worktree sweep:** `git worktree list` — if any worktree is
+   locked and references a branch from this arc that isn't in the declared
+   set, the arc is incomplete.
+
+**Only after all four checks pass:** signal `🏁 INTAKE COMPLETE [ctx-id: <id>]`
+to intake.
+
+**If checks fail:** request changes from the relevant agent (re-merge,
+drop, declare intent) OR explicitly defer the strand to a follow-up arc
+with `defer-to-arc-<id>` in the original done-report. NEVER ship INTAKE
+COMPLETE with unreconciled strands — that's the JEEVY-543 failure mode.
+
+**Why this matters:** task-level critic/verifier pass on within-scope
+correctness. Arc-level coherence (cross-task contract, branch union) is
+master's responsibility. Skipping Step 7 produces silent strands where
+all phases report ✅ but main HEAD doesn't compose.
+
+**Class-invariant test:** `test_no_stranded_arc_branches` (in
+`packages/khimaira/tests/test_role_convention_lint.py`) validates that
+every closed-arc done-report declares branch + merge_intent. Full branch
+audit (Cat 2) extends this to checkout-and-test verification.
 
 ## When to Delegate / When to Act Yourself
 
