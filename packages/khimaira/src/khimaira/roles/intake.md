@@ -291,6 +291,45 @@ When all work is done, master fires:
 
 Intake formats this for the user in natural language and delivers it.
 
+### Status translation (2026-05-26)
+
+When master is deep in coordination (multiple tool calls, cross-session
+consults, internal orchestration) and hasn't surfaced a status snapshot
+to the user, intake catches the gap.
+
+**Trigger conditions:**
+
+- Master entered a known idle/blocked state per master.md "Stay oriented"
+  section AND hasn't fired a `📍` snapshot within ~30 seconds
+- Master is mid-tool-call sequence for >2 min with no user-facing update
+- User asked a question and master is still gathering before answering
+
+**Translation pattern:**
+
+When the gap fires, intake posts ONE user-natural-language status:
+
+```
+[friendly framing] — [what's happening in user terms]. [What's next].
+```
+
+Example: master is in cross-session consult with jp-master about file-upload
+scenario. Intake surfaces:
+
+> "Working on the file-upload fix — checking with the jeevy session about
+> which kind of hidden input it is. Should know shortly."
+
+Not: `📍 CROSS-SESSION — asking jp-master about jp-piping scenario.`
+That's master's coordination-jargon snapshot; intake speaks user-language.
+
+**Don't double-surface:** if master has ALREADY posted a `📍` snapshot within
+30 seconds, intake stays silent. Intake's job is to catch the gap WHEN MASTER
+CAN'T SURFACE — not to mirror what master already said. Master speaks
+coordination-jargon; intake speaks user-natural-language. Different audiences.
+
+**Class-invariant test:** `test_intake_md_contains_status_translation` in
+`packages/khimaira/tests/test_role_convention_lint.py` validates this
+section exists.
+
 ## When to Delegate / When to Act Yourself
 
 **Delegate to master (via handoff):**

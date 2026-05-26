@@ -319,3 +319,54 @@ def test_in_data_lead_themis_rules_present():
     assert "NO_FILE_EDIT_OUTSIDE_DATA" in content
     assert "IN-DATA-LEAD-2" in content
     assert "NO_STANDALONE_AGENTS" in content
+
+
+def test_master_md_contains_stay_oriented_section():
+    """Regression guard: master.md must articulate proactive status-surface
+    protocol for state transitions.
+
+    Per architect-1 enumeration msg-9cb4a253b786. Catches Joseph's "silence
+    on idle" feedback failure mode (2026-05-26).
+    """
+    content = (ROLE_DIR / "master.md").read_text()
+    lowered = content.lower()
+    assert "stay oriented" in lowered or "stay-oriented" in lowered, (
+        "master.md missing 'Stay oriented' section"
+    )
+    assert "📍" in content, "master.md missing 📍 status snapshot marker"
+    assert "awaiting your reply" in lowered, "master.md missing question-then-idle transition"
+    assert "blocked on" in lowered or "blocked—" in lowered or "blocked —" in lowered, (
+        "master.md missing blocked-on-external-dep transition"
+    )
+    assert "no work in queue" in lowered, "master.md missing all-idle transition"
+    assert "Open until" in content, "master.md missing open-until template marker"
+    for state in ("IDLE", "BLOCKED"):
+        assert state in content, f"master.md missing state '{state}' enumeration"
+
+
+def test_intake_md_contains_status_translation():
+    """Regression guard: intake.md must describe user-facing status translation
+    when master is deep in coordination."""
+    content = (ROLE_DIR / "intake.md").read_text()
+    lowered = content.lower()
+    assert "status translation" in lowered, "intake.md missing 'Status translation' section"
+    assert ("don't double-surface" in lowered or "don't double surface" in lowered
+            or "doesn't double" in lowered or "stays silent" in lowered), (
+        "intake.md missing double-surface guard"
+    )
+    assert "📍" in content, "intake.md missing 📍 cross-reference to master's status template"
+
+
+def test_status_snapshot_template_documented():
+    """Regression guard: canonical status template format must be in master.md.
+
+    Template: 📍 [STATE] — [one-line context]. Open until [condition].
+    """
+    content = (ROLE_DIR / "master.md").read_text()
+    assert "📍" in content, "status snapshot emoji marker missing from master.md"
+    assert "Open until" in content, "open-until-condition marker missing"
+    states_present = sum(1 for s in ("IDLE", "BLOCKED", "CONSULTING", "CROSS-SESSION") if s in content)
+    assert states_present >= 2, (
+        f"master.md must enumerate at least 2 canonical states "
+        f"(IDLE/BLOCKED/CONSULTING/CROSS-SESSION); found {states_present}"
+    )

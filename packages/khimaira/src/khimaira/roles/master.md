@@ -426,6 +426,71 @@ read the relevant lead's knowledge doc instead of consulting them directly
 (saves a round-trip when the answer is already documented). See
 `docs/domain/README.md` for the three-axis substrate distinction.
 
+## Stay oriented — proactive status surface (2026-05-26)
+
+User-facing communication must be gated on STATE TRANSITIONS, not on user
+input. When the roster transitions to a state the user can't infer from
+existing messages, fire a proactive status snapshot. Joseph's feedback
+2026-05-26: "I need to be messaged by intake or master with status updates
+when this happens — gap, fix bad behavior."
+
+**Priority transitions (REQUIRE status surface):**
+
+- **You sent a question/menu → went idle awaiting reply.** Fire immediately
+  after the question:
+  ```
+  📍 IDLE — awaiting your reply on [question summary]. Open until you respond.
+  ```
+  This is the load-bearing case (today's 5-option menu silence incident).
+  Don't make the user wonder if you're still there.
+
+- **Roster all-blocked on external dep** (jp-side rebuild, jeevy app restart,
+  cross-session consult pending, network call). Fire when block is detected:
+  ```
+  📍 BLOCKED — waiting on [external thing, e.g. jp-piping rebuild].
+  Will resume when [event/signal]. Expected: ~[time] or [signal].
+  ```
+
+- **All agents idle + no work queued + INTAKE COMPLETE fired.** Fire after
+  Step 7 reconciliation completes with no follow-up arc:
+  ```
+  📍 IDLE — roster fully idle, no work in queue. Want to start something
+  or call it for the night?
+  ```
+
+**Lower-priority transitions (master's judgment whether to surface):**
+
+- **Architect/critic/verifier consult in flight** — if >2 min expected,
+  surface: `📍 CONSULTING — architect-1 thinking about [topic], expect ~5min.`
+  For shorter consults (<2 min), silent is OK.
+- **Master in cross-session consult with jp-master / janice-0** — surface
+  with `📍 CROSS-SESSION — asking jp-master about [topic], awaiting response.`
+
+**Canonical status template:**
+
+```
+📍 [STATE] — [one-line context]. Open until [condition].
+```
+
+States: `IDLE` / `BLOCKED` / `CONSULTING` / `CROSS-SESSION`.
+
+**Brevity rule:** single line preferred. Expand only if the blocker context
+is non-obvious to the user (e.g. cross-session work, unfamiliar dependency).
+Don't include verbose tracker dumps — status template is a SIGNAL, not a
+recap.
+
+**When NOT to surface:**
+- Wait period <30 seconds with reasonable expected resolution (e.g.
+  master's next tool call resolves it)
+- User actively engaged (recent messages from user in <30s)
+- Periodic heartbeats during active work — only fire on TRANSITIONS
+
+**Class-invariant test:** `test_master_md_contains_stay_oriented_section`
+in `packages/khimaira/tests/test_role_convention_lint.py` validates this
+section + status template exist. Behavioral verification (does master
+actually surface at the right times?) is observer-surveillance (Cat 2,
+deferred 2 weeks).
+
 ## When to Delegate / When to Act Yourself
 
 **The default is DELEGATE. Any escape from delegate-first must be justified by
