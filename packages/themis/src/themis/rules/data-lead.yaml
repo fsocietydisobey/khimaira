@@ -1,4 +1,5 @@
 # Themis rules — data-lead role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
 role: data-lead
 invariants:
   - id: IN-DATA-LEAD-1
@@ -8,20 +9,17 @@ invariants:
       - tool: Edit
         tool_input_field:
           field: file_path
-          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/monitor/(?:sessions\\.py|chats\\.py|discovery/)|packages/khimaira/src/khimaira/roles/data-lead\\.md|packages/khimaira/tests/test_(?:sessions|chats|schema)_|docs/domain/data-knowledge\\.md)).+"
+          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/monitor/sessions\.py|packages/khimaira/src/khimaira/monitor/chats\.py|packages/khimaira/src/khimaira/monitor/discovery/|packages/khimaira/tests/test_sessions_|packages/khimaira/tests/test_chats_|packages/khimaira/tests/test_schema_|packages/khimaira/src/khimaira/roles/data\-lead\.md|docs/domain/data\-knowledge\.md)).+"
       - tool: Write
         tool_input_field:
           field: file_path
-          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/monitor/(?:sessions\\.py|chats\\.py|discovery/)|packages/khimaira/src/khimaira/roles/data-lead\\.md|packages/khimaira/tests/test_(?:sessions|chats|schema)_|docs/domain/data-knowledge\\.md)).+"
+          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/monitor/sessions\.py|packages/khimaira/src/khimaira/monitor/chats\.py|packages/khimaira/src/khimaira/monitor/discovery/|packages/khimaira/tests/test_sessions_|packages/khimaira/tests/test_chats_|packages/khimaira/tests/test_schema_|packages/khimaira/src/khimaira/roles/data\-lead\.md|docs/domain/data\-knowledge\.md)).+"
     message: |
-      🛑 Themis IN-DATA-LEAD-1 (NO_FILE_EDIT_OUTSIDE_DATA): data-lead attempted
-      to edit a file outside the data domain. Edits restricted to:
-        packages/khimaira/src/khimaira/monitor/{sessions.py,chats.py,discovery/}
-        packages/khimaira/src/khimaira/roles/data-lead.md
-        packages/khimaira/tests/test_sessions_* + test_chats_* + test_schema_*
-        docs/domain/data-knowledge.md
-      Cross-domain work (especially shared sessions.py / chats.py with
-      backend-lead): flag to master, who defines the contract.
+      🛑 Themis IN-DATA-LEAD-1 (NO_FILE_EDIT_OUTSIDE_DATA): data-lead
+      attempted to edit a file outside the data domain. Edits restricted to
+      the paths listed in the data-lead role doc's Domain scope section.
+      Cross-domain work: flag to master, who defines the contract. Direct
+      cross-domain edits violate the domain-lead boundary.
 
   - id: IN-DATA-LEAD-2
     name: NO_STANDALONE_AGENTS
@@ -29,5 +27,7 @@ invariants:
     matchers:
       - tool: Task
     message: |
-      🛑 Themis IN-DATA-LEAD-2 (NO_STANDALONE_AGENTS): data-lead spawned a
-      standalone Task agent. Use chat_task_create for roster transient agents.
+      🛑 Themis IN-DATA-LEAD-2 (NO_STANDALONE_AGENTS): data-lead spawned
+      a standalone Task agent. Use chat_task_create + chat_send_to for fan-out
+      to roster transient agents. Standalone Task agents bypass the enforcement
+      gate + observer lifecycle.

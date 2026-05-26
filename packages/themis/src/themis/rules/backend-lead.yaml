@@ -9,20 +9,15 @@ invariants:
       - tool: Edit
         tool_input_field:
           field: file_path
-          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/(?:monitor|hooks|mcp_calls|attach)/|packages/khimaira/src/khimaira/roles/backend-lead\\.md|packages/themis/src/themis/|packages/khimaira/tests/|packages/specter/src/specter/server\\.py|docs/domain/backend-knowledge\\.md)).+"
+          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/monitor/|packages/khimaira/src/khimaira/hooks/|packages/khimaira/src/khimaira/mcp_calls/|packages/khimaira/src/khimaira/attach/|packages/themis/src/themis/|packages/khimaira/tests/|packages/specter/src/specter/server\.py|packages/khimaira/src/khimaira/roles/backend\-lead\.md|docs/domain/backend\-knowledge\.md)).+"
       - tool: Write
         tool_input_field:
           field: file_path
-          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/(?:monitor|hooks|mcp_calls|attach)/|packages/khimaira/src/khimaira/roles/backend-lead\\.md|packages/themis/src/themis/|packages/khimaira/tests/|packages/specter/src/specter/server\\.py|docs/domain/backend-knowledge\\.md)).+"
+          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/monitor/|packages/khimaira/src/khimaira/hooks/|packages/khimaira/src/khimaira/mcp_calls/|packages/khimaira/src/khimaira/attach/|packages/themis/src/themis/|packages/khimaira/tests/|packages/specter/src/specter/server\.py|packages/khimaira/src/khimaira/roles/backend\-lead\.md|docs/domain/backend\-knowledge\.md)).+"
     message: |
       🛑 Themis IN-BACKEND-LEAD-1 (NO_FILE_EDIT_OUTSIDE_BACKEND): backend-lead
-      attempted to edit a file outside the backend domain. Edits restricted to:
-        packages/khimaira/src/khimaira/{monitor,hooks,mcp_calls,attach}/
-        packages/khimaira/src/khimaira/roles/backend-lead.md
-        packages/themis/src/themis/
-        packages/khimaira/tests/
-        packages/specter/src/specter/server.py
-        docs/domain/backend-knowledge.md
+      attempted to edit a file outside the backend domain. Edits restricted to
+      the paths listed in the backend-lead role doc's Domain scope section.
       Cross-domain work: flag to master, who defines the contract. Direct
       cross-domain edits violate the domain-lead boundary.
 

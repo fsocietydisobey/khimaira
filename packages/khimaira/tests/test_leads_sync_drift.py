@@ -1,7 +1,8 @@
 """Tests for leads sync — drift detection + manual-block preservation.
 
 test_khimaira_leads_manifest_matches_generated:
-    Skipped until Phase C creates .khimaira/leads.toml for the khimaira project.
+    xfail until the central manifest ~/.local/share/khimaira/leads/khimaira.toml exists.
+    Activates (runs as real test) once Phase C writes that file.
 
 test_manual_block_preservation:
     Generate a role doc, inject a manual block, regenerate, assert block survives.
@@ -9,6 +10,7 @@ test_manual_block_preservation:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -18,17 +20,31 @@ from khimaira.leads.sync import check_drift, sync_leads
 
 
 # ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def central_leads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect central leads dir to tmp_path for test isolation."""
+    leads_dir = tmp_path / "xdg" / "khimaira" / "leads"
+    leads_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    return leads_dir
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _minimal_manifest(tmp_path: Path) -> Path:
-    """Write a minimal valid manifest + directory structure."""
-    (tmp_path / ".khimaira").mkdir(exist_ok=True)
-    (tmp_path / ".khimaira" / "leads.toml").write_text(
-        """
+def _minimal_manifest(tmp_path: Path, central_leads: Path) -> str:
+    """Write a minimal valid central manifest + project directory structure."""
+    (central_leads / "testproject.toml").write_text(
+        f"""
 [project]
 name = "testproject"
+root_path = "{tmp_path}"
 roles_dir = "roles"
 themis_dir = "themis/rules"
 knowledge_dir = "docs/domain"
@@ -42,27 +58,31 @@ effort = "medium"
     (tmp_path / "roles").mkdir(exist_ok=True)
     (tmp_path / "themis" / "rules").mkdir(parents=True, exist_ok=True)
     (tmp_path / "docs" / "domain").mkdir(parents=True, exist_ok=True)
-    return tmp_path
+    return "testproject"
 
 
 # ---------------------------------------------------------------------------
-# Phase C placeholder (xfail until leads.toml exists)
+# Phase C integration — khimaira's own central manifest
 # ---------------------------------------------------------------------------
+
+
+def _khimaira_central_manifest_path() -> Path:
+    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(xdg) / "khimaira" / "leads" / "khimaira.toml"
 
 
 @pytest.mark.xfail(
-    not (Path(__file__).parents[5] / ".khimaira" / "leads.toml").exists(),
-    reason="Phase C: .khimaira/leads.toml does not exist yet for khimaira project",
+    not _khimaira_central_manifest_path().exists(),
+    reason="Phase C: central manifest ~/.local/share/khimaira/leads/khimaira.toml does not exist yet",
     strict=False,
 )
 def test_khimaira_leads_manifest_matches_generated():
-    """Run leads sync --check against khimaira's own manifest.
+    """Run leads sync --check against khimaira's own central manifest.
 
-    Passes once Phase C creates .khimaira/leads.toml and the generated files
+    Passes once Phase C writes the central manifest and the generated files
     match the committed role docs + Themis YAML (fidelity proof).
     """
-    project_root = Path(__file__).parents[5]  # packages/khimaira/src/khimaira → repo root × 5
-    has_drift, diff_lines = check_drift(project_root)
+    has_drift, diff_lines = check_drift("khimaira")
     if has_drift:
         pytest.fail("Drift detected:\n" + "".join(diff_lines))
 
@@ -72,12 +92,12 @@ def test_khimaira_leads_manifest_matches_generated():
 # ---------------------------------------------------------------------------
 
 
-def test_manual_block_preserved_across_regen(tmp_path):
+def test_manual_block_preserved_across_regen(tmp_path: Path, central_leads: Path):
     """Generate a role doc, inject a manual block, regenerate, assert block survives."""
-    _minimal_manifest(tmp_path)
+    project_name = _minimal_manifest(tmp_path, central_leads)
 
     # First sync: generates role doc with default <!-- BEGIN MANUAL --> blocks
-    sync_leads(tmp_path)
+    sync_leads(project_name)
     role_path = tmp_path / "roles" / "backend-lead.md"
     assert role_path.exists()
     first_content = role_path.read_text()
@@ -99,7 +119,7 @@ def test_manual_block_preserved_across_regen(tmp_path):
     role_path.write_text(modified)
 
     # Second sync: should preserve the custom manual block
-    sync_leads(tmp_path)
+    sync_leads(project_name)
     second_content = role_path.read_text()
 
     assert "- Custom authority pattern here" in second_content, (
@@ -107,9 +127,9 @@ def test_manual_block_preserved_across_regen(tmp_path):
     )
 
 
-def test_sync_creates_role_doc_and_themis(tmp_path):
-    _minimal_manifest(tmp_path)
-    summary = sync_leads(tmp_path)
+def test_sync_creates_role_doc_and_themis(tmp_path: Path, central_leads: Path):
+    project_name = _minimal_manifest(tmp_path, central_leads)
+    summary = sync_leads(project_name)
 
     role_path = tmp_path / "roles" / "backend-lead.md"
     themis_path = tmp_path / "themis" / "rules" / "backend-lead.yaml"
@@ -128,46 +148,46 @@ def test_sync_creates_role_doc_and_themis(tmp_path):
     assert "packages/backend/" in themis_content  # allow-list fragment
 
 
-def test_sync_seeds_knowledge_doc(tmp_path):
-    _minimal_manifest(tmp_path)
-    sync_leads(tmp_path)
+def test_sync_seeds_knowledge_doc(tmp_path: Path, central_leads: Path):
+    project_name = _minimal_manifest(tmp_path, central_leads)
+    sync_leads(project_name)
 
     knowledge_path = tmp_path / "docs" / "domain" / "backend-knowledge.md"
     assert knowledge_path.exists(), "Knowledge doc was not seeded"
 
 
-def test_sync_does_not_clobber_existing_knowledge(tmp_path):
-    _minimal_manifest(tmp_path)
+def test_sync_does_not_clobber_existing_knowledge(tmp_path: Path, central_leads: Path):
+    project_name = _minimal_manifest(tmp_path, central_leads)
     knowledge_path = tmp_path / "docs" / "domain" / "backend-knowledge.md"
     knowledge_path.write_text("existing content")
 
-    sync_leads(tmp_path)
+    sync_leads(project_name)
 
     assert knowledge_path.read_text() == "existing content", (
         "sync clobbered existing knowledge doc"
     )
 
 
-def test_check_drift_detects_missing_file(tmp_path):
-    _minimal_manifest(tmp_path)
+def test_check_drift_detects_missing_file(tmp_path: Path, central_leads: Path):
+    project_name = _minimal_manifest(tmp_path, central_leads)
     # Don't sync first — files are missing
-    has_drift, diff_lines = check_drift(tmp_path)
+    has_drift, diff_lines = check_drift(project_name)
     assert has_drift
     assert any("MISSING" in line for line in diff_lines)
 
 
-def test_check_drift_clean_after_sync(tmp_path):
-    _minimal_manifest(tmp_path)
-    sync_leads(tmp_path)
+def test_check_drift_clean_after_sync(tmp_path: Path, central_leads: Path):
+    project_name = _minimal_manifest(tmp_path, central_leads)
+    sync_leads(project_name)
 
-    has_drift, diff_lines = check_drift(tmp_path)
+    has_drift, diff_lines = check_drift(project_name)
     assert not has_drift, f"Unexpected drift after clean sync:\n{''.join(diff_lines)}"
 
 
-def test_themis_yaml_has_allow_regex_with_dir_prefix(tmp_path):
+def test_themis_yaml_has_allow_regex_with_dir_prefix(tmp_path: Path, central_leads: Path):
     """Themis YAML must use dir/ prefix for dir/** paths (not dir/**  literally)."""
-    _minimal_manifest(tmp_path)
-    sync_leads(tmp_path)
+    project_name = _minimal_manifest(tmp_path, central_leads)
+    sync_leads(project_name)
 
     themis_content = (tmp_path / "themis" / "rules" / "backend-lead.yaml").read_text()
     # The glob "packages/backend/**" must become "packages/backend/" in the regex
@@ -175,23 +195,23 @@ def test_themis_yaml_has_allow_regex_with_dir_prefix(tmp_path):
     assert "packages/backend/**" not in themis_content
 
 
-def test_role_doc_contains_paths_list(tmp_path):
+def test_role_doc_contains_paths_list(tmp_path: Path, central_leads: Path):
     """Role doc must list the manifest paths in ## Domain scope."""
-    _minimal_manifest(tmp_path)
-    sync_leads(tmp_path)
+    project_name = _minimal_manifest(tmp_path, central_leads)
+    sync_leads(project_name)
 
     role_content = (tmp_path / "roles" / "backend-lead.md").read_text()
     assert "packages/backend/**" in role_content
 
 
-def test_prefix_produces_prefixed_lead_name(tmp_path):
+def test_prefix_produces_prefixed_lead_name(tmp_path: Path, central_leads: Path):
     """With prefix='jp', domain='backend' → jp-backend-lead files."""
-    (tmp_path / ".khimaira").mkdir()
-    (tmp_path / ".khimaira" / "leads.toml").write_text(
-        """
+    (central_leads / "jeevy.toml").write_text(
+        f"""
 [project]
 name = "jeevy"
 prefix = "jp"
+root_path = "{tmp_path}"
 roles_dir = "roles"
 themis_dir = "themis/rules"
 knowledge_dir = "docs/domain"
@@ -204,7 +224,7 @@ paths = ["apps/jeevy/src/**"]
     (tmp_path / "themis" / "rules").mkdir(parents=True)
     (tmp_path / "docs" / "domain").mkdir(parents=True)
 
-    sync_leads(tmp_path)
+    sync_leads("jeevy")
 
     # Role doc filename must include jp- prefix
     assert (tmp_path / "roles" / "jp-backend-lead.md").exists()
@@ -220,10 +240,10 @@ paths = ["apps/jeevy/src/**"]
     assert "IN-JP-BACKEND-LEAD-2" in themis_content
 
 
-def test_no_prefix_produces_unprefixed_lead_name(tmp_path):
+def test_no_prefix_produces_unprefixed_lead_name(tmp_path: Path, central_leads: Path):
     """Without prefix, domain='backend' → backend-lead (khimaira convention)."""
-    _minimal_manifest(tmp_path)
-    sync_leads(tmp_path)
+    project_name = _minimal_manifest(tmp_path, central_leads)
+    sync_leads(project_name)
 
     assert (tmp_path / "roles" / "backend-lead.md").exists()
     assert (tmp_path / "themis" / "rules" / "backend-lead.yaml").exists()

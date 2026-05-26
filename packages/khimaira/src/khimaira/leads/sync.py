@@ -112,9 +112,10 @@ def _render_role_doc(
     """Render the role doc for one lead, preserving any manual blocks."""
     lead_name = _lead_name(domain, manifest.prefix)
     knowledge_doc_path = (
-        manifest.knowledge_dir / f"{domain}-knowledge.md"
-    ).as_posix()
-    role_doc_path = (manifest.roles_dir / f"{lead_name}.md").as_posix()
+        (manifest.knowledge_dir / f"{domain}-knowledge.md")
+        .relative_to(manifest.root_path)
+        .as_posix()
+    )
     themis_rule_id, themis_rule_id_2 = _themis_rule_ids(domain, manifest.prefix)
 
     paths_list = "\n".join(f"- `{p}`" for p in lead_cfg.paths)
@@ -129,6 +130,7 @@ def _render_role_doc(
             "lead_name": lead_name,
             "roster": manifest.project_name,
             "model": lead_cfg.model,
+            "Model": lead_cfg.model.capitalize(),
             "effort": lead_cfg.effort,
             "knowledge_doc_path": knowledge_doc_path,
             "paths_list": paths_list,
@@ -153,9 +155,15 @@ def _render_themis_yaml(
     """Render the Themis YAML for one lead."""
     lead_name = _lead_name(domain, manifest.prefix)
     knowledge_doc_path = (
-        manifest.knowledge_dir / f"{domain}-knowledge.md"
-    ).as_posix()
-    role_doc_path = (manifest.roles_dir / f"{lead_name}.md").as_posix()
+        (manifest.knowledge_dir / f"{domain}-knowledge.md")
+        .relative_to(manifest.root_path)
+        .as_posix()
+    )
+    role_doc_path = (
+        (manifest.roles_dir / f"{lead_name}.md")
+        .relative_to(manifest.root_path)
+        .as_posix()
+    )
     themis_rule_id, themis_rule_id_2 = _themis_rule_ids(domain, manifest.prefix)
 
     allow_regex = build_allow_regex(
@@ -225,13 +233,14 @@ def _seed_knowledge_doc(
 # ---------------------------------------------------------------------------
 
 
-def sync_leads(project_root: Path, *, dry_run: bool = False) -> list[str]:
+def sync_leads(project_name: str, *, dry_run: bool = False) -> list[str]:
     """Generate role docs + Themis YAML + knowledge seeds for all leads.
 
     Parameters
     ----------
-    project_root:
-        Root of the project containing ``.khimaira/leads.toml``.
+    project_name:
+        Name of the project whose central manifest to load.
+        Reads ``${XDG_DATA_HOME:-~/.local/share}/khimaira/leads/<project_name>.toml``.
     dry_run:
         If True, return the list of files that WOULD be written without
         actually writing anything (used by ``--check``).
@@ -241,7 +250,7 @@ def sync_leads(project_root: Path, *, dry_run: bool = False) -> list[str]:
     list[str]
         Summary lines describing what was generated.
     """
-    manifest = load_manifest(project_root)
+    manifest = load_manifest(project_name)
     summary: list[str] = []
 
     for domain, lead_cfg in manifest.leads.items():
@@ -276,15 +285,19 @@ def sync_leads(project_root: Path, *, dry_run: bool = False) -> list[str]:
     return summary
 
 
-def check_drift(project_root: Path) -> tuple[bool, list[str]]:
+def check_drift(project_name: str) -> tuple[bool, list[str]]:
     """Regenerate in-memory and diff against on-disk files.
 
     Returns
     -------
     (has_drift, diff_lines)
         ``has_drift`` is True if any generated file differs from on-disk.
+
+    Note: knowledge docs are seeded-only (never clobbered by sync), so they
+    are intentionally excluded from drift detection. Only role docs and Themis
+    YAML are checked.
     """
-    manifest = load_manifest(project_root)
+    manifest = load_manifest(project_name)
     has_drift = False
     diff_lines: list[str] = []
 

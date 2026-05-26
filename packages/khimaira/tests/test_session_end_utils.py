@@ -64,55 +64,140 @@ def test_detect_domain_case_insensitive():
 
 
 # ---------------------------------------------------------------------------
-# detect_project
+# detect_project — central manifest reverse-lookup
 # ---------------------------------------------------------------------------
 
 
-def test_detect_project_reads_leads_toml(tmp_path: Path):
-    """Finds leads.toml, parses project name."""
-    khimaira_dir = tmp_path / ".khimaira"
-    khimaira_dir.mkdir()
-    (khimaira_dir / "leads.toml").write_text(
-        '[project]\nname = "myproject"\n', encoding="utf-8"
+def _write_central_manifest(
+    leads_dir: Path, project_name: str, root_path: Path
+) -> None:
+    """Write a minimal central manifest for detect_project tests."""
+    content = (
+        f'[project]\nname = "{project_name}"\nroot_path = "{root_path}"\n'
+        f'[leads.backend]\npaths = ["packages/**"]\n'
     )
-    assert detect_project(str(tmp_path)) == "myproject"
+    (leads_dir / f"{project_name}.toml").write_text(content, encoding="utf-8")
 
 
-def test_detect_project_walks_upward(tmp_path: Path):
-    """Finds leads.toml in a parent directory."""
-    khimaira_dir = tmp_path / ".khimaira"
-    khimaira_dir.mkdir()
-    (khimaira_dir / "leads.toml").write_text(
-        'name = "parentproject"\n', encoding="utf-8"
-    )
-    sub = tmp_path / "sub" / "deep"
-    sub.mkdir(parents=True)
-    assert detect_project(str(sub)) == "parentproject"
+def test_detect_project_matches_root_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """cwd inside root_path → correct project name returned."""
+    leads_dir = tmp_path / "xdg" / "khimaira" / "leads"
+    leads_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    project_root = tmp_path / "myproject"
+    project_root.mkdir()
+    _write_central_manifest(leads_dir, "myproject", project_root)
+
+    cwd = project_root / "packages" / "some" / "deep"
+    cwd.mkdir(parents=True)
+    assert detect_project(str(cwd)) == "myproject"
 
 
-def test_detect_project_falls_back_to_cwd_basename(tmp_path: Path):
-    """No leads.toml found → returns cwd basename."""
-    result = detect_project(str(tmp_path))
-    assert result == tmp_path.name
+def test_detect_project_falls_back_to_cwd_basename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """No matching central manifest → returns cwd basename."""
+    leads_dir = tmp_path / "xdg" / "khimaira" / "leads"
+    leads_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    cwd = tmp_path / "some-project"
+    cwd.mkdir()
+    result = detect_project(str(cwd))
+    assert result == "some-project"
 
 
-def test_detect_project_quoted_name(tmp_path: Path):
-    """Single-quoted name value is parsed correctly."""
-    khimaira_dir = tmp_path / ".khimaira"
-    khimaira_dir.mkdir()
-    (khimaira_dir / "leads.toml").write_text(
-        "name = 'quoted-project'\n", encoding="utf-8"
-    )
-    assert detect_project(str(tmp_path)) == "quoted-project"
+def test_detect_project_longest_prefix_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Nested projects: manifest with longest (deepest) root_path wins."""
+    leads_dir = tmp_path / "xdg" / "khimaira" / "leads"
+    leads_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    parent_root = tmp_path / "parent"
+    child_root = tmp_path / "parent" / "child"
+    parent_root.mkdir()
+    child_root.mkdir()
+
+    _write_central_manifest(leads_dir, "parent", parent_root)
+    _write_central_manifest(leads_dir, "child", child_root)
+
+    cwd = child_root / "src"
+    cwd.mkdir()
+    assert detect_project(str(cwd)) == "child"
 
 
-def test_detect_project_ignores_unrelated_name_lines(tmp_path: Path):
-    """Only the first `name = ...` line under any section is used."""
-    khimaira_dir = tmp_path / ".khimaira"
-    khimaira_dir.mkdir()
-    toml = '[project]\nname = "rightproject"\n[other]\nname = "wrongproject"\n'
-    (khimaira_dir / "leads.toml").write_text(toml, encoding="utf-8")
-    assert detect_project(str(tmp_path)) == "rightproject"
+def test_detect_project_no_false_sibling_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Sibling dirs with shared prefix must NOT match (is_relative_to semantics)."""
+    leads_dir = tmp_path / "xdg" / "khimaira" / "leads"
+    leads_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    khimaira_root = tmp_path / "khimaira"
+    khimaira_root.mkdir()
+    _write_central_manifest(leads_dir, "khimaira", khimaira_root)
+
+    # sibling with a shared prefix — must NOT match as "khimaira"
+    sibling = tmp_path / "khimaira-foo"
+    sibling.mkdir()
+    result = detect_project(str(sibling))
+    assert result != "khimaira"
+    assert result == "khimaira-foo"
+
+
+def test_detect_project_falls_back_when_no_leads_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Absent central leads dir → cwd basename fallback."""
+    empty_xdg = tmp_path / "empty_xdg"
+    empty_xdg.mkdir()
+    monkeypatch.setenv("XDG_DATA_HOME", str(empty_xdg))
+
+    cwd = tmp_path / "myrepo"
+    cwd.mkdir()
+    assert detect_project(str(cwd)) == "myrepo"
+
+
+def test_detect_project_qualified_key_khimaira(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """khimaira cwd → 'khimaira' (load-bearing: qualifies mnemosyne key as khimaira:backend)."""
+    leads_dir = tmp_path / "xdg" / "khimaira" / "leads"
+    leads_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    khimaira_root = tmp_path / "khimaira"
+    khimaira_root.mkdir()
+    _write_central_manifest(leads_dir, "khimaira", khimaira_root)
+
+    cwd = khimaira_root / "packages" / "khimaira" / "src"
+    cwd.mkdir(parents=True)
+    assert detect_project(str(cwd)) == "khimaira"
+
+
+def test_detect_project_qualified_key_jeevy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """jeevy_portal cwd → 'jeevy' (load-bearing: qualifies mnemosyne key as jeevy:backend)."""
+    leads_dir = tmp_path / "xdg" / "khimaira" / "leads"
+    leads_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    # jeevy uses jeevy_portal as directory name but project name "jeevy"
+    jeevy_root = tmp_path / "jeevy_portal"
+    jeevy_root.mkdir()
+    _write_central_manifest(leads_dir, "jeevy", jeevy_root)
+
+    cwd = jeevy_root / "apps" / "jeevy" / "src"
+    cwd.mkdir(parents=True)
+    # detect_project must return "jeevy" (from manifest name), NOT "jeevy_portal" (basename)
+    assert detect_project(str(cwd)) == "jeevy"
 
 
 # ---------------------------------------------------------------------------

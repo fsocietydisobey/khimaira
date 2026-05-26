@@ -21,34 +21,74 @@ _DOMAINS = ("backend", "frontend", "data", "devops")
 _PROJECTS_ROOT = (
     Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
 )
-_LEADS_TOML = ".khimaira/leads.toml"
+
+
+def _central_leads_dir() -> Path:
+    """Stdlib-only resolution of the central leads directory.
+
+    Follows XDG Base Directory Specification:
+    ${XDG_DATA_HOME:-~/.local/share}/khimaira/leads/
+    No imports from khimaira.leads — keeps this hook stdlib-only.
+    """
+    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(xdg) / "khimaira" / "leads"
 
 
 def detect_project(cwd: str) -> str:
-    """Walk upward from cwd to find .khimaira/leads.toml; return [project] name.
+    """Reverse-lookup cwd against central manifests; return the matching project name.
 
-    Fallback: basename of cwd if no leads.toml found or [project] name unset.
-    Stdlib only — uses basic string parsing instead of tomllib so it works on
-    Python <3.11 environments.
+    Scans ~/.local/share/khimaira/leads/*.toml for a manifest whose root_path
+    is an ancestor of cwd. Uses Path.is_relative_to() (Python 3.9+) for
+    path-component-boundary matching — prevents false matches on sibling dirs
+    with shared prefixes (e.g. /dev/khimaira vs /dev/khimaira-foo).
+
+    Longest-match wins: if multiple manifests match (nested projects), the one
+    with the deepest root_path (most path components) is chosen.
+
+    Fallback: basename of cwd if no manifest matches or on any error.
+    Stdlib only — no imports from khimaira.leads.
     """
+    best_name: str | None = None
+    best_depth = -1
+
     try:
-        path = Path(cwd).resolve()
-        for candidate in [path, *path.parents]:
-            toml_path = candidate / _LEADS_TOML
-            if toml_path.is_file():
-                try:
-                    text = toml_path.read_text(encoding="utf-8")
-                    for line in text.splitlines():
-                        line = line.strip()
-                        if line.startswith("name") and "=" in line:
-                            value = line.split("=", 1)[1].strip().strip('"').strip("'")
-                            if value:
-                                return value
-                except OSError:
-                    pass
-                break  # found the toml but couldn't parse — fall through to basename
+        cwd_resolved = Path(cwd).resolve()
+        leads_dir = _central_leads_dir()
+
+        if not leads_dir.is_dir():
+            raise FileNotFoundError("central leads dir absent")
+
+        for toml_file in sorted(leads_dir.glob("*.toml")):
+            try:
+                text = toml_file.read_text(encoding="utf-8")
+                name: str | None = None
+                root_path_str: str | None = None
+                for line in text.splitlines():
+                    stripped = line.strip()
+                    if name is None and stripped.startswith("name") and "=" in stripped:
+                        name = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                    if root_path_str is None and stripped.startswith("root_path") and "=" in stripped:
+                        root_path_str = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                    if name and root_path_str:
+                        break
+
+                if not name or not root_path_str:
+                    continue
+
+                root_resolved = Path(root_path_str).resolve()
+                if cwd_resolved.is_relative_to(root_resolved):
+                    depth = len(root_resolved.parts)
+                    if depth > best_depth:
+                        best_depth = depth
+                        best_name = name
+            except Exception:
+                continue
     except Exception:
         pass
+
+    if best_name:
+        return best_name
+
     # Fallback: cwd basename
     try:
         return Path(cwd).resolve().name or "unknown"
