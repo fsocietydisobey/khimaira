@@ -1,0 +1,33 @@
+# Themis rules — {{ lead_name }} role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+role: {{ lead_name }}
+invariants:
+  - id: {{ themis_rule_id }}
+    name: NO_FILE_EDIT_OUTSIDE_{{ DOMAIN }}
+    severity: block
+    matchers:
+      - tool: Edit
+        tool_input_field:
+          field: file_path
+          pattern: "{{ allow_regex }}"
+      - tool: Write
+        tool_input_field:
+          field: file_path
+          pattern: "{{ allow_regex }}"
+    message: |
+      🛑 Themis {{ themis_rule_id }} (NO_FILE_EDIT_OUTSIDE_{{ DOMAIN }}): {{ lead_name }}
+      attempted to edit a file outside the {{ domain }} domain. Edits restricted to
+      the paths listed in the {{ lead_name }} role doc's Domain scope section.
+      Cross-domain work: flag to master, who defines the contract. Direct
+      cross-domain edits violate the domain-lead boundary.
+
+  - id: {{ themis_rule_id_2 }}
+    name: NO_STANDALONE_AGENTS
+    severity: block
+    matchers:
+      - tool: Task
+    message: |
+      🛑 Themis {{ themis_rule_id_2 }} (NO_STANDALONE_AGENTS): {{ lead_name }} spawned
+      a standalone Task agent. Use chat_task_create + chat_send_to for fan-out
+      to roster transient agents. Standalone Task agents bypass the enforcement
+      gate + observer lifecycle.
