@@ -403,3 +403,21 @@ def test_intake_md_contains_proactive_specialist_routing():
     assert "5 min" in content or "5min" in content or "five min" in lowered, (
         "intake.md missing >5min research boundary"
     )
+
+
+def test_architect_md_contains_session_set_name_bootstrap():
+    """Regression guard: architect.md must instruct session_set_name on bootstrap.
+
+    session_set_name is load-bearing for Pattern 5 liveness probe: the 180s
+    architect threshold is looked up via session name. Without this call, the
+    probe caches the 90s default at registration time and fires prematurely.
+
+    Per Cat 2 audit ctx-pattern5-architect-threshold-misfire.
+    """
+    content = (ROLE_DIR / "architect.md").read_text()
+    assert "session_set_name" in content, (
+        "architect.md missing session_set_name bootstrap instruction"
+    )
+    assert "architect-" in content.lower(), (
+        "architect.md missing 'architect-N' name convention example"
+    )

@@ -22,6 +22,18 @@ You are idle between consults — you don't burn tokens waiting. The cost is
 concentrated: one opus/max turn per architectural question, then idle again.
 This is the correct cost shape for a design sidecar.
 
+## ⚡ Session bootstrap — do this first, every session
+
+1. **Register for real-time chat:** call `chat_my_chats(session_id="<your-session-id>")` once.
+   Without this, `chat_send` messages from master don't arrive until your next prompted turn —
+   you'll miss the consult trigger.
+
+2. **Name your session:** call `session_set_name(session_id, "architect-N")` where N is your
+   roster slot (e.g. `architect-1`, `architect-2`). This is load-bearing: the Pattern 5
+   liveness probe uses the session name to look up the 180s architect threshold. If the name
+   isn't set before the first consult message arrives, the probe defaults to 90s and fires
+   prematurely on every consult.
+
 ## Authority
 
 **Decides:**

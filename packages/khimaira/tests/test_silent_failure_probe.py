@@ -199,3 +199,88 @@ async def test_sweep_drops_expired_supersede_entries(monkeypatch):
 
     assert ("old-sid", "from-sid") not in api_chats._RECENTLY_PRESUMED_DEAD
     assert ("recent-sid", "from-sid") in api_chats._RECENTLY_PRESUMED_DEAD
+
+
+# ---------------------------------------------------------------------------
+# Class-invariant: _threshold_for_session role lookup
+# Per Cat 2 audit ctx-pattern5-architect-threshold-misfire.
+# ---------------------------------------------------------------------------
+
+
+def test_threshold_for_session_returns_role_specific_for_architect(monkeypatch):
+    """After member_roles backfill, _threshold_for_session returns 180s for
+    architect — not 90s default — regardless of whether session name is set.
+
+    Canonical path (member_roles) checked BEFORE name-inference fallback.
+    Guards the race that caused Pattern 5 to fire at T+92-116s: threshold
+    cached at probe-registration before session name was set, locking in 90s.
+    """
+    import khimaira.monitor.chats as chats_mod
+
+    monkeypatch.setattr(
+        chats_mod,
+        "load_room",
+        lambda chat_id: {
+            "meta": {
+                "member_roles": {"arch-uuid": "architect"},
+                "created_by": "master-uuid",
+            },
+            "members": {},
+            "messages": [],
+        },
+    )
+
+    result = api_chats._threshold_for_session("arch-uuid", "chat-any")
+    assert result == 180.0, f"expected 180.0, got {result}"
+
+
+def test_threshold_for_session_fallback_via_session_name(monkeypatch):
+    """When member_roles absent, name-fallback returns role-specific threshold
+    if session status.name contains the role segment.
+
+    Covers v1-era chats before backfill: threshold correct only when name set
+    before probe registration.
+    """
+    import khimaira.monitor.chats as chats_mod
+    import khimaira.monitor.sessions as sessions_mod
+
+    monkeypatch.setattr(
+        chats_mod,
+        "load_room",
+        lambda chat_id: {"meta": {}, "members": {}, "messages": []},
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "state",
+        lambda sid: {"status": {"name": "architect-1"}, "name": None},
+    )
+
+    result = api_chats._threshold_for_session("arch-uuid", "chat-any")
+    assert result == 180.0, f"expected 180.0 via name-fallback, got {result}"
+
+
+def test_threshold_for_session_defaults_when_no_role_and_no_name(monkeypatch):
+    """When member_roles absent AND session name unset, threshold falls back
+    to 90s default — the broken state this fix closes.
+
+    Documents the failure mode: if session_set_name not called before first
+    probe registration, probe fires at T+90s instead of T+180s.
+    """
+    import khimaira.monitor.chats as chats_mod
+    import khimaira.monitor.sessions as sessions_mod
+
+    monkeypatch.setattr(
+        chats_mod,
+        "load_room",
+        lambda chat_id: {"meta": {}, "members": {}, "messages": []},
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "state",
+        lambda sid: {"status": None, "name": None},
+    )
+
+    result = api_chats._threshold_for_session("arch-uuid", "chat-any")
+    assert result == api_chats._REPLY_OVERDUE_DEFAULT_S, (
+        f"expected {api_chats._REPLY_OVERDUE_DEFAULT_S} (default), got {result}"
+    )
