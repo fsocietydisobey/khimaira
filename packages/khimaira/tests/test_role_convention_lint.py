@@ -370,3 +370,36 @@ def test_status_snapshot_template_documented():
         f"master.md must enumerate at least 2 canonical states "
         f"(IDLE/BLOCKED/CONSULTING/CROSS-SESSION); found {states_present}"
     )
+
+
+def test_intake_md_contains_begin_gate_scope():
+    """Regression guard: intake.md must distinguish in-chat fan-out from
+    cross-session handoff per agent-3 BEGIN-gate confusion incident
+    (msg-d4b089b0e2fc).
+    """
+    content = (ROLE_DIR / "intake.md").read_text()
+    lowered = content.lower()
+    assert "begin-gate scope" in lowered or "begin gate scope" in lowered, (
+        "intake.md missing 'BEGIN-gate scope' section"
+    )
+    assert "in-chat fan-out" in lowered, "intake.md missing 'in-chat fan-out' distinction"
+    assert "cross-session handoff" in lowered, "intake.md missing 'cross-session handoff' distinction"
+    assert "master mediation" in lowered, "intake.md missing 'master mediation' requirement phrase"
+
+
+def test_intake_md_contains_proactive_specialist_routing():
+    """Regression guard: intake.md must describe proactive specialist dispatch
+    on research-blocker phrases (jp-intake-1 relay msg-2ba0730b3db9).
+    """
+    content = (ROLE_DIR / "intake.md").read_text()
+    lowered = content.lower()
+    assert "proactive specialist routing" in lowered, (
+        "intake.md missing 'Proactive specialist routing' section"
+    )
+    for phrase in ("reading", "investigating", "research"):
+        assert phrase in lowered, f"intake.md missing trigger phrase '{phrase}'"
+    for role in ("architect-1", "analyst-1", "verifier-1", "critic-1"):
+        assert role in content, f"intake.md missing specialist '{role}'"
+    assert "5 min" in content or "5min" in content or "five min" in lowered, (
+        "intake.md missing >5min research boundary"
+    )

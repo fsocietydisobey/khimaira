@@ -248,6 +248,32 @@ broadcast a CONTEXT UPDATE itself before delegating — same format, same
 intake-id generation. This ensures agents always have shared context
 regardless of whether intake was in the loop.
 
+### BEGIN-gate scope — in-chat fan-out vs cross-session handoff (2026-05-26)
+
+Two coordination primitives can both look like "intake fired work to an agent" but have **distinct authority chains**. Conflating them produces BEGIN-gate violations (agents jumping the gate citing wrong primitive).
+
+**Cross-session handoff** (`session_post_handoff`):
+- DIRECTIVE — receiving session is expected to start on its NEXT bootstrap
+- No BEGIN gate needed — the directive IS the authorization
+- Used for project-scoped handoffs to future sessions (e.g. "next intake-1 session, work on X")
+- Pattern: `session_post_handoff(scope_project=..., text="...")`
+
+**In-chat fan-out** (intake posts HANDOFF in chat → master dispatches):
+- REQUIRES master mediation — intake's HANDOFF message doesn't authorize work directly
+- Master converts HANDOFF to `chat_task_create` calls
+- Agent acks `✅ ready [task-id]` + waits for BEGIN signal
+- Master fires `🟢 ALL AGENTS CONFIRMED — BEGIN` once all assigned agents ack
+- BEGIN gate IS the synchronization primitive for multi-agent dispatch
+
+**Agents must distinguish:** if you received your assignment via:
+- `<channel kind="task" sender="khimaira-0">` (master-issued chat_task_create) → in-chat fan-out → WAIT for BEGIN signal
+- SessionStart `📦 khimaira handoffs` block → cross-session handoff → start immediately (handoff IS authorization)
+- Direct chat message from intake-1 with HANDOFF content → in-chat fan-out → wait for master's chat_task_create + BEGIN gate
+
+**Today's incident (msg-d4b089b0e2fc):** agent-3 started on item 3 (ML deps install) after intake's HANDOFF without waiting for master's chat_task_create + BEGIN. Cited "no BEGIN needed for intake fan-out direct assignment" — that conflates the two primitives. Correct behavior: agent ack the HANDOFF, wait for master's task_create, then wait for BEGIN.
+
+**Why this gate exists:** master mediates budget coordination + verifies independence across the fan-out batch BEFORE work starts. Without master mediation, agents can start work with mismatched contexts or compete for the same scope.
+
 ### Master's acknowledgement
 
 Master replies:
@@ -361,6 +387,37 @@ section exists.
 - Skip the CONTEXT UPDATE step, even for simple requests — brief context
   is still context; agents shouldn't have to reconstruct intent from the
   task body alone
+
+## Proactive specialist routing on research blockers (2026-05-26)
+
+When an implementing agent surfaces a research blocker — "I need to read X to find Y", "checking Z against docs", "investigating before I implement" — intake should PROACTIVELY dispatch the relevant specialist(s) to parallelize research, NOT wait for Joseph to suggest it.
+
+**Trigger phrases (in agent messages):**
+- "reading [file/spec]" / "let me read X first"
+- "investigating [unknown]" / "investigating why Y"
+- "checking against docs" / "verifying with documentation"
+- "need to research [topic]" / "before I implement, need to understand"
+- "let me look at [system]" / "looking up [API/contract]"
+
+**Proactive dispatch action (when trigger fires):**
+
+If implementer's research would take >5 min (your judgment), fire parallel specialist consult IN ADDITION to the agent's ongoing work:
+
+- **Architectural / design question** → consult `architect-1`
+- **Scope / spec disambiguation** → consult `analyst-1`
+- **Correctness / risk assessment** → consult `critic-1`
+- **Coverage / detection mechanism** → consult `verifier-1`
+
+Pattern: `chat_send_to(specialist_id, body="📐 RESEARCH PARALLEL — [implementer agent-N] is investigating [topic]. While they read, you research [specific specialist-shaped question]. Race condition acceptable; whoever has the answer first surfaces it.")`
+
+**Boundary — when NOT to dispatch:**
+- Implementer's research is trivially short (<5 min): they'll have the answer faster than the round-trip
+- Question is purely a syntax / API lookup the specialist can't accelerate
+- Specialist budget is already over-committed (track architect's queue depth)
+
+**Cross-reference:** master.md `### Pre-AskUserQuestion routing — decision table` defines analogous routing logic for user-vs-specialist routing. Same shape: route by question signature, not by default-to-{user|implementer-research}.
+
+**Today's incident (msg-2ba0730b3db9):** jp-intake-1 relayed Joseph's correction from JEEVY-543: implementer was reading source for 15+ min while architect/verifier sat idle. Joseph's framing: "when user says 'use all agents/sessions', intake should be dispatching specialists in parallel to research, not making the implementer do solo deep-reads." This convention codifies the proactive trigger.
 
 ## Channel selection — which primitive to use
 
