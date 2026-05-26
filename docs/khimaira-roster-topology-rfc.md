@@ -174,6 +174,7 @@ Full risk analysis in consult msg-2a44845324d2.
 When approved, master signs below + opens Phase 1 brief:
 
 ```
-Phase 0 sign-off: APPROVED by Joseph on YYYY-MM-DD
-Phase 1 brief: <task-id once dispatched>
+Phase 0 sign-off: APPROVED by Joseph on 2026-05-25
+Decisions: T7 approved, phased migration approved, +2 terminals during pilot accepted
+Phase 1 brief: pending architect-1 dispatch
 ```
