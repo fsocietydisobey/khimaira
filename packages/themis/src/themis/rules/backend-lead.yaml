@@ -1,0 +1,38 @@
+# Themis rules — backend-lead role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+role: backend-lead
+invariants:
+  - id: IN-BACKEND-LEAD-1
+    name: NO_FILE_EDIT_OUTSIDE_BACKEND
+    severity: block
+    matchers:
+      - tool: Edit
+        tool_input_field:
+          field: file_path
+          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/(?:monitor|hooks|mcp_calls|attach)/|packages/khimaira/src/khimaira/roles/backend-lead\\.md|packages/themis/src/themis/|packages/khimaira/tests/|packages/specter/src/specter/server\\.py|docs/domain/backend-knowledge\\.md)).+"
+      - tool: Write
+        tool_input_field:
+          field: file_path
+          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/(?:monitor|hooks|mcp_calls|attach)/|packages/khimaira/src/khimaira/roles/backend-lead\\.md|packages/themis/src/themis/|packages/khimaira/tests/|packages/specter/src/specter/server\\.py|docs/domain/backend-knowledge\\.md)).+"
+    message: |
+      🛑 Themis IN-BACKEND-LEAD-1 (NO_FILE_EDIT_OUTSIDE_BACKEND): backend-lead
+      attempted to edit a file outside the backend domain. Edits restricted to:
+        packages/khimaira/src/khimaira/{monitor,hooks,mcp_calls,attach}/
+        packages/khimaira/src/khimaira/roles/backend-lead.md
+        packages/themis/src/themis/
+        packages/khimaira/tests/
+        packages/specter/src/specter/server.py
+        docs/domain/backend-knowledge.md
+      Cross-domain work: flag to master, who defines the contract. Direct
+      cross-domain edits violate the domain-lead boundary.
+
+  - id: IN-BACKEND-LEAD-2
+    name: NO_STANDALONE_AGENTS
+    severity: block
+    matchers:
+      - tool: Task
+    message: |
+      🛑 Themis IN-BACKEND-LEAD-2 (NO_STANDALONE_AGENTS): backend-lead spawned
+      a standalone Task agent. Use chat_task_create + chat_send_to for fan-out
+      to roster transient agents. Standalone Task agents bypass the enforcement
+      gate + observer lifecycle.

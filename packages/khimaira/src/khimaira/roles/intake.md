@@ -193,6 +193,24 @@ inline; master would dispatch the full batch atomically rather than receiving
 the mapping + serializing the calls. Don't change intake's convention to depend
 on this primitive yet — convention works without it.
 
+**Domain signal (Phase 1 — 2026-05-26).** When the CONTEXT UPDATE's
+relevant-files OR intent clearly maps to a single domain that has a lead in
+the current roster (backend, data — see topology RFC), add a `domain-signal:`
+field to the CONTEXT UPDATE:
+
+- `domain-signal: backend` — work is purely in monitor/hooks/mcp_calls/attach
+- `domain-signal: data` — work is purely in DB schemas / JSONL / data pipelines
+- `domain-signal: cross-cutting` — work spans both
+- (omit field for general work / single-task arcs that don't fit cleanly)
+
+Master uses this signal in Step 1 — Decompose to route to the appropriate
+lead (see master.md Domain lead delegation section). Don't speculate when the
+work is genuinely cross-cutting — `cross-cutting` is the right value, master
+will define the per-domain contracts.
+
+Cross-reference: `docs/khimaira-roster-topology-rfc.md` for the topology
+spec; `backend-lead.md` / `data-lead.md` for the lead roles.
+
 ### Step 2: Send the private INTAKE HANDOFF to master
 
 Use `chat_send_to(chat_id, to=[master_session_id], body=<spec>, private=True)`.

@@ -267,3 +267,55 @@ def test_knowledge_doc_has_required_sections():
                 f"{doc_path.name} missing required section '{section}'. "
                 f"Compare against docs/domain/_template-knowledge.md."
             )
+
+
+def test_backend_lead_md_exists():
+    """Phase 1 regression guard: backend-lead role file must exist."""
+    assert (ROLE_DIR / "backend-lead.md").exists(), (
+        "backend-lead.md missing — Phase 1 of topology RFC creates this. "
+        "See docs/khimaira-roster-topology-rfc.md."
+    )
+
+
+def test_data_lead_md_exists():
+    """Phase 1 regression guard: data-lead role file must exist."""
+    assert (ROLE_DIR / "data-lead.md").exists(), (
+        "data-lead.md missing — Phase 1 of topology RFC creates this."
+    )
+
+
+def test_master_md_contains_lead_handshake():
+    """Phase 1 regression guard: master.md must contain lead handshake protocol."""
+    content = (ROLE_DIR / "master.md").read_text()
+    lowered = content.lower()
+    assert "domain lead delegation" in lowered, "master.md missing 'Domain lead delegation' section"
+    assert "BACKEND INTENT" in content, "master.md missing BACKEND INTENT handshake marker"
+    assert "BACKEND PLAN" in content, "master.md missing BACKEND PLAN return marker"
+    assert "cross-cutting" in lowered, "master.md missing cross-cutting handshake guidance"
+
+
+def test_intake_md_contains_domain_signal():
+    """Phase 1 regression guard: intake.md must describe domain-signal CONTEXT UPDATE field."""
+    content = (ROLE_DIR / "intake.md").read_text()
+    lowered = content.lower()
+    assert "domain signal" in lowered, "intake.md missing 'Domain signal' subsection"
+    assert "domain-signal:" in content, "intake.md missing 'domain-signal:' field marker"
+    assert "cross-cutting" in lowered, "intake.md missing cross-cutting domain-signal value"
+
+
+def test_in_backend_lead_themis_rules_present():
+    """Phase 1 regression guard: IN-BACKEND-LEAD-1/2 must be defined."""
+    content = (THEMIS_RULES / "backend-lead.yaml").read_text()
+    assert "IN-BACKEND-LEAD-1" in content
+    assert "NO_FILE_EDIT_OUTSIDE_BACKEND" in content
+    assert "IN-BACKEND-LEAD-2" in content
+    assert "NO_STANDALONE_AGENTS" in content
+
+
+def test_in_data_lead_themis_rules_present():
+    """Phase 1 regression guard: IN-DATA-LEAD-1/2 must be defined."""
+    content = (THEMIS_RULES / "data-lead.yaml").read_text()
+    assert "IN-DATA-LEAD-1" in content
+    assert "NO_FILE_EDIT_OUTSIDE_DATA" in content
+    assert "IN-DATA-LEAD-2" in content
+    assert "NO_STANDALONE_AGENTS" in content

@@ -130,6 +130,67 @@ They're orthogonal — fire both if both apply.
 
 **Pre-dispatch independence checkpoint.** Before any `chat_task_create`, scan: is there ANOTHER task you could fire NOW that doesn't depend on this task's outcome? If yes, batch them in a single message (parallel tool uses) instead of sequencing. Default to parallel-dispatch when independent; sequence only when there's a true causal dependency (task B reads task A's output). Architect-consult replies surface a `## PARALLEL-CAPABLE while you wait` section when applicable — read that section and fire those tasks before waiting on architect's downstream brief. The 30s-window IN-MASTER-5 rule catches isolated serial dispatches; the 60s-window IN-MASTER-6 rule (shipped 2026-05-25) catches sequential pairs that could have been batched in one message.
 
+**Domain lead delegation (Phase 1 — 2026-05-26).** If the CONTEXT UPDATE's
+intent maps to a single domain that has a lead in the roster (backend, data
+in khimaira-dev per the topology RFC), DO NOT decompose the work yourself —
+delegate decomposition to the lead.
+
+**Handshake protocol:**
+
+1. **Identify the lead** by domain. Read CONTEXT UPDATE intent + relevant-files;
+   if work is purely in `monitor/`, `hooks/`, `mcp_calls/`, `attach/`, or non-data
+   parts of other packages → `backend-lead`. If purely DB / JSONL persistence /
+   schema → `data-lead`. If both → cross-cutting (see step 5).
+
+2. **Send intent to lead** via `chat_send_to(lead_session_id)`:
+   ```
+   🎯 BACKEND INTENT [ctx-id: ctx-<8hex>]
+   Goal: <one-line distilled goal>
+   Scope: see CONTEXT UPDATE v1 — ctx-<same>
+   Constraints: <budget, timing, anti-touch list>
+   ```
+
+3. **Wait for lead's decomposed plan.** Lead returns:
+   ```
+   🎯 BACKEND PLAN [ctx-id: ctx-<8hex>]
+   Decomposition:
+   - <work unit 1> — <self / fan-out>
+   - <work unit 2> — <self / fan-out>
+   Cross-domain dependencies: <none / lists>
+   Estimated complexity: <S/M/L>
+   ```
+
+4. **Approve or refine.** Small plans (1-2 work units): approve and let lead
+   execute. Large plans (≥3 work units or unclear acceptance criteria): refine
+   via chat_send_to ack before execution. NEVER decompose internally — that's
+   the lead's job; refining means challenging the plan shape, not rewriting it.
+
+5. **Cross-cutting work (multi-domain):** when intent spans backend + data:
+   - You define the CONTRACT between domains (e.g. "backend exposes
+     `POST /widgets`; data layer provides `widgets` table with PK `widget_id`")
+   - Send per-domain intent to EACH lead with explicit contract reference
+   - Leads decompose + execute WITHIN their slice
+   - You integrate at the contract boundary (Step 6 / Step 7)
+   - Leads do NOT peer-coordinate — handshake via contract is the only
+     allowed cross-domain pattern
+
+6. **Lead reports done** via standard task_update protocol. Lead's done-report
+   honors IN-AGENT-4 (branch / worktree / merge_intent declarations). You
+   approve and proceed to Step 6 (Integrate) + Step 7 (Reconcile).
+
+**When NO lead exists for the domain** (e.g. devops-lead deferred to Phase 1B):
+fall back to original master-decomposes-then-dispatches-agents pattern. The
+domain-lead delegation is opt-in based on roster.
+
+**When lead is unavailable** (session ended, session unreachable per
+target_reachable=false): fall back to original pattern + log a project
+decision noting the lead session needs restart. Don't block the user on
+lead unavailability.
+
+Cross-reference: see `docs/khimaira-roster-topology-rfc.md` for the topology
+context, `docs/domain/README.md` for the three-axis substrate distinction,
+and `backend-lead.md` / `data-lead.md` for the lead role specs.
+
 ### Step 2 — Assign with budgets
 
 Use `/khimaira-assign <agent> <task> --model <m> --effort <e>`.

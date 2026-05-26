@@ -122,17 +122,17 @@ class TestMyRules:
 
 
 class TestListRules:
-    def test_no_role_returns_all_9(self):
-        """Omitting role returns data for all 9 known roles."""
+    def test_no_role_returns_all_known_roles(self):
+        """Omitting role returns data for all known roles."""
+        from themis.data import VALID_ROLES
         from themis.server import list_rules
 
         result = list_rules()
 
         assert isinstance(result, list)
-        assert len(result) == 9
+        assert len(result) == len(VALID_ROLES)
         returned_roles = {entry["role"] for entry in result}
-        expected = {"intake", "master", "agent", "observer", "architect", "analyst", "verifier", "critic", "tracker"}
-        assert returned_roles == expected
+        assert returned_roles == VALID_ROLES
 
     def test_specific_role_returns_one_entry(self):
         """Passing role='intake' returns exactly one entry."""
