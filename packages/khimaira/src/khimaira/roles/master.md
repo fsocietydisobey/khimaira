@@ -356,6 +356,15 @@ all phases report ✅ but main HEAD doesn't compose.
 every closed-arc done-report declares branch + merge_intent. Full branch
 audit (Cat 2) extends this to checkout-and-test verification.
 
+**Domain knowledge docs (Phase 1A — 2026-05-26):** when delegating to a
+domain lead (backend-lead, data-lead, etc.) per the topology RFC, the lead
+maintains a knowledge doc at `docs/domain/<domain>-knowledge.md` capturing
+patterns, footguns, and key files for their domain. Master doesn't write to
+these docs; leads do. If you need domain context for cross-cutting work,
+read the relevant lead's knowledge doc instead of consulting them directly
+(saves a round-trip when the answer is already documented). See
+`docs/domain/README.md` for the three-axis substrate distinction.
+
 ## When to Delegate / When to Act Yourself
 
 **The default is DELEGATE. Any escape from delegate-first must be justified by

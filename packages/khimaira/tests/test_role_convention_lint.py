@@ -217,3 +217,53 @@ def test_no_stranded_arc_branches():
         "master.md Step 7, agent.md merge_intent field, IN-AGENT-4 rule "
         "is missing. Full convention required for class closure."
     )
+
+
+DOMAIN_DOCS_DIR = REPO_ROOT / "docs" / "domain"
+
+
+def test_each_lead_role_has_knowledge_doc():
+    """Phase 1A regression guard: every declared domain-lead role must have a
+    corresponding knowledge doc at docs/domain/<domain>-knowledge.md.
+
+    Per architect-1 enumeration msg-883b3e43c9d1. Catches "role exists but
+    knowledge doc never created" — the primary failure mode of Phase 1A.
+
+    Note: this test passes vacuously until lead role files exist (Phase 1 of
+    the topology RFC). Once `backend-lead.md` / `data-lead.md` etc. land, the
+    test enforces doc-existence per lead.
+    """
+    leads = list(ROLE_DIR.glob("*-lead.md"))
+    for role_path in leads:
+        domain = role_path.stem.replace("-lead", "")
+        doc_path = DOMAIN_DOCS_DIR / f"{domain}-knowledge.md"
+        assert doc_path.exists(), (
+            f"Lead role {role_path.name} has no knowledge doc at {doc_path}. "
+            f"See docs/domain/_template-knowledge.md + docs/domain/README.md. "
+            f"Per docs/khimaira-roster-topology-rfc.md Phase 1A spec."
+        )
+
+
+def test_knowledge_doc_has_required_sections():
+    """Each non-template knowledge doc must contain required section headers.
+
+    Validates STRUCTURE (sections exist), NOT CORRECTNESS (entries are accurate).
+    Correctness is a human-discipline + Phase 2 reconciliation concern.
+    """
+    required_sections = [
+        "## Patterns",
+        "## Footguns",
+        "## Key files",
+        "## Open questions",
+        "## Recent significant changes",
+    ]
+    for doc_path in DOMAIN_DOCS_DIR.glob("*-knowledge.md"):
+        # Skip the template — it's a scaffold, not a real knowledge doc
+        if doc_path.name == "_template-knowledge.md":
+            continue
+        content = doc_path.read_text()
+        for section in required_sections:
+            assert section in content, (
+                f"{doc_path.name} missing required section '{section}'. "
+                f"Compare against docs/domain/_template-knowledge.md."
+            )

@@ -214,6 +214,14 @@ The handoff is deliberately brief — master reads the broadcast for full
 context. Task assignments from master to agents carry `ctx-id: ctx-<8hex>`
 as a required field so agents can look up the right CONTEXT UPDATE.
 
+**Domain knowledge docs (Phase 1A — 2026-05-26):** when the topology RFC's
+domain leads ship (Phase 1+), each maintains a knowledge doc at
+`docs/domain/<domain>-knowledge.md`. Intake doesn't write to these — they're
+the lead's role memory. If you need to confirm a CONTEXT UPDATE detail
+against domain knowledge before sending the HANDOFF, you may read the
+relevant lead's doc. See `docs/domain/README.md` for the three-axis
+substrate distinction (project / session / role).
+
 ### Bypass path — when master receives a request directly
 
 If master receives a user request WITHOUT a preceding CONTEXT UPDATE in chat
