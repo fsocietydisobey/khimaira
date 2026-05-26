@@ -12,8 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from khimaira.hooks.session_end_utils import detect_domain, extract_transcript
-
+from khimaira.hooks.session_end_utils import (
+    detect_domain,
+    detect_project,
+    extract_transcript,
+)
 
 # ---------------------------------------------------------------------------
 # detect_domain
@@ -61,6 +64,58 @@ def test_detect_domain_case_insensitive():
 
 
 # ---------------------------------------------------------------------------
+# detect_project
+# ---------------------------------------------------------------------------
+
+
+def test_detect_project_reads_leads_toml(tmp_path: Path):
+    """Finds leads.toml, parses project name."""
+    khimaira_dir = tmp_path / ".khimaira"
+    khimaira_dir.mkdir()
+    (khimaira_dir / "leads.toml").write_text(
+        '[project]\nname = "myproject"\n', encoding="utf-8"
+    )
+    assert detect_project(str(tmp_path)) == "myproject"
+
+
+def test_detect_project_walks_upward(tmp_path: Path):
+    """Finds leads.toml in a parent directory."""
+    khimaira_dir = tmp_path / ".khimaira"
+    khimaira_dir.mkdir()
+    (khimaira_dir / "leads.toml").write_text(
+        'name = "parentproject"\n', encoding="utf-8"
+    )
+    sub = tmp_path / "sub" / "deep"
+    sub.mkdir(parents=True)
+    assert detect_project(str(sub)) == "parentproject"
+
+
+def test_detect_project_falls_back_to_cwd_basename(tmp_path: Path):
+    """No leads.toml found → returns cwd basename."""
+    result = detect_project(str(tmp_path))
+    assert result == tmp_path.name
+
+
+def test_detect_project_quoted_name(tmp_path: Path):
+    """Single-quoted name value is parsed correctly."""
+    khimaira_dir = tmp_path / ".khimaira"
+    khimaira_dir.mkdir()
+    (khimaira_dir / "leads.toml").write_text(
+        "name = 'quoted-project'\n", encoding="utf-8"
+    )
+    assert detect_project(str(tmp_path)) == "quoted-project"
+
+
+def test_detect_project_ignores_unrelated_name_lines(tmp_path: Path):
+    """Only the first `name = ...` line under any section is used."""
+    khimaira_dir = tmp_path / ".khimaira"
+    khimaira_dir.mkdir()
+    toml = '[project]\nname = "rightproject"\n[other]\nname = "wrongproject"\n'
+    (khimaira_dir / "leads.toml").write_text(toml, encoding="utf-8")
+    assert detect_project(str(tmp_path)) == "rightproject"
+
+
+# ---------------------------------------------------------------------------
 # extract_transcript
 # ---------------------------------------------------------------------------
 
@@ -71,24 +126,31 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
             f.write(json.dumps(rec) + "\n")
 
 
-def test_extract_transcript_returns_none_for_unknown_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_extract_transcript_returns_none_for_unknown_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """No JSONL file found → None."""
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     # Reload so _PROJECTS_ROOT picks up the new env var
     import importlib
     import khimaira.hooks.session_end_utils as mod
+
     importlib.reload(mod)
     from khimaira.hooks.session_end_utils import extract_transcript as et
+
     assert et("nonexistent-session-id") is None
 
 
 def test_extract_transcript_reads_jsonl_via_path(tmp_path: Path):
     """transcript_path provided → reads directly, ignores project dirs."""
     jsonl = tmp_path / "session.jsonl"
-    _write_jsonl(jsonl, [
-        {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "world"},
-    ])
+    _write_jsonl(
+        jsonl,
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ],
+    )
     result = extract_transcript("any-id", transcript_path=str(jsonl))
     assert result is not None
     assert "[user]: hello" in result
@@ -98,15 +160,18 @@ def test_extract_transcript_reads_jsonl_via_path(tmp_path: Path):
 def test_extract_transcript_handles_list_content(tmp_path: Path):
     """content as list of text blocks is supported."""
     jsonl = tmp_path / "session.jsonl"
-    _write_jsonl(jsonl, [
-        {
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "structured block"},
-                {"type": "tool_use", "id": "x"},
-            ],
-        }
-    ])
+    _write_jsonl(
+        jsonl,
+        [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "structured block"},
+                    {"type": "tool_use", "id": "x"},
+                ],
+            }
+        ],
+    )
     result = extract_transcript("any-id", transcript_path=str(jsonl))
     assert result is not None
     assert "structured block" in result
@@ -142,5 +207,7 @@ def test_extract_transcript_returns_none_for_empty_jsonl(tmp_path: Path):
 
 def test_extract_transcript_returns_none_for_nonexistent_path(tmp_path: Path):
     """transcript_path points to nonexistent file → None."""
-    result = extract_transcript("any-id", transcript_path=str(tmp_path / "missing.jsonl"))
+    result = extract_transcript(
+        "any-id", transcript_path=str(tmp_path / "missing.jsonl")
+    )
     assert result is None

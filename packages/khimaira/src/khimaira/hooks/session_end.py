@@ -21,18 +21,20 @@ Stdlib only. No third-party deps.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Import utilities from the companion module. Both live in the same hooks/
-# package so the relative import is stable regardless of venv path.
-from khimaira.hooks.session_end_utils import detect_domain, extract_transcript
+from khimaira.hooks.mnemosyne_client import distill as _mnemosyne_distill
+from khimaira.hooks.session_end_utils import (
+    detect_domain,
+    detect_project,
+    extract_transcript,
+)
 
-_MNEMOSYNE_URL = "http://127.0.0.1:8766/distill"
 _DAEMON_URL = "http://127.0.0.1:8740"
-_POST_TIMEOUT_S = 2
 _DAEMON_TIMEOUT_S = 1
 
 
@@ -68,6 +70,7 @@ def main() -> int:
         return 0
 
     transcript_path = data.get("transcript_path") or None
+    cwd = data.get("cwd") or os.getcwd()
 
     session_name = _get_session_name(session_id)
     domain = detect_domain(session_name)
@@ -81,27 +84,17 @@ def main() -> int:
     if not transcript:
         return 0
 
-    payload = json.dumps(
-        {
-            "domain": domain,
-            "transcript": transcript,
-            "session_slug": session_name,
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-
+    # Qualify domain key as <project>:<domain> to prevent cross-project pollution.
+    # Fail-open: if project detection fails, fall back to bare domain.
     try:
-        req = urllib.request.Request(
-            _MNEMOSYNE_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        project = detect_project(cwd)
+        qualified_domain = (
+            f"{project}:{domain}" if project and project != "unknown" else domain
         )
-        with urllib.request.urlopen(req, timeout=_POST_TIMEOUT_S):
-            pass
-    except (urllib.error.URLError, OSError, TimeoutError):
-        pass
+    except Exception:
+        qualified_domain = domain
 
+    _mnemosyne_distill(qualified_domain, transcript, session_name)
     return 0
 
 

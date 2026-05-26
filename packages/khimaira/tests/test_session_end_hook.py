@@ -19,7 +19,6 @@ import pytest
 
 import khimaira.hooks.session_end as hook_mod
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -69,14 +68,19 @@ def test_backend_lead_fires_post(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     _write_jsonl(jsonl, [{"role": "user", "content": "backend work"}])
     _patch_stdin(monkeypatch, _make_payload(transcript_path=str(jsonl)))
     monkeypatch.setattr(hook_mod, "_get_session_name", lambda sid: "backend-lead-1")
+    monkeypatch.setattr(
+        "khimaira.hooks.session_end.detect_project", lambda cwd: "khimaira"
+    )
 
     captured_body: list[bytes] = []
 
     class _FakeResp:
         def __enter__(self):
             return self
+
         def __exit__(self, *a):
             pass
+
         def read(self):
             return b""
 
@@ -90,7 +94,7 @@ def test_backend_lead_fires_post(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert result == 0
     assert len(captured_body) == 1
     posted = json.loads(captured_body[0])
-    assert posted["domain"] == "backend"
+    assert posted["domain"] == "khimaira:backend"
     assert posted["session_slug"] == "backend-lead-1"
     assert "backend work" in posted["transcript"]
 
@@ -104,7 +108,10 @@ def test_connection_refused_is_silent(tmp_path: Path, monkeypatch: pytest.Monkey
     _patch_stdin(monkeypatch, _make_payload(transcript_path=str(jsonl)))
     monkeypatch.setattr(hook_mod, "_get_session_name", lambda sid: "data-lead-2")
 
-    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")):
+    with patch(
+        "urllib.request.urlopen",
+        side_effect=urllib.error.URLError("connection refused"),
+    ):
         result = hook_mod.main()
 
     assert result == 0

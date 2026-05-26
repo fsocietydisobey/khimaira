@@ -28,8 +28,12 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from khimaira.hooks.mnemosyne_client import query as _mnemosyne_query
+from khimaira.hooks.session_end_utils import detect_domain, detect_project
+
 _STATE_ROOT = (
-    Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))) / "khimaira"
+    Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
+    / "khimaira"
 )
 _BASE_DIR = _STATE_ROOT / "sessions"
 _HANDOFFS_PATH = _STATE_ROOT / "handoffs.jsonl"
@@ -166,7 +170,9 @@ def _consume_inbox(session_id: str, cwd: str | None = None) -> list[dict]:
     """
     # --- HTTP path (preferred) ---
     qs = f"mark_read=true{('&cwd=' + urllib.parse.quote(cwd, safe='')) if cwd else ''}"
-    payload = _http_get_json(f"/api/sessions/{urllib.parse.quote(session_id)}/pending?{qs}")
+    payload = _http_get_json(
+        f"/api/sessions/{urllib.parse.quote(session_id)}/pending?{qs}"
+    )
     if payload is not None:
         notes = payload.get("notes", [])
         return notes if isinstance(notes, list) else []
@@ -438,7 +444,9 @@ def _format_chat_roles(roles: list[dict]) -> str:
         else:
             budget_str = "(no default — orchestrator's discretion)"
         title_part = f' "{title}"' if title else ""
-        lines.append(f"  {chat_id_short}{title_part} — {role}{annotation} → {budget_str}")
+        lines.append(
+            f"  {chat_id_short}{title_part} — {role}{annotation} → {budget_str}"
+        )
     lines.append("")
     lines.append(
         "Type the budget commands in this window if you want to match the "
@@ -579,7 +587,13 @@ def _format_tasks(tasks: list[dict]) -> str:
         return ""
     # Sort: by source first (group source-wise), then by state
     # (in-progress / in-review surface above todo).
-    state_order = {"in progress": 0, "in-progress": 0, "in review": 1, "in-review": 1, "todo": 2}
+    state_order = {
+        "in progress": 0,
+        "in-progress": 0,
+        "in review": 1,
+        "in-review": 1,
+        "todo": 2,
+    }
 
     def _sort_key(t: dict) -> tuple:
         state = (t.get("state") or "").lower()
@@ -744,6 +758,49 @@ def _format_active_sessions(sessions: list[dict]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _inject_domain_memory(session_id: str, cwd: str) -> str:
+    """Return a PROVISIONAL domain-memory block for lead sessions, or '' on any failure.
+
+    Fetches the session name from the daemon; returns '' immediately if the session
+    is not a lead session or if mnemosyne is down.
+
+    Fail-open: any exception returns '' and never blocks session boot.
+    """
+    try:
+        session_info = _http_get_json(f"/api/sessions/{urllib.parse.quote(session_id)}")
+        session_name = ((session_info or {}).get("name") or "").strip()
+        if not session_name:
+            return ""
+
+        lower = session_name.lower()
+        if "-lead" not in lower:
+            return ""
+        domain = detect_domain(session_name)
+        if domain == "general":
+            return ""
+
+        project = detect_project(cwd)
+        qualified = (
+            f"{project}:{domain}" if project and project != "unknown" else domain
+        )
+
+        result = _mnemosyne_query(qualified)
+        if not result:
+            return ""
+        answer = result.get("answer") or ""
+        if not answer:
+            return ""
+        count = result.get("training_pairs_available") or 0
+
+        return (
+            f"🧠 PROVISIONAL domain memory — {qualified} ({count} pair(s) accumulated)\n"
+            "⚠️  Auto-distilled from prior sessions — unreviewed. "
+            "Curated knowledge doc (if any) is authoritative.\n\n" + answer
+        )
+    except Exception:
+        return ""
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -853,6 +910,11 @@ def main() -> int:
                 except OSError:
                     pass
         blocks.append(_format_chat_roles(chat_roles))
+
+    domain_memory = _inject_domain_memory(session_id, cwd)
+    if domain_memory:
+        blocks.append(domain_memory)
+
     if others:
         blocks.append(_format_active_sessions(others))
 

@@ -18,7 +18,42 @@ from typing import Optional
 
 _DOMAINS = ("backend", "frontend", "data", "devops")
 
-_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
+_PROJECTS_ROOT = (
+    Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
+)
+_LEADS_TOML = ".khimaira/leads.toml"
+
+
+def detect_project(cwd: str) -> str:
+    """Walk upward from cwd to find .khimaira/leads.toml; return [project] name.
+
+    Fallback: basename of cwd if no leads.toml found or [project] name unset.
+    Stdlib only — uses basic string parsing instead of tomllib so it works on
+    Python <3.11 environments.
+    """
+    try:
+        path = Path(cwd).resolve()
+        for candidate in [path, *path.parents]:
+            toml_path = candidate / _LEADS_TOML
+            if toml_path.is_file():
+                try:
+                    text = toml_path.read_text(encoding="utf-8")
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if line.startswith("name") and "=" in line:
+                            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if value:
+                                return value
+                except OSError:
+                    pass
+                break  # found the toml but couldn't parse — fall through to basename
+    except Exception:
+        pass
+    # Fallback: cwd basename
+    try:
+        return Path(cwd).resolve().name or "unknown"
+    except Exception:
+        return "unknown"
 
 
 def detect_domain(session_name_or_transcript: str) -> str:
@@ -95,7 +130,9 @@ def _read_jsonl(path: Path, max_chars: int) -> Optional[str]:
                 if not isinstance(rec, dict):
                     continue
                 role = rec.get("role") or rec.get("type", "")
-                content = rec.get("content") or (rec.get("message") or {}).get("content")
+                content = rec.get("content") or (rec.get("message") or {}).get(
+                    "content"
+                )
                 if isinstance(content, str) and content.strip():
                     parts.append(f"[{role}]: {content.strip()}")
                 elif isinstance(content, list):

@@ -179,3 +179,76 @@ def test_discover_uses_http_when_available(hook_module):
     assert len(result) == 1
     assert result[0]["session_id"] == "other-sess"
     assert result[0]["decision_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# _inject_domain_memory
+# ---------------------------------------------------------------------------
+
+
+def test_inject_domain_memory_returns_block_for_lead_session(hook_module, tmp_path):
+    """Lead session with mnemosyne data → PROVISIONAL block returned."""
+    fake_session = {"name": "backend-lead-1"}
+    fake_query = {
+        "domain": "khimaira:backend",
+        "answer": "# Domain memory — khimaira:backend (2 of 2 pairs)\nQ: q\nA: a",
+        "training_pairs_available": 2,
+    }
+
+    with patch.object(hook_module, "_http_get_json", return_value=fake_session):
+        with patch(
+            "khimaira.hooks.session_start._mnemosyne_query", return_value=fake_query
+        ):
+            with patch(
+                "khimaira.hooks.session_start.detect_project", return_value="khimaira"
+            ):
+                result = hook_module._inject_domain_memory("sess-abc", str(tmp_path))
+
+    assert "PROVISIONAL" in result
+    assert "khimaira:backend" in result
+    assert "2 pair" in result
+    assert "Q: q" in result
+
+
+def test_inject_domain_memory_returns_empty_for_non_lead(hook_module, tmp_path):
+    """Non-lead session name → empty string, no mnemosyne call."""
+    fake_session = {"name": "khimaira-0"}
+
+    with patch.object(hook_module, "_http_get_json", return_value=fake_session):
+        with patch("khimaira.hooks.session_start._mnemosyne_query") as mock_query:
+            result = hook_module._inject_domain_memory("sess-abc", str(tmp_path))
+
+    assert result == ""
+    mock_query.assert_not_called()
+
+
+def test_inject_domain_memory_returns_empty_when_session_unnamed(hook_module, tmp_path):
+    """Daemon returns no name (fresh session) → empty string."""
+    with patch.object(hook_module, "_http_get_json", return_value={"name": ""}):
+        with patch("khimaira.hooks.session_start._mnemosyne_query") as mock_query:
+            result = hook_module._inject_domain_memory("sess-abc", str(tmp_path))
+
+    assert result == ""
+    mock_query.assert_not_called()
+
+
+def test_inject_domain_memory_returns_empty_when_mnemosyne_down(hook_module, tmp_path):
+    """mnemosyne unavailable (query returns None) → empty string, fail-open."""
+    fake_session = {"name": "data-lead-2"}
+
+    with patch.object(hook_module, "_http_get_json", return_value=fake_session):
+        with patch("khimaira.hooks.session_start._mnemosyne_query", return_value=None):
+            with patch(
+                "khimaira.hooks.session_start.detect_project", return_value="khimaira"
+            ):
+                result = hook_module._inject_domain_memory("sess-abc", str(tmp_path))
+
+    assert result == ""
+
+
+def test_inject_domain_memory_fail_open_on_exception(hook_module, tmp_path):
+    """Any unexpected exception in injection → empty string, never raises."""
+    with patch.object(hook_module, "_http_get_json", side_effect=RuntimeError("boom")):
+        result = hook_module._inject_domain_memory("sess-abc", str(tmp_path))
+
+    assert result == ""
