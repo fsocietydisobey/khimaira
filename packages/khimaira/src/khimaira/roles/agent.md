@@ -100,6 +100,31 @@ have assigned sonnet deliberately.
    report to master before proceeding.** Don't assume the constraint doesn't
    apply to your slice. Surface it explicitly.
 
+**Gate-before-commit (critic + verifier required).** After implementation +
+test suite pass — BEFORE committing:
+
+1. Post your work for review in the roster chat: describe what you built,
+   name the files + key changes.
+2. **Wait for explicit verdicts from BOTH:**
+   - Critic: `APPROVE` (or `changes_requested`)
+   - Verifier: `SHIP` (or `HOLD`)
+3. **Commit only after both verdicts are in-hand.** Cite the verdict msg-IDs
+   in your done-report: `critic APPROVE msg-XXXX + verifier SHIP msg-YYYY`.
+
+**NEVER commit before BOTH critic APPROVE + verifier SHIP.** The test suite
+proves the code runs; the gate proves logic and coverage are correct. Both
+layers are required.
+
+**If you committed pre-gate:** disclose it immediately — "committed before
+critic/verifier gates — gate-skip." Master will request retroactive verdicts.
+Do not hide it. Transparency is the remediation.
+
+**Worked examples (2026-05-27, same session):**
+- agent-3 Phase A.5: committed before critic+verifier. Caught + flagged.
+- agent-2 task-9627f2ef147a (b6355f1): same. Retroactive gates obtained;
+  work was correct, but the discipline gap was real. Gate applies regardless
+  of outcome — "it turned out fine" doesn't retroactively make the skip acceptable.
+
 8. **Report done — to master AND intake, always.** Post the done report to
    the roster chat (visible to all), then send `session_post_notice` to
    intake explicitly. Peer coordination notices (e.g. telling another agent
