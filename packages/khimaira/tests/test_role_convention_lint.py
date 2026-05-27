@@ -411,6 +411,41 @@ def test_intake_md_contains_proactive_specialist_routing():
     )
 
 
+def test_in_intake_5_themis_rule_present():
+    """Regression guard: IN-INTAKE-5 (NO_MASTER_DISPATCH) must be defined in intake.yaml.
+
+    Per behavioral-rule-promotion intake-skip-master-mediation class (2026-05-26).
+    Observed twice: intake bypassed master's chat_task_create + BEGIN gate.
+    """
+    content = (THEMIS_RULES / "intake.yaml").read_text()
+    assert "IN-INTAKE-5" in content, "intake.yaml missing IN-INTAKE-5 rule"
+    assert "NO_MASTER_DISPATCH" in content, "intake.yaml IN-INTAKE-5 missing rule name"
+    assert "chat_task_create" in content, "intake.yaml IN-INTAKE-5 missing chat_task_create matcher"
+    assert "chat_task_signal_start" in content, (
+        "intake.yaml IN-INTAKE-5 missing chat_task_signal_start matcher"
+    )
+
+
+def test_intake_md_no_direct_dispatch_section():
+    """Regression guard: intake.md must explicitly forbid direct task dispatch.
+
+    Per behavioral-rule-promotion intake-skip-master-mediation class (2026-05-26).
+    Role-doc enforcement alone is insufficient (violation recurred within minutes of
+    BEGIN-gate scope rule shipping). Convention + structural Themis nudge are both
+    required; this test guards the convention layer.
+    """
+    content = (ROLE_DIR / "intake.md").read_text()
+    lowered = content.lower()
+    assert "intake never dispatches tasks directly" in lowered, (
+        "intake.md missing 'Intake NEVER dispatches tasks directly' section"
+    )
+    assert "chat_task_create" in content, "intake.md no-direct-dispatch section missing chat_task_create"
+    assert "chat_task_signal_start" in content, (
+        "intake.md no-direct-dispatch section missing chat_task_signal_start"
+    )
+    assert "IN-INTAKE-5" in content, "intake.md no-direct-dispatch section missing IN-INTAKE-5 reference"
+
+
 def test_architect_md_contains_session_set_name_bootstrap():
     """Regression guard: architect.md must instruct session_set_name on bootstrap.
 

@@ -274,6 +274,34 @@ Two coordination primitives can both look like "intake fired work to an agent" b
 
 **Why this gate exists:** master mediates budget coordination + verifies independence across the fan-out batch BEFORE work starts. Without master mediation, agents can start work with mismatched contexts or compete for the same scope.
 
+### Intake NEVER dispatches tasks directly (2026-05-26)
+
+**Intake must NOT call** `chat_task_create`, `chat_task_signal_start`, or `chat_send_to` with a task body. These are master's exclusive primitives. Calling them from intake bypasses the BEGIN gate, skips budget coordination, and removes master's independence-checkpoint.
+
+**Correct intake dispatch sequence:**
+
+1. Package context into CONTEXT UPDATE (or HANDOFF block if cross-session)
+2. Relay to master via `chat_send` (roster channel) or `session_post_notice` (async)
+3. Master calls `chat_task_create` per agent, collects `✅ ready [task-id]` acks
+4. Master fires `🟢 ALL AGENTS CONFIRMED — BEGIN`
+
+**Intake's tools for relaying to master:**
+- `chat_send(chat_id=..., body="HANDOFF: ...")` — in-chat relay, master acts in real time
+- `session_post_notice(to_session_id=master_id, ...)` — async, lands in master's inbox
+
+**What intake NEVER touches:**
+- `chat_task_create` — creates the BEGIN-gated task contract
+- `chat_task_signal_start` — fires the BEGIN signal to an agent
+- `chat_send_to` with a task-assignment body (i.e., acting as if intake is master)
+
+**Worked examples from observed violations (intake-skip-master-mediation class):**
+
+*Violation 1 (2026-05-25):* intake-1 called `chat_task_create` to create the mnemosyne-distiller-restore task, bypassing master. The task ran, but master was not in the loop for budget or scope check. Happened hours before the BEGIN-gate scope rule shipped (9ba8b95).
+
+*Violation 2 (2026-05-26, msg-c27d2bb49268):* intake-1 dispatched mnemosyne distiller restore directly to agent-3, again bypassing master — this time AFTER 9ba8b95 landed. Confirmed role-doc enforcement alone is insufficient; structural Themis rule IN-INTAKE-5 added as Cat 2 deterrent.
+
+**Themis rule:** IN-INTAKE-5 (NO_MASTER_DISPATCH, severity=warn) fires on any call to `chat_task_create` or `chat_task_signal_start` from an intake session.
+
 ### Master's acknowledgement
 
 Master replies:

@@ -62,4 +62,19 @@ invariants:
       🛑 Themis IN-INTAKE-4 (NO_BASH_MUTATING): this Bash command mutates state
       (git commit/push, rm/mv/cp/mkdir, or shell output redirect outside /tmp).
       Intake is a non-executor role — read-only Bash (wc, find, grep, ls) is
-      allowed; mutating operations are not. Hand off via chat_task_create.
+      allowed; mutating operations are not. Hand off by relaying to master
+      (notice/chat); master dispatches.
+
+  - id: IN-INTAKE-5
+    name: NO_MASTER_DISPATCH
+    severity: warn
+    matchers:
+      - tool: mcp__khimaira-chat__chat_task_create
+      - tool: mcp__khimaira-chat__chat_task_signal_start
+    message: |
+      ⚠️  Themis IN-INTAKE-5 (NO_MASTER_DISPATCH): intake called {tool_name},
+      which is master's exclusive dispatch primitive. Intake owns context
+      packaging and handoff; master owns BEGIN-gate and task lifecycle.
+      Correct path: post a HANDOFF or notice to master (chat_send / session_post_notice),
+      then let master call chat_task_create + chat_task_signal_start.
+      Observed twice (2026-05-25 + 2026-05-26 — intake-skip-master-mediation class).
