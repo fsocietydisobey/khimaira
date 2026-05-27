@@ -12,7 +12,7 @@ invariants:
       - tool: NotebookEdit
     message: |
       🛑 Themis IN-INTAKE-1 (NO_FILE_EDIT): intake cannot call {tool_name}.
-      Hand off to an agent via /khimaira-assign <agent> "<task spec>" instead.
+      Relay to master (notice/chat); master dispatches.
       The boundary exists so intake's status answers stay current — the
       moment intake implements, its "what's the status?" answer drifts.
 
@@ -25,7 +25,7 @@ invariants:
       - tool: mcp__khimaira__research
     message: |
       🛑 Themis IN-INTAKE-2 (NO_API_DISPATCH): {tool_name} hits the Anthropic API
-      and duplicates the roster's dispatch layer. Use /khimaira-assign instead.
+      and duplicates the roster's dispatch layer. Relay to master (notice/chat); master dispatches.
 
   - id: IN-INTAKE-3
     name: NO_STANDALONE_AGENTS
@@ -35,7 +35,7 @@ invariants:
     message: |
       🛑 Themis IN-INTAKE-3 (NO_STANDALONE_AGENTS): cannot spawn worktree or
       background Claude Code agents. Check session_list() — if agents are idle,
-      use /khimaira-assign. Standalone agents bypass the enforcement gate,
+      relay to master (notice/chat); master dispatches. Standalone agents bypass the enforcement gate,
       context broadcast, observer, and task lifecycle.
 
   - id: IN-INTAKE-4

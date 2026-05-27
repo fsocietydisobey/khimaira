@@ -79,6 +79,24 @@ def test_distill_returns_none_on_os_error():
 # ---------------------------------------------------------------------------
 
 
+def test_query_uses_post_verb():
+    captured: list[str] = []
+    payload = {
+        "domain": "khimaira:backend",
+        "answer": "# Domain memory\nQ: something\nA: reply",
+        "training_pairs_available": 1,
+    }
+
+    def _fake_urlopen(req, timeout=None):
+        captured.append(req.method)
+        return _fake_resp(json.dumps(payload).encode())
+
+    with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+        query("khimaira:backend")
+
+    assert captured == ["POST"]
+
+
 def test_query_returns_dict_with_answer():
     payload = {
         "domain": "khimaira:backend",
