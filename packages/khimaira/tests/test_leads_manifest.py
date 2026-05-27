@@ -220,6 +220,42 @@ paths = ["packages/khimaira/**"]
     assert manifest.prefix == ""
 
 
+def test_propose_only_parsed_when_true(tmp_path: Path, central_leads: Path):
+    _write_toml(
+        central_leads,
+        "jeevy",
+        f"""
+[project]
+name = "jeevy"
+prefix = "jp"
+root_path = "{tmp_path}"
+propose_only = true
+
+[leads.backend]
+paths = ["apps/jeevy/**"]
+""",
+    )
+    manifest = load_manifest("jeevy")
+    assert manifest.propose_only is True
+
+
+def test_propose_only_defaults_false_when_absent(tmp_path: Path, central_leads: Path):
+    _write_toml(
+        central_leads,
+        "khimaira",
+        f"""
+[project]
+name = "khimaira"
+root_path = "{tmp_path}"
+
+[leads.backend]
+paths = ["packages/**"]
+""",
+    )
+    manifest = load_manifest("khimaira")
+    assert manifest.propose_only is False
+
+
 def test_root_path_resolves_dirs(tmp_path: Path, central_leads: Path):
     """roles_dir + themis_dir + knowledge_dir are joined with root_path."""
     _write_toml(

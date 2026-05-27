@@ -253,6 +253,124 @@ def test_no_prefix_produces_unprefixed_lead_name(tmp_path: Path, central_leads: 
     assert "IN-JP-BACKEND-LEAD-1" not in themis_content
 
 
+# ---------------------------------------------------------------------------
+# propose_only — per-project write-block gate
+# ---------------------------------------------------------------------------
+
+
+def _propose_only_manifest(tmp_path: Path, central_leads: Path, propose_only: bool) -> str:
+    """Write a manifest with configurable propose_only flag."""
+    flag = "true" if propose_only else "false"
+    (central_leads / "testproject.toml").write_text(
+        f"""
+[project]
+name = "testproject"
+prefix = "jp"
+root_path = "{tmp_path}"
+roles_dir = "roles"
+themis_dir = "themis/rules"
+knowledge_dir = "docs/domain"
+propose_only = {flag}
+
+[leads.backend]
+paths = ["packages/backend/**"]
+model = "sonnet"
+effort = "medium"
+"""
+    )
+    (tmp_path / "roles").mkdir(exist_ok=True)
+    (tmp_path / "themis" / "rules").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "domain").mkdir(parents=True, exist_ok=True)
+    return "testproject"
+
+
+def test_propose_only_true_emits_block_rule(tmp_path: Path, central_leads: Path):
+    """propose_only=true → Themis YAML contains NO_FILE_EDIT_PROPOSE_ONLY block rule."""
+    project_name = _propose_only_manifest(tmp_path, central_leads, propose_only=True)
+    sync_leads(project_name)
+
+    themis_content = (tmp_path / "themis" / "rules" / "jp-backend-lead.yaml").read_text()
+    assert "NO_FILE_EDIT_PROPOSE_ONLY" in themis_content, (
+        "propose_only=true must emit NO_FILE_EDIT_PROPOSE_ONLY in Themis YAML"
+    )
+    assert "IN-JP-BACKEND-LEAD-1-PO" in themis_content, (
+        "propose_only rule id must follow <rule_id>-PO convention"
+    )
+    assert "severity: block" in themis_content, "propose_only rule must be severity: block"
+    # All 4 write tools must be in matchers (unconditional)
+    for tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        assert f"tool: {tool}" in themis_content, (
+            f"propose_only rule missing matcher for tool: {tool}"
+        )
+
+
+def test_propose_only_false_omits_block_rule(tmp_path: Path, central_leads: Path):
+    """propose_only=false → NO_FILE_EDIT_PROPOSE_ONLY rule MUST NOT appear.
+
+    Critical assertion: per-project isolation. A false/absent flag must leave
+    other projects' leads completely unchanged.
+    """
+    project_name = _propose_only_manifest(tmp_path, central_leads, propose_only=False)
+    sync_leads(project_name)
+
+    themis_content = (tmp_path / "themis" / "rules" / "jp-backend-lead.yaml").read_text()
+    assert "NO_FILE_EDIT_PROPOSE_ONLY" not in themis_content, (
+        "propose_only=false must NOT emit NO_FILE_EDIT_PROPOSE_ONLY rule"
+    )
+    assert "-PO" not in themis_content, (
+        "propose_only=false must NOT emit any -PO rule id"
+    )
+
+
+def test_propose_only_true_emits_role_doc_section(tmp_path: Path, central_leads: Path):
+    """propose_only=true → role doc contains PROPOSE-ONLY section under Constraints."""
+    project_name = _propose_only_manifest(tmp_path, central_leads, propose_only=True)
+    sync_leads(project_name)
+
+    role_content = (tmp_path / "roles" / "jp-backend-lead.md").read_text()
+    assert "PROPOSE-ONLY" in role_content, (
+        "propose_only=true must emit PROPOSE-ONLY section in role doc"
+    )
+    assert "NO_FILE_EDIT_PROPOSE_ONLY" in role_content, (
+        "role doc must reference the Themis rule by name"
+    )
+    assert "OVERRIDES" in role_content, (
+        "propose_only section must state it overrides the small-plans clause"
+    )
+
+
+def test_propose_only_false_omits_role_doc_section(tmp_path: Path, central_leads: Path):
+    """propose_only=false → PROPOSE-ONLY section MUST NOT appear in role doc.
+
+    Per-project isolation: khimaira leads must be unaffected by jeevy's flag.
+    """
+    project_name = _propose_only_manifest(tmp_path, central_leads, propose_only=False)
+    sync_leads(project_name)
+
+    role_content = (tmp_path / "roles" / "jp-backend-lead.md").read_text()
+    assert "PROPOSE-ONLY" not in role_content, (
+        "propose_only=false must NOT emit PROPOSE-ONLY section"
+    )
+
+
+def test_propose_only_true_no_drift_after_sync(tmp_path: Path, central_leads: Path):
+    """sync then check_drift on propose_only=true project → clean (no drift)."""
+    project_name = _propose_only_manifest(tmp_path, central_leads, propose_only=True)
+    sync_leads(project_name)
+
+    has_drift, diff_lines = check_drift(project_name)
+    assert not has_drift, f"Unexpected drift after propose_only=true sync:\n{''.join(diff_lines)}"
+
+
+def test_propose_only_false_no_drift_after_sync(tmp_path: Path, central_leads: Path):
+    """sync then check_drift on propose_only=false project → clean (no drift)."""
+    project_name = _propose_only_manifest(tmp_path, central_leads, propose_only=False)
+    sync_leads(project_name)
+
+    has_drift, diff_lines = check_drift(project_name)
+    assert not has_drift, f"Unexpected drift after propose_only=false sync:\n{''.join(diff_lines)}"
+
+
 def test_absolute_output_dirs_generate_into_separate_repo(
     tmp_path: Path, central_leads: Path
 ):

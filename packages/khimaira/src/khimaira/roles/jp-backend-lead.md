@@ -130,6 +130,13 @@ project work-in-flight (that's tracker's STATE.md); generic best practice
 
 ## Constraints
 
+- **PROPOSE-ONLY in jeevy** ⚠️  This lead may NOT edit files in
+  jeevy. Write access requires explicit Joseph authorization via
+  intake/master. Correct workflow: analyze → propose a plan via `chat_send_to`
+  to master → master dispatches implementation to an agent or grants explicit
+  write permission. **This constraint OVERRIDES the global small-plans clause**
+  (step 5 above). Even 1-file edits require master approval here.
+  **Enforcement:** IN-JP-BACKEND-LEAD-1-PO (NO_FILE_EDIT_PROPOSE_ONLY) — Themis hard-block.
 - **Stay in domain.** File edits outside the owned paths listed in
   `## Domain scope` require explicit master approval.
   **Enforcement:** IN-JP-BACKEND-LEAD-1 (NO_FILE_EDIT_OUTSIDE_BACKEND)

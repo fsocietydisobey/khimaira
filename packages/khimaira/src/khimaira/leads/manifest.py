@@ -49,6 +49,7 @@ class Manifest:
     themis_dir: Path
     knowledge_dir: Path
     leads: dict[str, LeadConfig]
+    propose_only: bool = False  # if True, all leads in this project are write-blocked
 
 
 def load_manifest(project_name: str) -> Manifest:
@@ -112,6 +113,8 @@ def load_manifest(project_name: str) -> Manifest:
             effort=cfg.get("effort", "medium"),
         )
 
+    propose_only = bool(project.get("propose_only", False))
+
     return Manifest(
         project_name=project_name_parsed,
         prefix=prefix,
@@ -120,4 +123,5 @@ def load_manifest(project_name: str) -> Manifest:
         themis_dir=themis_dir,
         knowledge_dir=knowledge_dir,
         leads=leads,
+        propose_only=propose_only,
     )

@@ -117,6 +117,48 @@ def _themis_rule_ids(domain: str, prefix: str) -> tuple[str, str]:
     return f"IN-{base}-LEAD-1", f"IN-{base}-LEAD-2"
 
 
+def _propose_only_rule_block(
+    themis_rule_id: str,
+    lead_name: str,
+    project_name: str,
+) -> str:
+    """Return the YAML block for the propose-only invariant, or '' if not needed."""
+    po_id = f"{themis_rule_id}-PO"
+    return (
+        f"\n  - id: {po_id}\n"
+        f"    name: NO_FILE_EDIT_PROPOSE_ONLY\n"
+        f"    severity: block\n"
+        f"    matchers:\n"
+        f"      - tool: Edit\n"
+        f"      - tool: Write\n"
+        f"      - tool: MultiEdit\n"
+        f"      - tool: NotebookEdit\n"
+        f"    message: |\n"
+        f"      \U0001f6d1 Themis {po_id} (NO_FILE_EDIT_PROPOSE_ONLY): {lead_name} is in\n"
+        f"      PROPOSE-ONLY mode for {project_name}. Audit, analyze, propose, and\n"
+        f"      review only — no writes without explicit Joseph authorization via\n"
+        f"      intake/master. To implement, propose your plan to master; master\n"
+        f"      dispatches to an authorized agent or grants explicit write permission.\n"
+    )
+
+
+def _propose_only_section_block(
+    themis_rule_id: str,
+    project_name: str,
+) -> str:
+    """Return the role-doc PROPOSE-ONLY constraint section, or '' if not needed."""
+    po_id = f"{themis_rule_id}-PO"
+    return (
+        f"- **PROPOSE-ONLY in {project_name}** ⚠️  This lead may NOT edit files in\n"
+        f"  {project_name}. Write access requires explicit Joseph authorization via\n"
+        f"  intake/master. Correct workflow: analyze → propose a plan via `chat_send_to`\n"
+        f"  to master → master dispatches implementation to an agent or grants explicit\n"
+        f"  write permission. **This constraint OVERRIDES the global small-plans clause**\n"
+        f"  (step 5 above). Even 1-file edits require master approval here.\n"
+        f"  **Enforcement:** {po_id} (NO_FILE_EDIT_PROPOSE_ONLY) — Themis hard-block.\n"
+    )
+
+
 def _render_role_doc(
     manifest: Manifest,
     domain: str,
@@ -132,6 +174,12 @@ def _render_role_doc(
     themis_rule_id, themis_rule_id_2 = _themis_rule_ids(domain, manifest.prefix)
 
     paths_list = "\n".join(f"- `{p}`" for p in lead_cfg.paths)
+
+    propose_only_section = (
+        _propose_only_section_block(themis_rule_id, manifest.project_name)
+        if manifest.propose_only
+        else ""
+    )
 
     template_text = _TEMPLATE_ROLE.read_text()
     rendered = _render(
@@ -149,6 +197,7 @@ def _render_role_doc(
             "paths_list": paths_list,
             "themis_rule_id": themis_rule_id,
             "themis_rule_id_2": themis_rule_id_2,
+            "propose_only_section": propose_only_section,
         },
     )
 
@@ -183,8 +232,14 @@ def _render_themis_yaml(
         knowledge_doc_path=knowledge_doc_path,
     )
 
+    propose_only_rule = (
+        _propose_only_rule_block(themis_rule_id, lead_name, manifest.project_name)
+        if manifest.propose_only
+        else ""
+    )
+
     template_text = _TEMPLATE_THEMIS.read_text()
-    return _render(
+    rendered = _render(
         template_text,
         {
             "lead_name": lead_name,
@@ -194,8 +249,11 @@ def _render_themis_yaml(
             "themis_rule_id": themis_rule_id,
             "themis_rule_id_2": themis_rule_id_2,
             "allow_regex": allow_regex,
+            "propose_only_rule": propose_only_rule,
         },
     )
+    # Normalize: exactly one trailing newline regardless of propose_only_rule content.
+    return rendered.rstrip() + "\n"
 
 
 # ---------------------------------------------------------------------------

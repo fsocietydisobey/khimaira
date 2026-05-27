@@ -31,3 +31,18 @@ invariants:
       a standalone Task agent. Use chat_task_create + chat_send_to for fan-out
       to roster transient agents. Standalone Task agents bypass the enforcement
       gate + observer lifecycle.
+
+  - id: IN-JP-BACKEND-LEAD-1-PO
+    name: NO_FILE_EDIT_PROPOSE_ONLY
+    severity: block
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+      - tool: NotebookEdit
+    message: |
+      🛑 Themis IN-JP-BACKEND-LEAD-1-PO (NO_FILE_EDIT_PROPOSE_ONLY): jp-backend-lead is in
+      PROPOSE-ONLY mode for jeevy. Audit, analyze, propose, and
+      review only — no writes without explicit Joseph authorization via
+      intake/master. To implement, propose your plan to master; master
+      dispatches to an authorized agent or grants explicit write permission.
