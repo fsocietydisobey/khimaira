@@ -131,13 +131,35 @@ def invalidate_role_cache(session_id: str) -> None:
     _ROLE_CACHE.pop(session_id, None)
 
 
+_UNRESOLVABLE = "__unresolvable__"
+
+
 def _resolve_role_from_jsonl(sid: str) -> str | None:
-    """Scan chat JSONLs and return the most-recently-active role for sid."""
+    """Scan chat JSONLs and return the most-recently-active role for sid.
+
+    Resolution order per chat (4-layer):
+      1. member_roles[sid] — authoritative; wins when present.
+      2. created_by master fallback — when member_roles dict is absent entirely
+         (v1-era chat) and sid is the room creator, resolves to "master".
+         Mirrors chats._is_master's v1 fallback; real signal, not inference.
+      3. registry-validated name inference — rsplit trailing -<N>, validate
+         remainder against themis.data.VALID_ROLES. Resolves role-named sessions
+         (e.g. jp-frontend-lead-1) in chats that pre-date member_roles.
+      4. fail-closed backstop — ONLY for chats where member_roles IS present.
+         Known member with unresolvable role → "_unresolvable__" sentinel →
+         BLOCK+loud in _call_engine. Chats without member_roles get fail-open
+         for unresolved sessions (prerequisite: backfill writes member_roles).
+
+    Returns None when sid is not an accepted member of any chat.
+    Returns _UNRESOLVABLE when sid IS a member but role can't be resolved in
+    a chat that already has explicit member_roles (fail-closed backstop fired).
+    """
     chat_dir = chats._chat_dir()
     if not chat_dir.exists():
         return None
 
     candidates: list[tuple[str, str]] = []  # (last_ts, role)
+    unresolvable_member = False
     for path in chat_dir.glob("chat-*.jsonl"):
         chat_id = path.stem
         try:
@@ -148,14 +170,35 @@ def _resolve_role_from_jsonl(sid: str) -> str | None:
         member = room["members"].get(sid)
         if not member or member["state"] != chats.ACCEPTED:
             continue
-        member_roles = room["meta"].get("member_roles") or {}
+        # Layer 1: explicit member_roles (authoritative)
+        member_roles_dict = room["meta"].get("member_roles")
+        member_roles = member_roles_dict or {}
         role = member_roles.get(sid)
         if role is None:
+            # Layer 2: created_by master fallback — mirrors chats._is_master().
+            # Authoritative when member_roles is absent (v1-era chat, no role write
+            # yet); _is_master's invariant: "first chat_grant_role materializes
+            # member_roles", so created_by is current master iff member_roles absent.
+            if chats._is_master(room, sid):
+                role = chats.ROLE_MASTER
+        if role is None:
+            # Layer 3: registry-validated name inference
+            session_name = member.get("session_name", "")
+            role = chats.infer_role_from_name(session_name)
+        if role is None:
+            # Layer 4: fail-closed gated on member_roles present for this chat.
+            # Chats without member_roles have not had roles recorded yet — fail-open
+            # there until backfill writes member_roles (at which point future calls
+            # resolve via Layer 1, and any genuinely-unresolvable session hits this).
+            if member_roles_dict:
+                unresolvable_member = True
             continue
         last_ts = room["messages"][-1]["ts"] if room["messages"] else ""
         candidates.append((last_ts, role))
 
     if not candidates:
+        if unresolvable_member:
+            return _UNRESOLVABLE
         return None
 
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -209,8 +252,29 @@ def _call_engine(
       .message, .severity).
     """
     if role is None:
-        # No role assignment → passthrough, no rules apply
+        # Not a member of any chat → passthrough, no rules apply
         return {"ok": True}
+    if role == _UNRESOLVABLE:
+        # Known member in a chat with explicit member_roles, but role cannot be
+        # resolved via member_roles, created_by, or name-inference. Fail-closed
+        # (S4 backstop): block until role is explicitly granted via chat_grant_role.
+        logger.warning(
+            "themis: known chat member with unresolvable role — blocking (S4 fail-closed)"
+        )
+        return {
+            "ok": False,
+            "violation": {
+                "rule_id": "IN-UNRESOLVABLE",
+                "name": "UNRESOLVABLE_ROLE",
+                "message": (
+                    "🛑 Themis: this session is a known chat member but its role cannot be "
+                    "resolved (not in member_roles, not the chat creator, and session name "
+                    "is not role-inferable). Tool blocked until role is explicitly granted "
+                    "via chat_grant_role."
+                ),
+                "severity": "block",
+            },
+        }
     try:
         engine = importlib.import_module("themis.engine")
         result = engine.evaluate(role, tool_name, tool_input)
@@ -237,10 +301,25 @@ def _call_engine(
         # Phase 1: themis package not yet installed — fail-open (D7)
         return {"ok": True}
     except Exception as exc:
-        # Engine runtime error (bad YAML, validation error, etc.) — fail-open.
-        # Without this, a single corrupt rule file would brick the PreToolUse hook.
-        logger.warning("themis engine error (fail-open): %s", exc)
-        return {"ok": True}
+        # Engine runtime error (bad YAML, rule load failure, evaluate exception).
+        # Role resolved but rules could not be evaluated → fail-CLOSED unconditionally.
+        # This is the resolved-role-with-broken-rules backstop: independent of
+        # member_roles (the per-chat gate applies only to unresolvable-role sessions).
+        # A broken rule file is a real enforcement failure that must not become a
+        # silent allow-through; operator must fix the rule file to unblock.
+        logger.warning("themis engine error (fail-closed): role=%s exc=%s", role, exc)
+        return {
+            "ok": False,
+            "violation": {
+                "rule_id": "IN-ENGINE-ERROR",
+                "name": "RULES_LOAD_FAILURE",
+                "message": (
+                    f"🛑 Themis: role {role!r} resolved but rules could not be evaluated "
+                    f"({type(exc).__name__}: {exc}). Tool blocked until rules are fixed."
+                ),
+                "severity": "block",
+            },
+        }
 
 
 def _violations_record(record: dict) -> dict:
@@ -410,7 +489,10 @@ def build_router():
         """
         role = resolve_session_role(req.session_id)
         result = _call_engine(role, req.tool_name, req.tool_input, req.cwd)
-        return {**result, "role": role}
+        # Normalize internal sentinel to null in the public response role field;
+        # the BLOCK verdict already conveys the fail-closed decision.
+        response_role = None if role == _UNRESOLVABLE else role
+        return {**result, "role": response_role}
 
     @router.post("/themis/violations")
     async def record_violation(req: ViolationRecordReq) -> dict:

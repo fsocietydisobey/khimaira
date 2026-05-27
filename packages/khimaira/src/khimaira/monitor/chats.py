@@ -74,9 +74,17 @@ ROLE_INTAKE = "intake"
 ROLE_ANALYST = "analyst"
 ROLE_VERIFIER = "verifier"
 ROLE_TRACKER = "tracker"
-_VALID_ROLES: frozenset[str] = frozenset(
-    {ROLE_MASTER, ROLE_AGENT, ROLE_OBSERVER, ROLE_CRITIC, ROLE_ARCHITECT, ROLE_INTAKE}
-)
+try:
+    # Single-source registry: themis.data.VALID_ROLES is glob-derived from rule yamls
+    # and auto-includes prefixed leads (e.g. jp-frontend-lead). Reuses the existing
+    # khimaira→themis dependency (_call_engine already lazy-imports themis.engine).
+    # D7 fallback: if themis is not installed, use the core hardcoded set — leads
+    # don't enforce without themis anyway.
+    from themis.data import VALID_ROLES as _VALID_ROLES
+except ImportError:
+    _VALID_ROLES: frozenset[str] = frozenset(
+        {ROLE_MASTER, ROLE_AGENT, ROLE_OBSERVER, ROLE_CRITIC, ROLE_ARCHITECT, ROLE_INTAKE}
+    )
 
 # Phase B v1.5: recommended model + effort budget per role.
 # Used by `_emit_role_directive` to surface slash-command suggestions to the
@@ -97,12 +105,24 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
 
 
 def infer_role_from_name(session_name: str) -> str | None:
-    """Return the role prefix from a session name, or None if not a known role.
+    """Return the validated role from a session name, or None if not a registry role.
 
-    "agent-1" → "agent", "observer-2" → "observer", "khimaira-0" → None
+    Strips a trailing -<number> suffix via rsplit, then validates the remainder
+    against _VALID_ROLES (derived from themis rule yamls). Falls back to checking
+    the full name if no numeric suffix is present.
+
+    "jp-frontend-lead-1" → "jp-frontend-lead" ✓
+    "agent-1" → "agent" ✓
+    "janice-0" → "janice" ✗ → None ✓
     """
-    prefix = session_name.split("-")[0]
-    return prefix if prefix in ROLE_BUDGET else None
+    parts = session_name.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        candidate = parts[0]
+        if candidate in _VALID_ROLES:
+            return candidate
+    if session_name in _VALID_ROLES:
+        return session_name
+    return None
 
 
 # (from_status, to_status) → roles allowed to perform the transition.

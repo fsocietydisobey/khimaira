@@ -79,6 +79,7 @@ def create_room(
     title: str | None = None,
     fresh: bool = False,
     topology: str = "flat",
+    member_roles: dict[str, str] | None = None,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
     resp = _request_with_retry(
@@ -90,6 +91,7 @@ def create_room(
             "title": title,
             "fresh": fresh,
             "topology": topology,
+            "member_roles": member_roles,
         },
         timeout=10.0,
     )

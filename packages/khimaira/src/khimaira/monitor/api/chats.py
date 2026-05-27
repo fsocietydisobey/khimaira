@@ -332,6 +332,7 @@ class CreateRoomReq(BaseModel):
     title: str | None = None
     fresh: bool = False
     topology: str = "flat"  # v1.9.5: flat | hierarchical | custom
+    member_roles: dict[str, str] | None = None  # session_id → role; written to meta at creation
 
 
 class InviteReq(BaseModel):
@@ -446,6 +447,7 @@ def build_router():
                 title=req.title,
                 fresh=req.fresh,
                 topology=req.topology,
+                member_roles=req.member_roles,
             )
             # Invalidate creator + all initial members — they may now have roles
             _inval(req.creator_session_id, *req.member_session_ids)

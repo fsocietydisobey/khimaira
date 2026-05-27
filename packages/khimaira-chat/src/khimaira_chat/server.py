@@ -403,6 +403,16 @@ def _build_server() -> Server:
                             ),
                             "default": "flat",
                         },
+                        "member_roles": {
+                            "type": "object",
+                            "description": (
+                                "Optional session_id→role mapping written to room meta at "
+                                "creation. Pass when you know the role each member will hold "
+                                "(e.g. master spawning a roster). Enables Themis enforcement "
+                                "from day one without a separate chat_grant_role call."
+                            ),
+                            "additionalProperties": {"type": "string"},
+                        },
                     },
                     "required": ["session_id", "members"],
                 },
@@ -864,6 +874,7 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
             title=args.get("title"),
             fresh=bool(args.get("fresh", False)),
             topology=args.get("topology", "flat"),
+            member_roles=args.get("member_roles"),
         )
     if name == "chat_invite":
         return daemon_client.invite(args["chat_id"], sid, args["invitee"])

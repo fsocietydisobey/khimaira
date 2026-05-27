@@ -2662,6 +2662,62 @@ def test_infer_role_from_name_unknown(isolated_chats):
     assert isolated_chats.infer_role_from_name("khimaira-0") is None
 
 
+def test_infer_role_from_name_prefixed_lead(isolated_chats):
+    """rsplit inference resolves multi-segment lead names (S2 class test)."""
+    assert isolated_chats.infer_role_from_name("jp-frontend-lead-1") == "jp-frontend-lead"
+
+
+def test_infer_role_from_name_person_name_is_none(isolated_chats):
+    """Person-named sessions (e.g. janice-0) don't infer a role — 'janice' ∉ registry."""
+    assert isolated_chats.infer_role_from_name("janice-0") is None
+
+
+def test_infer_role_from_name_bare_role(isolated_chats):
+    """A session named exactly after a role (no numeric suffix) is recognized."""
+    assert isolated_chats.infer_role_from_name("agent") == "agent"
+
+
+def test_role_budget_keys_subset_of_valid_roles(isolated_chats):
+    """Drift test: every key in ROLE_BUDGET is a valid role in _VALID_ROLES.
+
+    Prevents budget entries for roles that no longer exist in the registry,
+    and ensures ROLE_BUDGET stays coupled to the canonical role source.
+    """
+    for role in isolated_chats.ROLE_BUDGET:
+        assert role in isolated_chats._VALID_ROLES, (
+            f"ROLE_BUDGET key {role!r} is not in _VALID_ROLES — "
+            "update the budget table or the themis rule registry"
+        )
+
+
+def test_chat_grant_role_accepts_all_registry_roles(isolated_chats):
+    """Class test: chat_grant_role accepts every non-master role in _VALID_ROLES.
+
+    Previously failed for lead roles (jp-frontend-lead, backend-lead, etc.)
+    because _VALID_ROLES was a hardcoded frozenset that excluded them.
+    Master-grant is tested separately (it mutates the master identity).
+    """
+    from khimaira.monitor import sessions as sessions_mod
+
+    master_id = "aaaa1111-0000-0000-0000-000000000001"
+    _make_session(sessions_mod, master_id, "master")
+    target_id = "bbbb2222-0000-0000-0000-000000000002"
+    _make_session(sessions_mod, target_id, "target")
+
+    room = isolated_chats.create_room(
+        master_id, [target_id], title="registry-test", member_roles={master_id: "master"}
+    )
+    chat_id = room["meta"]["chat_id"]
+    isolated_chats.accept(chat_id, target_id)
+
+    non_master_roles = sorted(
+        r for r in isolated_chats._VALID_ROLES if r != isolated_chats.ROLE_MASTER
+    )
+    for role in non_master_roles:
+        # Grant each role without raising ValueError for unknown role
+        isolated_chats.chat_grant_role(chat_id, master_id, target_id, role)
+
+
 def test_create_room_member_roles_stored(isolated_chats, tmp_path, monkeypatch):
     import importlib
     from khimaira.monitor import sessions as sessions_mod

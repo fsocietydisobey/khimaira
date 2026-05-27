@@ -12,9 +12,9 @@ Block mechanism (verified via probe v2, 2026-05-21):
   exit 0 with no stdout (or non-JSON stdout) → allowed.
 
 Latency budget: p99 <300ms total (Python cold-start ~295ms on this machine).
-  TIMEOUT_S = 0.1 (D7 must-fix #2 per architect-1 — 100ms covers daemon p99
-  with 75ms slack; was 0.5 in spec pseudocode but 500ms + 295ms cold-start
-  = 795ms total, well over 300ms p99 target).
+  TIMEOUT_S = 0.5 (raised from 0.1 to cover cold-scan overhead from 4-layer
+  resolution — inference + registry validation adds latency; fail-open-but-LOUD
+  on timeout preserves the safety net).
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from urllib.request import Request, urlopen
 
 # Configurable daemon base URL — override via THEMIS_DAEMON env for testing.
 DAEMON = os.environ.get("THEMIS_DAEMON", "http://127.0.0.1:8740")
-TIMEOUT_S = 0.1
+TIMEOUT_S = 0.5
 FAIL_OPEN_LOG = Path.home() / ".claude" / "hooks" / "themis_fail_open.log"
 
 
