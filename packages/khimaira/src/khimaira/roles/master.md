@@ -278,6 +278,46 @@ For every approval:
    Approval is YOUR sign-off, not critic's. Critic's review is input to
    your decision; you still own the call.
 
+6. **Post-approval distillation for domain leads (2026-05-27).** After
+   approving a task whose assignee is a domain lead, automatically push
+   the lead's domain knowledge into mnemosyne — so long sessions contribute
+   even if the lead never manually runs `/khimaira-distill`.
+
+   **Trigger condition:** the approved task's assignee session name contains
+   a domain-lead pattern (`detect_domain(assignee_name) != "general"`).
+   Skip for agent, observer, tracker, critic, verifier, architect, intake —
+   only domain leads (backend-lead, frontend-lead, data-lead, devops-lead
+   and project-prefixed variants like jp-frontend-lead-1) distill.
+
+   **What to distill:** the lead's done-report text (task note + any key
+   decisions from `session_state(assignee)`) — NOT the raw transcript.
+   Curated beats raw; 5–15 bullets is enough.
+
+   **How to distill:**
+   ```bash
+   /home/_3ntropy/dev/khimaira/.venv/bin/python3 - <<'PYEOF'
+   from khimaira.hooks.mnemosyne_client import distill
+   from khimaira.hooks.session_end_utils import detect_domain, detect_project
+   import json, os
+   assignee_name = "ASSIGNEE_SESSION_NAME"
+   done_report   = """LEAD_DONE_REPORT_TEXT"""
+   domain  = detect_domain(assignee_name)
+   project = detect_project(os.getcwd())
+   qualified = f"{project}:{domain}" if project and project != "unknown" else domain
+   result = distill(domain=qualified, transcript=done_report, session_slug=assignee_name)
+   print(f"distilled → {qualified}: {result}")
+   PYEOF
+   ```
+
+   Fail-open: if mnemosyne is unreachable (`result=None`), log a warning
+   and continue — do NOT hold up the approval for a missing distillation.
+
+   **Two knowledge sinks (document in the approval note when distilling):**
+   - **mnemosyne PROVISIONAL** (just updated) — surfaces at SessionStart
+     for the next lead session on this project:domain key
+   - **`docs/domain/<domain>-knowledge.md`** (AUTHORITATIVE) — human-written
+     permanent reference; lead also maintains this separately
+
 **Observed failure (2026-05-22, tracker wiring approval):** master fired
 critic consult ~8 seconds AFTER critic had self-volunteered the review,
 then approved 23 seconds later. Audit trail looked like a rubber-stamp

@@ -556,3 +556,59 @@ def test_lead_role_template_emits_propose_only_how_to_work(tmp_path):
     assert "implementation-ready plan" not in plain_doc.lower(), (
         "lead-role template must NOT emit propose-only how-to-work when propose_only=False"
     )
+
+
+def test_agent_md_contains_gate_before_commit():
+    """Regression guard: agent.md must contain a gate-before-commit section.
+
+    Per behavioral-rule-promotion gate-skip class (2026-05-27). Pattern observed
+    2× in one session (agent-3 Phase A.5, agent-2 b6355f1): agent commits before
+    critic+verifier. Role-doc enforcement only (Layer 2 Themis fragile: detecting
+    "git commit without task-specific verdicts in chat" requires stateful semantic
+    reasoning at hook-time — same tractability verdict as intake-solo-research).
+    """
+    content = (ROLE_DIR / "agent.md").read_text()
+    lowered = content.lower()
+    assert "gate-before-commit" in lowered, (
+        "agent.md missing 'gate-before-commit' section"
+    )
+    assert "never commit before" in lowered, (
+        "agent.md gate-before-commit missing NEVER-commit-before mandate"
+    )
+    assert "critic approve" in lowered, (
+        "agent.md gate-before-commit missing critic APPROVE requirement"
+    )
+    assert "verifier ship" in lowered, (
+        "agent.md gate-before-commit missing verifier SHIP requirement"
+    )
+    assert "msg-" in content, (
+        "agent.md gate-before-commit missing verdict msg-ID citation requirement"
+    )
+
+
+def test_master_md_contains_post_approval_distillation():
+    """Regression guard: master.md must document the post-approval distillation step
+    for domain leads.
+
+    Per task-1e87b6702b6a: auto-distill into mnemosyne when master approves a domain
+    lead's done report. Without this, long-lived leads lose their session knowledge
+    unless they manually run /khimaira-distill. The step must name detect_domain
+    (the lead-detection gate), mnemosyne, and both knowledge sinks.
+    """
+    content = (ROLE_DIR / "master.md").read_text()
+    lowered = content.lower()
+    assert "post-approval distillation" in lowered, (
+        "master.md missing 'post-approval distillation' section in approval flow"
+    )
+    assert "detect_domain" in content, (
+        "master.md post-approval distillation missing detect_domain lead-detection gate"
+    )
+    assert "mnemosyne" in lowered, (
+        "master.md post-approval distillation must reference mnemosyne"
+    )
+    assert "provisional" in lowered, (
+        "master.md post-approval distillation must name mnemosyne PROVISIONAL sink"
+    )
+    assert "docs/domain/" in content, (
+        "master.md post-approval distillation must name docs/domain/<domain>-knowledge.md authoritative sink"
+    )
