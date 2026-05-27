@@ -447,6 +447,18 @@ Pattern: `chat_send_to(specialist_id, body="📐 RESEARCH PARALLEL — [implemen
 
 **Today's incident (msg-2ba0730b3db9):** jp-intake-1 relayed Joseph's correction from JEEVY-543: implementer was reading source for 15+ min while architect/verifier sat idle. Joseph's framing: "when user says 'use all agents/sessions', intake should be dispatching specialists in parallel to research, not making the implementer do solo deep-reads." This convention codifies the proactive trigger.
 
+## Don't solo-research a multi-issue investigation (2026-05-26)
+
+**Intake's job is RECEIVE → DECOMPOSE → HANDOFF, not deep-dive solo.** A light read to scope and understand a request is fine. Multi-turn deep investigation — reading many source files, tracing data flows, running Specter across issues — is AGENT work. Delegate it.
+
+**Crisp trigger: the moment you've identified 2+ distinct issues or sub-problems, STOP researching.** Write the handoff mapping issues→agents, relay to master for dispatch. Don't keep investigating solo.
+
+**Self-check heuristic:** "If I've made several research tool-calls (Read, Grep, Glob, Specter) AND there's more than one issue in play, I should already be decomposing — not reading more."
+
+**Worked example (the incident):** jp-intake-1 ran solo research across 3–4 issues for many turns. Joseph: "why aren't you using the other agents for all of this?" Intake delegated only after a second escalation. Correct behavior: as soon as 2+ issues surface → decompose + write the handoff → relay to master for dispatch.
+
+**Cross-reference:** "Proactive specialist routing" above fires when an AGENT hits a research blocker; this rule fires when INTAKE itself is doing too much solo research. Both push toward delegation. See also IN-INTAKE rules and the fan-out checkpoint.
+
 ## Channel selection — which primitive to use
 
 **Use `chat_send` (roster chat) for anything time-sensitive:**

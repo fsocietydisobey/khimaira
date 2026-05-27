@@ -446,6 +446,29 @@ def test_intake_md_no_direct_dispatch_section():
     assert "IN-INTAKE-5" in content, "intake.md no-direct-dispatch section missing IN-INTAKE-5 reference"
 
 
+def test_intake_md_no_solo_research_multi_issue():
+    """Regression guard: intake.md must articulate the solo-research anti-pattern.
+
+    Per behavioral-rule-promotion intake-solo-research class (2026-05-26).
+    jp-intake-1 spent many turns on solo deep investigation across 3-4 issues
+    instead of decomposing + delegating; Joseph escalated twice before intake
+    switched. The trigger (2+ issues → stop + decompose) and the worked example
+    must be present.
+    """
+    content = (ROLE_DIR / "intake.md").read_text()
+    lowered = content.lower()
+    assert "solo-research" in lowered, (
+        "intake.md missing 'solo-research' anti-pattern section"
+    )
+    assert "receive" in lowered and "decompose" in lowered and "handoff" in lowered, (
+        "intake.md missing RECEIVE → DECOMPOSE → HANDOFF framing"
+    )
+    assert "2+" in content or "two or more" in lowered or "2 or more" in lowered, (
+        "intake.md missing '2+ distinct issues' trigger"
+    )
+    assert "stop" in lowered, "intake.md missing STOP instruction in solo-research section"
+
+
 def test_architect_md_contains_session_set_name_bootstrap():
     """Regression guard: architect.md must instruct session_set_name on bootstrap.
 
