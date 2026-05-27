@@ -1,0 +1,33 @@
+# Themis rules — jp-frontend-lead role
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+role: jp-frontend-lead
+invariants:
+  - id: IN-JP-FRONTEND-LEAD-1
+    name: NO_FILE_EDIT_OUTSIDE_FRONTEND
+    severity: block
+    matchers:
+      - tool: Edit
+        tool_input_field:
+          field: file_path
+          pattern: "^(?!.*(?:frontend/|/home/_3ntropy/dev/khimaira/packages/khimaira/src/khimaira/roles/jp\-frontend\-lead\.md|/home/_3ntropy/dev/khimaira/docs/domain/frontend\-knowledge\.md)).+"
+      - tool: Write
+        tool_input_field:
+          field: file_path
+          pattern: "^(?!.*(?:frontend/|/home/_3ntropy/dev/khimaira/packages/khimaira/src/khimaira/roles/jp\-frontend\-lead\.md|/home/_3ntropy/dev/khimaira/docs/domain/frontend\-knowledge\.md)).+"
+    message: |
+      🛑 Themis IN-JP-FRONTEND-LEAD-1 (NO_FILE_EDIT_OUTSIDE_FRONTEND): jp-frontend-lead
+      attempted to edit a file outside the frontend domain. Edits restricted to
+      the paths listed in the jp-frontend-lead role doc's Domain scope section.
+      Cross-domain work: flag to master, who defines the contract. Direct
+      cross-domain edits violate the domain-lead boundary.
+
+  - id: IN-JP-FRONTEND-LEAD-2
+    name: NO_STANDALONE_AGENTS
+    severity: block
+    matchers:
+      - tool: Task
+    message: |
+      🛑 Themis IN-JP-FRONTEND-LEAD-2 (NO_STANDALONE_AGENTS): jp-frontend-lead spawned
+      a standalone Task agent. Use chat_task_create + chat_send_to for fan-out
+      to roster transient agents. Standalone Task agents bypass the enforcement
+      gate + observer lifecycle.

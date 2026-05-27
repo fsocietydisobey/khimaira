@@ -24,6 +24,20 @@ _MANUAL_BLOCK_RE = re.compile(
 )
 
 
+def _relative_or_absolute(path: Path, root: Path) -> str:
+    """Return path relative to root if under it; absolute POSIX string otherwise.
+
+    Handles the cross-repo case: when output dirs (roles_dir, knowledge_dir)
+    live in a different repo from root_path (e.g. jeevy leads whose docs land
+    in the khimaira repo), .relative_to() raises ValueError. Fall back to the
+    absolute path so templates and allow-regexes remain correct.
+    """
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 # ---------------------------------------------------------------------------
 # Template rendering
 # ---------------------------------------------------------------------------
@@ -111,10 +125,9 @@ def _render_role_doc(
 ) -> str:
     """Render the role doc for one lead, preserving any manual blocks."""
     lead_name = _lead_name(domain, manifest.prefix)
-    knowledge_doc_path = (
-        (manifest.knowledge_dir / f"{domain}-knowledge.md")
-        .relative_to(manifest.root_path)
-        .as_posix()
+    knowledge_doc_path = _relative_or_absolute(
+        manifest.knowledge_dir / f"{domain}-knowledge.md",
+        manifest.root_path,
     )
     themis_rule_id, themis_rule_id_2 = _themis_rule_ids(domain, manifest.prefix)
 
@@ -154,15 +167,13 @@ def _render_themis_yaml(
 ) -> str:
     """Render the Themis YAML for one lead."""
     lead_name = _lead_name(domain, manifest.prefix)
-    knowledge_doc_path = (
-        (manifest.knowledge_dir / f"{domain}-knowledge.md")
-        .relative_to(manifest.root_path)
-        .as_posix()
+    knowledge_doc_path = _relative_or_absolute(
+        manifest.knowledge_dir / f"{domain}-knowledge.md",
+        manifest.root_path,
     )
-    role_doc_path = (
-        (manifest.roles_dir / f"{lead_name}.md")
-        .relative_to(manifest.root_path)
-        .as_posix()
+    role_doc_path = _relative_or_absolute(
+        manifest.roles_dir / f"{lead_name}.md",
+        manifest.root_path,
     )
     themis_rule_id, themis_rule_id_2 = _themis_rule_ids(domain, manifest.prefix)
 

@@ -251,3 +251,63 @@ def test_no_prefix_produces_unprefixed_lead_name(tmp_path: Path, central_leads: 
     themis_content = (tmp_path / "themis" / "rules" / "backend-lead.yaml").read_text()
     assert "IN-BACKEND-LEAD-1" in themis_content
     assert "IN-JP-BACKEND-LEAD-1" not in themis_content
+
+
+def test_absolute_output_dirs_generate_into_separate_repo(
+    tmp_path: Path, central_leads: Path
+):
+    """Cross-repo case: root_path=X, roles_dir/themis_dir/knowledge_dir are absolute
+    paths outside X.  Generated files must land in the absolute dirs — NOT in X.
+
+    This is the jeevy pattern: jeevy_portal is the project root, but lead docs,
+    Themis YAMLs, and knowledge seeds land in the khimaira repo.
+    """
+    project_root = tmp_path / "project_root"
+    output_root = tmp_path / "output_repo"
+    for d in [
+        project_root,
+        output_root / "roles",
+        output_root / "themis" / "rules",
+        output_root / "docs" / "domain",
+    ]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    (central_leads / "cross.toml").write_text(
+        f"""
+[project]
+name = "cross"
+prefix = "xp"
+root_path = "{project_root}"
+roles_dir = "{output_root / "roles"}"
+themis_dir = "{output_root / "themis" / "rules"}"
+knowledge_dir = "{output_root / "docs" / "domain"}"
+
+[leads.backend]
+paths = ["src/backend/**"]
+model = "sonnet"
+effort = "medium"
+"""
+    )
+
+    sync_leads("cross")
+
+    # Generated files must land in output_repo, NOT in project_root
+    role_path = output_root / "roles" / "xp-backend-lead.md"
+    themis_path = output_root / "themis" / "rules" / "xp-backend-lead.yaml"
+    knowledge_path = output_root / "docs" / "domain" / "backend-knowledge.md"
+
+    assert role_path.exists(), "Role doc not generated into absolute output dir"
+    assert themis_path.exists(), "Themis YAML not generated into absolute output dir"
+    assert knowledge_path.exists(), "Knowledge seed not created in absolute output dir"
+
+    # Nothing should be written under project_root
+    project_files = list(project_root.rglob("*"))
+    assert project_files == [], f"Files unexpectedly written to project_root: {project_files}"
+
+    # Themis allow-regex must include the domain paths (project-root-relative)
+    themis_content = themis_path.read_text()
+    assert "src/backend/" in themis_content
+
+    # Role doc knowledge_doc_path should be the absolute path (cross-repo fallback)
+    role_content = role_path.read_text()
+    assert str(output_root / "docs" / "domain" / "backend-knowledge.md") in role_content

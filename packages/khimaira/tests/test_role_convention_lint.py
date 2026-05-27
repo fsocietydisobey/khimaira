@@ -235,7 +235,13 @@ def test_each_lead_role_has_knowledge_doc():
     """
     leads = list(ROLE_DIR.glob("*-lead.md"))
     for role_path in leads:
-        domain = role_path.stem.replace("-lead", "")
+        # Strip "-lead" suffix, then take the last "-"-separated token as the
+        # bare domain.  Prefixed leads (e.g. jp-frontend-lead) use bare domain
+        # knowledge docs (frontend-knowledge.md), not prefixed ones — per the
+        # prefix contract in manifest._lead_name / _themis_rule_ids.
+        # assumes domain names are single-word (no hyphens)
+        stem_without_lead = role_path.stem[: -len("-lead")]  # e.g. "jp-frontend"
+        domain = stem_without_lead.rsplit("-", 1)[-1]  # "frontend"
         doc_path = DOMAIN_DOCS_DIR / f"{domain}-knowledge.md"
         assert doc_path.exists(), (
             f"Lead role {role_path.name} has no knowledge doc at {doc_path}. "
