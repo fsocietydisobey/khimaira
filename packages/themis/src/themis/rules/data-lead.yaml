@@ -9,11 +9,11 @@ invariants:
       - tool: Edit
         tool_input_field:
           field: file_path
-          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/monitor/sessions\.py|packages/khimaira/src/khimaira/monitor/chats\.py|packages/khimaira/src/khimaira/monitor/discovery/|packages/khimaira/tests/test_sessions_|packages/khimaira/tests/test_chats_|packages/khimaira/tests/test_schema_|packages/khimaira/src/khimaira/roles/data\-lead\.md|docs/domain/data\-knowledge\.md)).+"
+          pattern: '^(?!.*(?:packages/khimaira/src/khimaira/monitor/sessions\.py|packages/khimaira/src/khimaira/monitor/chats\.py|packages/khimaira/src/khimaira/monitor/discovery/|packages/khimaira/tests/test_sessions_|packages/khimaira/tests/test_chats_|packages/khimaira/tests/test_schema_|packages/khimaira/src/khimaira/roles/data\-lead\.md|docs/domain/data\-knowledge\.md)).+'
       - tool: Write
         tool_input_field:
           field: file_path
-          pattern: "^(?!.*(?:packages/khimaira/src/khimaira/monitor/sessions\.py|packages/khimaira/src/khimaira/monitor/chats\.py|packages/khimaira/src/khimaira/monitor/discovery/|packages/khimaira/tests/test_sessions_|packages/khimaira/tests/test_chats_|packages/khimaira/tests/test_schema_|packages/khimaira/src/khimaira/roles/data\-lead\.md|docs/domain/data\-knowledge\.md)).+"
+          pattern: '^(?!.*(?:packages/khimaira/src/khimaira/monitor/sessions\.py|packages/khimaira/src/khimaira/monitor/chats\.py|packages/khimaira/src/khimaira/monitor/discovery/|packages/khimaira/tests/test_sessions_|packages/khimaira/tests/test_chats_|packages/khimaira/tests/test_schema_|packages/khimaira/src/khimaira/roles/data\-lead\.md|docs/domain/data\-knowledge\.md)).+'
     message: |
       🛑 Themis IN-DATA-LEAD-1 (NO_FILE_EDIT_OUTSIDE_DATA): data-lead
       attempted to edit a file outside the data domain. Edits restricted to

@@ -9,11 +9,11 @@ invariants:
       - tool: Edit
         tool_input_field:
           field: file_path
-          pattern: "{{ allow_regex }}"
+          pattern: '{{ allow_regex }}'
       - tool: Write
         tool_input_field:
           field: file_path
-          pattern: "{{ allow_regex }}"
+          pattern: '{{ allow_regex }}'
     message: |
       🛑 Themis {{ themis_rule_id }} (NO_FILE_EDIT_OUTSIDE_{{ DOMAIN }}): {{ lead_name }}
       attempted to edit a file outside the {{ domain }} domain. Edits restricted to

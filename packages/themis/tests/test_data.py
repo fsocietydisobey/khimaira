@@ -110,7 +110,7 @@ class TestLoadRules:
             assert isinstance(rs.invariants, list)
 
     def test_unknown_role_raises(self):
-        with pytest.raises(ValueError, match="Unknown role"):
+        with pytest.raises(FileNotFoundError, match="No rule file for role"):
             load_rules("supervillain")
 
     def test_all_bundled_rules_have_required_fields(self):
@@ -131,9 +131,9 @@ class TestLoadRules:
         rs = load_rules("verifier")
         assert rs.invariants == []
 
-    def test_intake_has_four_invariants(self):
+    def test_intake_has_five_invariants(self):
         rs = load_rules("intake")
-        assert len(rs.invariants) == 4
+        assert len(rs.invariants) == 5
 
     def test_intake_in_intake_1_severity_is_block(self):
         rs = load_rules("intake")
@@ -184,6 +184,53 @@ class TestLoadRules:
         )
         with pytest.raises(ValueError, match="missing required fields"):
             load_rules("intake")
+
+    # --- class-invariant tests: every yaml in the rules dir must load + evaluate ---
+
+    def test_all_yaml_roles_load_successfully(self):
+        """load_rules(role) must succeed for EVERY .yaml in the bundled rules dir.
+
+        This is the class-invariant that hid the VALID_ROLES gap: any role with a
+        .yaml file must be loadable without raising, regardless of whether its name
+        is in a static set. Adding a new lead via sync_leads automatically satisfies
+        this invariant.
+        """
+        from themis.data import _RULES_DIR
+
+        roles_from_dir = [p.stem for p in _RULES_DIR.glob("*.yaml")]
+        assert roles_from_dir, "No .yaml files found in rules dir — sync_leads may not have run"
+        for role in roles_from_dir:
+            rs = load_rules(role)
+            assert rs.role == role, f"load_rules({role!r}) returned rs.role={rs.role!r}"
+            assert isinstance(rs.invariants, list)
+
+    def test_jp_frontend_lead_has_propose_only_block_rule(self):
+        """jp-frontend-lead must have the NO_FILE_EDIT_PROPOSE_ONLY invariant (BLOCK)."""
+        rs = load_rules("jp-frontend-lead")
+        po_inv = next(
+            (i for i in rs.invariants if i.name == "NO_FILE_EDIT_PROPOSE_ONLY"),
+            None,
+        )
+        assert po_inv is not None, "NO_FILE_EDIT_PROPOSE_ONLY invariant not found in jp-frontend-lead"
+        assert po_inv.severity == Severity.BLOCK
+        assert po_inv.id.endswith("-PO")
+
+    def test_evaluate_jp_frontend_lead_edit_blocks(self):
+        """evaluate() must return ok=False/BLOCK for jp-frontend-lead + Edit outside domain.
+
+        This is the runtime path test — not just yaml-exists, but the full load +
+        evaluate chain that was failing via VALID_ROLES ValueError → fail-open.
+        """
+        from themis.engine import evaluate
+
+        result = evaluate(
+            "jp-frontend-lead",
+            "Edit",
+            {"file_path": "/tmp/not-in-jp-domain.py"},
+        )
+        assert not result.ok, "Expected ok=False but got ok=True (fail-open path may still be active)"
+        assert result.violation is not None
+        assert result.violation.severity == Severity.BLOCK
 
 
 class TestViolationRecord:

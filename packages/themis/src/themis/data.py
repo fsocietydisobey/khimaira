@@ -23,21 +23,7 @@ import yaml
 # Bundled rules directory, co-located with this package.
 _RULES_DIR = Path(__file__).parent / "rules"
 
-VALID_ROLES = frozenset(
-    [
-        "intake",
-        "master",
-        "agent",
-        "observer",
-        "architect",
-        "analyst",
-        "verifier",
-        "critic",
-        "tracker",
-        "backend-lead",
-        "data-lead",
-    ]
-)
+VALID_ROLES: frozenset[str] = frozenset(p.stem for p in _RULES_DIR.glob("*.yaml"))
 
 
 class Severity(str, Enum):
@@ -222,15 +208,17 @@ def _parse_invariant(raw: dict[str, Any]) -> Invariant:
 def load_rules(role: str) -> RuleSet:
     """Load and parse the rule YAML for `role`.
 
+    A role is valid iff a ``<role>.yaml`` file exists in the bundled rules dir.
+    This generalizes to any prefixed lead name (e.g. ``jp-frontend-lead``) without
+    requiring manual registration in a static set.
+
     Raises:
-        ValueError: Unknown role or invalid YAML schema.
-        FileNotFoundError: Rule file missing from the package.
+        FileNotFoundError: No rule file for this role.
+        ValueError: Rule file exists but fails schema validation.
     """
-    if role not in VALID_ROLES:
-        raise ValueError(f"Unknown role {role!r}. Valid roles: {sorted(VALID_ROLES)}")
     path = _RULES_DIR / f"{role}.yaml"
     if not path.exists():
-        raise FileNotFoundError(f"Rule file not found: {path}")
+        raise FileNotFoundError(f"No rule file for role {role!r}: {path}")
     try:
         doc = yaml.safe_load(path.read_text())
     except yaml.YAMLError as exc:
