@@ -142,6 +142,32 @@ def _propose_only_rule_block(
     )
 
 
+def _propose_only_how_to_work_block(
+    themis_rule_id: str,
+) -> str:
+    """Return the propose-only how-to-work section, or '' if not needed."""
+    po_id = f"{themis_rule_id}-PO"
+    return (
+        f"\n## 🛠 How You Work — PROPOSE-ONLY mode\n\n"
+        f"Because this roster is `propose_only`, you are the **domain authority\n"
+        f"but NOT the executor**. Themis blocks all writes; master's implementing\n"
+        f"agent is your hands.\n\n"
+        f"**Propose-only workflow:**\n\n"
+        f"1. Receive intent from master (same as standard flow).\n"
+        f"2. Read knowledge first (same as standard flow).\n"
+        f"3. **Produce an IMPLEMENTATION-READY plan** — concrete file paths, exact\n"
+        f"   changes, acceptance criteria. Do NOT attempt to execute; Themis blocks\n"
+        f"   writes anyway ({po_id} — NO_FILE_EDIT_PROPOSE_ONLY).\n"
+        f"4. **Send plan to master** via `chat_send_to`. Master dispatches an\n"
+        f"   implementing agent with your plan as the spec.\n"
+        f"5. **Guide the implementing agent.** Answer its domain questions; review\n"
+        f"   its output against your plan; flag domain-correctness issues to master.\n"
+        f"6. **You are the domain authority; the agent is your hands.** This\n"
+        f"   lead↔agent guidance is allowed — the agent executes YOUR plan, which\n"
+        f"   is NOT the forbidden cross-lead peer-coordination.\n"
+    )
+
+
 def _propose_only_section_block(
     themis_rule_id: str,
     project_name: str,
@@ -180,6 +206,11 @@ def _render_role_doc(
         if manifest.propose_only
         else ""
     )
+    propose_only_how_to_work = (
+        _propose_only_how_to_work_block(themis_rule_id)
+        if manifest.propose_only
+        else ""
+    )
 
     template_text = _TEMPLATE_ROLE.read_text()
     rendered = _render(
@@ -198,6 +229,7 @@ def _render_role_doc(
             "themis_rule_id": themis_rule_id,
             "themis_rule_id_2": themis_rule_id_2,
             "propose_only_section": propose_only_section,
+            "propose_only_how_to_work": propose_only_how_to_work,
         },
     )
 

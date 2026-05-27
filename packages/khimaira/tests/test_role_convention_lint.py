@@ -485,3 +485,74 @@ def test_architect_md_contains_session_set_name_bootstrap():
     assert "architect-" in content.lower(), (
         "architect.md missing 'architect-N' name convention example"
     )
+
+
+def test_master_md_contains_propose_only_branch():
+    """Regression guard: master.md must describe the PROPOSE-ONLY BRANCH for
+    domain-lead delegation when leads are write-blocked.
+
+    Per task-9627f2ef147a: PROPOSE-ONLY FLOW documentation gap (2026-05-27).
+    Without this section master dispatches lead to execute → Themis blocks →
+    janice stuck improvising. The branch must name master's correct role
+    (dispatch agent + lead guides) and be keyed to propose_only=true.
+    """
+    content = (ROLE_DIR / "master.md").read_text()
+    lowered = content.lower()
+    assert "propose-only branch" in lowered, (
+        "master.md missing 'PROPOSE-ONLY BRANCH' section in domain-lead delegation"
+    )
+    assert "implementation-ready plan" in lowered, (
+        "master.md propose-only branch missing 'implementation-ready plan' anchor"
+    )
+    assert "domain authority" in lowered, (
+        "master.md propose-only branch missing 'domain authority' role framing"
+    )
+    assert "lead guides" in lowered or "lead↔agent" in lowered or "lead guides" in lowered, (
+        "master.md propose-only branch missing lead-guides-agent guidance"
+    )
+
+
+def test_lead_role_template_emits_propose_only_how_to_work(tmp_path):
+    """Regression guard: lead-role template must emit propose-only how-to-work
+    guidance when propose_only=True and omit it when propose_only=False.
+
+    Per task-9627f2ef147a: per-project isolation is load-bearing — jp-leads get
+    the guidance; khimaira leads (propose_only=False) must not.
+    """
+    from khimaira.leads.manifest import Manifest, LeadConfig
+    from khimaira.leads.sync import _render_role_doc
+
+    lead_cfg = LeadConfig(
+        name="frontend", paths=["frontend/**"], model="sonnet", effort="medium"
+    )
+
+    def make_manifest(propose_only: bool) -> Manifest:
+        return Manifest(
+            project_name="test-project",
+            prefix="tp",
+            root_path=tmp_path,
+            roles_dir=tmp_path / "roles",
+            themis_dir=tmp_path / "themis",
+            knowledge_dir=tmp_path / "docs" / "domain",
+            leads={"frontend": lead_cfg},
+            propose_only=propose_only,
+        )
+
+    propose_doc = _render_role_doc(make_manifest(propose_only=True), "frontend", lead_cfg)
+    plain_doc = _render_role_doc(make_manifest(propose_only=False), "frontend", lead_cfg)
+
+    # propose_only=True: guidance section must be present
+    assert "propose-only mode" in propose_doc.lower(), (
+        "lead-role template missing propose-only how-to-work section when propose_only=True"
+    )
+    assert "implementation-ready plan" in propose_doc.lower(), (
+        "lead-role template missing 'implementation-ready plan' guidance when propose_only=True"
+    )
+    assert "domain authority" in propose_doc.lower(), (
+        "lead-role template missing 'domain authority' framing when propose_only=True"
+    )
+
+    # propose_only=False: no propose-only how-to-work content
+    assert "implementation-ready plan" not in plain_doc.lower(), (
+        "lead-role template must NOT emit propose-only how-to-work when propose_only=False"
+    )

@@ -178,6 +178,24 @@ delegate decomposition to the lead.
    honors IN-AGENT-4 (branch / worktree / merge_intent declarations). You
    approve and proceed to Step 6 (Integrate) + Step 7 (Reconcile).
 
+**PROPOSE-ONLY BRANCH (when leads are write-blocked).** If the project's leads are
+configured `propose_only = true`, execution diverges at step 4:
+
+- **Lead's output is a plan, not execution.** The lead produces an
+  IMPLEMENTATION-READY plan — concrete file paths, exact changes, acceptance
+  criteria — and sends it to master via `chat_send_to`. Lead does NOT execute;
+  Themis blocks all writes (NO_FILE_EDIT_PROPOSE_ONLY).
+- **Master dispatches an implementing agent** via `chat_task_create` + BEGIN with
+  the lead's plan as the task spec. The agent is the lead's hands.
+- **Lead guides the implementing agent — domain authority role.** The lead answers
+  the agent's domain questions (via `chat_send_to`) and reviews the agent's output
+  against the plan. This direct lead↔agent guidance is allowed: the agent executes
+  the lead's plan — this is NOT the forbidden cross-lead peer-coordination.
+- **Agent reports to master; critic + verifier review as usual.**
+
+The lead never writes in a propose-only roster. Your job: ensure the agent has the
+lead's plan as authoritative spec before dispatching.
+
 **When NO lead exists for the domain** (e.g. devops-lead deferred to Phase 1B):
 fall back to original master-decomposes-then-dispatches-agents pattern. The
 domain-lead delegation is opt-in based on roster.
