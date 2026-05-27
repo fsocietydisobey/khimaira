@@ -612,3 +612,54 @@ def test_master_md_contains_post_approval_distillation():
     assert "docs/domain/" in content, (
         "master.md post-approval distillation must name docs/domain/<domain>-knowledge.md authoritative sink"
     )
+
+
+def test_role_budget_lead_entries_in_sync():
+    """Regression guard: ROLE_BUDGET (chats.py) and _ROLE_BUDGET (session_start.py)
+    must both contain entries for the 4 core domain leads.
+
+    These two dicts are explicit duplicates (session_start.py is stdlib-only and
+    cannot import from chats.py). Without this test, one copy can drift silently.
+    Per F2/F3 of the backend-lead-1 role-set audit (task-6a0fa19f3639, 2026-05-27).
+    """
+    # Only leads with themis rule yamls — entries must be in _VALID_ROLES.
+    _LEAD_ROLES = ("backend-lead", "data-lead", "jp-backend-lead", "jp-data-lead", "jp-frontend-lead")
+    _EXPECTED_BUDGET = {"model": "sonnet", "effort": "medium"}
+
+    chats_src = (REPO_ROOT / "packages/khimaira/src/khimaira/monitor/chats.py").read_text()
+    session_start_src = (
+        REPO_ROOT / "packages/khimaira/src/khimaira/hooks/session_start.py"
+    ).read_text()
+
+    for lead in _LEAD_ROLES:
+        assert f'"{lead}"' in chats_src, (
+            f"ROLE_BUDGET in chats.py missing entry for {lead!r}"
+        )
+        assert f'"{lead}"' in session_start_src, (
+            f"_ROLE_BUDGET in session_start.py missing entry for {lead!r}"
+        )
+        # Both must agree on sonnet/medium (not opus/max — per lead-role.md.j2 convention)
+        assert '"sonnet"' in chats_src, "chats.py ROLE_BUDGET lead entries must use sonnet model"
+        assert '"sonnet"' in session_start_src, (
+            "session_start.py _ROLE_BUDGET lead entries must use sonnet model"
+        )
+
+
+def test_domains_tuple_covers_core_lead_domains():
+    """Regression guard: session_end_utils._DOMAINS must contain the 4 core domains.
+
+    _DOMAINS is not registry-derived — it's a standalone tuple. Adding a new lead
+    domain requires updating this tuple; failing to do so silently breaks session-end
+    distillation and session-start provisional memory injection for that domain.
+    Per F5 of the backend-lead-1 role-set audit (task-6a0fa19f3639, 2026-05-27).
+    Approach (b): _DOMAINS stays as single source; this test prevents silent removal
+    of an established domain.
+    """
+    src = (
+        REPO_ROOT / "packages/khimaira/src/khimaira/hooks/session_end_utils.py"
+    ).read_text()
+    for domain in ("backend", "frontend", "data", "devops"):
+        assert f'"{domain}"' in src, (
+            f"session_end_utils._DOMAINS missing {domain!r} — "
+            "leads for this domain will miss distillation + provisional memory"
+        )

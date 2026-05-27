@@ -346,6 +346,14 @@ _ROLE_BUDGET: dict[str, dict[str, str]] = {
     "verifier": {"model": "opus", "effort": "max"},
     "tracker": {"model": "haiku", "effort": "medium"},
     # critic intentionally absent — no default
+    # Domain leads: sonnet/medium (mirrors ROLE_BUDGET in chats.py — kept duplicated
+    # here because session_start must run in a stdlib-only subprocess). Entries must
+    # match the lead roles in the themis rule registry.
+    "backend-lead": {"model": "sonnet", "effort": "medium"},
+    "data-lead": {"model": "sonnet", "effort": "medium"},
+    "jp-backend-lead": {"model": "sonnet", "effort": "medium"},
+    "jp-data-lead": {"model": "sonnet", "effort": "medium"},
+    "jp-frontend-lead": {"model": "sonnet", "effort": "medium"},
 }
 
 

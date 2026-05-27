@@ -82,8 +82,21 @@ try:
     # don't enforce without themis anyway.
     from themis.data import VALID_ROLES as _VALID_ROLES
 except ImportError:
+    # D7 fallback: include all named ROLE_* constants so the set won't lag future
+    # additions of named roles (e.g. analyst/verifier/tracker were missing pre-fix).
+    # Lead roles (dynamic, prefixed) can't be enumerated here; they require themis.
     _VALID_ROLES: frozenset[str] = frozenset(
-        {ROLE_MASTER, ROLE_AGENT, ROLE_OBSERVER, ROLE_CRITIC, ROLE_ARCHITECT, ROLE_INTAKE}
+        {
+            ROLE_MASTER,
+            ROLE_AGENT,
+            ROLE_OBSERVER,
+            ROLE_CRITIC,
+            ROLE_ARCHITECT,
+            ROLE_INTAKE,
+            ROLE_ANALYST,
+            ROLE_VERIFIER,
+            ROLE_TRACKER,
+        }
     )
 
 # Phase B v1.5: recommended model + effort budget per role.
@@ -101,6 +114,15 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
     ROLE_ANALYST: {"model": "opus", "effort": "max"},  # spec disambiguation, idle-by-default
     ROLE_VERIFIER: {"model": "opus", "effort": "max"},  # test coverage gate, idle-by-default
     ROLE_TRACKER: {"model": "haiku", "effort": "medium"},  # checklist curator + Linear filer
+    # Domain leads: sonnet/medium default; escalate to opus only for rare decomposition-heavy
+    # initiatives (per lead-role.md.j2 convention). Entries here must match the themis rule
+    # yaml filenames in packages/themis/src/themis/rules/ — ROLE_BUDGET keys must be in
+    # _VALID_ROLES (enforced by test_role_budget_keys_subset_of_valid_roles).
+    "backend-lead": {"model": "sonnet", "effort": "medium"},
+    "data-lead": {"model": "sonnet", "effort": "medium"},
+    "jp-backend-lead": {"model": "sonnet", "effort": "medium"},
+    "jp-data-lead": {"model": "sonnet", "effort": "medium"},
+    "jp-frontend-lead": {"model": "sonnet", "effort": "medium"},
 }
 
 

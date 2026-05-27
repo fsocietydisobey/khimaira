@@ -41,6 +41,12 @@ _REPLY_OVERDUE_BY_ROLE: dict[str, float] = {
     "analyst": 180.0,
     "verifier": 300.0,
     "critic": 120.0,
+    # Domain leads do substantive research; 90s default is too tight.
+    "backend-lead": 180.0,
+    "data-lead": 180.0,
+    "jp-backend-lead": 180.0,
+    "jp-data-lead": 180.0,
+    "jp-frontend-lead": 180.0,
 }
 _LIVENESS_WINDOW_S = 60.0  # activity within this window = session is alive
 
