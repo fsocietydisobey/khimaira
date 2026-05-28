@@ -195,8 +195,8 @@ def test_oracle_project_passed_to_stores(oracle_client: TestClient) -> None:
         seance_calls.append((project, question))
         return [], False
 
-    def fake_mnemo(domain: str) -> None:
-        mnemo_calls.append(domain)
+    def fake_mnemo(project: str) -> None:
+        mnemo_calls.append(project)
         return None
 
     with (
@@ -207,3 +207,30 @@ def test_oracle_project_passed_to_stores(oracle_client: TestClient) -> None:
 
     assert seance_calls[0][0] == "jeevy_portal"
     assert mnemo_calls[0] == "jeevy_portal"
+
+
+def test_oracle_mnemosyne_qualified_key_fanout(oracle_client: TestClient) -> None:
+    """Fan-out queries qualified `project:domain` keys; returns data from the matching domain."""
+    backend_result = {
+        "domain": "khimaira:backend",
+        "question": "recent context for khimaira:backend",
+        "answer": "Q: How does auth work?\nA: JWT via middleware.",
+        "training_pairs_available": 3,
+    }
+
+    def fake_inner_query(domain: str) -> dict | None:
+        # Only khimaira:backend has data; all others return None.
+        return backend_result if domain == "khimaira:backend" else None
+
+    with (
+        patch("khimaira.monitor.api.oracle._seance_search", return_value=_SEANCE_EMPTY_OK),
+        patch("khimaira.monitor.api.oracle.mnemosyne_client.query", side_effect=fake_inner_query),
+    ):
+        data = _call_oracle(oracle_client, project="khimaira")
+
+    assert data["degraded"] is False
+    assert "mnemosyne" in data["stores_hit"]
+    assert "JWT via middleware" in data["context"]
+    # Citation should reference the merged result, not bare project
+    mnemo_citation = next(c for c in data["citations"] if c["store"] == "mnemosyne")
+    assert "backend" in mnemo_citation["ref"]

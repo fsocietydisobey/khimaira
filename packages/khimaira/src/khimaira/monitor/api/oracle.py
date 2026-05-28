@@ -65,9 +65,40 @@ def _seance_search(project: str, question: str) -> tuple[list[dict[str, Any]], b
         return [], True
 
 
-def _mnemosyne_query(domain: str) -> dict[str, Any] | None:
-    """Query mnemosyne for domain. Returns None on failure or empty memory."""
-    return mnemosyne_client.query(domain)
+# Domains that capture-v1 writes qualified keys for. Must stay in sync with
+# session_end_utils._DOMAINS + "general" (the fallback domain).
+_MNEMOSYNE_DOMAINS = ("backend", "frontend", "data", "devops", "general")
+
+
+def _mnemosyne_query(project: str) -> dict[str, Any] | None:
+    """Fan out across all known qualified domain keys for project.
+
+    Queries `{project}:{domain}` for each domain in _MNEMOSYNE_DOMAINS.
+    Merges non-empty results into one synthetic dict so _build_context
+    doesn't need to change. Returns None when all domains are empty.
+
+    Bare-project lookup (pre-fix) silently missed all pairs because capture-v1
+    writes at qualified keys. This fan-out closes that seam.
+    """
+    parts: list[str] = []
+    total_pairs = 0
+    domains_hit: list[str] = []
+
+    for domain in _MNEMOSYNE_DOMAINS:
+        result = mnemosyne_client.query(f"{project}:{domain}")
+        if result and result.get("answer"):
+            parts.append(f"### {domain}\n\n{result['answer']}")
+            total_pairs += result.get("training_pairs_available", 0)
+            domains_hit.append(domain)
+
+    if not parts:
+        return None
+
+    return {
+        "domain": f"{project}:[{','.join(domains_hit)}]",
+        "answer": "\n\n".join(parts),
+        "training_pairs_available": total_pairs,
+    }
 
 
 # ---------------------------------------------------------------------------
