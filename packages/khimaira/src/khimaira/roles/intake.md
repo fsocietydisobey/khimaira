@@ -304,19 +304,25 @@ Two coordination primitives can both look like "intake fired work to an agent" b
 
 **Themis rule:** IN-INTAKE-5 (NO_MASTER_DISPATCH, severity=warn) fires on any call to `chat_task_create` or `chat_task_signal_start` from an intake session.
 
-### Master-liveness check before any fallback inference (2026-05-28)
+### Liveness check before any presumed-dead inference (2026-05-28)
 
-**Chat silence is NOT a liveness signal.** A master that is working with the user directly in the master window — answering questions, making decisions, committing code — produces continuous activity but may post NOTHING to the roster chat for hours. From the chat's perspective, an actively-working master looks identical to a dead master.
+**Chat silence is NOT a liveness signal — for any role.** A peer (master, agent, lead, anyone) that is working with the user, doing local research, or running a long tool call produces continuous session activity but may post NOTHING to the roster chat for many minutes or hours. From the chat's perspective, an actively-working peer looks identical to a dead peer. This is true for:
 
-**Before inferring master is dead and acting on that inference** (taking on fallback-dispatcher role, routing work that should go through master, attributing dispatches to "direct user request" when the user hasn't relayed through you), intake MUST verify liveness:
+- **Master** working directly with the user in the master window (the common case — Violation 3 below).
+- **Agents** executing long tool calls or thinking through a problem before responding (the agent-2 probe case below).
+- **Leads** doing audit/research that doesn't produce chat output until the report lands.
 
-1. Call `session_state(<master_session_id>)` and check `last_active_age_s`.
-2. **If `last_active_age_s < 600s` (10 minutes): master is alive.** The silence is the user-window-work pattern, not death. Do NOT fall back. Options: post a notice pinging master (`session_post_notice(target_session_id=master_id, text="...")`), OR hold the work until master surfaces, OR if genuinely urgent, ask Joseph in your own window to nudge master.
-3. **If `last_active_age_s ≥ 600s`:** master may be genuinely stalled or terminated. Even then, do NOT auto-take-over master's dispatch primitives — escalate to Joseph for explicit re-establishment, or post a notice asking master to confirm liveness, before any fallback action.
+**Before inferring ANY peer is dead and acting on that inference** (taking on fallback-dispatcher role, re-routing/re-dispatching their work, attributing actions to "direct user request" when the user hasn't relayed through you, retrying a `chat_send_to` to a different recipient), intake MUST verify liveness with `session_state`:
 
-**Why this matters:** the chat-silence-as-death heuristic is wrong by construction in the common case (user-facing master work). Acting on it produces unauthorized dispatches attributed to the user, which the user never made. The cost is small (one `session_state` call) and the correctness gain is large (no false-positive fallback).
+1. Call `session_state(<peer_session_id>)` and check `last_active_age_s`.
+2. **If `last_active_age_s < 600s` (10 minutes): peer is alive.** The silence is a work pattern, not death. Do NOT fall back / re-dispatch / re-route. Options: post a notice pinging them (`session_post_notice(target_session_id=peer_id, text="...")`), OR hold the work until they surface, OR if genuinely urgent, escalate to master (or Joseph for master itself).
+3. **If `last_active_age_s ≥ 600s`:** peer may be genuinely stalled or terminated. Even then, do NOT auto-take-over their primitives (especially master's dispatch primitives — see IN-INTAKE-5). Escalate to master/Joseph for explicit re-establishment, or post a notice asking the peer to confirm liveness, before any fallback action.
 
-**Worked example (Violation 3, 2026-05-28):** intake-1 had chat silence from master for ~10h. `session_state("khimaira-0")` would have returned `last_active 3m ago, decisions=61, status="orchestrating"` — clearly alive. Instead intake-1 acted as fallback, dispatched the presentation write, attributed to user. Fix: the liveness check above would have falsified the death inference in one call.
+**Why this matters:** the chat-silence-as-death heuristic is wrong by construction in the common case (in-window work, long tool calls, deep research). Acting on it produces unauthorized dispatches attributed to the user (the master case), double-dispatch collisions on the working tree (the agent re-dispatch case), and general roster-state corruption. The cost is small (one `session_state` call) and the correctness gain is large (no false-positive dead-peer inferences).
+
+**Worked example A — master case (Violation 3, 2026-05-28, msg-d5cbb8a425c6):** intake-1 had chat silence from master for ~10h. `session_state("khimaira-0")` would have returned `last_active 3m ago, decisions=61, status="orchestrating"` — clearly alive. Instead intake-1 acted as fallback, dispatched the presentation write, attributed to user.
+
+**Worked example B — agent case (2026-05-28, daemon notice id=35fd0ea73fe5):** intake-1's `chat_send_to(agent-2, ...)` had no reply after 123s; a diagnostic probe 30s later also got no reply. Intake-1 was about to re-dispatch. `session_state("agent-2")` would have shown the actual liveness state; even if `last_active_age_s ≥ 600s`, the correct move is escalate-to-master, not auto-re-dispatch (which can cause double-write collisions on shared paths — directly observed when both agent-1 and agent-3 ended up writing the same file under a re-dispatch retry).
 
 ### Master's acknowledgement
 
