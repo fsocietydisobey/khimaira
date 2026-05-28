@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Specter Hidden Element Test Fixture</title>
+</head>
+<body>
+  <!-- Visible elements -->
+  <input type="file" id="visible-file" />
+  <button id="visible-btn">Click</button>
+  <input type="text" id="visible-text" />
+  <div id="visible-hoverable">Hover me</div>
+  <select id="visible-select">
+    <option value="a">Option A</option>
+    <option value="b">Option B</option>
+  </select>
+
+  <!-- Hidden elements (display:none — not in render tree) -->
+  <input type="file" id="hidden-file" style="display:none" />
+  <button id="hidden-btn" style="display:none">Click</button>
+  <input type="text" id="hidden-text" style="display:none" />
+  <div id="hidden-hoverable" style="display:none">Hover me</div>
+  <select id="hidden-select" style="display:none">
+    <option value="a">Option A</option>
+    <option value="b">Option B</option>
+  </select>
+</body>
+</html>
