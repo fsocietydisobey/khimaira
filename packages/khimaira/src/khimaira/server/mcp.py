@@ -2484,6 +2484,37 @@ async def cancel_scheduled_task(task_id: str) -> str:
 
 
 @mcp.tool()
+@logged_tool("oracle_query")
+async def oracle_query(
+    question: str,
+    project: str,
+    scope: str = "all",
+) -> str:
+    """Codebase oracle — fuses Séance (live code, scored) + mnemosyne (distilled lessons).
+
+    Returns labeled context sections with citations. Context mode only (v1):
+    caller (Claude) synthesizes the answer from the returned sections.
+
+    Use when you need to know "how does X work", "where is Y handled", or
+    "what lessons were distilled about Z" for a project — single call to both
+    stores in parallel.
+
+    Args:
+        question: Natural language question about the codebase.
+        project:  Project name as indexed in Séance / mnemosyne domain key.
+                  Use the bare project name (e.g. "khimaira") or
+                  "project:domain" for domain-specific mnemosyne lookup.
+        scope:    "all" (default) | "structural" | "experiential"
+                  (v1 always fans out to both stores regardless of scope).
+
+    Note: Séance index may lag live code — reindex with
+    `khimaira seance reindex-changed <project>` if results seem stale.
+    degraded=True in the response means one or more stores returned no data.
+    """
+    return await _monitor_tools.oracle_query(question, project, scope)
+
+
+@mcp.tool()
 @logged_tool("session_wait_for_answer")
 async def session_wait_for_answer(
     session_id: str,

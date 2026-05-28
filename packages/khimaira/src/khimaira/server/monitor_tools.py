@@ -15,6 +15,7 @@ actionable feedback instead of a stack trace.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import urllib.error
@@ -1671,3 +1672,51 @@ async def cancel_scheduled_task(task_id: str) -> str:
         return _DAEMON_DOWN_HINT.format(base=_DEFAULT_BASE)
     except Exception as exc:
         return f"khimaira-monitor cancel failed: {exc}"
+
+
+async def oracle_query(
+    question: str,
+    project: str,
+    scope: str = "all",
+) -> str:
+    """Query the codebase oracle: Séance (code) + mnemosyne (lessons), fused.
+
+    Returns labeled context sections + citations for the caller (already Claude)
+    to synthesize. Fail-open — if either store is unavailable, the other's
+    results are included and degraded=True is noted.
+    """
+    result = await asyncio.to_thread(
+        _post,
+        "/api/oracle/query",
+        {"question": question, "project": project, "scope": scope, "mode": "context"},
+        timeout=30.0,
+    )
+    if isinstance(result, str):
+        return result  # error message from _post
+
+    stores = result.get("stores_hit", [])
+    degraded = result.get("degraded", False)
+    context = result.get("context", "")
+    citations = result.get("citations", [])
+    note = result.get("seance_index_note", "")
+
+    header_parts = [f"stores_hit: {stores}"]
+    if degraded:
+        header_parts.append("degraded=True (one or more stores returned no data)")
+    header = " | ".join(header_parts)
+
+    citation_block = ""
+    if citations:
+        cit_lines = ["**Citations:**"]
+        for c in citations:
+            score_part = f" (score: {c['score']:.4f})" if "score" in c else ""
+            cit_lines.append(f"- [{c['store']}] {c['ref']}{score_part}")
+        citation_block = "\n".join(cit_lines)
+
+    parts = [f"**Oracle query** — {header}", context]
+    if citation_block:
+        parts.append(citation_block)
+    if note:
+        parts.append(f"_{note}_")
+
+    return "\n\n".join(p for p in parts if p)
