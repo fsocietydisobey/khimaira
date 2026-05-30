@@ -106,15 +106,15 @@ def _lead_name(domain: str, prefix: str) -> str:
     return f"{domain}-lead"
 
 
-def _themis_rule_ids(domain: str, prefix: str) -> tuple[str, str]:
-    """Return (rule_id_1, rule_id_2) for a lead's two Themis invariants.
+def _themis_rule_ids(domain: str, prefix: str) -> tuple[str, str, str]:
+    """Return (rule_id_1, rule_id_2, rule_id_3) for a lead's three Themis invariants.
 
-    Convention: ``IN-[<PREFIX>-]<DOMAIN>-LEAD-1`` / ``…-LEAD-2`` (uppercased).
+    Convention: ``IN-[<PREFIX>-]<DOMAIN>-LEAD-1`` / ``…-LEAD-2`` / ``…-LEAD-3`` (uppercased).
     Examples: khimaira backend → ``IN-BACKEND-LEAD-1``; jeevy → ``IN-JP-BACKEND-LEAD-1``.
     """
     parts = [p.upper() for p in ([prefix, domain] if prefix else [domain])]
     base = "-".join(parts)
-    return f"IN-{base}-LEAD-1", f"IN-{base}-LEAD-2"
+    return f"IN-{base}-LEAD-1", f"IN-{base}-LEAD-2", f"IN-{base}-LEAD-3"
 
 
 def _propose_only_rule_block(
@@ -197,7 +197,7 @@ def _render_role_doc(
         manifest.knowledge_dir / f"{domain}-knowledge.md",
         manifest.root_path,
     )
-    themis_rule_id, themis_rule_id_2 = _themis_rule_ids(domain, manifest.prefix)
+    themis_rule_id, themis_rule_id_2, themis_rule_id_3 = _themis_rule_ids(domain, manifest.prefix)
 
     paths_list = "\n".join(f"- `{p}`" for p in lead_cfg.paths)
 
@@ -256,7 +256,7 @@ def _render_themis_yaml(
         manifest.roles_dir / f"{lead_name}.md",
         manifest.root_path,
     )
-    themis_rule_id, themis_rule_id_2 = _themis_rule_ids(domain, manifest.prefix)
+    themis_rule_id, themis_rule_id_2, themis_rule_id_3 = _themis_rule_ids(domain, manifest.prefix)
 
     allow_regex = build_allow_regex(
         paths=lead_cfg.paths,
@@ -280,6 +280,7 @@ def _render_themis_yaml(
             "DOMAIN": domain.upper(),
             "themis_rule_id": themis_rule_id,
             "themis_rule_id_2": themis_rule_id_2,
+            "themis_rule_id_3": themis_rule_id_3,
             "allow_regex": allow_regex,
             "propose_only_rule": propose_only_rule,
         },

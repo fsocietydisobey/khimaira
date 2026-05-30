@@ -32,6 +32,22 @@ invariants:
       to roster transient agents. Standalone Task agents bypass the enforcement
       gate + observer lifecycle.
 
+  - id: IN-JP-DATA-LEAD-3
+    name: PATH_CONTENTION
+    severity: warn
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+      - tool: NotebookEdit
+    conditions:
+      - check: path_touched_by_other_live_session
+    message: |
+      ⚠️ Themis IN-JP-DATA-LEAD-3 (PATH_CONTENTION): another live session recently
+      touched the same file you are about to edit — concurrent {tool_name} risks
+      silent clobber/lost writes. Coordinate via roster chat or use isolation:worktree.
+      (Guard-2 — #54 working-tree-lock)
+
   - id: IN-JP-DATA-LEAD-1-PO
     name: NO_FILE_EDIT_PROPOSE_ONLY
     severity: block
