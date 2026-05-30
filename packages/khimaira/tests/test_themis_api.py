@@ -297,11 +297,11 @@ def test_check_engine_block_returns_violation(isolated_chats, sessions_mod, them
     assert body["violation"]["severity"] == "block"
 
 
-def test_check_engine_runtime_error_fails_closed(isolated_chats, sessions_mod, themis_client):
-    """If themis.engine.evaluate() raises any non-ImportError exception (bad YAML, etc.),
-    check endpoint fails CLOSED — a resolved-role-with-broken-rules is an enforcement
-    failure that must not become a silent allow-through (unconditional, not gated on
-    member_roles being present)."""
+def test_check_engine_missing_rule_file_fails_open(isolated_chats, sessions_mod, themis_client):
+    """If load_rules raises FileNotFoundError (no yaml for this role), check endpoint
+    fails OPEN — a missing file means 'no rules authored yet', not 'rules broken'.
+    D7 principle: missing config must not self-lockout a session (observed: frontend-lead
+    blocked until frontend-lead.yaml was created, commit 4f6d097)."""
     s1 = "11111111-0000-0000-0000-000000000001"
     s2 = "22222222-0000-0000-0000-000000000002"
     _make_session(sessions_mod, s1)
@@ -328,7 +328,40 @@ def test_check_engine_runtime_error_fails_closed(isolated_chats, sessions_mod, t
 
     assert r.status_code == 200
     body = r.json()
-    assert body["ok"] is False  # fail-closed: resolved role but rules broken
+    assert body["ok"] is True  # fail-open: missing file = no rules = allow
+
+
+def test_check_engine_runtime_error_fails_closed(isolated_chats, sessions_mod, themis_client):
+    """If themis.engine.evaluate() raises a non-FileNotFoundError exception (e.g. bad YAML),
+    check endpoint fails CLOSED — a present-but-broken rule file is an enforcement
+    failure that must not become a silent allow-through."""
+    s1 = "11111111-0000-0000-0000-000000000001"
+    s2 = "22222222-0000-0000-0000-000000000002"
+    _make_session(sessions_mod, s1)
+    _make_session(sessions_mod, s2)
+
+    isolated_chats.create_room(
+        s2, [s1], title="test", member_roles={s2: "master", s1: "intake"}
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    isolated_chats.accept(chat_id, s1)
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+
+    mock_engine = MagicMock()
+    mock_engine.evaluate.side_effect = ValueError("YAML parse error: unexpected token")
+
+    with patch.dict("sys.modules", {"themis.engine": mock_engine}):
+        r = themis_client.post(
+            "/api/themis/check",
+            json={"session_id": s1, "tool_name": "Edit", "tool_input": {}},
+        )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False  # fail-closed: rules exist but are broken
     assert body["violation"]["rule_id"] == "IN-ENGINE-ERROR"
     assert body["violation"]["severity"] == "block"
 
