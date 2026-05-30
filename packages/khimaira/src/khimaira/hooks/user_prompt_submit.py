@@ -1071,11 +1071,9 @@ def main() -> int:
             # Use session_cwd from hook stdin (set at line 1000), not os.environ PWD
             # which may not match the project directory in the hook subprocess.
             owned_handoffs = _consume_handoffs(session_id, session_cwd)
-            # Filter to only owned (not observed) handoffs
-            owned = [
-                h for h in owned_handoffs
-                if h.get("_claim_role") == "owner"
-            ]
+            # Show all handoffs relevant to this cwd — owner OR observer.
+            # The distinction matters for routing but not for boot-display.
+            owned = [h for h in owned_handoffs if h.get("text")]
             if owned:
                 handoff_boot_block = (
                     "🚨 ACTION REQUIRED — you have pending handoff(s) to act on:\n\n"
