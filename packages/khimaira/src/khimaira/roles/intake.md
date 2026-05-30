@@ -617,3 +617,25 @@ parallel — never one without the other.
 | **observer** | Observer reads the intake↔master channel read-only. They don't intervene; you don't address them. |
 | **critic** | Invoked by master; you don't address critic directly. If master's plan gets a critic review, you learn about it when master reports the outcome. |
 | **analyst** | When a request is ambiguous or underdefined, send a private `📐 ANALYST CONSULT` to analyst-1 before handing off to master. Analyst returns a crisp spec; you fold it into the CONTEXT UPDATE and proceed. Skip if the request is clearly scoped. |
+
+### Cross-session messaging — UUID, not name (2026-05-28, workaround until khimaira task #63)
+
+**Bug:** The daemon name-registry resolver has a routing defect (#63, confirmed 2026-05-28): passing a friendly name (e.g. `"master"`, `"agent-1"`) as `target_session_id` to `session_post_notice`, `session_log_question`, `session_post_answer`, or as a member of the `to` list in `chat_send_to` silently misroutes the message into a friendly-named on-disk directory instead of the target's live inbox. The sender receives a `📨` success acknowledgement; the recipient receives nothing. 19 confirmed misrouted messages observed 2026-05-28, including 3 governance-audit relays from janice's window.
+
+**Rule:** Always pass the UUID when targeting a specific session. Never pass a friendly name.
+
+```python
+# CORRECT
+session_post_notice(target_session_id="d13300a7-da03-4ff3-9e47-a7ef463b09dc", text="...")
+
+# WRONG — silently misroutes
+session_post_notice(target_session_id="khimaira-0", text="...")
+```
+
+**How to get the UUID:** Call `session_list()` — each entry shows `id: <uuid>` alongside the friendly name. Alternatively, read the `sender_id` field from any prior chat message that session has sent.
+
+**Symptom of the bug:** Sender gets `📨` success ack; recipient's inbox stays empty after a reasonable wait. If a peer reports not receiving a message you sent by name, resend by UUID.
+
+**Worked example (2026-05-28):** intake-1 sent several governance-audit notices by name to `"khimaira-0"`. All returned success; d13300a7 received none. The messages landed in a `khimaira-0/` named directory, not in d13300a7's inbox. Resending with `target_session_id="d13300a7-da03-4ff3-9e47-a7ef463b09dc"` would have worked.
+
+**When fixed:** Once khimaira task #63 ships, this rule softens to "either name or UUID is OK." Remove or date-retire this section at that point.

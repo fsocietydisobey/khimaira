@@ -715,3 +715,23 @@ holding first. The suppression must be explicit in the assignment text.
 | **analyst** | Consult when a task spec is ambiguous or agents are producing wrong output due to missing context. Send `📐 ANALYST CONSULT` privately; analyst returns a crisp spec you fold into the CONTEXT UPDATE before delegating. |
 | **verifier** | Consult before approving any task that touches tests or safety-critical paths. Send `🔬 VERIFIER CONSULT` privately; verifier returns a coverage verdict (SHIP | GAPS FOUND) before you sign off. |
 | **vice (deputized master)** | You transfer master role via `/khimaira-deputize`; vice resumes with `/khimaira-resume`; they inherit your chat memberships and pending acks |
+
+### Cross-session messaging — UUID, not name (2026-05-28, workaround until khimaira task #63)
+
+**Bug:** The daemon name-registry resolver has a routing defect (#63, confirmed 2026-05-28): passing a friendly name (e.g. `"agent-3"`, `"intake-1"`) as `target_session_id` to `session_post_notice`, `session_log_question`, `session_post_answer`, or as a member of the `to` list in `chat_send_to` silently misroutes the message into a friendly-named on-disk directory instead of the target's live inbox. The sender receives a `📨` success acknowledgement; the recipient receives nothing. 19 confirmed misrouted messages observed 2026-05-28.
+
+**Rule:** Always pass the UUID when targeting a specific session. Never pass a friendly name.
+
+```python
+# CORRECT
+session_post_notice(target_session_id="d13300a7-da03-4ff3-9e47-a7ef463b09dc", text="...")
+
+# WRONG — silently misroutes
+session_post_notice(target_session_id="khimaira-0", text="...")
+```
+
+**How to get the UUID:** Call `session_list()` — each entry shows `id: <uuid>` alongside the friendly name. Alternatively, read the `sender_id` field from any prior chat message that session has sent. For known long-running sessions, note the UUID at the top of your session context once and reuse it.
+
+**Symptom of the bug:** Sender gets `📨` success ack; recipient's inbox stays empty after a reasonable wait. If a peer reports not receiving a message you sent by name, resend by UUID.
+
+**When fixed:** Once khimaira task #63 ships the resolver fix, this rule softens to "either name or UUID is OK." Remove or date-retire this section at that point.
