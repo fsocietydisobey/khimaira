@@ -13,6 +13,9 @@ facing ways. Run with `uv run pytest packages/khimaira/tests/`.
 
 from __future__ import annotations
 
+import json
+import uuid
+
 import pytest
 
 
@@ -836,3 +839,128 @@ def test_pending_assignments_banner_suppression_appears_once_for_multiple_tasks(
     assert result.count("ENFORCEMENT GATE ACTIVE") == 1
     # Per-entry "Run /agent-ready" line removed; only the section-level block remains.
     assert "Run /agent-ready when budget is set" not in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 substrate fix — name-registry routing bug (#63)
+# Tests for: _session_dir_create, _session_dir_read, resolve_session_id hardening.
+# ---------------------------------------------------------------------------
+
+
+def test_session_dir_create_rejects_non_uuid(isolated_state):
+    """_session_dir_create raises ValueError for non-UUID input."""
+    from khimaira.monitor import sessions as s
+
+    with pytest.raises(ValueError, match="must be a UUID4"):
+        s._session_dir_create("khimaira-0")
+
+    with pytest.raises(ValueError, match="must be a UUID4"):
+        s._session_dir_create("test-session-1")
+
+    with pytest.raises(ValueError, match="must be a UUID4"):
+        s._session_dir_create("alice-uuid")
+
+
+def test_session_dir_create_accepts_valid_uuid(isolated_state):
+    """_session_dir_create creates the dir when given a valid UUID4."""
+    from khimaira.monitor import sessions as s
+
+    sid = str(uuid.uuid4())
+    d = s._session_dir_create(sid)
+    assert d.is_dir()
+    assert d.name == sid
+
+
+def test_session_dir_read_returns_none_when_absent(isolated_state):
+    """_session_dir_read returns None without creating a dir when session doesn't exist."""
+    from khimaira.monitor import sessions as s
+
+    sid = str(uuid.uuid4())
+    result = s._session_dir_read(sid)
+    assert result is None
+    assert not (s._BASE_DIR / sid).exists()
+
+
+def test_resolve_session_id_prefers_uuid_dir_over_orphan(isolated_state):
+    """resolve_session_id returns the UUID-named dir even when a friendly-named
+    orphan dir also exists — this is the core fix for the routing bug (#63).
+    """
+    from khimaira.monitor import sessions as s
+
+    real_uuid = str(uuid.uuid4())
+
+    # Create the real session in a UUID-named dir with name="khimaira-0".
+    real_dir = s._BASE_DIR / real_uuid
+    real_dir.mkdir(parents=True, exist_ok=True)
+    (real_dir / "status.json").write_text(
+        json.dumps({"status": "idle", "name": "khimaira-0"}), encoding="utf-8"
+    )
+
+    # Simulate the orphan: a friendly-named dir also named "khimaira-0" on disk,
+    # exactly as created by the old _session_dir side-effect.
+    orphan_dir = s._BASE_DIR / "khimaira-0"
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    # Orphan may have a status.json too (from old writes landing here).
+    (orphan_dir / "status.json").write_text(
+        json.dumps({"status": "idle", "name": "khimaira-0"}), encoding="utf-8"
+    )
+
+    resolved = s.resolve_session_id("khimaira-0")
+    assert resolved == real_uuid, (
+        f"Expected UUID-named dir {real_uuid!r} to win over orphan 'khimaira-0', "
+        f"but got {resolved!r}"
+    )
+
+
+def test_resolve_session_id_uuid_fast_path(isolated_state):
+    """resolve_session_id returns UUID input unchanged when its dir exists."""
+    from khimaira.monitor import sessions as s
+
+    sid = str(uuid.uuid4())
+    d = s._BASE_DIR / sid
+    d.mkdir(parents=True, exist_ok=True)
+
+    result = s.resolve_session_id(sid)
+    assert result == sid
+
+
+def test_no_orphan_dirs_created_by_cross_session_write(isolated_state):
+    """CLASS-LEVEL INVARIANT — routing bug (#63) regression guard.
+
+    Sending post_notice / post_answer to a FRIENDLY NAME must land in the
+    UUID-named session dir, not create a new friendly-named orphan dir.
+
+    Before the resolver fix, resolve_session_id("khimaira-0") returned "khimaira-0"
+    when a khimaira-0/ dir existed on disk, causing writes to the wrong dir.
+    After the fix, it returns the UUID, so the write lands correctly and no
+    new non-UUID dirs are created.
+    """
+    from khimaira.monitor import sessions as s
+
+    sender_uuid = str(uuid.uuid4())
+    target_uuid = str(uuid.uuid4())
+
+    # Create sender and target sessions in UUID-named dirs.
+    for sid, name in ((sender_uuid, "agent-3"), (target_uuid, "master")):
+        d = s._BASE_DIR / sid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "status.json").write_text(
+            json.dumps({"status": "idle", "name": name}), encoding="utf-8"
+        )
+
+    # Send a notice to "master" (friendly name) and a question-answer to "master".
+    s.post_notice("master", "hello from agent-3", from_session_id=sender_uuid)
+
+    # Verify: the notice landed in the UUID-named dir.
+    inbox = s._BASE_DIR / target_uuid / "inbox.jsonl"
+    assert inbox.exists(), "Notice did not land in UUID-named target dir"
+    records = [json.loads(ln) for ln in inbox.read_text().splitlines() if ln.strip()]
+    assert any(r.get("text") == "hello from agent-3" for r in records)
+
+    # Verify: no non-UUID-named dirs were created during this workflow.
+    for d in s._BASE_DIR.iterdir():
+        if d.is_dir():
+            assert s._is_uuid(d.name), (
+                f"Cross-session write created an orphan non-UUID dir: {d.name!r}. "
+                "This is a regression of the routing bug fixed in task #63."
+            )

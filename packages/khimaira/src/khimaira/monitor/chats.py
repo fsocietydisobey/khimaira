@@ -284,7 +284,10 @@ def _resolve_sender_name(session_id: str, fallback: str) -> str:
     and read-time (api/chats.get_history) so names stay current after renames.
     """
     try:
-        status_path = sessions_mod._session_dir(session_id) / "status.json"
+        sd = sessions_mod._session_dir_read(session_id)
+        if sd is None:
+            return fallback
+        status_path = sd / "status.json"
         data = json.loads(status_path.read_text())
         return data.get("name") or fallback
     except Exception:
@@ -483,7 +486,9 @@ def load_room(chat_id: str) -> dict[str, Any]:
 def _resolve_session_name(session_id: str) -> str | None:
     """Look up friendly name from the session's status.json (best-effort)."""
     try:
-        sd = sessions_mod._session_dir(session_id)
+        sd = sessions_mod._session_dir_read(session_id)
+        if sd is None:
+            return None
         status_file = sd / "status.json"
         if status_file.is_file():
             data = json.loads(status_file.read_text(encoding="utf-8"))

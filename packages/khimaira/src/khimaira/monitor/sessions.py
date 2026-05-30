@@ -52,9 +52,49 @@ _BASE_DIR = (
     / "sessions"
 )
 
+# Matches a canonical UUID4 (lowercase or uppercase hex, with hyphens).
+_UUID4_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _is_uuid(s: str) -> bool:
+    return bool(_UUID4_RE.match(s))
+
+
+def _session_dir_create(session_id: str) -> Path:
+    """Resolve and create the per-session storage directory.
+
+    Requires session_id to be a UUID4. Raises ValueError for friendly names
+    or other non-UUID inputs — callers must resolve first via resolve_session_id().
+    """
+    if not _is_uuid(session_id):
+        raise ValueError(
+            f"session_id must be a UUID4; got {session_id!r}. "
+            "Call resolve_session_id() first to convert a friendly name to its UUID."
+        )
+    d = _BASE_DIR / session_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _session_dir_read(session_id: str) -> Path | None:
+    """Return the per-session directory path for read-only access.
+
+    Does NOT create the directory. Returns None if the session directory does
+    not exist, allowing callers to treat absence as "no data" gracefully.
+    """
+    d = _BASE_DIR / session_id
+    return d if d.is_dir() else None
+
 
 def _session_dir(session_id: str) -> Path:
-    """Resolve the per-session storage directory, creating it lazily."""
+    """Resolve the per-session storage directory, creating it lazily.
+
+    Deprecated: prefer _session_dir_create (write paths) or _session_dir_read
+    (read-only paths). This shim exists for call sites not yet audited.
+    """
     safe = session_id.replace("/", "_").replace("..", "_")
     d = _BASE_DIR / safe
     d.mkdir(parents=True, exist_ok=True)
@@ -177,7 +217,10 @@ def recent_tool_calls(session_id: str, limit: int = 20) -> list[dict]:
     Returns [] for a fresh session with no tool_calls.jsonl.
     Used by the PreToolUse Themis hook to check for recent top-tier consults.
     """
-    path = _session_dir(session_id) / "tool_calls.jsonl"
+    sd = _session_dir_read(session_id)
+    if sd is None:
+        return []
+    path = sd / "tool_calls.jsonl"
     return _read_jsonl(path)[-limit:]
 
 
@@ -225,7 +268,10 @@ def recent_touches(session_id: str, limit: int = 20) -> list[dict]:
 
     Returns [] for a fresh session with no files_touched.jsonl.
     """
-    path = _session_dir(session_id) / "files_touched.jsonl"
+    sd = _session_dir_read(session_id)
+    if sd is None:
+        return []
+    path = sd / "files_touched.jsonl"
     return _read_jsonl(path)[-limit:] if path.exists() else []
 
 
@@ -491,7 +537,10 @@ def get_workspace(session_id: str) -> str:
     a missing or malformed status.json returns DEFAULT_WORKSPACE so
     we don't accidentally hide sessions whose status file is truncated.
     """
-    path = _session_dir(session_id) / "status.json"
+    sd = _session_dir_read(session_id)
+    if sd is None:
+        return DEFAULT_WORKSPACE
+    path = sd / "status.json"
     if not path.exists():
         return DEFAULT_WORKSPACE
     try:
@@ -516,9 +565,13 @@ def resolve_session_id(query: str) -> str:
     Used by the read-side tools (state, pending_notes, post_answer) so users
     can pass either UUIDs or names interchangeably.
     """
-    safe = query.replace("/", "_").replace("..", "_")
-    if (_BASE_DIR / safe).is_dir():
-        return safe
+    # Fast path: if query is already a UUID4, return it directly.
+    # Only enter name-search if query is NOT UUID-shaped — this prevents
+    # the self-perpetuating-loop bug where a friendly-named dir (created by
+    # the old _session_dir side-effect) causes step 1 to short-circuit
+    # name resolution and return the wrong identifier.
+    if _is_uuid(query) and (_BASE_DIR / query).is_dir():
+        return query
 
     # Name-based search
     if not _BASE_DIR.exists():
@@ -552,16 +605,42 @@ def resolve_session_id(query: str) -> str:
                 else 0
             )
             has_heartbeat = 1 if s.get("last_sse_heartbeat") else 0
-            candidates.append((has_heartbeat, decisions, mtime, d.name))
+            # Prefer UUID-named dirs over friendly-named orphan dirs.
+            # Non-UUID dirnames are relics of the old _session_dir side-effect;
+            # a dir named "khimaira-0" is an orphan, not a real session storage.
+            is_uuid_dir = 1 if _is_uuid(d.name) else 0
+            if not is_uuid_dir:
+                log.warning(
+                    "resolve_session_id(%r): candidate dir %r is not UUID-shaped — "
+                    "likely an orphan created by a routing bug (#63). "
+                    "Run `khimaira migrate-orphan-inboxes` to consolidate.",
+                    query,
+                    d.name,
+                )
+            candidates.append((is_uuid_dir, has_heartbeat, decisions, mtime, d.name))
 
     if not candidates:
+        # Last-resort fallback: if query matches a dirname exactly (non-UUID dirname),
+        # return it with a deprecation warning. This handles legacy call sites and
+        # test fixtures that use non-UUID session identifiers.  A UUID-named dir
+        # matching the query would have been returned above; this only fires for
+        # non-UUID dirnames (orphan dirs from the old routing bug).
+        fallback_dir = _BASE_DIR / query
+        if fallback_dir.is_dir() and not _is_uuid(query):
+            log.warning(
+                "resolve_session_id(%r): no name-match found; falling back to dirname. "
+                "This dirname is not UUID-shaped — likely an orphan from routing bug #63. "
+                "Update callers to use UUID session IDs.",
+                query,
+            )
+            return query
         raise ValueError(
             f"No session named or id'd {query!r}. Use session_list() to see available sessions."
         )
 
-    # Prefer live over stub; among equal liveness, prefer most-recently-active.
+    # Prefer UUID-named dirs first; then live over stub; then most-recently-active.
     candidates.sort(reverse=True)
-    _hb, _dec, _mtime, winner = candidates[0]
+    _is_uuid_dir, _hb, _dec, _mtime, winner = candidates[0]
     if _hb == 0 and _dec == 0 and len(candidates) > 1:
         log.warning(
             "resolve_session_id(%r): all %d candidates are stubs (no heartbeat, no decisions); "
@@ -1269,7 +1348,8 @@ def post_handoff(
     if inferred is None:
         # Infer from session's most-recent file touch — that's the
         # directory they were working in. Fallback: process cwd.
-        files = _read_jsonl(_session_dir(from_session_id) / "files_touched.jsonl")
+        _sd = _session_dir_read(from_session_id)
+        files = _read_jsonl(_sd / "files_touched.jsonl") if _sd else []
         if files:
             most_recent = files[-1].get("file") or ""
             if most_recent:
