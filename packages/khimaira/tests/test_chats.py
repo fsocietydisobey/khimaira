@@ -729,6 +729,27 @@ def test_create_task_requires_accepted_member(isolated_chats):
         c.create_task(chat_id, "bob-uuid", "do thing")
 
 
+def test_create_task_requires_master(isolated_chats):
+    """B-M4: non-master accepted member cannot create tasks — mirrors signal_start."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _setup_two_member_chat(c, sessions_mod)
+    # bob is accepted but not master — should be rejected
+    with pytest.raises(ValueError, match="not the master"):
+        c.create_task(chat_id, "bob-uuid", "do thing")
+
+
+def test_create_task_master_succeeds(isolated_chats):
+    """B-M4: master can create tasks as before."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _setup_two_member_chat(c, sessions_mod)
+    task = c.create_task(chat_id, "alice-uuid", "do thing")
+    assert task["status"] == c.TASK_PENDING
+
+
 def test_task_status_lifecycle_happy_path(isolated_chats):
     from khimaira.monitor import sessions as sessions_mod
 

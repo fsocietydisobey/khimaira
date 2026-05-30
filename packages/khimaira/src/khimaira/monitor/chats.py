@@ -887,6 +887,16 @@ def create_task(
         )
     _check_not_observer(room, sender_session_id, "create tasks")
 
+    # Phase B v2: only the master may create tasks. Mirrors the signal_start +
+    # approve-only-for-master pattern — task creation is a master coordination
+    # primitive, not a general-member action. (B-M4: closes the class where
+    # non-master sessions bypassed master and created tasks directly.)
+    if not _is_master(room, sender_session_id):
+        raise ValueError(
+            f"Session {sender_session_id!r} is not the master of {chat_id!r}; "
+            f"only the master can create tasks."
+        )
+
     assignee_resolved = None
     assignee_name = None
     if assignee_session_id is not None:
