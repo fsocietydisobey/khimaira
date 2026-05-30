@@ -99,3 +99,27 @@ invariants:
         2. Different files / no causal dependency → can run in parallel
       If sequential (task B reads task A's output), proceed — this warn is advisory.
       Severity is warn; will stay warn (this is a behavioral nudge, not a hard rule).
+
+  - id: IN-MASTER-7
+    name: NO_DIRECT_CODE_IMPLEMENTATION
+    severity: warn
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+    conditions:
+      - check: file_is_code
+    message: |
+      ⚠️ Themis IN-MASTER-7 (NO_DIRECT_CODE_IMPLEMENTATION): master is directly
+      editing a code or test file. Master role is coordination, not implementation.
+      This includes writing tests — tests are part of implementation and belong to agents.
+
+      Before writing code or tests yourself:
+        1. session_list() — are any agents idle in this roster?
+        2. If yes → assign via chat_task_create + BEGIN signal, don't implement
+        3. If genuinely no agents available (solo session) → proceed, but document why
+
+      Root cause of 2026-05-30 incident: khimaira-master edited
+      user_prompt_submit.py AND wrote tests directly instead of delegating to agents.
+      Severity is warn (master may legitimately edit config/docs/yaml/markdown);
+      enforcement is by convention, not hard block.

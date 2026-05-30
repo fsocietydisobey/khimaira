@@ -703,3 +703,37 @@ def test_domains_tuple_covers_core_lead_domains():
             f"session_end_utils._DOMAINS missing {domain!r} — "
             "leads for this domain will miss distillation + provisional memory"
         )
+
+
+def test_master_no_direct_code_implementation_themis_rule_exists():
+    """Regression guard: IN-MASTER-7 (NO_DIRECT_CODE_IMPLEMENTATION) must exist in master.yaml.
+
+    Prevents silent regression of the behavioral rule that master should delegate
+    code implementation to agents rather than implementing directly. Observed violation
+    on 2026-05-30: khimaira-master edited user_prompt_submit.py and wrote tests
+    directly instead of assigning to idle roster agents.
+
+    All three layers of behavioral-rule-promotion must be present:
+    - Layer 1 (role-doc): master.md constraint section ← already linted elsewhere
+    - Layer 2 (Themis): IN-MASTER-7 in master.yaml ← this test
+    - Layer 3 (lint): this test file entry ← this function
+    """
+    master_yaml = (
+        REPO_ROOT / "packages/themis/src/themis/rules/master.yaml"
+    ).read_text()
+    assert "IN-MASTER-7" in master_yaml, (
+        "IN-MASTER-7 (NO_DIRECT_CODE_IMPLEMENTATION) missing from master.yaml. "
+        "This Themis rule warns master when it edits code/test files directly "
+        "instead of delegating to agents. Add it back."
+    )
+    assert "NO_DIRECT_CODE_IMPLEMENTATION" in master_yaml, (
+        "IN-MASTER-7 name field missing from master.yaml."
+    )
+    # Also verify master.md has the constraint documented
+    master_md = (
+        REPO_ROOT / "packages/khimaira/src/khimaira/roles/master.md"
+    ).read_text()
+    assert "Single-master authority" in master_md, (
+        "Single-master authority section missing from master.md. "
+        "See commit 106dc13."
+    )
