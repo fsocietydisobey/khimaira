@@ -31,11 +31,11 @@ invariants:
       - tool: Bash
         tool_input_field:
           field: command
-          pattern: '>\s*[^/]'
+          pattern: '>\s*[^/&]'
       - tool: Bash
         tool_input_field:
           field: command
-          pattern: '>>\s*[^/]'
+          pattern: '>>\s*[^/&]'
     message: |
       🛑 Themis IN-ARCHITECT-2 (NO_BASH_MUTATING): architect produces design
       recommendations, not executor operations. Mutating Bash is a role-boundary

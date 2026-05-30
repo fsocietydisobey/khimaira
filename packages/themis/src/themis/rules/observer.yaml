@@ -40,11 +40,11 @@ invariants:
       - tool: Bash
         tool_input_field:
           field: command
-          pattern: '>\s*[^/]'
+          pattern: '>\s*[^/&]'
       - tool: Bash
         tool_input_field:
           field: command
-          pattern: '>>\s*[^/]'
+          pattern: '>>\s*[^/&]'
     message: |
       🛑 Themis IN-OBSERVER-3 (NO_BASH_MUTATING): observer is read-only.
       Mutating Bash is a role-boundary violation. Surface findings via chat,

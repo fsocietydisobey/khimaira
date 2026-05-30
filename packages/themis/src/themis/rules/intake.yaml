@@ -53,11 +53,11 @@ invariants:
       - tool: Bash
         tool_input_field:
           field: command
-          pattern: '>\s*[^/]'
+          pattern: '>\s*[^/&]'
       - tool: Bash
         tool_input_field:
           field: command
-          pattern: '>>\s*[^/]'
+          pattern: '>>\s*[^/&]'
     message: |
       🛑 Themis IN-INTAKE-4 (NO_BASH_MUTATING): this Bash command mutates state
       (git commit/push, rm/mv/cp/mkdir, or shell output redirect outside /tmp).

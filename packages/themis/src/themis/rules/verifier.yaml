@@ -1,8 +1,63 @@
 # Themis rules — verifier role
 # Conditions are AND-combined only. No OR/NOT support in Phase 1.
 #
-# NOTE: verifier intentionally has NO file-edit restriction in Phase 1.
-# Mode B verification (write/fix failing tests) legitimately requires Edit/Write.
-# A path-allowlist matcher (block edits to non-test files) is deferred to Phase 3.
+# NOTE: verifier may edit test files only (Mode B: write/fix failing tests).
+# Production file edits go to an agent. Phase 3 path-allowlist is now live
+# via IN-VERIFIER-1 (negative-lookahead regex, mirrors IN-TRACKER-1 pattern).
 role: verifier
-invariants: []
+invariants:
+  - id: IN-VERIFIER-1
+    name: NO_NONTEST_FILE_EDIT
+    severity: block
+    matchers:
+      - tool: Edit
+        tool_input_field:
+          field: file_path
+          # Block edits to any path that is NOT a test path.
+          # Test paths: test_*.py, *_test.py, */tests/*,  */test/*,
+          #             conftest.py, *.spec.*, *.test.*
+          # Negative-lookahead mirrors IN-TRACKER-1 (proven pattern in Themis).
+          pattern: '^(?!.*(?:test_|_test\.|/tests?/|conftest|\.spec\.|\.test\.)).*'
+      - tool: Write
+        tool_input_field:
+          field: file_path
+          pattern: '^(?!.*(?:test_|_test\.|/tests?/|conftest|\.spec\.|\.test\.)).*'
+      - tool: MultiEdit
+        tool_input_field:
+          field: file_path
+          pattern: '^(?!.*(?:test_|_test\.|/tests?/|conftest|\.spec\.|\.test\.)).*'
+      - tool: NotebookEdit
+        tool_input_field:
+          field: file_path
+          pattern: '^(?!.*(?:test_|_test\.|/tests?/|conftest|\.spec\.|\.test\.)).*'
+    message: |
+      🛑 Themis IN-VERIFIER-1 (NO_NONTEST_FILE_EDIT): verifier may only edit test
+      files (test_*, *_test, /tests/, conftest, *.spec, *.test). This production
+      path is off-limits — verifier's job is SHIP/HOLD verdict and fixing failing
+      tests, not changing source code. Production edits go to an agent.
+
+  - id: IN-VERIFIER-2
+    name: NO_BASH_MUTATING
+    severity: block
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+(commit|push|merge|rebase|reset|checkout\s+-|stash\s+pop|tag\s+-)'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\b(rm|mv|cp|mkdir|touch|chmod|chown)\s+'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>\s*[^/&]'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>>\s*[^/&]'
+    message: |
+      🛑 Themis IN-VERIFIER-2 (NO_BASH_MUTATING): verifier cannot commit, push, or
+      run destructive Bash ops. Verifier's verdict is SHIP | GAPS FOUND — committing
+      belongs to the agent that implemented the change. Package-manager operations
+      (npm install, pip install) are allowed; git-state mutations are not.

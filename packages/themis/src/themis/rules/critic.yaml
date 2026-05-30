@@ -31,11 +31,11 @@ invariants:
       - tool: Bash
         tool_input_field:
           field: command
-          pattern: '>\s*[^/]'
+          pattern: '>\s*[^/&]'
       - tool: Bash
         tool_input_field:
           field: command
-          pattern: '>>\s*[^/]'
+          pattern: '>>\s*[^/&]'
     message: |
       🛑 Themis IN-CRITIC-2 (NO_BASH_MUTATING): critic is review-only.
       Mutating Bash is a role-boundary violation. Return verdict via chat;

@@ -127,9 +127,12 @@ class TestLoadRules:
         all_rules = load_all_rules()
         assert set(all_rules.keys()) == VALID_ROLES
 
-    def test_verifier_has_no_invariants(self):
+    def test_verifier_has_two_invariants(self):
+        """Phase 3 path-allowlist is live: verifier now has IN-VERIFIER-1 + IN-VERIFIER-2."""
         rs = load_rules("verifier")
-        assert rs.invariants == []
+        ids = {inv.id for inv in rs.invariants}
+        assert "IN-VERIFIER-1" in ids
+        assert "IN-VERIFIER-2" in ids
 
     def test_intake_has_five_invariants(self):
         rs = load_rules("intake")
