@@ -327,6 +327,64 @@ def test_in_data_lead_themis_rules_present():
     assert "NO_STANDALONE_AGENTS" in content
 
 
+def test_editing_leads_have_cross_cutting_rules():
+    """Parity guard: every write-capable lead yaml must carry each cross-cutting
+    rule by NAME (not by per-lead-prefixed ID).
+
+    "Editing lead" = lead yaml that does NOT contain a NO_FILE_EDIT block.
+    Derives the set from the yamls themselves — new editing leads auto-join.
+    Excludes read-only roles (analyst/critic/verifier/observer/tracker/master/
+    intake/agent/architect + propose-only leads that only carry a -PO rule).
+
+    Cross-cutting rule set (explicit, not inferred — membership is a deliberate
+    decision per architect, not "whatever happens to be on all leads today"):
+      - PATH_CONTENTION: Guard-2 (#54) — every editing role can contend on files.
+
+    Catches the Guard-2 gap (PATH_CONTENTION missed on frontend-lead.yaml,
+    passed 1114 tests, caught only by critic's manual read).
+    """
+    # Cross-cutting rules that EVERY editing lead must carry (by rule NAME).
+    # Add new universal rules here when they're deliberately designated as such.
+    CROSS_CUTTING_RULE_NAMES = {"PATH_CONTENTION"}
+
+    import re as _re
+
+    lead_yamls = sorted(THEMIS_RULES.glob("*-lead*.yaml"))
+    assert lead_yamls, "No lead yamls found — check THEMIS_RULES path"
+
+    # A lead is "editing" if it does NOT have a BLANKET NO_FILE_EDIT rule
+    # (i.e. name: NO_FILE_EDIT with no further suffix). Domain-scoped rules
+    # like NO_FILE_EDIT_OUTSIDE_BACKEND are restrictions, not blanket bans —
+    # those leads still edit within their domain and need PATH_CONTENTION.
+    # Propose-only leads (NO_FILE_EDIT_PROPOSE_ONLY) are also excluded since
+    # Themis-gates their writes.
+    _BLANKET_NOEDIT = _re.compile(r"name:\s+NO_FILE_EDIT\s*$", _re.MULTILINE)
+    _PROPOSE_ONLY = _re.compile(r"name:\s+NO_FILE_EDIT_PROPOSE_ONLY", _re.MULTILINE)
+
+    editing_leads = []
+    for path in lead_yamls:
+        content = path.read_text()
+        if not _BLANKET_NOEDIT.search(content) and not _PROPOSE_ONLY.search(content):
+            editing_leads.append(path)
+
+    assert editing_leads, (
+        "No editing-lead yamls found (all have NO_FILE_EDIT). "
+        "Check that the write-capable leads are included."
+    )
+
+    missing: list[str] = []
+    for path in editing_leads:
+        content = path.read_text()
+        for rule_name in CROSS_CUTTING_RULE_NAMES:
+            if rule_name not in content:
+                missing.append(f"{path.name}: missing {rule_name!r}")
+
+    assert not missing, (
+        "Cross-cutting rule parity failure — editing leads must carry all "
+        "cross-cutting rules:\n" + "\n".join(f"  {m}" for m in missing)
+    )
+
+
 def test_master_md_contains_stay_oriented_section():
     """Regression guard: master.md must articulate proactive status-surface
     protocol for state transitions.
