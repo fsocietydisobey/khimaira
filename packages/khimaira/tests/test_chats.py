@@ -2797,3 +2797,92 @@ def test_assignee_cannot_cancel_task(isolated_chats):
 
     with pytest.raises(ValueError, match="not authorized"):
         c.update_task_status(chat_id, task["id"], "agent-uuid", c.TASK_CANCELLED)
+
+
+# ---------------------------------------------------------------------------
+# Creator role resolution — #67/#68 regression
+#
+# A chat created with an explicit member_roles dict that OMITS the creator
+# must not leave the creator roleless. That gap made the creator unresolvable
+# to the Themis role gate (Layer-1 miss → IN-UNRESOLVABLE) and fail-closed
+# EVERY tool — including the ones (chat_grant_role) that would clear it. Two
+# guarantees, tested at the class level so any future path into the same bug
+# is caught:
+#   #67 — create_room injects creator -> master into member_roles.
+#   #68 — _is_master falls back to created_by when member_roles is present but
+#         omits sid (covers pre-#67 chats that already exist on disk and only
+#         get fixed by a daemon redeploy).
+# ---------------------------------------------------------------------------
+
+
+def test_create_room_includes_creator_in_member_roles(isolated_chats):
+    """#67: explicit member_roles omitting the creator still records the
+    creator as master, so role resolution never leaves them unresolvable."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "boss", "boss")
+    _make_session(sessions_mod, "worker", "worker")
+
+    # Creator deliberately omitted from member_roles — the exact bootstrap bug.
+    room = c.create_room(
+        "boss",
+        ["worker"],
+        member_roles={"worker": c.ROLE_AGENT},
+    )
+
+    member_roles = room["meta"]["member_roles"]
+    assert member_roles["boss"] == c.ROLE_MASTER
+    assert member_roles["worker"] == c.ROLE_AGENT
+    # Class invariant: the creator resolves as master.
+    assert c._is_master(room, "boss") is True
+
+
+def test_create_room_does_not_override_explicit_creator_role(isolated_chats):
+    """#67 guard: if the caller explicitly placed the creator in member_roles,
+    setdefault must not clobber that choice."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "boss", "boss")
+    _make_session(sessions_mod, "worker", "worker")
+
+    room = c.create_room(
+        "boss",
+        ["worker"],
+        member_roles={"boss": c.ROLE_MASTER, "worker": c.ROLE_AGENT},
+    )
+    assert room["meta"]["member_roles"]["boss"] == c.ROLE_MASTER
+
+
+def test_is_master_falls_back_to_created_by_when_creator_missing(isolated_chats):
+    """#68: a pre-#67 room on disk whose member_roles omits the creator must
+    still resolve the creator as master via the created_by fallback."""
+    c = isolated_chats
+    room = {
+        "meta": {
+            "created_by": "creator-sid",
+            "member_roles": {"agent-sid": c.ROLE_AGENT},  # creator absent
+        },
+        "members": {},
+        "messages": [],
+    }
+    assert c._is_master(room, "creator-sid") is True
+    assert c._is_master(room, "agent-sid") is False
+    assert c._is_master(room, "stranger-sid") is False
+
+
+def test_is_master_explicit_role_is_authoritative_over_created_by(isolated_chats):
+    """#68 guard: an explicit member_roles entry wins over the created_by
+    fallback — a creator demoted via chat_grant_role is no longer master."""
+    c = isolated_chats
+    room = {
+        "meta": {
+            "created_by": "old-master",  # was creator, since demoted
+            "member_roles": {"old-master": c.ROLE_AGENT, "new-master": c.ROLE_MASTER},
+        },
+        "members": {},
+        "messages": [],
+    }
+    assert c._is_master(room, "old-master") is False
+    assert c._is_master(room, "new-master") is True
