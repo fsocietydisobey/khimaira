@@ -1058,6 +1058,38 @@ def main() -> int:
         except Exception:  # noqa: BLE001 — hook must not break
             chat_register_block = ""
 
+    # On turn 1, surface any owned handoffs as ACTION REQUIRED so the session
+    # auto-acts on them without needing an explicit user prompt. The SessionStart
+    # hook already injects handoffs into the system context, but only as passive
+    # text — the session won't act until the user types something. This block
+    # makes the FIRST user turn (even just pressing Enter) trigger handoff action.
+    handoff_boot_block = ""
+    if new_count == 1:
+        try:
+            from khimaira.hooks.session_start import _consume_handoffs
+
+            cwd = os.environ.get("PWD", "")
+            owned_handoffs = _consume_handoffs(session_id, cwd)
+            # Filter to only owned (not observed) handoffs
+            owned = [
+                h for h in owned_handoffs
+                if h.get("_claim_role") == "owner"
+            ]
+            if owned:
+                handoff_boot_block = (
+                    "🚨 ACTION REQUIRED — you have pending handoff(s) to act on:\n\n"
+                )
+                for h in owned[:3]:  # cap at 3 to keep context bounded
+                    text = (h.get("text") or "").strip()
+                    handoff_boot_block += f"{text[:2000]}\n\n"
+                handoff_boot_block += (
+                    "**Start immediately** — pick the highest-priority item above, "
+                    "state which file/line you're starting at, then begin. "
+                    "The handoff IS the authorization. Do not wait for further confirmation."
+                )
+        except Exception:  # noqa: BLE001 — hook must not break
+            handoff_boot_block = ""
+
     # --- Phase B v1.7.2: per-turn role-budget reminder --------------------
     # Surfaces "you are role X in chat Y → /model A, /effort B" on every
     # prompt submission across every session. Closes the gap where v1.5's
@@ -1226,16 +1258,18 @@ def main() -> int:
         and not quiet_channel_block
         and not missed_chat_block
         and not chat_register_block
+        and not handoff_boot_block
     ):
         return 0
 
-    # Ordering: chat_register (turn-1 only, highest priority) →
-    # missed_chat → quiet_channel → bottleneck → pending_assignments →
-    # unfired_acks → stale_acks → role_budget → delegate → inbox →
-    # incoming questions → reminder.
+    # Ordering: handoff_boot (turn-1 owned handoffs, absolute top priority) →
+    # chat_register (turn-1 only) → missed_chat → quiet_channel → bottleneck →
+    # pending_assignments → unfired_acks → stale_acks → role_budget → delegate →
+    # inbox → incoming questions → reminder.
     additional_context = "\n\n".join(
         b
         for b in (
+            handoff_boot_block,
             chat_register_block,
             missed_chat_block,
             quiet_channel_block,
