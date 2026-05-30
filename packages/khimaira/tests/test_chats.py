@@ -1591,11 +1591,11 @@ def test_chat_create_room_emits_master_directive_to_creator(isolated_chats):
     d = directives[0]
     assert d["to"] == ["alice-uuid"]
     assert d["meta"]["role"] == c.ROLE_MASTER
-    assert d["meta"]["model"] == "opus"
-    assert d["meta"]["effort"] == "max"
+    assert d["meta"]["model"] == "sonnet"
+    assert d["meta"]["effort"] == "medium"
     assert "🎚️ Role updated: you are now master" in d["body"]
-    assert "/model opus" in d["body"]
-    assert "/effort max" in d["body"]
+    assert "/model sonnet" in d["body"]
+    assert "/effort medium" in d["body"]
 
 
 def test_chat_grant_role_emits_directive_to_target(isolated_chats):
@@ -1623,7 +1623,7 @@ def test_chat_grant_role_emits_directive_to_target(isolated_chats):
 def test_chat_grant_role_master_swap_emits_two_directives(isolated_chats):
     """Promoting B to master atomically demotes A (the implicit creator-
     master). Two directives fire in the same call: one to B (new master,
-    opus/max), one to A (demoted, default agent tier sonnet/medium)."""
+    sonnet/medium), one to A (demoted, default agent tier sonnet/medium)."""
     from khimaira.monitor import sessions as sessions_mod
 
     c = isolated_chats
@@ -1637,7 +1637,7 @@ def test_chat_grant_role_master_swap_emits_two_directives(isolated_chats):
 
     by_target = {d["to"][0]: d for d in new_directives}
     assert by_target["bob"]["meta"]["role"] == c.ROLE_MASTER
-    assert by_target["bob"]["meta"]["model"] == "opus"
+    assert by_target["bob"]["meta"]["model"] == "sonnet"
     assert by_target["alice"]["meta"]["role"] == c.ROLE_AGENT
     assert by_target["alice"]["meta"]["model"] == "sonnet"
 
@@ -1705,11 +1705,11 @@ def test_set_creator_emits_master_directive(isolated_chats):
     d = post[-1]
     assert d["to"] == ["bob-uuid"]
     assert d["meta"]["role"] == c.ROLE_MASTER
-    assert d["meta"]["model"] == "opus"
-    assert d["meta"]["effort"] == "max"
+    assert d["meta"]["model"] == "sonnet"
+    assert d["meta"]["effort"] == "medium"
     assert "🎚️ Role updated: you are now master" in d["body"]
-    assert "/model opus" in d["body"]
-    assert "/effort max" in d["body"]
+    assert "/model sonnet" in d["body"]
+    assert "/effort medium" in d["body"]
 
 
 def test_transfer_membership_master_swap_emits_directive(isolated_chats):
@@ -1738,7 +1738,7 @@ def test_transfer_membership_master_swap_emits_directive(isolated_chats):
     assert d["to"] == ["dave-uuid"]
     assert d["meta"]["role"] == c.ROLE_MASTER
     assert "you are now master" in d["body"]
-    assert "/model opus" in d["body"]
+    assert "/model sonnet" in d["body"]
 
 
 def test_transfer_membership_non_master_emits_no_directive(isolated_chats):
@@ -2068,7 +2068,7 @@ def test_deputize_resume_round_trip_single_chat_full_state(isolated_chats):
     swap_directives = post_directives[2:]
     by_target = {d["to"][0]: d for d in swap_directives}
     assert by_target["alice"]["meta"]["role"] == c.ROLE_MASTER
-    assert by_target["alice"]["meta"]["model"] == "opus"
+    assert by_target["alice"]["meta"]["model"] == "sonnet"
     assert by_target["vice"]["meta"]["role"] == c.ROLE_AGENT
     assert by_target["vice"]["meta"]["model"] == "sonnet"
 
