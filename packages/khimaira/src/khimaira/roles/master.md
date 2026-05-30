@@ -516,6 +516,20 @@ when this happens — gap, fix bad behavior."
   or call it for the night?
   ```
 
+- **Task closes with backlog remaining (2026-05-30).** When the last in-flight
+  task reaches `approved` state AND the backlog has pending items, master MUST
+  queue the next item WITHOUT waiting for user input. Do NOT go idle after a
+  task closes if there is more work. Specifically:
+  1. Check the open backlog (session state, handoff, or the task list)
+  2. Pick the highest-priority unblocked item
+  3. Dispatch it immediately (create task + BEGIN, or unblock a pending spec)
+  4. Only surface `📍 IDLE` if the backlog is genuinely empty
+
+  **Observed violation (2026-05-30):** After #66 closed, all agents went idle.
+  Acting master did not queue #58 or any other backlog item. Joseph had to
+  intervene to ask why agents were idle. The backlog was not empty — analyst-1
+  was waiting for a single design decision to proceed on #58.
+
 **Lower-priority transitions (master's judgment whether to surface):**
 
 - **Architect/critic/verifier consult in flight** — if >2 min expected,
