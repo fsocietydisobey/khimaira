@@ -138,6 +138,13 @@ def build_app():
         from .api.chats import _overdue_watcher
         asyncio.create_task(_overdue_watcher())
 
+    # Guard-4 + #13b-light watcher — escalates sessions silent-while-obligated
+    # beyond the CC retry/request grace window; fast-escalates dead processes.
+    @app.on_event("startup")
+    async def _start_guard4_watcher() -> None:
+        from .api.chats import _guard4_watcher
+        asyncio.create_task(_guard4_watcher())
+
     # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
     # Replay-on-boot recovers stuck-firing tasks; worker tick fires due tasks.
     @app.on_event("startup")

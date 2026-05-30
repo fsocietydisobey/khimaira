@@ -326,6 +326,252 @@ async def _overdue_watcher() -> None:
             _log.warning("overdue-reply watcher error: %s", exc)
 
 
+# ---------------------------------------------------------------------------
+# Guard-4 + #13b-light — escalate-on-stall + throttle grace window
+# ---------------------------------------------------------------------------
+
+_GUARD4_WATCH_INTERVAL = 60.0  # seconds between scans
+_GUARD4_STALLED: dict[tuple[str, str], float] = {}  # (session_id, obligation_id) → escalation_ts
+_GUARD4_STALLED_TTL_S = 3600.0  # clear debounce entries after 1h
+_GUARD4_MIN_SILENCE_S = 120.0  # ignore sessions silent < 2min (normal idle)
+
+
+def _compute_throttle_ceiling_s() -> float:
+    """Compute the generous upper bound for CC's retry+request horizon.
+
+    Reads KHIMAIRA_THROTTLE_GRACE_S for an override, otherwise derives from
+    CLAUDE_CODE_MAX_RETRIES (default 10) using a conservative exp-backoff
+    ceiling, compared with API_TIMEOUT_MS (default 600000).
+
+    Defaults generous: over-grace only delays crash-detection marginally
+    (with /proc-liveness, dead processes escalate immediately regardless);
+    under-grace re-introduces the false-kill we're fixing.
+    """
+    import os
+
+    grace_override = os.environ.get("KHIMAIRA_THROTTLE_GRACE_S")
+    if grace_override:
+        return float(grace_override)
+    max_retries = int(os.environ.get("CLAUDE_CODE_MAX_RETRIES", "10"))
+    api_timeout_ms = int(os.environ.get("API_TIMEOUT_MS", "600000"))
+    api_timeout_s = api_timeout_ms / 1000.0
+    # Conservative exp-backoff ceiling: sum 2^i * base_s, capped per-retry
+    base_s = 1.0
+    cap_s = 60.0
+    backoff_ceiling = sum(min(base_s * (2**i), cap_s) for i in range(max_retries))
+    # Add 50% jitter margin; take max with single-request timeout
+    return max(backoff_ceiling * 1.5, api_timeout_s)
+
+
+def _is_process_alive_for_session(session_id: str) -> bool | None:
+    """Check if the Claude Code process for this session is alive via /proc.
+
+    Returns True (alive), False (dead), or None (unknown — ppid not registered
+    or /proc not available on this platform).
+    """
+    import pathlib
+    import os
+
+    try:
+        ppid = chats.get_session_ppid(session_id)
+        if ppid is None:
+            return None
+        # Prefer psutil if available (cross-platform)
+        try:
+            import psutil
+            return psutil.pid_exists(ppid)
+        except ImportError:
+            pass
+        # Fall back to /proc (Linux only)
+        proc_path = pathlib.Path(f"/proc/{ppid}")
+        return proc_path.exists()
+    except Exception:
+        return None
+
+
+def _get_session_obligations(session_id: str) -> list[dict]:
+    """Find tasks where session_id is assignee with status pending or in_progress.
+
+    Scans all chat JSONL files. Returns list of {task_id, chat_id, status}.
+    Fail-open: errors scanning a chat are silently skipped.
+    """
+    obligations: list[dict] = []
+    try:
+        chat_dir = chats._chat_dir()
+        if not chat_dir.exists():
+            return []
+        for chat_path in chat_dir.glob("chat-*.jsonl"):
+            chat_id = chat_path.stem
+            try:
+                # Fold task state from the JSONL without calling load_room first
+                # (avoids member validation for a read-only scan).
+                tasks: dict[str, dict] = {}
+                for line in chats._read(chat_id):
+                    k = line.get("kind")
+                    if k == chats.TASK:
+                        tid = line.get("id")
+                        if tid:
+                            tasks[tid] = {
+                                "task_id": tid,
+                                "assignee_id": line.get("assignee_id"),
+                                "status": line.get("status"),
+                            }
+                    elif k == chats.TASK_UPDATE:
+                        tid = line.get("task_id")
+                        if tid and tid in tasks:
+                            tasks[tid]["status"] = line.get("status")
+                for task in tasks.values():
+                    if (
+                        task.get("assignee_id") == session_id
+                        and task.get("status") in (chats.TASK_PENDING, chats.TASK_IN_PROGRESS)
+                    ):
+                        obligations.append({
+                            "task_id": task["task_id"],
+                            "chat_id": chat_id,
+                            "status": task["status"],
+                        })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return obligations
+
+
+async def _guard4_escalate(
+    session_id: str,
+    obligation: dict,
+    session_name: str,
+    reason: str,
+    silence_s: float,
+) -> None:
+    """Broadcast escalation notice to the roster chat + notify intake/master."""
+    task_id = obligation["task_id"]
+    chat_id = obligation["chat_id"]
+    task_status = obligation["status"]
+
+    if reason == "crash":
+        reason_text = "process appears dead (crash)"
+    elif reason == "hung":
+        reason_text = f"process alive but silent >{silence_s:.0f}s (possibly hung/paused)"
+    else:
+        reason_text = f"silent >{silence_s:.0f}s with obligation (liveness unknown)"
+
+    body = (
+        f"⚠️ {session_name} unreachable but owes "
+        f"[task-{task_id[:8]} ({task_status})] — {reason_text}. "
+        f"Roster may be serializing on it; reassign or restart. chat_id={chat_id}"
+    )
+
+    try:
+        from khimaira.monitor.chats import _post_synthetic_message
+        await _post_synthetic_message(chat_id, body)
+    except Exception:
+        pass
+
+    try:
+        from khimaira.monitor import sessions as sessions_mod
+
+        # Notify intake if present; fall back to master
+        intake_sid = _resolve_intake_session_id(chat_id)
+        target = intake_sid or _resolve_master_session_id(chat_id)
+        if target:
+            sessions_mod.post_notice(
+                target_session_id=target,
+                text=body,
+                from_session_id="khimaira-daemon",
+            )
+    except Exception:
+        pass
+
+
+def _resolve_intake_session_id(chat_id: str) -> str | None:
+    """Find the session_id with role=intake in this chat."""
+    try:
+        room = chats.load_room(chat_id)
+        member_roles = (room.get("meta") or {}).get("member_roles") or {}
+        for sid, role in member_roles.items():
+            if role == "intake":
+                return sid
+    except Exception:
+        pass
+    return None
+
+
+async def _guard4_check_once() -> None:
+    """Scan sessions for stall conditions; escalate with debounce."""
+    now = time.time()
+
+    # Sweep stale debounce entries
+    expired = [k for k, ts in _GUARD4_STALLED.items() if now - ts > _GUARD4_STALLED_TTL_S]
+    for k in expired:
+        _GUARD4_STALLED.pop(k, None)
+
+    try:
+        from khimaira.monitor import sessions as sessions_mod
+        session_rows = sessions_mod.list_sessions(use_cache=True)
+    except Exception:
+        return
+
+    ceiling = _compute_throttle_ceiling_s()
+
+    for row in session_rows:
+        session_id = row.get("session_id")
+        if not session_id:
+            continue
+        last_age_s = row.get("last_active_age_s") or 0
+        if last_age_s < _GUARD4_MIN_SILENCE_S:
+            continue  # recently active — skip
+
+        obligations = _get_session_obligations(session_id)
+        if not obligations:
+            continue  # no obligations — silent demote is fine
+
+        # Session is silent AND has obligations — three-way logic
+        alive = _is_process_alive_for_session(session_id)
+        silence_s = float(last_age_s)
+        status_raw = row.get("status") or {}
+        session_name = (
+            status_raw.get("name") or status_raw.get("effective_status") or session_id[:8]
+        )
+
+        for obligation in obligations:
+            obligation_key = (session_id, obligation["task_id"])
+            if obligation_key in _GUARD4_STALLED:
+                # Check if obligation cleared (session became active again)
+                if last_age_s < _GUARD4_MIN_SILENCE_S:
+                    _GUARD4_STALLED.pop(obligation_key, None)
+                continue  # already escalated; don't re-fire
+
+            if alive is False:
+                # Process DEAD → crash → escalate immediately
+                _GUARD4_STALLED[obligation_key] = now
+                await _guard4_escalate(session_id, obligation, session_name, "crash", silence_s)
+            elif alive is True and silence_s <= ceiling:
+                # Process ALIVE, within grace window → suppress (🟡 throttled)
+                pass
+            elif alive is True and silence_s > ceiling:
+                # Process ALIVE but beyond ceiling → possibly hung
+                _GUARD4_STALLED[obligation_key] = now
+                await _guard4_escalate(session_id, obligation, session_name, "hung", silence_s)
+            else:
+                # alive is None (liveness unknown) — fall back to ceiling check only
+                if silence_s > ceiling:
+                    _GUARD4_STALLED[obligation_key] = now
+                    await _guard4_escalate(session_id, obligation, session_name, "unknown", silence_s)
+
+
+async def _guard4_watcher() -> None:
+    import logging
+
+    _log = logging.getLogger(__name__)
+    while True:
+        await asyncio.sleep(_GUARD4_WATCH_INTERVAL)
+        try:
+            await _guard4_check_once()
+        except Exception as exc:
+            _log.warning("guard4-watcher error: %s", exc)
+
+
 from khimaira.monitor import chats
 from khimaira.monitor.chats import _resolve_sender_name  # shared with _broadcast
 

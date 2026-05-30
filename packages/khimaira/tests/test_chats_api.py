@@ -1223,3 +1223,251 @@ def test_last_event_id_hint_used_when_no_cursor(chats_api_client):
     assert "msg 0" not in msg_bodies, (
         f"msg 0 predates the pivot and must not appear; got: {msg_bodies}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Guard-4 + #13b-light — escalate-on-stall + throttle grace window
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def guard4_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Isolated state for Guard-4 tests."""
+    state_root = tmp_path / "state"
+    state_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_root))
+
+    import importlib
+    from khimaira.monitor import sessions as sessions_mod
+
+    importlib.reload(sessions_mod)
+    from khimaira.monitor import chats as chats_mod
+
+    importlib.reload(chats_mod)
+    from khimaira.monitor.api import chats as api_mod
+
+    importlib.reload(api_mod)
+
+    yield chats_mod, sessions_mod, api_mod
+
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    importlib.reload(sessions_mod)
+    importlib.reload(chats_mod)
+    importlib.reload(api_mod)
+
+
+def _setup_guard4_scenario(
+    chats_mod, sessions_mod, assignee_sid: str, silence_s: float = 300.0
+) -> str:
+    """Create a chat with a pending task assigned to assignee_sid.
+
+    Returns the chat_id.
+    """
+    import time, json, uuid
+
+    master_sid = str(uuid.uuid4())
+
+    # Create session dirs
+    for sid in (master_sid, assignee_sid):
+        sd = sessions_mod._BASE_DIR / sid
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "status.json").write_text(
+            json.dumps({"status": "idle", "name": sid[:8]}), encoding="utf-8"
+        )
+
+    # Create a chat and task
+    chat_id = chats_mod.create_room(
+        creator_session_id=master_sid,
+        member_session_ids=[assignee_sid],
+        title="test-roster",
+        member_roles={master_sid: "master", assignee_sid: "agent"},
+    )["meta"]["chat_id"]
+    chats_mod.accept(chat_id, assignee_sid)
+    chats_mod.create_task(
+        chat_id=chat_id,
+        sender_session_id=master_sid,
+        body="do the thing",
+        assignee_session_id=assignee_sid,
+    )
+    return chat_id
+
+
+def test_guard4_escalates_when_process_dead(guard4_env, monkeypatch):
+    """Guard-4 AC-1 (live-daemon): session with pending task + dead process → escalates.
+
+    Tests the full _guard4_check_once() → _guard4_escalate() path.
+    """
+    import asyncio, json, uuid
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    assignee_sid = str(uuid.uuid4())
+    chat_id = _setup_guard4_scenario(chats_mod, sessions_mod, assignee_sid)
+
+    notices: list[dict] = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append({"args": a, "kw": kw}) or {},
+    )
+
+    # Mock: process is dead
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)
+
+    # Mock: session is silent (last_active_age_s > GUARD4_MIN_SILENCE_S)
+    real_list = sessions_mod.list_sessions
+
+    def _mock_list(use_cache=True, **kw_):
+        rows = real_list(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = 300.0
+        return rows
+
+    monkeypatch.setattr(sessions_mod, "list_sessions", _mock_list)
+    api_mod._GUARD4_STALLED.clear()
+
+    asyncio.run(api_mod._guard4_check_once())
+
+    assert len(notices) >= 1, (
+        "Guard-4 must escalate when session has obligation + dead process. "
+        f"notices={notices}"
+    )
+    # Assert the escalation mentions crash and the session
+    all_text = " ".join(
+        str(n.get("kw", {}).get("text", "")) + " " + str(n.get("args", ""))
+        for n in notices
+    )
+    assert "crash" in all_text or assignee_sid[:8] in all_text, (
+        f"Escalation text should mention crash or session; got: {all_text!r}"
+    )
+
+
+def test_guard4_suppresses_when_alive_within_ceiling(guard4_env, monkeypatch):
+    """Guard-4 AC-2 + #13b-light AC-2: process alive + silence ≤ ceiling → suppress."""
+    import asyncio, uuid
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    assignee_sid = str(uuid.uuid4())
+    _setup_guard4_scenario(chats_mod, sessions_mod, assignee_sid)
+
+    notices: list[tuple] = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append(a) or {},
+    )
+
+    # Mock: process is alive
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: True)
+
+    # Silence is within the grace ceiling (small)
+    small_silence = 150.0  # > GUARD4_MIN_SILENCE_S (120) but small
+    monkeypatch.setattr(api_mod, "_compute_throttle_ceiling_s", lambda: 600.0)
+
+    def _mock_list(use_cache=True, **kw):
+        rows = sessions_mod.list_sessions.__wrapped__(use_cache=False) if hasattr(sessions_mod.list_sessions, '__wrapped__') else sessions_mod.list_sessions(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = small_silence
+        return rows
+
+    real_list_sessions = sessions_mod.list_sessions
+
+    def _mock_list2(use_cache=True, **kw):
+        rows = real_list_sessions(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = small_silence
+        return rows
+
+    monkeypatch.setattr(sessions_mod, "list_sessions", _mock_list2)
+    api_mod._GUARD4_STALLED.clear()
+
+    asyncio.run(api_mod._guard4_check_once())
+
+    assert len(notices) == 0, (
+        f"Guard-4 must suppress when process alive + silence ({small_silence}s) ≤ ceiling (600s). "
+        f"Got {len(notices)} escalation(s)."
+    )
+
+
+def test_guard4_no_escalation_without_obligation(guard4_env, monkeypatch):
+    """Guard-4 AC-4: session silent + no obligations → no escalation."""
+    import asyncio, uuid, json
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    # Create a session with NO tasks assigned
+    lone_sid = str(uuid.uuid4())
+    sd = sessions_mod._BASE_DIR / lone_sid
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / "status.json").write_text(
+        json.dumps({"status": "idle"}), encoding="utf-8"
+    )
+
+    notices: list = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append(a) or {},
+    )
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)
+
+    def _mock_list(use_cache=True, **kw):
+        rows = sessions_mod.list_sessions(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == lone_sid:
+                r["last_active_age_s"] = 300.0
+        return rows
+
+    real_fn = sessions_mod.list_sessions
+    monkeypatch.setattr(sessions_mod, "list_sessions", lambda **kw: real_fn(use_cache=False))
+    api_mod._GUARD4_STALLED.clear()
+
+    asyncio.run(api_mod._guard4_check_once())
+
+    # No tasks → no escalation regardless of liveness
+    task_related = [n for n in notices if lone_sid[:8] in str(n)]
+    assert len(task_related) == 0, (
+        "Guard-4 must be silent when session has no task obligations."
+    )
+
+
+def test_guard4_debounce_fires_once(guard4_env, monkeypatch):
+    """Guard-4 AC-5 (debounce): repeated scans with same stalled session fire escalation once."""
+    import asyncio, uuid
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    assignee_sid = str(uuid.uuid4())
+    _setup_guard4_scenario(chats_mod, sessions_mod, assignee_sid)
+
+    notices: list = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append(a) or {},
+    )
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)
+
+    real_fn = sessions_mod.list_sessions
+
+    def _mock_list(use_cache=True, **kw):
+        rows = real_fn(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = 300.0
+        return rows
+
+    monkeypatch.setattr(sessions_mod, "list_sessions", _mock_list)
+    api_mod._GUARD4_STALLED.clear()
+
+    asyncio.run(api_mod._guard4_check_once())
+    count_after_first = len(notices)
+
+    asyncio.run(api_mod._guard4_check_once())
+    count_after_second = len(notices)
+
+    assert count_after_first >= 1, "Guard-4 must escalate on first scan."
+    assert count_after_second == count_after_first, (
+        f"Guard-4 debounce: should not re-fire on second scan. "
+        f"First={count_after_first}, second={count_after_second}."
+    )
