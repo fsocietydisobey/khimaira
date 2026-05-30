@@ -245,9 +245,10 @@ def test_check_calls_engine_with_resolved_role(isolated_chats, sessions_mod, the
     body = r.json()
     assert body["ok"] is True
     assert body["role"] == "agent"
-    mock_engine.evaluate.assert_called_once_with(
-        "agent", "Edit", {"file_path": "/tmp/x"}
-    )
+    # P0: conditions_payload is now always passed (keyword arg); check positional args only.
+    call_args, call_kwargs = mock_engine.evaluate.call_args
+    assert call_args[:3] == ("agent", "Edit", {"file_path": "/tmp/x"})
+    assert "conditions_payload" in call_kwargs
 
 
 def test_check_engine_block_returns_violation(isolated_chats, sessions_mod, themis_client):
@@ -1027,3 +1028,205 @@ def test_check_engine_runtime_error_fails_closed_without_member_roles(
     assert body["ok"] is False
     assert body["violation"]["rule_id"] == "IN-ENGINE-ERROR"
     assert body["violation"]["severity"] == "block"
+
+
+# ---------------------------------------------------------------------------
+# P0 — conditions_payload plumbing tests
+# Verifies that recent_tool_calls round-trips, subscriber_last_heartbeat +
+# turn_start_ts are enriched from disk, and file_is_code is registered.
+# These tests go through the full TestClient path (themis_check → _call_engine
+# → engine.evaluate) — equivalent to a live-daemon path per the TestClient
+# contract (real HTTP request/response cycle, real module stack).
+# ---------------------------------------------------------------------------
+
+
+def test_p0_recent_tool_calls_round_trips_to_engine(isolated_chats, sessions_mod, themis_client):
+    """recent_tool_calls POSTed to /themis/check reaches engine.evaluate as conditions_payload.
+
+    P0 AC-2: recent_tool_calls round-trips. Verifies the pre-P0 silent-drop is fixed.
+    """
+    s1 = "11111111-0000-0000-0000-000000000001"
+    s2 = "22222222-0000-0000-0000-000000000002"
+    _make_session(sessions_mod, s1)
+    _make_session(sessions_mod, s2)
+
+    isolated_chats.create_room(
+        s2, [s1], title="test", member_roles={s2: "master", s1: "agent"}
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    isolated_chats.accept(chat_id, s1)
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+
+    mock_result = MagicMock()
+    mock_result.ok = True
+    mock_result.violation = None
+    mock_engine = MagicMock()
+    mock_engine.evaluate.return_value = mock_result
+
+    fake_recent = [{"tool": "mcp__khimaira__session_state", "ts": "2026-01-01T00:00:00+00:00"}]
+
+    with patch.dict("sys.modules", {"themis.engine": mock_engine}):
+        r = themis_client.post(
+            "/api/themis/check",
+            json={
+                "session_id": s1,
+                "tool_name": "Edit",
+                "tool_input": {},
+                "recent_tool_calls": fake_recent,
+            },
+        )
+
+    assert r.status_code == 200
+    _call_args, call_kwargs = mock_engine.evaluate.call_args
+    payload = call_kwargs.get("conditions_payload") or {}
+    assert payload.get("recent_tool_calls") == fake_recent, (
+        "recent_tool_calls must reach engine.evaluate.conditions_payload (was silently dropped pre-P0)"
+    )
+
+
+def test_p0_heartbeat_and_turn_start_enriched_from_disk(isolated_chats, sessions_mod, themis_client, tmp_path):
+    """subscriber_last_heartbeat + turn_start_ts are read from session files and reach engine.
+
+    P0 AC-1 (partial): enrichment from disk reaches conditions_payload so condition-gated
+    rules (like IN-MASTER-1 CHAT_MY_CHATS_FRESH) can evaluate against real timestamps.
+    """
+    s1 = "11111111-0000-0000-0000-000000000001"
+    s2 = "22222222-0000-0000-0000-000000000002"
+    _make_session(sessions_mod, s1)
+    _make_session(sessions_mod, s2)
+
+    isolated_chats.create_room(
+        s2, [s1], title="test", member_roles={s2: "master", s1: "intake"}
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    isolated_chats.accept(chat_id, s1)
+
+    # Write heartbeat + turn_start to session dir
+    from khimaira.monitor import sessions as sess
+    sd = sess._session_dir_read(s1)
+    assert sd is not None
+    status = json.loads((sd / "status.json").read_text())
+    status["last_sse_heartbeat"] = "2026-01-01T00:00:00+00:00"
+    (sd / "status.json").write_text(json.dumps(status))
+    (sd / "turn_start.txt").write_text("2026-01-01T01:00:00+00:00")
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+
+    mock_result = MagicMock()
+    mock_result.ok = True
+    mock_result.violation = None
+    mock_engine = MagicMock()
+    mock_engine.evaluate.return_value = mock_result
+
+    with patch.dict("sys.modules", {"themis.engine": mock_engine}):
+        r = themis_client.post(
+            "/api/themis/check",
+            json={"session_id": s1, "tool_name": "mcp__khimaira-chat__chat_send", "tool_input": {}},
+        )
+
+    assert r.status_code == 200
+    _call_args, call_kwargs = mock_engine.evaluate.call_args
+    payload = call_kwargs.get("conditions_payload") or {}
+    assert payload.get("subscriber_last_heartbeat") == "2026-01-01T00:00:00+00:00"
+    assert payload.get("turn_start_ts") == "2026-01-01T01:00:00+00:00"
+
+
+def test_p0_in_master_1_fires_via_conditions_payload(isolated_chats, sessions_mod, themis_client):
+    """IN-MASTER-1 (CHAT_MY_CHATS_FRESH) fires when subscriber heartbeat < turn_start.
+
+    P0 AC-1 (core): a condition-gated rule fires through the full POST path with real
+    payload enrichment. Pre-P0 this rule was always a silent no-op (payload={}).
+    """
+    master_id = "22222222-0000-0000-0000-000000000002"
+    _make_session(sessions_mod, master_id)
+
+    isolated_chats.create_room(
+        master_id, [], title="solo", member_roles={master_id: "master"}
+    )
+
+    # Write stale heartbeat (before turn start)
+    from khimaira.monitor import sessions as sess
+    sd = sess._session_dir_read(master_id)
+    assert sd is not None
+    status = json.loads((sd / "status.json").read_text())
+    status["last_sse_heartbeat"] = "2026-01-01T00:00:00+00:00"  # old
+    (sd / "status.json").write_text(json.dumps(status))
+    (sd / "turn_start.txt").write_text("2026-01-01T01:00:00+00:00")  # newer
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": master_id,
+            "tool_name": "mcp__khimaira-chat__chat_send",
+            "tool_input": {},
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False, (
+        "IN-MASTER-1 must fire when subscriber_last_heartbeat < turn_start_ts. "
+        "If ok=True, conditions_payload is not reaching engine.evaluate (pre-P0 bug)."
+    )
+    assert body["violation"]["rule_id"] == "IN-MASTER-1"
+    assert body["violation"]["severity"] == "block"
+
+
+def test_p0_file_is_code_condition_registered():
+    """file_is_code is registered in _REGISTRY (fixes IN-MASTER-7 double-dead).
+
+    P0 AC-3: the condition was unknown-name → False pre-P0; now registered and evaluates.
+    """
+    from themis.conditions import evaluate_condition
+
+    # .py file → True
+    result = evaluate_condition("file_is_code", {"tool_input": {"file_path": "/proj/src/foo.py"}})
+    assert result is True
+
+    # .md file → False (not a code extension)
+    result = evaluate_condition("file_is_code", {"tool_input": {"file_path": "/proj/README.md"}})
+    assert result is False
+
+    # absent file_path → False (fail-open)
+    result = evaluate_condition("file_is_code", {})
+    assert result is False
+
+
+def test_p0_no_regression_pure_matcher_rules_still_block(isolated_chats, sessions_mod, themis_client):
+    """Pure-matcher rules (no conditions) still block as before P0.
+
+    P0 AC-5: the conditions_payload plumbing must not break unconditional block rules.
+    """
+    s1 = "11111111-0000-0000-0000-000000000001"
+    s2 = "22222222-0000-0000-0000-000000000002"
+    _make_session(sessions_mod, s1)
+    _make_session(sessions_mod, s2)
+
+    isolated_chats.create_room(
+        s2, [s1], title="test", member_roles={s2: "master", s1: "intake"}
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    isolated_chats.accept(chat_id, s1)
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={"session_id": s1, "tool_name": "Edit", "tool_input": {}},
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False  # IN-INTAKE-1 still fires
+    assert body["violation"]["rule_id"] == "IN-INTAKE-1"

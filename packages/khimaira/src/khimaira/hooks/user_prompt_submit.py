@@ -1068,6 +1068,21 @@ def main() -> int:
     # cwd is provided by Claude Code in hook input; used for scope_cwd filtering.
     session_cwd = data.get("cwd") or ""
 
+    # --- Stamp turn_start.txt (used by Themis chat_my_chats_fresh condition) --
+    # Written at top of every turn so the PreToolUse hook can compare
+    # subscriber_last_heartbeat < turn_start_ts to detect stale SSE.
+    _state_base_dir = Path(
+        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+    ) / "khimaira" / "sessions" / session_id
+    try:
+        _state_base_dir.mkdir(parents=True, exist_ok=True)
+        (_state_base_dir / "turn_start.txt").write_text(
+            __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
     # --- Sync Claude Code's /rename → khimaira's session name (every turn) ---
     # Cheap idempotent check; only POSTs when the names differ. Closes the
     # gap where /rename in Claude Code is UI-only and other sessions can't

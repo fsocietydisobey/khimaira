@@ -248,12 +248,16 @@ def _call_engine(
     tool_name: str,
     tool_input: dict,
     cwd: str,
+    conditions_payload: dict | None = None,
 ) -> dict:
     """Call themis.engine.evaluate. Fail-open if themis not installed yet (D7).
 
     Agent-1 interface: evaluate(role, tool_name, tool_input, conditions_payload?, rule_set?)
     → EvalResult with .ok, .violation (optional ViolationDetail with .rule_id, .name,
       .message, .severity).
+
+    conditions_payload: runtime state dict assembled by themis_check (P0 plumbing).
+    When None, engine defaults to {} → all condition-gated rules evaluate to False.
     """
     if role is None:
         # Not a member of any chat → passthrough, no rules apply
@@ -281,7 +285,7 @@ def _call_engine(
         }
     try:
         engine = importlib.import_module("themis.engine")
-        result = engine.evaluate(role, tool_name, tool_input)
+        result = engine.evaluate(role, tool_name, tool_input, conditions_payload=conditions_payload)
         # EvalResult is a dataclass/namedtuple — serialize to dict for the response
         if hasattr(result, "__dict__"):
             out: dict = {"ok": result.ok}
@@ -436,6 +440,7 @@ class CheckReq(BaseModel):
     tool_name: str
     tool_input: dict = {}
     cwd: str = ""
+    recent_tool_calls: list = []  # forwarded from hook; was silently dropped pre-P0
 
 
 class InvalidateCacheReq(BaseModel):
@@ -490,14 +495,71 @@ def build_router():
     async def themis_check(req: CheckReq) -> dict:
         """Combined role-resolve + rule-check. One HTTP hop per hook fire (D3).
 
-        Body: {session_id, tool_name, tool_input, cwd?}
+        Body: {session_id, tool_name, tool_input, cwd?, recent_tool_calls?}
         Returns: {ok: bool, violation?: {rule_id, name, message, severity}, role: str|null}
 
         Fail-open (D7): if themis engine not installed, returns ok=true.
         No role assignment → returns ok=true (null role passthrough).
+
+        conditions_payload is assembled here (P0 plumbing):
+          - recent_tool_calls: forwarded from hook (was silently dropped pre-P0)
+          - subscriber_last_heartbeat: from session status.json (cheap, always)
+          - turn_start_ts: from session turn_start.txt written by UserPromptSubmit hook
+          - idle_agents: LAZY — only when role==master AND tool in dispatch-adjacent set
+          - gate_verdicts: stub None (populated in B3 Slice B when implemented)
         """
+        from khimaira.monitor import sessions as sessions_mod  # local import: lazy + avoids circular
+
         role = resolve_session_role(req.session_id)
-        result = _call_engine(role, req.tool_name, req.tool_input, req.cwd)
+
+        # --- Assemble conditions_payload (LAZY enrichment per architect design) ---
+        conditions_payload: dict = {
+            "recent_tool_calls": req.recent_tool_calls,
+            "tool_name": req.tool_name,
+            "tool_input": req.tool_input,
+            "gate_verdicts": None,  # B3 Slice B stub — not yet populated
+        }
+
+        # Cheap enrichment: subscriber heartbeat + turn start (always, ~1 file read each)
+        try:
+            sd = sessions_mod._session_dir_read(req.session_id)
+            if sd is not None:
+                status_file = sd / "status.json"
+                if status_file.is_file():
+                    status = json.loads(status_file.read_text(encoding="utf-8"))
+                    hb = status.get("last_sse_heartbeat")
+                    if hb:
+                        conditions_payload["subscriber_last_heartbeat"] = hb
+                turn_start_file = sd / "turn_start.txt"
+                if turn_start_file.is_file():
+                    conditions_payload["turn_start_ts"] = turn_start_file.read_text(
+                        encoding="utf-8"
+                    ).strip()
+        except Exception:
+            pass  # enrichment is best-effort; missing keys → conditions return False
+
+        # Lazy enrichment: idle_agents (only for master + dispatch-adjacent tools)
+        # list_sessions() has no role field — use name-inference as a lightweight proxy.
+        # Sessions whose name infers as "agent" AND whose status is "idle" AND active
+        # within the last 30 minutes are treated as idle agents.
+        _DISPATCH_TOOLS = frozenset(
+            {"chat_task_create", "chat_send_to", "AskUserQuestion", "Task"}
+        )
+        if role == "master" and req.tool_name in _DISPATCH_TOOLS:
+            try:
+                _ACTIVE_WINDOW_S = 1800  # 30 min
+                all_sessions = sessions_mod.list_sessions()
+                idle = [
+                    s for s in all_sessions
+                    if chats.infer_role_from_name(s.get("name") or "") == "agent"
+                    and s.get("status") == "idle"
+                    and (s.get("last_active_age_s") or _ACTIVE_WINDOW_S + 1) < _ACTIVE_WINDOW_S
+                ]
+                conditions_payload["idle_agents"] = idle
+            except Exception:
+                pass  # fail-open: missing key → idle_agents_exist returns False
+
+        result = _call_engine(role, req.tool_name, req.tool_input, req.cwd, conditions_payload=conditions_payload)
         # Normalize internal sentinel to null in the public response role field;
         # the BLOCK verdict already conveys the fail-closed decision.
         response_role = None if role == _UNRESOLVABLE else role

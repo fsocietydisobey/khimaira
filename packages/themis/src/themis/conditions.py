@@ -390,6 +390,29 @@ def done_report_missing_branch_declaration(payload: dict[str, Any]) -> bool:
     return not all(label in note for label in required_labels)
 
 
+def file_is_code(payload: dict[str, Any]) -> bool:
+    """True if the tool's file_path has a code-file extension.
+
+    Used by IN-MASTER-7 (NO_DIRECT_CODE_IMPLEMENTATION) to gate master
+    on Edit/Write calls that target production source files. Returns False
+    for non-edit tools or absent file_path.
+
+    Fail-open: if tool_input is absent or file_path is empty → False (don't fire).
+    """
+    tool_input = payload.get("tool_input") or {}
+    file_path = tool_input.get("file_path") or ""
+    if not file_path:
+        return False
+    _CODE_EXTENSIONS = frozenset({
+        ".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte",
+        ".go", ".rs", ".rb", ".java", ".kt", ".swift", ".c", ".cpp",
+        ".h", ".hpp", ".cs", ".php", ".sh", ".bash",
+    })
+    import os
+    _ext = os.path.splitext(file_path)[-1].lower()
+    return _ext in _CODE_EXTENSIONS
+
+
 # ---------------------------------------------------------------------------
 # Registry — maps YAML condition name → function
 # ---------------------------------------------------------------------------
@@ -403,4 +426,5 @@ _REGISTRY: dict[str, Any] = {
     "recent_dispatch_different_ctx": recent_dispatch_different_ctx,
     "question_text_is_design_shaped": question_text_is_design_shaped,
     "done_report_missing_branch_declaration": done_report_missing_branch_declaration,
+    "file_is_code": file_is_code,
 }
