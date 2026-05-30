@@ -106,7 +106,7 @@ except ImportError:
 # — no default; orchestrator picks per scope, and the directive emit is a
 # silent no-op when the role has no entry here.
 ROLE_BUDGET: dict[str, dict[str, str]] = {
-    ROLE_MASTER: {"model": "sonnet", "effort": "medium"},
+    ROLE_MASTER: {"model": "opus", "effort": "max"},
     ROLE_AGENT: {"model": "sonnet", "effort": "medium"},
     ROLE_OBSERVER: {"model": "haiku", "effort": "low"},
     ROLE_ARCHITECT: {"model": "opus", "effort": "max"},  # synthesis/design sidecar
@@ -401,7 +401,14 @@ def _is_master(room: dict[str, Any], sid: str) -> bool:
     """
     member_roles = room["meta"].get("member_roles")
     if member_roles is not None:
-        return member_roles.get(sid) == ROLE_MASTER
+        role = member_roles.get(sid)
+        if role is not None:
+            return role == ROLE_MASTER
+        # member_roles present but sid absent — e.g. a creator omitted from the
+        # dict at create_room (pre-#67 chats). Fall back to created_by so the
+        # creator is never self-locked out of master authority. created_by
+        # tracks the current master (transfer/resume swap it), so this stays
+        # correct after dethroning. (#68)
     return room["meta"].get("created_by") == sid
 
 
@@ -559,6 +566,13 @@ def create_room(
         "topology": topology,
     }
     if member_roles is not None:
+        # Always include the creator as master. A member_roles dict that omits
+        # the creator makes them unresolvable to the Themis role gate (Layer-1
+        # miss → fail-closed lockout of EVERY tool for the chat creator). The
+        # creator holds master implicitly via created_by; materialize it so role
+        # resolution is consistent whether or not member_roles was passed. (#67)
+        member_roles = dict(member_roles)
+        member_roles.setdefault(creator_session_id, ROLE_MASTER)
         meta["member_roles"] = member_roles
     _append(chat_id, meta)
 

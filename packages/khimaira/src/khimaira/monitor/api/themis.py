@@ -175,11 +175,15 @@ def _resolve_role_from_jsonl(sid: str) -> str | None:
         member_roles = member_roles_dict or {}
         role = member_roles.get(sid)
         if role is None:
-            # Layer 2: created_by master fallback — mirrors chats._is_master().
-            # Authoritative when member_roles is absent (v1-era chat, no role write
-            # yet); _is_master's invariant: "first chat_grant_role materializes
-            # member_roles", so created_by is current master iff member_roles absent.
-            if chats._is_master(room, sid):
+            # Layer 2: created_by master fallback.
+            # Original: delegated to _is_master() which short-circuits to
+            # member_roles[sid] == ROLE_MASTER — returns False when member_roles
+            # dict exists but doesn't contain the creator (e.g. after a bootstrap
+            # that wrote member_roles for all invited members but skipped the creator).
+            # Fix: check created_by directly regardless of member_roles state. The
+            # creator is always master until dethroned via chat_grant_role(role=master)
+            # which atomically writes the new master AND demotes the old one.
+            if room["meta"].get("created_by") == sid:
                 role = chats.ROLE_MASTER
         if role is None:
             # Layer 3: registry-validated name inference
@@ -300,11 +304,16 @@ def _call_engine(
     except ImportError:
         # Phase 1: themis package not yet installed — fail-open (D7)
         return {"ok": True}
+    except FileNotFoundError:
+        # Missing yaml file for this role = no rules defined yet = allow-all.
+        # A new role with no yaml file has no constraints; fail-open so a missing
+        # placeholder doesn't hard-block an entire session (observed: frontend-lead
+        # blocked until frontend-lead.yaml was created, commit 4f6d097).
+        logger.debug("themis: no rule file for role %r — fail-open (no rules defined)", role)
+        return {"ok": True}
     except Exception as exc:
         # Engine runtime error (bad YAML, rule load failure, evaluate exception).
-        # Role resolved but rules could not be evaluated → fail-CLOSED unconditionally.
-        # This is the resolved-role-with-broken-rules backstop: independent of
-        # member_roles (the per-chat gate applies only to unresolvable-role sessions).
+        # Role resolved and yaml exists but rules could not be evaluated → fail-CLOSED.
         # A broken rule file is a real enforcement failure that must not become a
         # silent allow-through; operator must fix the rule file to unblock.
         logger.warning("themis engine error (fail-closed): role=%s exc=%s", role, exc)
