@@ -337,7 +337,7 @@ def _discover_other_active_sessions(
 # stdlib-only subprocess that boots fast; pulling in the chats module would
 # transitively pull all of monitor/* and slow SessionStart.
 _ROLE_BUDGET: dict[str, dict[str, str]] = {
-    "master": {"model": "opus", "effort": "max"},
+    "master": {"model": "sonnet", "effort": "medium"},
     "agent": {"model": "sonnet", "effort": "medium"},
     "observer": {"model": "haiku", "effort": "default"},
     "architect": {"model": "opus", "effort": "max"},
