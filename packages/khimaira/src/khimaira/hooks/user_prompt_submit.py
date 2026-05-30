@@ -637,6 +637,120 @@ def _format_unfired_acks(tasks: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _discover_begun_not_started(session_id: str) -> list[dict]:
+    """Walk chat JSONLs and return tasks where BEGIN has been fired but
+    this session hasn't self-transitioned to in_progress yet.
+
+    A task is "begun-not-started" when ALL of:
+      (a) this session is the assignee (task.assignee_id == session_id)
+      (b) a kind=task_signal with signal="start" exists for that task_id
+      (c) the task's latest status is still "pending" (no in_progress update)
+
+    Returns newest-first list of dicts:
+        {chat_id, task_id, task_body, signal_ts}
+
+    Errors are silent — hook must never break.
+    """
+    state_root = (
+        Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))) / "khimaira"
+    )
+    chats_dir = state_root / "chats"
+    if not chats_dir.exists():
+        return []
+
+    results: list[dict] = []
+
+    for path in sorted(chats_dir.glob("*.jsonl")):
+        try:
+            records: list[dict] = []
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    for raw_line in f:
+                        raw_line = raw_line.strip()
+                        if not raw_line:
+                            continue
+                        try:
+                            records.append(json.loads(raw_line))
+                        except json.JSONDecodeError:
+                            continue
+            except OSError:
+                continue
+
+            if not records:
+                continue
+
+            chat_id = path.stem
+            for r in reversed(records):
+                if r.get("kind") == "meta":
+                    chat_id = r.get("chat_id") or path.stem
+                    break
+
+            # Collect tasks assigned to this session, their statuses, and
+            # whether a task_signal start has been fired for each.
+            tasks: dict[str, dict] = {}        # task_id → task record
+            task_statuses: dict[str, str] = {} # task_id → latest status
+            begin_signals: dict[str, str] = {} # task_id → signal_ts
+
+            for r in records:
+                k = r.get("kind")
+                if k == "task":
+                    tid = r.get("id")
+                    if tid and r.get("assignee_id") == session_id:
+                        tasks[tid] = r
+                        task_statuses.setdefault(tid, r.get("status") or "pending")
+                elif k == "task_update":
+                    tid = r.get("task_id")
+                    if tid and r.get("status"):
+                        task_statuses[tid] = r["status"]
+                elif k == "task_signal":
+                    tid = r.get("task_id")
+                    if tid and r.get("signal") == "start":
+                        begin_signals[tid] = r.get("ts") or ""
+
+            for tid, task_rec in tasks.items():
+                if tid not in begin_signals:
+                    continue  # BEGIN not yet fired
+                if task_statuses.get(tid, "pending") != "pending":
+                    continue  # already in_progress or beyond
+                body = (task_rec.get("body") or "")[:80].strip()
+                results.append({
+                    "chat_id": chat_id,
+                    "task_id": tid,
+                    "task_body": body,
+                    "signal_ts": begin_signals[tid],
+                })
+        except Exception:  # noqa: BLE001 — hook must never break
+            continue
+
+    results.sort(key=lambda x: x.get("signal_ts") or "", reverse=True)
+    return results
+
+
+def _format_begun_not_started(tasks: list[dict]) -> str:
+    """Render BEGUN-but-not-in_progress tasks as an agent-facing banner.
+
+    Returns "" when tasks is empty.
+    """
+    if not tasks:
+        return ""
+    lines = [
+        f"🟢 START NOW — BEGIN received for {len(tasks)} task(s) — mark in_progress to begin:",
+        "",
+    ]
+    for t in tasks:
+        tid = t.get("task_id") or "?"
+        body = t.get("task_body") or ""
+        ellipsis = "..." if len(body) >= 80 else ""
+        lines.append(f'  • [{tid}]: "{body}{ellipsis}"')
+        lines.append(f'    → chat_task_update(task_id="{tid}", new_status="in_progress") then begin work')
+        lines.append("")
+    lines += [
+        "This banner re-surfaces every turn until you self-transition.",
+        "(If you believe this is stale, check chat_history for the task's current status.)",
+    ]
+    return "\n".join(lines).rstrip()
+
+
 def _check_stale_acks(session_id: str) -> list[dict]:
     """Detect acked /khimaira-assign tasks whose budget has become stale.
 
@@ -1225,6 +1339,20 @@ def main() -> int:
         except Exception:  # noqa: BLE001 — hook must not break
             pending_assignments_block = ""
 
+    # --- #14b: un-missable BEGIN banner — BEGUN tasks not yet in_progress ---
+    # Closes handshake stall #5: after a ready-ack, the pending banner stops,
+    # but a missed BEGIN SSE event leaves the agent idle on an officially-started
+    # task. This banner re-surfaces the task every turn until the agent calls
+    # chat_task_update(in_progress). Opt-out: KHIMAIRA_BEGUN_BANNER=0.
+    begun_not_started_block = ""
+    if os.environ.get("KHIMAIRA_BEGUN_BANNER") not in ("0", "false", "no"):
+        try:
+            _begun = _discover_begun_not_started(session_id)
+            if _begun:
+                begun_not_started_block = _format_begun_not_started(_begun)
+        except Exception:  # noqa: BLE001 — hook must not break
+            begun_not_started_block = ""
+
     # --- v1.9.6: inverse banner — assignments awaiting agent ack ----------
     # Master-facing counterpart to the agent's pending-assignments banner.
     # Surfaces tasks created BY this session that have no in_progress update
@@ -1369,6 +1497,7 @@ def main() -> int:
         and not bottleneck_block
         and not role_budget_block
         and not pending_assignments_block
+        and not begun_not_started_block
         and not unfired_acks_block
         and not stale_acks_block
         and not quiet_channel_block
@@ -1393,6 +1522,7 @@ def main() -> int:
             dynamic_context_block,
             bottleneck_block,
             pending_assignments_block,
+            begun_not_started_block,
             unfired_acks_block,
             stale_acks_block,
             role_budget_block,
