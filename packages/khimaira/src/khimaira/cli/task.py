@@ -78,26 +78,44 @@ def run(args: argparse.Namespace) -> int:
 
 
 async def _run_async(args: argparse.Namespace) -> int:
-    from khimaira.dispatch.runners.claude import ClaudeAuthError
+    from khimaira.dispatch.runners.claude import ClaudeAuthError, ClaudeTransientError
 
     project = args.project or "."
 
-    # Step 1 — classify
+    # Step 1 — classify (with transient-overload retry)
     print(f"[khimaira task] classifying...", file=sys.stderr)
     t0 = time.monotonic()
-    try:
-        classification = await classify_task(args.description, project_path=project)
-    except ClaudeAuthError as e:
-        print(
-            f"\n[khimaira task] STOP — Claude rejected the call:\n  {e}\n"
-            "Skipping retries to avoid burning more quota. "
-            "Run `khimaira doctor` to check available alternatives.",
-            file=sys.stderr,
-        )
-        return 5
-    except Exception as e:
-        print(f"\n[khimaira task] classifier failed: {e}", file=sys.stderr)
-        return 1
+    _MAX_TRANSIENT_RETRIES = 3
+    _BACKOFF_BASE_S = 30  # conservative: CC already burned ~10 retries before raising
+    for _attempt in range(_MAX_TRANSIENT_RETRIES + 1):
+        try:
+            classification = await classify_task(args.description, project_path=project)
+            break
+        except ClaudeAuthError as e:
+            print(
+                f"\n[khimaira task] STOP — Claude rejected the call:\n  {e}\n"
+                "Skipping retries to avoid burning more quota. "
+                "Run `khimaira doctor` to check available alternatives.",
+                file=sys.stderr,
+            )
+            return 5
+        except ClaudeTransientError as e:
+            if _attempt >= _MAX_TRANSIENT_RETRIES:
+                print(
+                    f"\n[khimaira task] STOP — transient overload after {_MAX_TRANSIENT_RETRIES} retries:\n  {e}",
+                    file=sys.stderr,
+                )
+                return 6
+            backoff = _BACKOFF_BASE_S * (2 ** _attempt)
+            print(
+                f"\n[khimaira task] transient overload (attempt {_attempt + 1}/{_MAX_TRANSIENT_RETRIES}), "
+                f"retrying in {backoff}s...",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(backoff)
+        except Exception as e:
+            print(f"\n[khimaira task] classifier failed: {e}", file=sys.stderr)
+            return 1
     print(
         f"[khimaira task] {classification.task_type}/{classification.complexity_tier} "
         f"(confidence {classification.confidence:.0%}) — {classification.reasoning}",
@@ -148,23 +166,42 @@ async def _run_async(args: argparse.Namespace) -> int:
         else:
             runner_kwargs["effort"] = "medium"
 
-    try:
-        result = await runner.run(
-            args.description,
-            model=decision.chosen_model or None,
-            timeout=args.timeout,
-            cwd=args.project,
-            **runner_kwargs,
-        )
-    except ClaudeAuthError as e:
-        print(
-            f"\n[khimaira task] STOP — Claude rejected the dispatch:\n  {e}\nNot retrying.",
-            file=sys.stderr,
-        )
-        return 5
-    except Exception as e:
-        print(f"\n[khimaira task] runner {decision.chosen_runner} failed: {e}", file=sys.stderr)
-        return 4
+    result = None
+    for _attempt in range(_MAX_TRANSIENT_RETRIES + 1):
+        try:
+            result = await runner.run(
+                args.description,
+                model=decision.chosen_model or None,
+                timeout=args.timeout,
+                cwd=args.project,
+                **runner_kwargs,
+            )
+            break
+        except ClaudeAuthError as e:
+            print(
+                f"\n[khimaira task] STOP — Claude rejected the dispatch:\n  {e}\nNot retrying.",
+                file=sys.stderr,
+            )
+            return 5
+        except ClaudeTransientError as e:
+            if _attempt >= _MAX_TRANSIENT_RETRIES:
+                print(
+                    f"\n[khimaira task] STOP — transient overload after {_MAX_TRANSIENT_RETRIES} retries:\n  {e}",
+                    file=sys.stderr,
+                )
+                return 6
+            backoff = _BACKOFF_BASE_S * (2 ** _attempt)
+            print(
+                f"\n[khimaira task] transient overload (attempt {_attempt + 1}/{_MAX_TRANSIENT_RETRIES}), "
+                f"retrying in {backoff}s...",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(backoff)
+        except Exception as e:
+            print(f"\n[khimaira task] runner {decision.chosen_runner} failed: {e}", file=sys.stderr)
+            return 4
+    if result is None:
+        return 6
 
     elapsed = time.monotonic() - t0
 

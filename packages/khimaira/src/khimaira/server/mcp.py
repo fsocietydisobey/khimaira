@@ -692,18 +692,18 @@ async def _delegate_impl(
         # (incremental failure counter, opens circuit after K).
         # The runners raise distinct types when they can; fall back to
         # message-based detection for the rest.
-        from khimaira.dispatch.runners.claude import ClaudeAuthError
+        from khimaira.dispatch.runners.claude import ClaudeAuthError, ClaudeTransientError
 
         msg = str(e).lower()
-        is_rate_limited = (
-            isinstance(e, ClaudeAuthError)
-            or "rate limit" in msg
-            or "rate_limit" in msg
+        is_transient = (
+            isinstance(e, ClaudeTransientError)
             or "429" in msg
-            or "credit balance" in msg
-            or "quota" in msg
         )
-        if is_rate_limited:
+        is_account_hard_stop = isinstance(e, ClaudeAuthError)
+        # Route: transient overload → short cooldown (record_rate_limit);
+        # account-level hard stop → incremental failure counter (record_failure);
+        # other errors → failure counter. Only ClaudeTransientError is retriable.
+        if is_transient:
             circuit.record_rate_limit(chosen_runner)
         else:
             circuit.record_failure(chosen_runner)

@@ -31,22 +31,43 @@ DEFAULT_MODEL = os.environ.get("KHIMAIRA_CLAUDE_MODEL", "claude-opus-4-7")
 
 
 class ClaudeAuthError(RuntimeError):
-    """Claude CLI signaled a hard auth/billing failure — credits exhausted,
-    invalid key, rate limit. The classifier MUST NOT retry on these; doing
-    so just burns more quota for the same answer.
+    """Hard account-level failure — credits exhausted, invalid key, billing,
+    account usage limit. MUST NOT retry — the user has to fix something at
+    the account level before Claude can be called again.
     """
 
 
-# Substrings that mean "stop calling Claude until the user fixes something."
-# Matched against the JSON `result` field of error responses.
-_HARD_STOP_PATTERNS = (
+class ClaudeTransientError(RuntimeError):
+    """Server-side transient overload — Anthropic is temporarily rate-limiting
+    capacity (not the account's usage quota). Safe to retry with exponential
+    backoff after Claude Code exhausts its own ~10 internal retries.
+
+    Distinct from ClaudeAuthError: the error is infrastructure-side and WILL
+    clear without user action; retrying is correct.
+    """
+
+
+# Account-level hard stops — user must fix before retrying.
+# Matched against the JSON `result` field (case-insensitive substring).
+_ACCOUNT_HARD_STOP_PATTERNS = (
     "credit balance is too low",
     "credit balance too low",
     "billing",
     "invalid api key",
     "authentication",
-    "rate limit",
-    "rate_limit",
+    "usage limit",  # account usage cap, not server overload
+)
+
+# Server-side transient overload — retriable with backoff.
+# Joseph's exact post-exhaustion string: "Server is temporarily limiting
+# requests (not your usage limit)". Include both specific and generic
+# overloaded_error patterns; do NOT include generic "rate limit" (it's
+# the conflation source that made all rate-limits hard-stop previously).
+_TRANSIENT_OVERLOAD_PATTERNS = (
+    "server is temporarily limiting requests",
+    "not your usage limit",
+    "overloaded_error",
+    "overloaded",
 )
 
 
@@ -131,20 +152,34 @@ class ClaudeRunner:
                 text=raw, runner=self.name, model=model_id, latency_s=latency, raw=raw,
             )
 
-        # Hard-stop detection: claude emits is_error=true for billing/auth/rate-limit.
-        # Don't retry these — the user has to fix something at the account level.
+        # Error classification: three-way per #13a analysis.
+        #   1. Account-level hard stop (billing/auth/usage-cap) → ClaudeAuthError.
+        #      Do NOT retry — user must act.
+        #   2. Server transient overload → ClaudeTransientError.
+        #      Retriable with backoff after CC's own ~10 internal retries exhaust.
+        #   3. Other errors fall through to normal result handling.
         if data.get("is_error"):
             err_text = data.get("result", "") or ""
             err_lower = err_text.lower()
-            if any(p in err_lower for p in _HARD_STOP_PATTERNS):
+            if any(p in err_lower for p in _ACCOUNT_HARD_STOP_PATTERNS):
                 log.error(
-                    "claude: HARD STOP — %s (api_status=%s). Refusing further calls "
-                    "in this dispatch.",
+                    "claude: HARD STOP (account) — %s (api_status=%s). "
+                    "User must fix credits/auth before retrying.",
                     err_text, data.get("api_error_status"),
                 )
                 raise ClaudeAuthError(
-                    f"Claude refused — {err_text}. "
-                    "Add credits / fix auth / wait out rate limit before retrying."
+                    f"Claude refused (account-level) — {err_text}. "
+                    "Add credits / fix auth before retrying."
+                )
+            if any(p in err_lower for p in _TRANSIENT_OVERLOAD_PATTERNS):
+                log.warning(
+                    "claude: TRANSIENT OVERLOAD — %s (api_status=%s). "
+                    "Retriable with backoff.",
+                    err_text, data.get("api_error_status"),
+                )
+                raise ClaudeTransientError(
+                    f"Claude overloaded (transient) — {err_text}. "
+                    "Retry with exponential backoff."
                 )
 
         # Text — Claude Code emits `result` (top-level) or content blocks
