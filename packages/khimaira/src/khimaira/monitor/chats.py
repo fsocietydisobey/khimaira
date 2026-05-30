@@ -106,7 +106,7 @@ except ImportError:
 # — no default; orchestrator picks per scope, and the directive emit is a
 # silent no-op when the role has no entry here.
 ROLE_BUDGET: dict[str, dict[str, str]] = {
-    ROLE_MASTER: {"model": "sonnet", "effort": "medium"},
+    ROLE_MASTER: {"model": "opus", "effort": "max"},
     ROLE_AGENT: {"model": "sonnet", "effort": "medium"},
     ROLE_OBSERVER: {"model": "haiku", "effort": "low"},
     ROLE_ARCHITECT: {"model": "opus", "effort": "max"},  # synthesis/design sidecar

@@ -1623,8 +1623,8 @@ def test_chat_grant_role_emits_directive_to_target(isolated_chats):
 def test_chat_grant_role_master_swap_emits_two_directives(isolated_chats):
     """Promoting B to master atomically demotes A (the implicit creator-
     master). Two directives fire in the same call: one to B (new master,
-    master). Two directives fire in the same call: one to B (new master,
     opus/max), one to A (demoted, default agent tier sonnet/medium)."""
+    from khimaira.monitor import sessions as sessions_mod
 
     c = isolated_chats
     chat_id = _setup_v1_chat(c, sessions_mod, "alice", "bob")
