@@ -983,6 +983,75 @@ def _channel_event_response_level(prompt: str) -> str:
     return level
 
 
+def _classify_prompt(prompt: str) -> str:
+    """Classify a user prompt to decide which context to inject (task #66).
+
+    Returns one of: "architecture" | "bugfix" | "coordination" | "simple".
+
+    Keyword-based — pure stdlib, no LLM call, runs in the UserPromptSubmit
+    hot path where latency matters (v1; an LLM classifier is the v2 upgrade).
+
+    The DEFAULT is "coordination" (the full-context class that matches
+    pre-#66 behavior). This is deliberate: a misclassification must never
+    strip a coordination or safety signal. Only "simple" suppresses the
+    ambient reminder blocks, and it fires only for clearly-trivial lookups
+    (via the conservative `_looks_trivial`). Channel-only roster events
+    classify as "coordination" by definition.
+
+    Precedence (first match wins): channel-event → coordination keywords →
+    bug-fix signals → architecture signals → trivial-lookup (simple) →
+    default coordination.
+    """
+    if not prompt or not prompt.strip():
+        return "coordination"
+
+    # Channel-only roster events are coordination — never strip their context.
+    stripped = _SYSREM_RE.sub("", prompt).strip()
+    if _CHANNEL_ONLY_RE.match(stripped):
+        return "coordination"
+
+    lower = prompt.lower()
+
+    # Coordination: roster / delegation / multi-session orchestration. Checked
+    # first so a roster prompt is never downgraded to "simple" and stripped.
+    coordination_markers = (
+        "delegate", "assign", "roster", "dispatch", "handoff", "hand off",
+        "begin signal", "/khimaira", "session_", "chat_", "the agent",
+        "the master", "intake", "verifier", "tracker",
+    )
+    if any(m in lower for m in coordination_markers):
+        return "coordination"
+
+    # Bug-fix: failure language or a concrete source-file reference.
+    bugfix_markers = (
+        "bug", "error", "traceback", "exception", "failing", "fails",
+        "broken", "not working", "doesn't work", "crash", "stack trace",
+        "regression", "fix the", "throws", "stacktrace",
+    )
+    has_source_path = any(
+        seg.strip("`'\"(),").endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".vue"))
+        for seg in prompt.split()
+    )
+    if has_source_path or any(m in lower for m in bugfix_markers):
+        return "bugfix"
+
+    # Architecture / design: structure + trade-off language.
+    architecture_markers = (
+        "architecture", "architect", "design", "trade-off", "tradeoff",
+        "should we", "how should i structure", "structure this",
+        "approach", "refactor", "restructure", "module boundar",
+        "abstraction", "data flow", "best way to", "high-level",
+    )
+    if any(m in lower for m in architecture_markers):
+        return "architecture"
+
+    # Simple: short interrogative lookups (reuse the conservative heuristic).
+    if _looks_trivial(prompt):
+        return "simple"
+
+    return "coordination"
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -1244,6 +1313,39 @@ def main() -> int:
                 "review blocks the pipeline."
             )
 
+    # --- Task #66: dynamic per-prompt context injection -------------------
+    # Classify the user's prompt and tailor context: suppress the ambient
+    # reminder blocks for trivial "simple" prompts (the roster-noise the
+    # "Static Memory → Dynamic RAM" pitch targets), and surface a relevant-
+    # context pointer for architecture / bug-fix prompts. Actionable/safety
+    # blocks (inbox, incoming, assignments, acks, handoffs, missed-chat,
+    # quiet-channel, bottleneck) are NEVER gated — suppressing a coordination
+    # signal by guessing prompt-type would break the roster. The default
+    # class is "coordination" (full context) so a misclassification can only
+    # add a pointer or drop a reminder, never strip a safety signal.
+    # Opt-out: KHIMAIRA_DYNAMIC_CONTEXT=0 restores pre-#66 (always-full) behavior.
+    dynamic_context_block = ""
+    if os.environ.get("KHIMAIRA_DYNAMIC_CONTEXT") not in ("0", "false", "no"):
+        prompt_class = _classify_prompt(data.get("prompt") or "")
+        if prompt_class == "simple":
+            # Trivial lookup — drop the ambient reminders only. delegate_block
+            # is intentionally KEPT (a simple prompt is exactly when delegation
+            # is worth suggesting), as is every actionable/event-driven block.
+            role_budget_block = ""
+            reminder_block = ""
+        elif prompt_class == "architecture":
+            dynamic_context_block = (
+                "🏛️ architecture/design prompt — read before proposing structure:\n"
+                "  • CLAUDE.md (project conventions + engineering rules)\n"
+                "  • tasks/BUILD-PLAN.md (phase status) + tasks/<name>/IMPLEMENTATION.md (open specs)"
+            )
+        elif prompt_class == "bugfix":
+            dynamic_context_block = (
+                "🐛 bug-fix prompt — suggested context: the failing file + its tests, "
+                "and recent git history for that path (`git log -p -S '<symbol>'`). "
+                "Reproduce first, then trace the data flow to the root cause."
+            )
+
     if (
         not inbox_block
         and not incoming_block
@@ -1258,6 +1360,7 @@ def main() -> int:
         and not missed_chat_block
         and not chat_register_block
         and not handoff_boot_block
+        and not dynamic_context_block
     ):
         return 0
 
@@ -1272,6 +1375,7 @@ def main() -> int:
             chat_register_block,
             missed_chat_block,
             quiet_channel_block,
+            dynamic_context_block,
             bottleneck_block,
             pending_assignments_block,
             unfired_acks_block,
