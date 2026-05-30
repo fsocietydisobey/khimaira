@@ -1,0 +1,6 @@
+# Themis rules — frontend-lead role
+# Khimaira's own frontend-lead (not jeevy-specific).
+# No domain-restriction rules at this time — khimaira has no frontend subtree.
+# File required so Themis can load the role without FileNotFoundError.
+role: frontend-lead
+invariants: []
