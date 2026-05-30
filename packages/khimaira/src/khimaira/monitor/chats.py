@@ -74,6 +74,7 @@ ROLE_INTAKE = "intake"
 ROLE_ANALYST = "analyst"
 ROLE_VERIFIER = "verifier"
 ROLE_TRACKER = "tracker"
+ROLE_MEMBER = "member"  # neutral catch-all; empty Themis ruleset (see member.yaml)
 try:
     # Single-source registry: themis.data.VALID_ROLES is glob-derived from rule yamls
     # and auto-includes prefixed leads (e.g. jp-frontend-lead). Reuses the existing
@@ -96,6 +97,7 @@ except ImportError:
             ROLE_ANALYST,
             ROLE_VERIFIER,
             ROLE_TRACKER,
+            ROLE_MEMBER,
         }
     )
 

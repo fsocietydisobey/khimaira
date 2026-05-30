@@ -1,0 +1,11 @@
+# Themis rules — member role
+# Neutral catch-all for chat members whose role cannot be inferred from
+# created_by or name-inference. Empty invariants = no enforcement constraints,
+# equivalent to fail-open. Exists so member_roles can reference a valid role
+# without hitting IN-ENGINE-ERROR / _UNRESOLVABLE lockout.
+#
+# NOTE: this role is assigned by the backfill script (#58) to members that
+# don't match master/agent/observer/etc. patterns. It intentionally has no
+# block rules — adding constraints requires an explicit architectural decision.
+role: member
+invariants: []
