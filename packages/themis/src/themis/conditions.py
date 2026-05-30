@@ -469,3 +469,38 @@ _REGISTRY: dict[str, Any] = {
     "assignee_not_ready": assignee_not_ready,
     "path_touched_by_other_live_session": path_touched_by_other_live_session,
 }
+
+# gate_verdicts_incomplete registered below (defined after _REGISTRY to avoid forward-ref)
+
+
+_GATE_SENTINEL = object()  # distinguishes "key not in payload" from "key=None"
+
+
+def gate_verdicts_incomplete(payload: dict[str, Any]) -> bool:
+    """True when the current task lacks both critic APPROVE + verifier SHIP.
+
+    Implements B3's Joseph-ruled semantics (exact tri-state):
+      - no gate_verdicts key in payload → False (fail-open; enrichment didn't run)
+      - gate_verdicts is None → False (no active task → ad-hoc commit; allow)
+      - "absent" → True (BLOCK: task found, no verdicts yet)
+      - "error" → True (BLOCK: verdict lookup failed; fail toward loud/recoverable)
+      - dict present + critic_approved=True + verifier_shipped=True → False (allow)
+      - dict present + incomplete → True (BLOCK: one or both missing)
+
+    The daemon-unreachable case is NOT handled here — themis_pretool.py
+    fail-opens on URLError before reaching this condition (D7 / #61 axis-A).
+    """
+    gate = payload.get("gate_verdicts", _GATE_SENTINEL)
+    if gate is _GATE_SENTINEL:
+        return False  # enrichment didn't run (wrong tool/role) → fail-open
+    if gate is None:
+        return False  # no active task → ad-hoc commit/approve → allow
+    if gate == "absent":
+        return True   # task found but no verdicts → block
+    if gate == "error":
+        return True   # enrichment error → fail closed (Joseph's ruling)
+    if isinstance(gate, dict):
+        return not (gate.get("critic_approved") and gate.get("verifier_shipped"))
+    return True  # unknown shape → fail closed
+
+_REGISTRY["gate_verdicts_incomplete"] = gate_verdicts_incomplete

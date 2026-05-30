@@ -277,6 +277,30 @@ def signal_task_start(
     return resp.json()
 
 
+def record_gate_verdict(
+    chat_id: str,
+    by_session_id: str,
+    task_id: str,
+    verdict: str,
+    base: str = DEFAULT_BASE,
+) -> dict[str, Any]:
+    """Write a structured gate-verdict event (B3 Slice B-1).
+
+    verdict ∈ {"approve", "changes", "ship", "hold"}.
+    critic writes approve/changes; verifier writes ship/hold.
+    IN-AGENT-6 GATE_BEFORE_COMMIT and IN-MASTER-9 APPROVE_WITHOUT_REVIEW_VERDICTS
+    read these structured events — prose chat messages do NOT satisfy the gate.
+    """
+    resp = _request_with_retry(
+        "POST",
+        f"{base}/api/chats/{chat_id}/tasks/{task_id}/verdict",
+        json={"by_session_id": by_session_id, "verdict": verdict},
+        timeout=10.0,
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
 def task_status(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> list[dict[str, Any]]:
     """List tasks in a chat with current status. Requester must be an
     accepted member."""

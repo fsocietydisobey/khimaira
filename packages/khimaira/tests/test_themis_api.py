@@ -1556,3 +1556,195 @@ def test_guard2_silent_when_other_session_is_dead(
                "PATH_CONTENTION" not in violation.get("name", ""), (
             "Guard-2 must be silent when the touching session is dead/unreachable."
         )
+
+
+# ---------------------------------------------------------------------------
+# B3+B-M1 — GATE_BEFORE_COMMIT (IN-AGENT-6) + APPROVE_WITHOUT_REVIEW_VERDICTS (IN-MASTER-9)
+# Verifies structured gate-verdict gates on git commit + task approval.
+# ---------------------------------------------------------------------------
+
+
+def _setup_gate_scenario(isolated_chats, sessions_mod):
+    """Set up a full master/agent/critic/verifier chat with an in_progress task for B3 tests."""
+    master_id = "44444444-4444-4000-8000-000000000001"
+    agent_id = "55555555-5555-4000-8000-000000000002"
+    critic_id = "66666666-6666-4000-8000-000000000003"
+    verifier_id = "77777777-7777-4000-8000-000000000004"
+    for sid in (master_id, agent_id, critic_id, verifier_id):
+        _make_session(sessions_mod, sid)
+
+    isolated_chats.create_room(
+        master_id, [agent_id, critic_id, verifier_id], title="b3test",
+        member_roles={
+            master_id: "master",
+            agent_id: "agent",
+            critic_id: "critic",
+            verifier_id: "verifier",
+        },
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    for sid in (agent_id, critic_id, verifier_id):
+        isolated_chats.accept(chat_id, sid)
+
+    # Create a task and mark it in_progress
+    task = isolated_chats.create_task(chat_id, master_id, "build X", assignee_session_id=agent_id)
+    task_id = task["id"]
+    isolated_chats.update_task_status(chat_id, task_id, agent_id, "in_progress")
+
+    return master_id, agent_id, critic_id, verifier_id, chat_id, task_id
+
+
+def test_b3_git_commit_blocked_when_no_verdicts(isolated_chats, sessions_mod, themis_client):
+    """IN-AGENT-6 blocks git commit when active task has no gate verdicts.
+
+    B3 AC-1 — BLOCK on absent verdicts. Full TestClient live-daemon path.
+    """
+    _master_id, agent_id, _critic_id, _verifier_id, _chat_id, _task_id = _setup_gate_scenario(isolated_chats, sessions_mod)
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": agent_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": 'git commit -m "done"'},
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False, "IN-AGENT-6 must block git commit when no verdicts exist"
+    assert body["violation"]["rule_id"] == "IN-AGENT-6"
+    assert body["violation"]["severity"] == "block"
+
+
+def test_b3_git_commit_allowed_when_both_verdicts_present(isolated_chats, sessions_mod, themis_client):
+    """IN-AGENT-6 allows git commit when critic APPROVE + verifier SHIP both present.
+
+    B3 AC-2 — allow when complete.
+    """
+    _master_id, agent_id, critic_id, verifier_id, chat_id, task_id = _setup_gate_scenario(isolated_chats, sessions_mod)
+    # critic + verifier already in chat (created by setup); write verdicts directly
+    isolated_chats.record_gate_verdict(chat_id, critic_id, task_id, "approve")
+    isolated_chats.record_gate_verdict(chat_id, verifier_id, task_id, "ship")
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": agent_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": 'git commit -m "done"'},
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True, "Commit must be allowed when critic APPROVE + verifier SHIP both present"
+
+
+def test_b3_git_commit_blocked_with_only_critic_approve(isolated_chats, sessions_mod, themis_client):
+    """IN-AGENT-6 blocks git commit when only critic APPROVE (no verifier SHIP).
+
+    B3 AC-3 — both required.
+    """
+    _master_id, agent_id, critic_id, _verifier_id, chat_id, task_id = _setup_gate_scenario(isolated_chats, sessions_mod)
+    # Write only critic verdict (no verifier ship)
+    isolated_chats.record_gate_verdict(chat_id, critic_id, task_id, "approve")  # critic only
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": agent_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": 'git commit -m "done"'},
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False, "Commit must be blocked with only critic approve (no verifier ship)"
+    assert body["violation"]["rule_id"] == "IN-AGENT-6"
+
+
+def test_b3_master_approve_blocked_when_no_verdicts(isolated_chats, sessions_mod, themis_client):
+    """IN-MASTER-9 blocks task approval when no gate verdicts exist.
+
+    B3 AC-4 — BLOCK master approve without verdicts.
+    """
+    master_id, _agent_id, _cid, _vid, chat_id, task_id = _setup_gate_scenario(isolated_chats, sessions_mod)
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": master_id,
+            "tool_name": "mcp__khimaira-chat__chat_task_update",
+            "tool_input": {"task_id": task_id, "new_status": "approved"},
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False, "IN-MASTER-9 must block task approval without gate verdicts"
+    assert body["violation"]["rule_id"] == "IN-MASTER-9"
+    assert body["violation"]["severity"] == "block"
+
+
+def test_b3_no_active_task_allows_commit(isolated_chats, sessions_mod, themis_client):
+    """IN-AGENT-6 allows git commit when session has no active task (ad-hoc commit).
+
+    B3 AC-6 — ad-hoc commit allowed.
+    """
+    agent_id = "55555555-5555-4000-8000-000000000002"
+    _make_session(sessions_mod, agent_id)
+    # No chat membership → no active task
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": agent_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": 'git commit -m "ad-hoc"'},
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True, "Ad-hoc commit (no active task) must be allowed"
+
+
+def test_b3_master_approve_not_blocked_on_other_status_transitions(isolated_chats, sessions_mod, themis_client):
+    """IN-MASTER-9 does NOT block non-approved status transitions.
+
+    B3 AC-8 — only →approved is blocked; in_progress/done/changes_requested are not.
+    """
+    master_id, _agent_id, _cid, _vid, chat_id, task_id = _setup_gate_scenario(isolated_chats, sessions_mod)
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    for status in ["done", "changes_requested"]:
+        r = themis_client.post(
+            "/api/themis/check",
+            json={
+                "session_id": master_id,
+                "tool_name": "mcp__khimaira-chat__chat_task_update",
+                "tool_input": {"task_id": task_id, "new_status": status},
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True, f"Status transition to {status!r} must NOT be blocked by IN-MASTER-9"

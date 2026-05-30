@@ -144,3 +144,28 @@ invariants:
 
       Severity is warn — legit edge case: master re-firing after a known-good
       ack the daemon didn't capture. This warn names the issue; master confirms.
+
+  - id: IN-MASTER-9
+    name: APPROVE_WITHOUT_REVIEW_VERDICTS
+    severity: block
+    matchers:
+      - tool: mcp__khimaira-chat__chat_task_update
+        tool_input_field:
+          field: new_status
+          pattern: '^approved$'
+    conditions:
+      - check: gate_verdicts_incomplete
+    message: |
+      🛑 Themis IN-MASTER-9 (APPROVE_WITHOUT_REVIEW_VERDICTS): task approval
+      blocked — the task lacks critic APPROVE + verifier SHIP structured gate
+      verdicts.
+
+      Get both verdicts before approving:
+        critic → chat_task_verdict(task_id, verdict="approve")
+        verifier → chat_task_verdict(task_id, verdict="ship")
+
+      Closes the rubber-stamp class: master.md Step-5 "no rubber-stamps" is now
+      enforced structurally, not just by prose (the 2026-05-22 incident + this
+      session's recurring inline-review escapes). This applies to →approved
+      transitions only; other status transitions (in_progress, done,
+      changes_requested) are not blocked.

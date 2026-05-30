@@ -52,6 +52,7 @@ MSG = "msg"
 TASK = "task"
 TASK_UPDATE = "task_update"
 TASK_SIGNAL = "task_signal"
+TASK_VERDICT = "task_verdict"  # B3 structured gate-verdict event
 
 # Task status values.
 TASK_PENDING = "pending"
@@ -487,7 +488,7 @@ def load_room(chat_id: str) -> dict[str, Any]:
                 }
             )
             members[sid] = existing
-        elif kind in (MSG, TASK, TASK_UPDATE, TASK_SIGNAL):
+        elif kind in (MSG, TASK, TASK_UPDATE, TASK_SIGNAL, TASK_VERDICT):
             messages.append(line)
     return {"meta": meta, "members": members, "messages": messages}
 
@@ -1111,6 +1112,226 @@ def signal_task_start(
     _append(chat_id, record)
     log.info("chats: task %s signal=start by %s in %s", task_id, by_session_id, chat_id)
     return record
+
+
+def record_gate_verdict(
+    chat_id: str,
+    by_session_id: str,
+    task_id: str,
+    verdict: str,
+) -> dict[str, Any]:
+    """Append a structured gate-verdict event (B3 Slice B-1).
+
+    verdict ∈ {"approve", "changes", "ship", "hold"}:
+      - "approve" / "changes": written by critic
+      - "ship" / "hold": written by verifier
+
+    Caller must be an accepted member. Verdict events are TASK_SIGNAL-shape
+    records that `get_gate_verdicts` reads back to compute the tri-state
+    (present+complete | absent | error) for the B3 commit/approve gate.
+    """
+    by_session_id = _resolve_or_uuid(by_session_id)
+    valid_verdicts = frozenset({"approve", "changes", "ship", "hold"})
+    if verdict not in valid_verdicts:
+        raise ValueError(
+            f"Invalid verdict {verdict!r}; must be one of {sorted(valid_verdicts)}"
+        )
+    room = load_room(chat_id)
+    member = room["members"].get(by_session_id)
+    if not member or member["state"] != ACCEPTED:
+        raise ValueError(
+            f"Session {by_session_id!r} is not an accepted member of {chat_id!r}."
+        )
+    # Verify the task exists
+    task_record = None
+    for msg in room.get("messages", []):
+        if msg.get("kind") == TASK and msg.get("id") == task_id:
+            task_record = msg
+            break
+    if task_record is None:
+        raise ValueError(f"No task with id={task_id!r} in {chat_id!r}.")
+
+    record = {
+        "kind": TASK_VERDICT,
+        "event_id": _new_event_id(),
+        "ts": _now_iso(),
+        "chat_id": chat_id,
+        "task_id": task_id,
+        "verdict": verdict,
+        "by_session_id": by_session_id,
+        "by_name": member.get("session_name") or by_session_id[:8],
+    }
+    _append(chat_id, record)
+    log.info(
+        "chats: task %s verdict=%r by %s in %s", task_id, verdict, by_session_id, chat_id
+    )
+    return record
+
+
+# Sentinel constants for the tri-state gate-verdict lookup.
+_GATE_ABSENT = "absent"
+_GATE_ERROR = "error"
+
+
+def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
+    """Return the gate-verdict state for the session's current active task.
+
+    TRI-STATE return (per B3 spec):
+      - dict {task_id, critic_approved, verifier_shipped} — verdicts found
+      - _GATE_ABSENT ("absent") — task found but no verdict events yet
+      - _GATE_ERROR ("error") — verdict read failed (corrupt/unreadable)
+      - None — no active task for this session (ad-hoc commit; allow)
+
+    Resolution:
+      1. Find the session's most-recent task in any chat where
+         assignee_id == session AND status ∈ {in_progress, done}.
+      2. Scan that chat for TASK_VERDICT events with matching task_id.
+      3. Last verdict from each role wins (critic last approve/changes;
+         verifier last ship/hold).
+    """
+    try:
+        session_id = _resolve_or_uuid(session_id)
+    except Exception:
+        return None
+
+    try:
+        chat_dir = _chat_dir()
+        if not chat_dir.exists():
+            return None
+
+        # Step 1: find active task (most-recently-updated in_progress or done)
+        best_task: dict[str, Any] | None = None
+        best_chat_id: str | None = None
+        best_ts: str = ""
+
+        for path in chat_dir.glob("chat-*.jsonl"):
+            try:
+                room = load_room(path.stem)
+            except Exception:
+                continue
+            member = room["members"].get(session_id)
+            if not member or member["state"] != ACCEPTED:
+                continue
+            # Fold task states from messages
+            task_latest: dict[str, dict[str, Any]] = {}
+            for msg in room.get("messages", []):
+                kind = msg.get("kind")
+                if kind == TASK and msg.get("assignee_id") == session_id:
+                    tid = msg.get("id")
+                    if tid:
+                        task_latest[tid] = {**msg, "status": TASK_PENDING}
+                elif kind == TASK_UPDATE:
+                    tid = msg.get("task_id")
+                    if tid and tid in task_latest:
+                        new_status = msg.get("new_status") or msg.get("status")
+                        if new_status:
+                            task_latest[tid]["status"] = new_status
+                        task_latest[tid]["last_ts"] = msg.get("ts", "")
+
+            for tid, task in task_latest.items():
+                if task.get("status") not in (TASK_IN_PROGRESS, TASK_DONE):
+                    continue
+                ts = task.get("last_ts") or task.get("ts", "")
+                if ts > best_ts:
+                    best_ts = ts
+                    best_task = task
+                    best_chat_id = path.stem
+
+        if best_task is None:
+            return None  # no active task → ad-hoc commit allowed
+
+        # Step 2: scan for verdict events
+        task_id = best_task.get("id")
+        try:
+            room = load_room(best_chat_id)
+        except Exception:
+            return _GATE_ERROR
+
+        critic_verdict: str | None = None
+        verifier_verdict: str | None = None
+        for msg in room.get("messages", []):
+            if msg.get("kind") != TASK_VERDICT:
+                continue
+            if msg.get("task_id") != task_id:
+                continue
+            v = msg.get("verdict")
+            if v in ("approve", "changes"):
+                critic_verdict = v
+            elif v in ("ship", "hold"):
+                verifier_verdict = v
+
+        if critic_verdict is None and verifier_verdict is None:
+            return _GATE_ABSENT  # task found but no verdicts yet
+
+        return {
+            "task_id": task_id,
+            "critic_approved": critic_verdict == "approve",
+            "verifier_shipped": verifier_verdict == "ship",
+        }
+
+    except Exception:
+        return _GATE_ERROR
+
+
+def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] | str:
+    """Look up gate verdicts by explicit task_id (for master's approve gate).
+
+    Same tri-state return as get_gate_verdicts, but scans by task_id directly
+    instead of inferring the task from the caller's assignee relationship.
+    Used when the caller is the reviewer (master), not the assignee (agent).
+    """
+    try:
+        chat_dir = _chat_dir()
+        if not chat_dir.exists():
+            return None
+
+        for path in chat_dir.glob("chat-*.jsonl"):
+            try:
+                room = load_room(path.stem)
+            except Exception:
+                continue
+            # Check if task exists in this chat
+            task_record = None
+            for msg in room.get("messages", []):
+                if msg.get("kind") == TASK and msg.get("id") == task_id:
+                    task_record = msg
+                    break
+            if task_record is None:
+                continue
+            # Verify caller is a member
+            try:
+                sid = _resolve_or_uuid(session_id)
+            except Exception:
+                continue
+            member = room["members"].get(sid)
+            if not member or member["state"] != ACCEPTED:
+                continue
+            # Scan verdicts
+            critic_verdict: str | None = None
+            verifier_verdict: str | None = None
+            for msg in room.get("messages", []):
+                if msg.get("kind") != TASK_VERDICT:
+                    continue
+                if msg.get("task_id") != task_id:
+                    continue
+                v = msg.get("verdict")
+                if v in ("approve", "changes"):
+                    critic_verdict = v
+                elif v in ("ship", "hold"):
+                    verifier_verdict = v
+
+            if critic_verdict is None and verifier_verdict is None:
+                return _GATE_ABSENT
+            return {
+                "task_id": task_id,
+                "critic_approved": critic_verdict == "approve",
+                "verifier_shipped": verifier_verdict == "ship",
+            }
+
+        return None  # task_id not found in any chat → no active task
+
+    except Exception:
+        return _GATE_ERROR
 
 
 def task_status(chat_id: str, requester_session_id: str) -> list[dict[str, Any]]:
@@ -2154,6 +2375,11 @@ _PPID_TTL_SECONDS = 300  # 5 min — subprocess should fetch within this window
 # ppid → (session_id, registered_at_unix_ts)
 _pending_session_by_ppid: dict[int, tuple[str, float]] = {}
 
+# Durable reverse map: session_id → ppid (Claude Code process PID).
+# Populated at register_session_by_ppid() time; no TTL since it's used
+# for long-running Guard-4 / #13b-light process-liveness checks.
+_session_ppid: dict[str, int] = {}
+
 
 def register_session_by_ppid(ppid: int, session_id: str) -> None:
     """SessionStart hook calls this with the session_id it knows about."""
@@ -2161,6 +2387,12 @@ def register_session_by_ppid(ppid: int, session_id: str) -> None:
 
     _gc_pending_sessions()
     _pending_session_by_ppid[ppid] = (session_id, time.time())
+    _session_ppid[session_id] = ppid
+
+
+def get_session_ppid(session_id: str) -> int | None:
+    """Return the Claude Code process PID for this session, or None if unknown."""
+    return _session_ppid.get(session_id)
 
 
 def lookup_session_by_ppid(ppid: int) -> str | None:

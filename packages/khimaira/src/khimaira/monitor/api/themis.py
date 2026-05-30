@@ -667,7 +667,7 @@ def build_router():
             "recent_tool_calls": req.recent_tool_calls,
             "tool_name": req.tool_name,
             "tool_input": req.tool_input,
-            "gate_verdicts": None,  # B3 Slice B stub — not yet populated
+            "gate_verdicts": None,  # filled lazily below for git-commit + approved-transition
         }
 
         # Cheap enrichment: subscriber heartbeat + turn start (always, ~1 file read each)
@@ -776,6 +776,31 @@ def build_router():
                     conditions_payload["concurrent_touchers"] = concurrent_touchers
             except Exception:
                 pass  # fail-open: missing key → condition returns False
+
+        # Lazy enrichment: gate_verdicts (B3 Slice B)
+        # Only computed for (a) Bash+git-commit and (b) chat_task_update→approved.
+        # get_gate_verdicts returns: None (no active task) | "absent" | "error" | dict.
+        _is_git_commit = (
+            req.tool_name == "Bash"
+            and __import__("re").search(r"\bgit\s+commit\b", (req.tool_input or {}).get("command", ""))
+        )
+        _is_approved_update = (
+            req.tool_name == "mcp__khimaira-chat__chat_task_update"
+            and (req.tool_input or {}).get("new_status") == "approved"
+        )
+        if _is_git_commit or _is_approved_update:
+            try:
+                if _is_approved_update:
+                    # For master's approve gate, look up by task_id (master is reviewer, not assignee)
+                    _tid = (req.tool_input or {}).get("task_id")
+                    conditions_payload["gate_verdicts"] = chats.get_gate_verdicts_by_task(
+                        req.session_id, _tid
+                    ) if _tid else chats.get_gate_verdicts(req.session_id)
+                else:
+                    # For agent's commit gate, look up by session_id (agent is the assignee)
+                    conditions_payload["gate_verdicts"] = chats.get_gate_verdicts(req.session_id)
+            except Exception:
+                conditions_payload["gate_verdicts"] = "error"  # fail closed on enrichment error
 
         result = _call_engine(role, req.tool_name, req.tool_input, req.cwd, conditions_payload=conditions_payload)
         # Normalize internal sentinel to null in the public response role field;

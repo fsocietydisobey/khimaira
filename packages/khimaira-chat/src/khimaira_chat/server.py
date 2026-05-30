@@ -764,6 +764,31 @@ def _build_server() -> Server:
                 },
             ),
             types.Tool(
+                name="chat_task_verdict",
+                description=(
+                    "Write a structured gate-verdict for a task (B3 enforcement). "
+                    "critic writes verdict='approve' or 'changes'; verifier writes "
+                    "verdict='ship' or 'hold'. IN-AGENT-6 GATE_BEFORE_COMMIT and "
+                    "IN-MASTER-9 APPROVE_WITHOUT_REVIEW_VERDICTS both read these "
+                    "structured events — do NOT use prose in chat messages to signal "
+                    "verdicts for block-level gates; only this tool counts."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "chat_id": {"type": "string"},
+                        "task_id": {"type": "string"},
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["approve", "changes", "ship", "hold"],
+                            "description": "critic: approve|changes; verifier: ship|hold",
+                        },
+                    },
+                    "required": ["session_id", "chat_id", "task_id", "verdict"],
+                },
+            ),
+            types.Tool(
                 name="chat_task_status",
                 description=(
                     "List all tasks in a chat with current status. Returns "
@@ -963,6 +988,10 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "chat_task_signal_start":
         return daemon_client.signal_task_start(
             args["chat_id"], args["task_id"], sid, note=args.get("note")
+        )
+    if name == "chat_task_verdict":
+        return daemon_client.record_gate_verdict(
+            args["chat_id"], sid, args["task_id"], args["verdict"]
         )
     if name == "chat_task_status":
         return daemon_client.task_status(args["chat_id"], sid)

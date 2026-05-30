@@ -84,3 +84,29 @@ invariants:
       KNOWN LIMITATION: sub-second simultaneous edits both pass (TOCTOU);
       hard exclusion requires isolation:worktree.
       (Guard-2 — #54 working-tree-lock)
+
+  - id: IN-AGENT-6
+    name: GATE_BEFORE_COMMIT
+    severity: block
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+commit\b'
+    conditions:
+      - check: gate_verdicts_incomplete
+    message: |
+      🛑 Themis IN-AGENT-6 (GATE_BEFORE_COMMIT): git commit blocked — the active
+      task lacks critic APPROVE + verifier SHIP structured gate verdicts.
+
+      Get both verdicts via chat_task_verdict(task_id, verdict) before committing:
+        critic → verdict="approve" or "changes"
+        verifier → verdict="ship" or "hold"
+
+      If critic/verifier is genuinely down and the daemon is unreachable, that is
+      a hard escalation to Joseph + roster — NOT a bypass. The gate exists to
+      prevent exactly the "inline review because reviewer is unreachable" pattern
+      that committed broken code in #66 (6a4ebf2) and #58 today.
+
+      No active task (ad-hoc commit)? → allowed without verdicts.
+      Daemon unreachable? → hook fail-opens at the network layer (D7 / #61 axis-A).

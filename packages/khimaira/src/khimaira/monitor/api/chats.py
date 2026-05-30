@@ -376,6 +376,11 @@ class SignalTaskStartReq(BaseModel):
     note: str | None = None
 
 
+class RecordGateVerdictReq(BaseModel):
+    by_session_id: str
+    verdict: str  # "approve" | "changes" | "ship" | "hold"
+
+
 class AutoAcceptReq(BaseModel):
     session_id: str
     allowlist: list[str]
@@ -655,6 +660,16 @@ def build_router():
             else:
                 # master-only / non-accepted member → 403
                 code = 403
+            raise fastapi.HTTPException(code, msg) from exc
+
+    @router.post("/chats/{chat_id}/tasks/{task_id}/verdict")
+    async def record_gate_verdict(chat_id: str, task_id: str, req: RecordGateVerdictReq) -> dict:
+        """Write a structured gate-verdict (B3). critic: approve/changes; verifier: ship/hold."""
+        try:
+            return chats.record_gate_verdict(chat_id, req.by_session_id, task_id, req.verdict)
+        except ValueError as exc:
+            msg = str(exc)
+            code = 404 if "No task" in msg else 400 if "Invalid verdict" in msg else 403
             raise fastapi.HTTPException(code, msg) from exc
 
     @router.get("/chats/{chat_id}/tasks")
