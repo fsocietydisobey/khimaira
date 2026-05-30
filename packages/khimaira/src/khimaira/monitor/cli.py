@@ -757,6 +757,12 @@ def _load_env() -> None:
     load_dotenv(project_root / ".env")
 
 
+def _cmd_backfill_roles(args: argparse.Namespace) -> int:
+    from khimaira.monitor.backfill_member_roles import run as backfill_run
+
+    return backfill_run(dry_run=args.dry_run, verbose=args.verbose)
+
+
 def main() -> None:
     _load_env()
     parser = argparse.ArgumentParser(prog="khimaira monitor")
@@ -797,6 +803,22 @@ def main() -> None:
         "project", nargs="?", help="Project name to rescan; omit for all"
     )
     p_rescan.set_defaults(func=_cmd_rescan)
+
+    p_backfill = sub.add_parser(
+        "backfill-roles",
+        help="Backfill missing member_roles entries in existing chats (#58).",
+    )
+    p_backfill.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would change without writing anything.",
+    )
+    p_backfill.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show already-complete chats too.",
+    )
+    p_backfill.set_defaults(func=lambda a: _cmd_backfill_roles(a))
 
     args = parser.parse_args()
     sys.exit(args.func(args))
