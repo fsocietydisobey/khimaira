@@ -332,3 +332,68 @@ def test_harvest_fail_open_on_empty_stdin(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert result == 0
     mock_distill.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Backlog drain reminder tests
+# ---------------------------------------------------------------------------
+
+def test_backlog_drain_reminder_returns_none_when_no_pending(tmp_path: Path) -> None:
+    """No pending tasks → no reminder injected."""
+    import json
+    chat_id = "chat-test-backlog"
+    chat_file = tmp_path / f"{chat_id}.jsonl"
+    # Only approved task, no pending
+    chat_file.write_text(
+        json.dumps({"kind": "task", "id": "task-abc", "body": "task body", "assignee_name": "agent-1", "status": "pending"}) + "\n" +
+        json.dumps({"kind": "task_update", "task_id": "task-abc", "status": "approved"}) + "\n"
+    )
+    monkeypatch_chats_dir = patch.object(hook_mod, "_CHATS_DIR", tmp_path)
+    with monkeypatch_chats_dir:
+        result = hook_mod._backlog_drain_reminder(chat_id, "task-abc")
+    assert result is None
+
+
+def test_backlog_drain_reminder_returns_message_when_pending_remain(tmp_path: Path) -> None:
+    """Pending task exists → reminder returned with task info."""
+    import json
+    chat_id = "chat-test-backlog2"
+    chat_file = tmp_path / f"{chat_id}.jsonl"
+    chat_file.write_text(
+        # Just-approved task
+        json.dumps({"kind": "task", "id": "task-done", "body": "finished task", "assignee_name": "agent-1"}) + "\n" +
+        json.dumps({"kind": "task_update", "task_id": "task-done", "status": "approved"}) + "\n" +
+        # Still-pending task
+        json.dumps({"kind": "task", "id": "task-pending", "body": "next important work", "assignee_name": "agent-2"}) + "\n"
+    )
+    with patch.object(hook_mod, "_CHATS_DIR", tmp_path):
+        result = hook_mod._backlog_drain_reminder(chat_id, "task-done")
+    assert result is not None
+    assert "BACKLOG DRAIN" in result
+    assert "next important work" in result
+    assert "Do NOT wait for Joseph" in result
+
+
+def test_backlog_drain_reminder_excludes_just_approved(tmp_path: Path) -> None:
+    """The just-approved task is not counted in remaining backlog."""
+    import json
+    chat_id = "chat-test-backlog3"
+    chat_file = tmp_path / f"{chat_id}.jsonl"
+    # Both tasks present but one is just being approved now
+    chat_file.write_text(
+        json.dumps({"kind": "task", "id": "task-a", "body": "task a", "assignee_name": "agent-1"}) + "\n" +
+        json.dumps({"kind": "task", "id": "task-b", "body": "task b", "assignee_name": "agent-2"}) + "\n" +
+        json.dumps({"kind": "task_update", "task_id": "task-b", "status": "approved"}) + "\n"
+    )
+    with patch.object(hook_mod, "_CHATS_DIR", tmp_path):
+        # Approving task-b — task-a remains pending
+        result = hook_mod._backlog_drain_reminder(chat_id, "task-b")
+    assert result is not None
+    assert "task a" in result
+
+
+def test_backlog_drain_reminder_fail_open_on_missing_file(tmp_path: Path) -> None:
+    """Missing chat file → None (fail-open, never raises)."""
+    with patch.object(hook_mod, "_CHATS_DIR", tmp_path):
+        result = hook_mod._backlog_drain_reminder("chat-nonexistent", "task-x")
+    assert result is None

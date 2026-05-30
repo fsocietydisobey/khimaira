@@ -192,7 +192,80 @@ def main() -> int:
         qualified_domain = domain
 
     _mnemosyne_distill(qualified_domain, curated_text, f"harvest-{task_id}")
+
+    # Post-approval backlog drain: inject a reminder if pending tasks remain
+    # in the same chat. Prevents master from going idle after task completion.
+    # Outputs additionalContext via hookSpecificOutput so master sees it.
+    backlog_reminder = _backlog_drain_reminder(chat_id, task_id)
+    if backlog_reminder:
+        import json as _json
+        out = {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": backlog_reminder,
+            }
+        }
+        sys.stdout.write(_json.dumps(out))
+
     return 0
+
+
+def _backlog_drain_reminder(chat_id: str, just_approved_task_id: str) -> str | None:
+    """Check if there are pending tasks remaining in the chat.
+
+    Returns an ACTION REQUIRED string if pending tasks exist, None otherwise.
+    Fail-open: any error → None (never blocks the hook).
+    """
+    chat_path = _CHATS_DIR / f"{chat_id}.jsonl"
+    if not chat_path.is_file():
+        return None
+
+    pending_tasks: dict[str, dict] = {}  # task_id → {body, assignee_name, status}
+    try:
+        with chat_path.open(encoding="utf-8") as fh:
+            for raw_line in fh:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    rec = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                kind = rec.get("kind")
+                tid = rec.get("id") or rec.get("task_id")
+                if kind == "task" and tid:
+                    pending_tasks[tid] = {
+                        "body": (rec.get("body") or "")[:120],
+                        "assignee_name": rec.get("assignee_name") or "unassigned",
+                        "status": "pending",
+                    }
+                elif kind == "task_update" and tid and tid in pending_tasks:
+                    pending_tasks[tid]["status"] = rec.get("status") or "pending"
+    except Exception:
+        return None
+
+    remaining = [
+        t for tid, t in pending_tasks.items()
+        if t["status"] in ("pending", "in_progress")
+        and tid != just_approved_task_id
+    ]
+
+    if not remaining:
+        return None
+
+    lines = [
+        f"📋 BACKLOG DRAIN — {len(remaining)} task(s) still pending after this approval. "
+        "Queue the next item now without waiting for user input:\n"
+    ]
+    for t in remaining[:3]:  # cap at 3 to keep context bounded
+        lines.append(f"  • [{t['status']}] {t['assignee_name']}: {t['body']}...")
+    if len(remaining) > 3:
+        lines.append(f"  • ...and {len(remaining) - 3} more")
+    lines.append(
+        "\nFire BEGIN on the highest-priority unblocked item or unblock its spec. "
+        "Do NOT wait for Joseph to prompt you."
+    )
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
