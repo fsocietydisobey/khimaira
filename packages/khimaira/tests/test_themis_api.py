@@ -1358,3 +1358,201 @@ def test_bm3_missing_payload_fails_open(isolated_chats, sessions_mod, themis_cli
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is True, "Missing task_id → assignee_readiness absent → fail-open."
+
+
+# ---------------------------------------------------------------------------
+# Guard-2 — PATH_CONTENTION live-daemon tests (#54)
+# Uses full TestClient path (themis_check → _call_engine → engine.evaluate)
+# ---------------------------------------------------------------------------
+
+
+def _setup_guard2_scenario(
+    isolated_chats,
+    sessions_mod,
+    *,
+    other_session_touches_file: bool,
+    other_session_alive: bool = True,
+    target_file: str = "/abs/path/to/foo.py",
+) -> tuple[str, str]:
+    """Set up a two-session scenario for Guard-2 tests.
+
+    Creates a chat with editing_sid as agent (so Themis resolves its role).
+    Returns (editing_session_id, other_session_id).
+    """
+    import datetime as _dt
+
+    # Use fixed UUIDs so the session dirs are predictable
+    editing_sid = "aaaaaaaa-aaaa-4000-8000-000000000011"
+    other_sid = "bbbbbbbb-bbbb-4000-8000-000000000022"
+    master_sid = "cccccccc-cccc-4000-8000-000000000033"
+
+    _make_session(sessions_mod, editing_sid)
+    _make_session(sessions_mod, other_sid)
+    _make_session(sessions_mod, master_sid)
+
+    # Create a chat with editing_sid as agent so Themis can resolve its role
+    isolated_chats.create_room(
+        master_sid,
+        [editing_sid, other_sid],
+        title="guard2-test",
+        member_roles={master_sid: "master", editing_sid: "agent", other_sid: "agent"},
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    isolated_chats.accept(chat_id, editing_sid)
+    isolated_chats.accept(chat_id, other_sid)
+
+    if other_session_alive:
+        # Mark other session as live with a fresh heartbeat
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        sd = sessions_mod._session_dir_read(other_sid)
+        if sd:
+            existing = json.loads((sd / "status.json").read_text())
+            existing["last_sse_heartbeat"] = now_iso
+            (sd / "status.json").write_text(json.dumps(existing))
+
+    if other_session_touches_file:
+        # Write a recent touch to other_session's files_touched.jsonl
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        touch = json.dumps({"ts": ts, "file": target_file, "summary": "auto-logged"})
+        sd = sessions_mod._session_dir_read(other_sid)
+        if sd:
+            (sd / "files_touched.jsonl").write_text(touch + "\n", encoding="utf-8")
+
+    return editing_sid, other_sid
+
+
+def test_guard2_warn_fires_when_other_session_recently_touched_file(
+    isolated_chats, sessions_mod, themis_client
+):
+    """Guard-2 AC-1: PATH_CONTENTION warns when another live session recently
+    touched the same file being edited.
+
+    Uses full TestClient path (hook→themis_check→engine), the live-daemon
+    test discipline (per verify-live-runtime-path rule).
+    """
+    target_file = "/abs/path/to/shared_module.py"
+    editing_sid, _other_sid = _setup_guard2_scenario(
+        isolated_chats,
+        sessions_mod,
+        other_session_touches_file=True,
+        other_session_alive=True,
+        target_file=target_file,
+    )
+
+    from khimaira.monitor.api import themis as themis_api
+    import importlib
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": editing_sid,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": target_file, "old_string": "x", "new_string": "y"},
+            "cwd": "/abs/path/to",
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    # PATH_CONTENTION is warn-level — ok may still be True (engine returns the
+    # violation even when severity==warn); assert violation is present.
+    violation = body.get("violation")
+    assert violation is not None, (
+        "Guard-2: editing a file recently touched by a live session must "
+        "surface a PATH_CONTENTION violation."
+    )
+    assert "PATH_CONTENTION" in violation.get("rule_id", "") or \
+           "PATH_CONTENTION" in violation.get("name", ""), (
+        f"Expected PATH_CONTENTION violation, got: {violation}"
+    )
+    assert violation.get("severity") == "warn"
+
+
+def test_guard2_silent_when_no_other_session_touched_file(
+    isolated_chats, sessions_mod, themis_client
+):
+    """Guard-2 AC-4: PATH_CONTENTION is silent when no other session recently
+    touched the file being edited.
+    """
+    target_file = "/abs/path/to/unique_module.py"
+    editing_sid, _other_sid = _setup_guard2_scenario(
+        isolated_chats,
+        sessions_mod,
+        other_session_touches_file=False,  # no touch by other session
+        other_session_alive=True,
+        target_file=target_file,
+    )
+
+    from khimaira.monitor.api import themis as themis_api
+    import importlib
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": editing_sid,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": target_file, "old_string": "x", "new_string": "y"},
+            "cwd": "/abs/path/to",
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    # No contention — if any violation exists it must not be PATH_CONTENTION
+    violation = body.get("violation")
+    if violation is not None:
+        assert "PATH_CONTENTION" not in violation.get("rule_id", "") and \
+               "PATH_CONTENTION" not in violation.get("name", ""), (
+            "Guard-2 must be silent when no other session recently touched the file."
+        )
+
+
+def test_guard2_silent_when_other_session_is_dead(
+    isolated_chats, sessions_mod, themis_client
+):
+    """Guard-2 AC-3: PATH_CONTENTION is silent when the session that touched
+    the file is dead (demoted to unreachable).
+    """
+    import datetime as _dt
+
+    target_file = "/abs/path/to/stale_module.py"
+    editing_sid, other_sid = _setup_guard2_scenario(
+        isolated_chats,
+        sessions_mod,
+        other_session_touches_file=True,
+        other_session_alive=True,  # we'll override to dead below
+        target_file=target_file,
+    )
+
+    # Make other session dead: write a stale heartbeat (well past demote threshold)
+    old_ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=2)).isoformat()
+    sd = sessions_mod._session_dir_read(other_sid)
+    if sd:
+        existing = json.loads((sd / "status.json").read_text())
+        existing["last_sse_heartbeat"] = old_ts
+        (sd / "status.json").write_text(json.dumps(existing))
+
+    from khimaira.monitor.api import themis as themis_api
+    import importlib
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": editing_sid,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": target_file, "old_string": "x", "new_string": "y"},
+            "cwd": "/abs/path/to",
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    violation = body.get("violation")
+    if violation is not None:
+        assert "PATH_CONTENTION" not in violation.get("rule_id", "") and \
+               "PATH_CONTENTION" not in violation.get("name", ""), (
+            "Guard-2 must be silent when the touching session is dead/unreachable."
+        )
