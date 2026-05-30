@@ -92,6 +92,49 @@ def _write_sse_heartbeat(session_id: str) -> None:
         pass
 
 
+_SPECTER_LOOKBACK = 15  # How many recent tool calls to scan for a snapshot.
+
+
+def _check_specter_verify(session_id: str, ui_files: list[str]) -> str | None:
+    """Return a reminder string if specter_debug_snapshot wasn't called recently.
+
+    Reads the last _SPECTER_LOOKBACK tool calls from the session's log, excluding
+    the current Edit/Write that just fired. If specter_debug_snapshot does not
+    appear in that window, returns a reminder message; otherwise returns None.
+
+    Fail-open: any I/O or parse error returns None (no reminder, no block).
+    """
+    path = _session_dir(session_id) / "tool_calls.jsonl"
+    try:
+        raw_lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return None
+
+    # Exclude the most recent entry (the Edit/Write that just triggered this hook).
+    prior_lines = raw_lines[:-1] if raw_lines else []
+    recent = prior_lines[-_SPECTER_LOOKBACK:]
+
+    for line in recent:
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if record.get("tool") == "mcp__khimaira__specter_debug_snapshot":
+            return None  # Recent snapshot found — no reminder needed.
+
+    # No snapshot found. Build a reminder.
+    files_str = ", ".join(f"`{f.split('/')[-1]}`" for f in ui_files[:3])
+    if len(ui_files) > 3:
+        files_str += f" (+{len(ui_files) - 3} more)"
+    return (
+        f"⚠️ Specter verify: edited {files_str} (UI file). "
+        f"`specter_debug_snapshot` was not called in the last {_SPECTER_LOOKBACK} tool calls. "
+        "Run it now to confirm the change rendered correctly — "
+        "`tsc passing` ≠ the user sees what you expect. "
+        "(khimaira-tools.md rule: Specter is a VERIFY tool, not just a debug tool.)"
+    )
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -151,6 +194,20 @@ def main() -> int:
         except OSError:
             # Don't block Claude Code on filesystem errors
             pass
+
+    # Specter-verify-after-UI-edit reminder (khimaira-tools.md personal rule).
+    # After editing a frontend component file, check if specter_debug_snapshot
+    # was called recently. If not, emit a reminder via additionalContext.
+    _ui_extensions = (".tsx", ".jsx", ".vue", ".svelte")
+    ui_files_edited = [f for f in files if any(f.endswith(ext) for ext in _ui_extensions)]
+    if ui_files_edited:
+        try:
+            _specter_reminder = _check_specter_verify(session_id, ui_files_edited)
+            if _specter_reminder:
+                out = {"hookSpecificOutput": {"additionalContext": _specter_reminder}}
+                sys.stdout.write(json.dumps(out))
+        except Exception:
+            pass  # Never block on reminder logic
 
     return 0
 
