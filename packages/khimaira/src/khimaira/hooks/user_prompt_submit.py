@@ -1068,8 +1068,9 @@ def main() -> int:
         try:
             from khimaira.hooks.session_start import _consume_handoffs
 
-            cwd = os.environ.get("PWD", "")
-            owned_handoffs = _consume_handoffs(session_id, cwd)
+            # Use session_cwd from hook stdin (set at line 1000), not os.environ PWD
+            # which may not match the project directory in the hook subprocess.
+            owned_handoffs = _consume_handoffs(session_id, session_cwd)
             # Filter to only owned (not observed) handoffs
             owned = [
                 h for h in owned_handoffs
