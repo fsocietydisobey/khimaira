@@ -435,6 +435,156 @@ def _log_auth_violation(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Guard-2 helpers — path contention enrichment (#54)
+# ---------------------------------------------------------------------------
+
+_EDIT_TOOLS: frozenset[str] = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+_CONTENTION_WINDOW_S = 600  # 10 min — "recently touched"
+
+
+def _extract_edited_paths(tool_input: dict, cwd: str) -> list[str]:
+    """Return absolute normalised paths being edited by the current tool call.
+
+    Handles Edit/Write (file_path), NotebookEdit (notebook_path), and
+    MultiEdit (edits[].file_path). Resolves relative paths using cwd.
+    """
+    from pathlib import Path as _Path
+
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def _norm(p: str) -> str:
+        pp = _Path(p)
+        if not pp.is_absolute() and cwd:
+            pp = _Path(cwd) / pp
+        try:
+            return str(pp.resolve())
+        except Exception:
+            return str(pp)
+
+    for key in ("file_path", "notebook_path"):
+        val = tool_input.get(key)
+        if isinstance(val, str) and val:
+            n = _norm(val)
+            if n not in seen:
+                seen.add(n)
+                paths.append(n)
+
+    edits = tool_input.get("edits")
+    if isinstance(edits, list):
+        for e in edits:
+            if isinstance(e, dict):
+                fp = e.get("file_path")
+                if isinstance(fp, str) and fp:
+                    n = _norm(fp)
+                    if n not in seen:
+                        seen.add(n)
+                        paths.append(n)
+
+    return paths
+
+
+def _compute_concurrent_touchers(
+    caller_session_id: str,
+    normalized_paths: list[str],
+    sessions_mod: object,
+) -> list[dict]:
+    """Return other LIVE sessions that touched any of the given paths within
+    _CONTENTION_WINDOW_S seconds.
+
+    Reads per-session files_touched.jsonl (last 20 entries) and status.json.
+    Skips the calling session and non-UUID dirs (orphan artifacts).
+    Fail-open: any per-session I/O error → that session skipped.
+    """
+    from pathlib import Path as _Path
+
+    now = time.time()
+    norm_set = set(normalized_paths)
+    demote_threshold = int(__import__("os").environ.get("KHIMAIRA_DEMOTE_THRESHOLD_S", 20 * 60))
+    base_dir: _Path = sessions_mod._BASE_DIR  # type: ignore[attr-defined]
+
+    if not base_dir.exists():
+        return []
+
+    touchers: list[dict] = []
+
+    for sd in base_dir.iterdir():
+        if not sd.is_dir():
+            continue
+        if not sessions_mod._is_uuid(sd.name):  # type: ignore[attr-defined]
+            continue
+        if sd.name == caller_session_id:
+            continue
+
+        # 1. Liveness check (reads status.json + last tool_call ts)
+        try:
+            status_file = sd / "status.json"
+            if not status_file.is_file():
+                continue
+            status_raw = json.loads(status_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        last_tool_ts: float | None = None
+        try:
+            tc_path = sd / "tool_calls.jsonl"
+            if tc_path.is_file():
+                lines = [ln for ln in tc_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                if lines:
+                    rec = json.loads(lines[-1])
+                    ts_str = rec.get("ts", "")
+                    if ts_str:
+                        from datetime import datetime as _dt
+                        last_tool_ts = _dt.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            pass
+
+        eff = sessions_mod._compute_effective_status(status_raw, last_tool_ts)  # type: ignore[attr-defined]
+        if eff.get("effective_status") == "unreachable":
+            continue
+
+        # 2. Touch overlap check
+        try:
+            touches_path = sd / "files_touched.jsonl"
+            if not touches_path.is_file():
+                continue
+            lines = [ln for ln in touches_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            for ln in reversed(lines[-20:]):
+                try:
+                    touch = json.loads(ln)
+                    ts_str = touch.get("ts", "")
+                    if not ts_str:
+                        continue
+                    from datetime import datetime as _dt
+                    touch_ts = _dt.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                    if (now - touch_ts) > _CONTENTION_WINDOW_S:
+                        continue  # outside window — stop looking (log is append-only, older entries earlier)
+                    touch_path = touch.get("file", "")
+                    if not touch_path:
+                        continue
+                    # Normalize stored path (best-effort: works when absolute)
+                    from pathlib import Path as _Path2
+                    try:
+                        norm_stored = str(_Path2(touch_path).resolve()) if _Path2(touch_path).is_absolute() else touch_path
+                    except Exception:
+                        norm_stored = touch_path
+                    if norm_stored in norm_set or touch_path in norm_set:
+                        touchers.append({
+                            "session_id": sd.name,
+                            "session_name": status_raw.get("name", sd.name[:8]),
+                            "touch_ts": ts_str,
+                            "file_path": touch_path,
+                        })
+                        break  # one match per session is enough
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return touchers
+
+
 class CheckReq(BaseModel):
     session_id: str
     tool_name: str
@@ -558,6 +708,74 @@ def build_router():
                 conditions_payload["idle_agents"] = idle
             except Exception:
                 pass  # fail-open: missing key → idle_agents_exist returns False
+
+        # Lazy enrichment: assignee_readiness (only for chat_task_signal_start)
+        # B-M3/Guard-1: check the assignee is ready before master fires BEGIN.
+        if req.tool_name == "mcp__khimaira-chat__chat_task_signal_start":
+            try:
+                _task_id = req.tool_input.get("task_id")
+                _chat_id_sig = req.tool_input.get("chat_id")
+                if _task_id and _chat_id_sig:
+                    # Resolve task → assignee_id
+                    _room = chats.load_room(_chat_id_sig)
+                    _assignee_id = None
+                    for _msg in _room.get("messages", []):
+                        if _msg.get("kind") == "task" and _msg.get("id") == _task_id:
+                            _assignee_id = _msg.get("assignee_id")
+                            break
+                    if _assignee_id:
+                        # (a) accepted
+                        _member = _room.get("members", {}).get(_assignee_id, {})
+                        _accepted = _member.get("state") == "accepted"
+                        # (b) heartbeat fresh — same machinery as P0, keyed on assignee
+                        _heartbeat_fresh = False
+                        _asd = sessions_mod._session_dir_read(_assignee_id)
+                        if _asd is not None:
+                            try:
+                                _astatus = json.loads((_asd / "status.json").read_text(encoding="utf-8"))
+                                _ahb = _astatus.get("last_sse_heartbeat")
+                                _ts = (_asd / "turn_start.txt")
+                                if _ahb and _ts.is_file():
+                                    from datetime import datetime, timezone as _tz
+                                    _hb_dt = datetime.fromisoformat(_ahb.replace("Z", "+00:00"))
+                                    _ts_dt = datetime.fromisoformat(_ts.read_text().strip().replace("Z", "+00:00"))
+                                    if _hb_dt.tzinfo is None:
+                                        _hb_dt = _hb_dt.replace(tzinfo=_tz.utc)
+                                    if _ts_dt.tzinfo is None:
+                                        _ts_dt = _ts_dt.replace(tzinfo=_tz.utc)
+                                    _heartbeat_fresh = _hb_dt >= _ts_dt
+                            except Exception:
+                                pass
+                        # (c) ready_ack — scan last N messages for "✅ ready" from assignee
+                        _READY_SCAN_LIMIT = 50
+                        _ready_ack = False
+                        for _m in _room.get("messages", [])[-_READY_SCAN_LIMIT:]:
+                            if (_m.get("sender_id") == _assignee_id
+                                    and "✅" in (_m.get("body") or "")
+                                    and "ready" in (_m.get("body") or "").lower()):
+                                _ready_ack = True
+                                break
+                        conditions_payload["assignee_readiness"] = {
+                            "accepted": _accepted,
+                            "heartbeat_fresh": _heartbeat_fresh,
+                            "ready_ack": _ready_ack,
+                            "assignee_id": _assignee_id,
+                        }
+            except Exception:
+                pass  # fail-open: missing key → assignee_not_ready returns False
+
+        # Lazy enrichment: concurrent_touchers (Guard-2, only for edit tools)
+        # Reads per-session files_touched.jsonl tails; skips dead sessions.
+        if req.tool_name in _EDIT_TOOLS:
+            try:
+                edited_paths = _extract_edited_paths(req.tool_input, req.cwd)
+                if edited_paths:
+                    concurrent_touchers = _compute_concurrent_touchers(
+                        req.session_id, edited_paths, sessions_mod
+                    )
+                    conditions_payload["concurrent_touchers"] = concurrent_touchers
+            except Exception:
+                pass  # fail-open: missing key → condition returns False
 
         result = _call_engine(role, req.tool_name, req.tool_input, req.cwd, conditions_payload=conditions_payload)
         # Normalize internal sentinel to null in the public response role field;

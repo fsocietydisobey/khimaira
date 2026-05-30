@@ -1230,3 +1230,131 @@ def test_p0_no_regression_pure_matcher_rules_still_block(isolated_chats, session
     body = r.json()
     assert body["ok"] is False  # IN-INTAKE-1 still fires
     assert body["violation"]["rule_id"] == "IN-INTAKE-1"
+
+
+# ---------------------------------------------------------------------------
+# B-M3/Guard-1 — BEGIN_BEFORE_READY (IN-MASTER-8) tests
+# Verifies that IN-MASTER-8 warns when master fires signal_start to an
+# assignee who lacks all three readiness signals.
+# ---------------------------------------------------------------------------
+
+
+def _setup_signal_start_scenario(isolated_chats, sessions_mod, assignee_ready=False):
+    """Helper: create a minimal master→assignee chat + task; optionally mark assignee ready."""
+    master_id = "22222222-2222-4000-8000-000000000001"
+    assignee_id = "33333333-3333-4000-8000-000000000002"
+    _make_session(sessions_mod, master_id)
+    _make_session(sessions_mod, assignee_id)
+
+    isolated_chats.create_room(
+        master_id, [assignee_id], title="test",
+        member_roles={master_id: "master", assignee_id: "agent"},
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    isolated_chats.accept(chat_id, assignee_id)
+
+    # Create a pending task
+    task = isolated_chats.create_task(
+        chat_id, master_id, "test task", assignee_session_id=assignee_id
+    )
+    task_id = task["id"]
+
+    if assignee_ready:
+        # Write fresh heartbeat + turn_start to mark assignee as SSE-live this turn
+        from khimaira.monitor import sessions as sess
+        asd = sess._session_dir_read(assignee_id)
+        if asd:
+            status = json.loads((asd / "status.json").read_text())
+            status["last_sse_heartbeat"] = "2099-01-01T01:00:00+00:00"
+            (asd / "status.json").write_text(json.dumps(status))
+            (asd / "turn_start.txt").write_text("2099-01-01T00:00:00+00:00")
+        # Post a ready-ack message from the assignee
+        isolated_chats.send_message(
+            chat_id, assignee_id, f"✅ ready [{task_id}] — budget set"
+        )
+
+    return master_id, assignee_id, chat_id, task_id
+
+
+def test_bm3_warn_when_assignee_no_heartbeat_no_ack(isolated_chats, sessions_mod, themis_client):
+    """IN-MASTER-8 warns when assignee has no SSE heartbeat + no ready-ack.
+
+    B-M3 AC-1: signal_start to assignee missing heartbeat AND ready-ack → warn.
+    Uses full TestClient path (hook→themis_check→engine), the live-path test discipline.
+    """
+    master_id, _assignee_id, chat_id, task_id = _setup_signal_start_scenario(
+        isolated_chats, sessions_mod, assignee_ready=False
+    )
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": master_id,
+            "tool_name": "mcp__khimaira-chat__chat_task_signal_start",
+            "tool_input": {"chat_id": chat_id, "task_id": task_id},
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False, (
+        "IN-MASTER-8 must warn when assignee has no heartbeat + no ready-ack."
+    )
+    assert body["violation"]["rule_id"] == "IN-MASTER-8"
+    assert body["violation"]["severity"] == "warn"
+
+
+def test_bm3_silent_when_assignee_fully_ready(isolated_chats, sessions_mod, themis_client):
+    """IN-MASTER-8 is silent when assignee is fully ready.
+
+    B-M3 AC-2: signal_start to ACCEPTED + heartbeat_fresh + ready_ack → no warn.
+    """
+    master_id, _assignee_id, chat_id, task_id = _setup_signal_start_scenario(
+        isolated_chats, sessions_mod, assignee_ready=True
+    )
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": master_id,
+            "tool_name": "mcp__khimaira-chat__chat_task_signal_start",
+            "tool_input": {"chat_id": chat_id, "task_id": task_id},
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True, "Fully-ready assignee must not trigger IN-MASTER-8."
+
+
+def test_bm3_missing_payload_fails_open(isolated_chats, sessions_mod, themis_client):
+    """IN-MASTER-8 fails open when assignee_readiness is absent from payload.
+
+    B-M3 AC-4: missing/partial payload → fail-open (no warn).
+    Simulate by not providing task_id (enrichment can't resolve assignee → no key set).
+    """
+    master_id, _assignee_id, chat_id, _task_id = _setup_signal_start_scenario(
+        isolated_chats, sessions_mod, assignee_ready=False
+    )
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": master_id,
+            "tool_name": "mcp__khimaira-chat__chat_task_signal_start",
+            "tool_input": {"chat_id": chat_id},  # no task_id → enrichment skipped
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True, "Missing task_id → assignee_readiness absent → fail-open."

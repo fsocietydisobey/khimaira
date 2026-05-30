@@ -390,6 +390,29 @@ def done_report_missing_branch_declaration(payload: dict[str, Any]) -> bool:
     return not all(label in note for label in required_labels)
 
 
+def assignee_not_ready(payload: dict[str, Any]) -> bool:
+    """True when the task's assignee is NOT fully ready to start.
+
+    Used by IN-MASTER-8 (BEGIN_BEFORE_READY) to warn master before firing BEGIN
+    to an unprepared assignee. "Ready" requires ALL of:
+      - state == accepted in the chat
+      - subscriber_last_heartbeat >= turn_start_ts (SSE is fresh this turn)
+      - a ✅ ready [task-id] message from the assignee in recent chat events
+
+    Fail-open: if assignee_readiness is absent from payload → False (don't fire).
+    This is a warn rule; the missing-payload case is not a crisis.
+    """
+    readiness = payload.get("assignee_readiness")
+    if not readiness:
+        return False
+    # Fire (True = not ready) when ANY component is False
+    return not (
+        readiness.get("accepted", False)
+        and readiness.get("heartbeat_fresh", False)
+        and readiness.get("ready_ack", False)
+    )
+
+
 def file_is_code(payload: dict[str, Any]) -> bool:
     """True if the tool's file_path has a code-file extension.
 
@@ -417,6 +440,22 @@ def file_is_code(payload: dict[str, Any]) -> bool:
 # Registry — maps YAML condition name → function
 # ---------------------------------------------------------------------------
 
+def path_touched_by_other_live_session(payload: dict[str, Any]) -> bool:
+    """True when another live session recently touched one of the files being edited.
+
+    Used by IN-AGENT-N PATH_CONTENTION (Guard-2) to warn before concurrent edits.
+    Reads payload["concurrent_touchers"] — a list of {session_id, session_name,
+    touch_ts, file_path} dicts populated by the Guard-2 enrichment in themis_check.
+    Non-empty list = contention detected → rule fires (warn).
+
+    Fail-open: absent/malformed key → False (no warn).
+    """
+    touchers = payload.get("concurrent_touchers")
+    if not isinstance(touchers, list):
+        return False
+    return len(touchers) > 0
+
+
 _REGISTRY: dict[str, Any] = {
     "idle_agents_exist": idle_agents_exist,
     "chat_my_chats_not_called_this_turn": chat_my_chats_not_called_this_turn,
@@ -427,4 +466,6 @@ _REGISTRY: dict[str, Any] = {
     "question_text_is_design_shaped": question_text_is_design_shaped,
     "done_report_missing_branch_declaration": done_report_missing_branch_declaration,
     "file_is_code": file_is_code,
+    "assignee_not_ready": assignee_not_ready,
+    "path_touched_by_other_live_session": path_touched_by_other_live_session,
 }

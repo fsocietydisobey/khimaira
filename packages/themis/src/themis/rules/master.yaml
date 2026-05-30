@@ -123,3 +123,24 @@ invariants:
       user_prompt_submit.py AND wrote tests directly instead of delegating to agents.
       Severity is warn (master may legitimately edit config/docs/yaml/markdown);
       enforcement is by convention, not hard block.
+
+  - id: IN-MASTER-8
+    name: BEGIN_BEFORE_READY
+    severity: warn
+    matchers:
+      - tool: mcp__khimaira-chat__chat_task_signal_start
+    conditions:
+      - check: assignee_not_ready
+    message: |
+      ⚠️ Themis IN-MASTER-8 (BEGIN_BEFORE_READY): master fired BEGIN but the
+      assignee may not be ready to receive it. Ready requires ALL of:
+        (a) state == accepted in the chat
+        (b) subscriber SSE heartbeat fresh this turn (call chat_my_chats first)
+        (c) a ✅ ready acknowledgement from the assignee in recent chat
+
+      A BEGIN to an unready assignee may be silently dropped (no SSE) or
+      cause the agent to run at the wrong budget tier. Confirm the assignee
+      is responsive before firing the signal.
+
+      Severity is warn — legit edge case: master re-firing after a known-good
+      ack the daemon didn't capture. This warn names the issue; master confirms.
