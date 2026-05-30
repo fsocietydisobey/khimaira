@@ -153,24 +153,18 @@ class ClaudeRunner:
             )
 
         # Error classification: three-way per #13a analysis.
-        #   1. Account-level hard stop (billing/auth/usage-cap) → ClaudeAuthError.
-        #      Do NOT retry — user must act.
-        #   2. Server transient overload → ClaudeTransientError.
-        #      Retriable with backoff after CC's own ~10 internal retries exhaust.
+        #   Check TRANSIENT first: the specific transient phrases (e.g.
+        #   "Server is temporarily limiting requests") must take precedence
+        #   over the more-general account patterns. "not your usage limit"
+        #   contains the substring "usage limit" which would otherwise match
+        #   the account-pattern — checking transient first avoids that false
+        #   classification.
+        #   1. Server transient overload → ClaudeTransientError (retriable).
+        #   2. Account-level hard stop (billing/auth/usage-cap) → ClaudeAuthError (no retry).
         #   3. Other errors fall through to normal result handling.
         if data.get("is_error"):
             err_text = data.get("result", "") or ""
             err_lower = err_text.lower()
-            if any(p in err_lower for p in _ACCOUNT_HARD_STOP_PATTERNS):
-                log.error(
-                    "claude: HARD STOP (account) — %s (api_status=%s). "
-                    "User must fix credits/auth before retrying.",
-                    err_text, data.get("api_error_status"),
-                )
-                raise ClaudeAuthError(
-                    f"Claude refused (account-level) — {err_text}. "
-                    "Add credits / fix auth before retrying."
-                )
             if any(p in err_lower for p in _TRANSIENT_OVERLOAD_PATTERNS):
                 log.warning(
                     "claude: TRANSIENT OVERLOAD — %s (api_status=%s). "
@@ -180,6 +174,16 @@ class ClaudeRunner:
                 raise ClaudeTransientError(
                     f"Claude overloaded (transient) — {err_text}. "
                     "Retry with exponential backoff."
+                )
+            if any(p in err_lower for p in _ACCOUNT_HARD_STOP_PATTERNS):
+                log.error(
+                    "claude: HARD STOP (account) — %s (api_status=%s). "
+                    "User must fix credits/auth before retrying.",
+                    err_text, data.get("api_error_status"),
+                )
+                raise ClaudeAuthError(
+                    f"Claude refused (account-level) — {err_text}. "
+                    "Add credits / fix auth before retrying."
                 )
 
         # Text — Claude Code emits `result` (top-level) or content blocks
