@@ -645,6 +645,46 @@ def test_role_budget_lead_entries_in_sync():
         )
 
 
+def test_master_role_budget_is_opus_max():
+    """Regression guard: ROLE_BUDGET for master must stay at opus/max in both files.
+
+    Master requires Opus 4.8 for coordination/synthesis quality. This was oscillated
+    between sonnet and opus during the 2026-05-30 session (commits 142e3d7, 20ef7db,
+    3ad222f) before Joseph confirmed opus/max. This test prevents silent regression.
+    Both chats.py (ROLE_BUDGET) and session_start.py (_ROLE_BUDGET) must be in sync.
+    """
+    import ast, re
+
+    chats_src = (REPO_ROOT / "packages/khimaira/src/khimaira/monitor/chats.py").read_text()
+    session_start_src = (
+        REPO_ROOT / "packages/khimaira/src/khimaira/hooks/session_start.py"
+    ).read_text()
+
+    # Extract ROLE_MASTER entry from chats.py
+    chats_master_match = re.search(r'ROLE_MASTER:\s*(\{[^}]+\})', chats_src)
+    assert chats_master_match, "ROLE_MASTER entry not found in chats.py ROLE_BUDGET"
+    chats_master_budget = ast.literal_eval(chats_master_match.group(1))
+    assert chats_master_budget.get("model") == "opus", (
+        f"chats.py ROLE_BUDGET master model must be 'opus', got {chats_master_budget.get('model')!r}. "
+        "Joseph confirmed opus/max 2026-05-30. Do not change without explicit approval."
+    )
+    assert chats_master_budget.get("effort") == "max", (
+        f"chats.py ROLE_BUDGET master effort must be 'max', got {chats_master_budget.get('effort')!r}."
+    )
+
+    # Extract master entry from session_start.py _ROLE_BUDGET
+    session_master_match = re.search(r'"master":\s*(\{[^}]+\})', session_start_src)
+    assert session_master_match, "master entry not found in session_start.py _ROLE_BUDGET"
+    session_master_budget = ast.literal_eval(session_master_match.group(1))
+    assert session_master_budget.get("model") == "opus", (
+        f"session_start.py _ROLE_BUDGET master model must be 'opus', got {session_master_budget.get('model')!r}. "
+        "chats.py and session_start.py must stay in sync."
+    )
+    assert session_master_budget.get("effort") == "max", (
+        f"session_start.py _ROLE_BUDGET master effort must be 'max', got {session_master_budget.get('effort')!r}."
+    )
+
+
 def test_domains_tuple_covers_core_lead_domains():
     """Regression guard: session_end_utils._DOMAINS must contain the 4 core domains.
 

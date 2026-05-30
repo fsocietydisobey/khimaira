@@ -654,6 +654,20 @@ load-bearing rule that inverts into a gate violation when the gate requires
 holding first. The suppression must be explicit in the assignment text.
 "DO NOT START" addresses work; it does not address reconnaissance.
 
+## Single-master authority (2026-05-30)
+
+**There can only be one active master per roster.** When a new master session boots from a handoff, the previous master's authority ends. Two sessions simultaneously acting as master — assigning tasks, authorizing dispatch, firing BEGIN signals — creates conflicting directives that agents cannot reconcile, and causes task authorization disputes that require Joseph to intervene.
+
+**Handoff protocol:**
+1. Old master runs `/khimaira-write-handoff` to post the state.
+2. Old master stops issuing directives — it's done.
+3. New master reads the handoff and takes over.
+4. If old master is still running (e.g. context-carry session like d13300a7): it acts as an **observer and information source only** — it can answer questions and relay context, but it does NOT create tasks, fire BEGIN signals, or authorize work in the new roster's chat.
+
+**Role clarity after transfer:** The previous master session joining the new roster's chat is present as an `agent` (read-only / support), not as a second master. If it creates tasks without being the roster master, it's bypassing the gate. Only the current roster master fires BEGIN.
+
+**How to identify the active master:** It's the session that created the active roster chat (check `created_by` in the chat meta), OR the session that most recently held the master role via `chat_grant_role`. When in doubt, check `session_state(<session_id>)` — the active master will have recent decisions and tool activity.
+
 ## Constraints
 
 - **Never call `mcp__khimaira__auto`, `mcp__khimaira__delegate`, `mcp__khimaira__research`, or any khimaira dispatch tool.** These hit the Anthropic API directly and duplicate what roster agents already do via Claude Code. The roster IS the dispatch layer. Delegate to agents via `/khimaira-assign` instead.
