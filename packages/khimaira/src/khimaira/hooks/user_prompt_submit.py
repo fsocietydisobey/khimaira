@@ -1476,18 +1476,38 @@ def main() -> int:
             # is worth suggesting), as is every actionable/event-driven block.
             role_budget_block = ""
             reminder_block = ""
-        elif prompt_class == "architecture":
-            dynamic_context_block = (
-                "🏛️ architecture/design prompt — read before proposing structure:\n"
-                "  • CLAUDE.md (project conventions + engineering rules)\n"
-                "  • tasks/BUILD-PLAN.md (phase status) + tasks/<name>/IMPLEMENTATION.md (open specs)"
-            )
-        elif prompt_class == "bugfix":
-            dynamic_context_block = (
-                "🐛 bug-fix prompt — suggested context: the failing file + its tests, "
-                "and recent git history for that path (`git log -p -S '<symbol>'`). "
-                "Reproduce first, then trace the data flow to the root cause."
-            )
+        elif prompt_class in ("architecture", "bugfix", "coordination"):
+            try:
+                from khimaira.context_inject import resolve_context
+                ctx = resolve_context(session_cwd or os.getcwd(), prompt_class)
+                hint = ctx.get("hint") or ""
+                pointers = ctx.get("pointers") or []
+                prose = ctx.get("prose") or {}
+                parts: list[str] = []
+                if hint:
+                    parts.append(hint)
+                if pointers:
+                    parts.extend(f"  • {p}" for p in pointers)
+                # Append prose fields (dep_graph_note, framework) after pointers
+                if prose.get("dep_graph_note"):
+                    parts.append(f"  ↳ {prose['dep_graph_note']}")
+                if prose.get("framework"):
+                    parts.append(f"  ↳ framework: {prose['framework']}")
+                dynamic_context_block = "\n".join(parts)
+            except Exception:
+                # Fall back to pre-#66 hardcoded blocks on any import/resolve error
+                if prompt_class == "architecture":
+                    dynamic_context_block = (
+                        "🏛️ architecture/design prompt — read before proposing structure:\n"
+                        "  • CLAUDE.md (project conventions + engineering rules)\n"
+                        "  • tasks/BUILD-PLAN.md (phase status) + tasks/<name>/IMPLEMENTATION.md (open specs)"
+                    )
+                elif prompt_class == "bugfix":
+                    dynamic_context_block = (
+                        "🐛 bug-fix prompt — suggested context: the failing file + its tests, "
+                        "and recent git history for that path (`git log -p -S '<symbol>'`). "
+                        "Reproduce first, then trace the data flow to the root cause."
+                    )
 
     if (
         not inbox_block
