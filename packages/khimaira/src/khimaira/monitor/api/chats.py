@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 
 from fastapi import Request
@@ -523,6 +524,200 @@ def _resolve_intake_session_id(chat_id: str) -> str | None:
     return None
 
 
+# ─── #13b-heavy: throttle-escalation (terminal 529-overload exhaustion) ────
+#
+# When a roster session's Stop hook detects that the turn ended on an
+# unrecovered 529-overload storm (CC exhausted its internal retries — see
+# khimaira.hooks.throttle_detect), it POSTs here. The session is now idle
+# awaiting USER input and will NOT resume on its own.
+#
+# Deliberately NOT "re-poke"/auto-resume: the daemon has no active wake
+# handle for an operator-launched interactive CC window (audited 2026-05-31 —
+# every daemon→session vector is a passive note seen only on the session's
+# next user turn; no tmux/pty/SDK injection; the window wasn't daemon-spawned
+# so there's no re-invoke handle). The human is the resume actor; khimaira's
+# job is to make sure they KNOW — loudly, backoff-paced.
+#
+#   • DETECT + ALERT — UNIVERSAL. Every terminal-overload (obligation or not)
+#     surfaces a 🟡 alert. This is the actual gap: a session that throttled
+#     out with no task obligation never tripped Guard-4, so nothing fired.
+#   • ESCALATE — OBLIGATION-SCOPED. A throttled session that owes a
+#     pending/in_progress task has stalled real work → louder, and after N
+#     repeats routes through Guard-4's harder escalation.
+#
+# Per-session backoff: at most one escalation per session per cooldown window
+# (the circuit.py-style cadence gate — don't re-alert on every Stop the
+# session fires while still throttled). Daemon-spawned dispatch-run auto-
+# resume (RunnerCircuit territory) IS buildable but is a deliberate v2
+# deferral — Joseph's failure was terminal interactive windows.
+_THROTTLE_COOLDOWN_S = float(
+    os.environ.get("KHIMAIRA_THROTTLE_ESCALATE_COOLDOWN_S", "300")
+)
+_THROTTLE_ESCALATE_AFTER_N = int(
+    os.environ.get("KHIMAIRA_THROTTLE_ESCALATE_AFTER_N", "3")
+)
+_THROTTLE_STATE_TTL_S = 3600.0  # forget a session's throttle streak after 1h quiet
+# session_id → {"last_ts": float, "count": int}
+_THROTTLE_STATE: dict[str, dict] = {}
+
+
+def _session_display_name(session_id: str) -> str:
+    """Best-effort human name for a session; falls back to the UUID prefix."""
+    try:
+        from khimaira.monitor import sessions as sessions_mod
+
+        sd = sessions_mod._session_dir_read(session_id)
+        if sd:
+            status_file = sd / "status.json"
+            if status_file.exists():
+                data = json.loads(status_file.read_text(encoding="utf-8"))
+                name = (data.get("name") or "").strip()
+                if name:
+                    return name
+    except Exception:
+        pass
+    return session_id[:8]
+
+
+def _chats_for_session(session_id: str) -> list[str]:
+    """Chat ids where `session_id` is a member. Used to surface a 🟡 alert for
+    a throttled bare-idle session (no obligation to scope it to). Fail-open."""
+    out: list[str] = []
+    try:
+        chat_dir = chats._chat_dir()
+        if not chat_dir.exists():
+            return out
+        for chat_path in chat_dir.glob("chat-*.jsonl"):
+            chat_id = chat_path.stem
+            try:
+                room = chats.load_room(chat_id)
+                members = room.get("members") or {}
+                roles = (room.get("meta") or {}).get("member_roles") or {}
+                if session_id in members or session_id in roles:
+                    out.append(chat_id)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+async def _handle_throttle_escalation(
+    session_id: str, payload: dict
+) -> dict:
+    """Process a terminal-overload detection from a session's Stop hook.
+
+    Universal 🟡 alert; obligation-scoped harder escalation; per-session
+    backoff so we don't re-alert on every Stop while a session stays
+    throttled. Returns a small status dict (the route echoes it).
+    """
+    from khimaira.monitor import sessions as sessions_mod
+
+    now = time.time()
+
+    # GC stale streaks.
+    for sid, st in list(_THROTTLE_STATE.items()):
+        if now - st.get("last_ts", 0) > _THROTTLE_STATE_TTL_S:
+            _THROTTLE_STATE.pop(sid, None)
+
+    prev = _THROTTLE_STATE.get(session_id)
+    if prev and (now - prev["last_ts"]) < _THROTTLE_COOLDOWN_S:
+        # Within the backoff window — record nothing new, stay quiet.
+        return {
+            "escalated": False,
+            "reason": "cooldown",
+            "session_id": session_id,
+            "cooldown_remaining_s": round(
+                _THROTTLE_COOLDOWN_S - (now - prev["last_ts"]), 1
+            ),
+        }
+
+    count = (prev["count"] + 1) if prev else 1
+    _THROTTLE_STATE[session_id] = {"last_ts": now, "count": count}
+
+    name = _session_display_name(session_id)
+    obligations = _get_session_obligations(session_id)
+
+    ra = payload.get("retry_attempt")
+    mr = payload.get("max_retries")
+    retry_str = f"{ra}/{mr}" if mr else str(ra)
+    detail = payload.get("message") or "service overloaded"
+
+    def _notify(chat_id: str, body: str) -> None:
+        target = _resolve_intake_session_id(chat_id) or _resolve_master_session_id(chat_id)
+        if target:
+            try:
+                sessions_mod.post_notice(
+                    target_session_id=target,
+                    text=body,
+                    from_session_id="khimaira-daemon",
+                )
+            except Exception:
+                pass
+
+    # Local import mirrors _guard4_escalate and _send_diagnostic_probe pattern —
+    # _post_synthetic_message lives in chats.py and is not a module-level import here.
+    try:
+        from khimaira.monitor.chats import _post_synthetic_message as _post_msg
+    except Exception:
+        async def _post_msg(chat_id, body, kind=None):  # type: ignore[assignment]
+            return None
+
+    if obligations:
+        for obligation in obligations:
+            tid = obligation["task_id"]
+            chat_id = obligation["chat_id"]
+            body = (
+                f"🟡 THROTTLE-ESCALATION: {name} exhausted rate-limit retries "
+                f"({retry_str}; {detail}) and STOPPED mid-[task-{tid[:8]} "
+                f"({obligation['status']})]. Interactive window — daemon can't "
+                f"auto-resume; needs a MANUAL re-prompt to continue. (alert #{count})"
+            )
+            try:
+                await _post_msg(chat_id, body)
+            except Exception:
+                pass
+            _notify(chat_id, body)
+            # After N repeats with the obligation still open, escalate harder.
+            if count >= _THROTTLE_ESCALATE_AFTER_N:
+                try:
+                    await _guard4_escalate(
+                        session_id, obligation, name, "hung",
+                        _THROTTLE_COOLDOWN_S * count,
+                    )
+                except Exception:
+                    pass
+        return {
+            "escalated": True,
+            "obligation_scoped": True,
+            "obligations": len(obligations),
+            "count": count,
+            "session_id": session_id,
+        }
+
+    # Bare-idle: no work to resume — informational alert only (universal
+    # coverage of the no-obligation gap Guard-4 misses).
+    body = (
+        f"🟡 THROTTLE-ALERT: {name} exhausted rate-limit retries "
+        f"({retry_str}; {detail}) and stopped — no active task (informational). "
+        f"(alert #{count})"
+    )
+    chat_ids = _chats_for_session(session_id)
+    for chat_id in chat_ids:
+        try:
+            await _post_msg(chat_id, body)
+        except Exception:
+            pass
+        _notify(chat_id, body)
+    return {
+        "escalated": True,
+        "obligation_scoped": False,
+        "chats": len(chat_ids),
+        "count": count,
+        "session_id": session_id,
+    }
+
+
 async def _guard4_check_once() -> None:
     """Scan sessions for stall conditions; escalate with debounce.
 
@@ -713,6 +908,15 @@ class RecordGateVerdictReq(BaseModel):
 class AutoAcceptReq(BaseModel):
     session_id: str
     allowlist: list[str]
+
+
+class ThrottleReq(BaseModel):
+    # #13b-heavy — posted by a session's Stop hook on terminal 529 exhaustion.
+    retry_attempt: int | None = None
+    max_retries: int | None = None
+    overload_count: int | None = None
+    last_timestamp: str | None = None
+    message: str | None = None
 
 
 class LeaveReq(BaseModel):
@@ -1040,6 +1244,21 @@ def build_router():
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
         return {"ok": True, "session_id": session_id, "allowlist": req.allowlist}
+
+    @router.post("/sessions/{session_id}/throttle")
+    async def throttle_detected(session_id: str, req: ThrottleReq) -> dict:
+        """#13b-heavy — a session's Stop hook reports terminal 529 exhaustion.
+
+        Surfaces a universal 🟡 alert + obligation-scoped escalation with
+        per-session backoff. Never raises into the hook: the daemon swallows
+        handler errors and returns ok=False so a Stop hook never blocks CC
+        from exiting on our account.
+        """
+        try:
+            result = await _handle_throttle_escalation(session_id, req.model_dump())
+            return {"ok": True, **result}
+        except Exception as exc:  # fail-open — the caller is a Stop hook
+            return {"ok": False, "session_id": session_id, "error": str(exc)}
 
     @router.post("/sessions/{session_id}/auto-accept/apply-by-name")
     async def apply_auto_accept_by_name(session_id: str, name: str) -> dict:

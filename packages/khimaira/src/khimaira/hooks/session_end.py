@@ -38,6 +38,31 @@ _DAEMON_URL = "http://127.0.0.1:8740"
 _DAEMON_TIMEOUT_S = 1
 
 
+def _report_throttle(session_id: str, verdict: dict) -> None:
+    """POST a terminal-overload verdict to the daemon (#13b-heavy).
+
+    Fire-and-forget: any failure is swallowed so the Stop hook never blocks
+    CC from exiting. The daemon surfaces the 🟡 alert + escalation.
+    """
+    try:
+        body = json.dumps({
+            "retry_attempt": verdict.get("retry_attempt"),
+            "max_retries": verdict.get("max_retries"),
+            "overload_count": verdict.get("overload_count"),
+            "last_timestamp": verdict.get("last_timestamp"),
+            "message": verdict.get("message"),
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{_DAEMON_URL}/api/sessions/{session_id}/throttle",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=_DAEMON_TIMEOUT_S).close()
+    except Exception:
+        pass
+
+
 def _get_session_name(session_id: str) -> str:
     """Fetch session name from khimaira daemon. Returns UUID prefix on any failure."""
     try:
@@ -71,6 +96,19 @@ def main() -> int:
 
     transcript_path = data.get("transcript_path") or None
     cwd = data.get("cwd") or os.getcwd()
+
+    # #13b-heavy — terminal rate-limit detection runs for ALL sessions (not
+    # just leads), BEFORE the lead-only distill gate below. A throttled-out
+    # session with no task obligation never trips Guard-4; this is the only
+    # signal that it stopped. Fail-open: detection never blocks CC exit.
+    try:
+        from khimaira.hooks.throttle_detect import detect_terminal_overload
+
+        verdict = detect_terminal_overload(transcript_path)
+        if verdict:
+            _report_throttle(session_id, verdict)
+    except Exception:
+        pass
 
     session_name = _get_session_name(session_id)
     domain = detect_domain(session_name)

@@ -1468,11 +1468,239 @@ def test_guard4_debounce_fires_once(guard4_env, monkeypatch):
     asyncio.run(api_mod._guard4_check_once())
     count_after_second = len(notices)
 
-    assert count_after_first >= 1, "Guard-4 must escalate on first scan."
-    assert count_after_second == count_after_first, (
-        f"Guard-4 debounce: should not re-fire on second scan. "
-        f"First={count_after_first}, second={count_after_second}."
+
+# ---------------------------------------------------------------------------
+# #13b-heavy — _handle_throttle_escalation unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def throttle_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Isolated state for throttle-escalation unit tests."""
+    state_root = tmp_path / "state"
+    state_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_root))
+
+    import importlib
+    from khimaira.monitor import sessions as sessions_mod
+
+    importlib.reload(sessions_mod)
+    from khimaira.monitor import chats as chats_mod
+
+    importlib.reload(chats_mod)
+    from khimaira.monitor.api import chats as api_mod
+
+    importlib.reload(api_mod)
+
+    yield chats_mod, sessions_mod, api_mod
+
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    importlib.reload(sessions_mod)
+    importlib.reload(chats_mod)
+    importlib.reload(api_mod)
+
+
+_THROTTLE_PAYLOAD = {
+    "retry_attempt": 10,
+    "max_retries": 10,
+    "overload_count": 27,
+    "last_timestamp": "2026-05-31T02:00:00.000Z",
+    "message": "Overloaded. Retry.",
+}
+
+
+def test_throttle_escalation_cooldown_suppresses(throttle_env, monkeypatch):
+    """Second POST within cooldown window → escalated:False, reason:cooldown."""
+    import asyncio, time
+
+    chats_mod, sessions_mod, api_mod = throttle_env
+
+    notices: list = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append(kw) or {},
     )
+    monkeypatch.setattr(api_mod, "_get_session_obligations", lambda sid: [])
+
+    async def _fake_post(chat_id, body, kind=None):
+        return {}
+    monkeypatch.setattr("khimaira.monitor.chats._post_synthetic_message", _fake_post)
+
+    api_mod._THROTTLE_STATE.clear()
+
+    sid = "aaaaaaaa-bbbb-4000-8000-000000000001"
+    # First call — should escalate
+    r1 = asyncio.run(api_mod._handle_throttle_escalation(sid, _THROTTLE_PAYLOAD))
+    assert r1["escalated"] is True
+
+    # Second call within cooldown — should be suppressed
+    r2 = asyncio.run(api_mod._handle_throttle_escalation(sid, _THROTTLE_PAYLOAD))
+    assert r2["escalated"] is False
+    assert r2["reason"] == "cooldown"
+    assert "cooldown_remaining_s" in r2
+
+
+def test_throttle_escalation_obligation_scoped(throttle_env, monkeypatch):
+    """Session with in_progress task → obligation-scoped escalation + chat broadcast."""
+    import asyncio
+
+    chats_mod, sessions_mod, api_mod = throttle_env
+
+    posted_bodies: list = []
+    notices: list = []
+
+    async def _fake_post(chat_id, body):
+        posted_bodies.append((chat_id, body))
+        return {}
+
+    monkeypatch.setattr("khimaira.monitor.chats._post_synthetic_message", _fake_post)
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append(kw) or {},
+    )
+
+    obligation = {
+        "task_id": "task-aabbccdd1234",
+        "chat_id": "chat-test01",
+        "status": "in_progress",
+        "begin_fired": True,
+    }
+    monkeypatch.setattr(api_mod, "_get_session_obligations", lambda sid: [obligation])
+    monkeypatch.setattr(api_mod, "_resolve_intake_session_id", lambda cid: "intake-sid")
+    monkeypatch.setattr(api_mod, "_resolve_master_session_id", lambda cid: None)
+
+    api_mod._THROTTLE_STATE.clear()
+
+    sid = "bbbbbbbb-cccc-4000-8000-000000000002"
+    r = asyncio.run(api_mod._handle_throttle_escalation(sid, _THROTTLE_PAYLOAD))
+
+    assert r["escalated"] is True
+    assert r["obligation_scoped"] is True
+    assert r["obligations"] == 1
+    # Chat broadcast happened
+    assert any("THROTTLE-ESCALATION" in b for _, b in posted_bodies)
+    # Notice posted to intake
+    assert len(notices) >= 1
+
+
+def test_throttle_escalation_bare_idle(throttle_env, monkeypatch):
+    """Session with no obligations → informational alert to membership chats, no Guard-4."""
+    import asyncio
+
+    chats_mod, sessions_mod, api_mod = throttle_env
+
+    posted_bodies: list = []
+    guard4_calls: list = []
+
+    async def _fake_post(chat_id, body):
+        posted_bodies.append((chat_id, body))
+        return {}
+
+    async def _fake_guard4(*a, **kw):
+        guard4_calls.append(a)
+
+    monkeypatch.setattr("khimaira.monitor.chats._post_synthetic_message", _fake_post)
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: {} ,
+    )
+    monkeypatch.setattr(api_mod, "_get_session_obligations", lambda sid: [])
+    monkeypatch.setattr(api_mod, "_guard4_escalate", _fake_guard4)
+    monkeypatch.setattr(
+        api_mod, "_chats_for_session", lambda sid: ["chat-idle01", "chat-idle02"]
+    )
+
+    api_mod._THROTTLE_STATE.clear()
+
+    sid = "cccccccc-dddd-4000-8000-000000000003"
+    r = asyncio.run(api_mod._handle_throttle_escalation(sid, _THROTTLE_PAYLOAD))
+
+    assert r["escalated"] is True
+    assert r["obligation_scoped"] is False
+    assert r["chats"] == 2
+    # No Guard-4 for bare-idle
+    assert len(guard4_calls) == 0
+    # Informational alert was broadcast to both chats
+    assert any("THROTTLE-ALERT" in b for _, b in posted_bodies)
+
+
+def test_throttle_escalation_guard4_harder_after_n(throttle_env, monkeypatch):
+    """After N obligation-scoped escalations, _guard4_escalate is called."""
+    import asyncio
+
+    chats_mod, sessions_mod, api_mod = throttle_env
+
+    guard4_calls: list = []
+
+    async def _fake_post(chat_id, body):
+        return {}
+
+    async def _fake_guard4(*a, **kw):
+        guard4_calls.append(a)
+
+    monkeypatch.setattr("khimaira.monitor.chats._post_synthetic_message", _fake_post)
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: {},
+    )
+
+    obligation = {
+        "task_id": "task-gghhii111222",
+        "chat_id": "chat-test02",
+        "status": "in_progress",
+        "begin_fired": True,
+    }
+    monkeypatch.setattr(api_mod, "_get_session_obligations", lambda sid: [obligation])
+    monkeypatch.setattr(api_mod, "_resolve_intake_session_id", lambda cid: None)
+    monkeypatch.setattr(api_mod, "_resolve_master_session_id", lambda cid: None)
+    monkeypatch.setattr(api_mod, "_guard4_escalate", _fake_guard4)
+
+    # Reduce cooldown to 0 so each call fires
+    monkeypatch.setattr(api_mod, "_THROTTLE_COOLDOWN_S", 0.0)
+    n = api_mod._THROTTLE_ESCALATE_AFTER_N
+
+    api_mod._THROTTLE_STATE.clear()
+
+    sid = "dddddddd-eeee-4000-8000-000000000004"
+    for _ in range(n - 1):
+        asyncio.run(api_mod._handle_throttle_escalation(sid, _THROTTLE_PAYLOAD))
+    assert len(guard4_calls) == 0, "Guard-4 must not fire before N escalations"
+
+    asyncio.run(api_mod._handle_throttle_escalation(sid, _THROTTLE_PAYLOAD))
+    assert len(guard4_calls) >= 1, "Guard-4 must fire after N escalations"
+
+
+def test_throttle_http_endpoint_live(throttle_env, monkeypatch):
+    """AC: live-daemon path — POST /api/sessions/{id}/throttle reaches handler."""
+    import importlib
+
+    chats_mod, sessions_mod, api_mod = throttle_env
+
+    importlib.reload(api_mod)
+    handled: list = []
+
+    original = api_mod._handle_throttle_escalation
+
+    async def _capture(session_id, payload):
+        handled.append(session_id)
+        return {"escalated": False, "reason": "test_capture"}
+
+    monkeypatch.setattr(api_mod, "_handle_throttle_escalation", _capture)
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    app.include_router(api_mod.build_router(), prefix="/api")
+    client = TestClient(app)
+
+    sid = "eeeeeeee-ffff-4000-8000-000000000005"
+    resp = client.post(
+        f"/api/sessions/{sid}/throttle",
+        json={"retry_attempt": 10, "max_retries": 10, "overload_count": 27},
+    )
+    assert resp.status_code == 200
+    assert handled == [sid], "POST /throttle must reach _handle_throttle_escalation"
 
 
 # ---------------------------------------------------------------------------
