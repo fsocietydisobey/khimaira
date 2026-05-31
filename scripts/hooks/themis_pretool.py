@@ -30,16 +30,45 @@ from urllib.request import Request, urlopen
 DAEMON = os.environ.get("THEMIS_DAEMON", "http://127.0.0.1:8740")
 TIMEOUT_S = 0.5
 FAIL_OPEN_LOG = Path.home() / ".claude" / "hooks" / "themis_fail_open.log"
+# Chat directory — for roster-active check (#61 daemon-down alert).
+_CHAT_DIR = Path.home() / ".local" / "state" / "khimaira" / "chats"
+
+
+def _is_roster_active() -> bool:
+    """Return True if any khimaira chat files exist (roster is deployed).
+
+    Lightweight: just checks for the existence of any chat-*.jsonl file.
+    Fail-open: returns False on any OS error.
+    """
+    try:
+        return next(_CHAT_DIR.glob("chat-*.jsonl"), None) is not None
+    except Exception:
+        return False
 
 
 def _fail_open(reason: str) -> None:
     """Log a fail-open event and exit 0 (allow the tool)."""
     FAIL_OPEN_LOG.parent.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     try:
         with FAIL_OPEN_LOG.open("a") as f:
-            f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] {reason}\n")
+            f.write(f"[{ts}] {reason}\n")
     except OSError:
         pass  # Can't log either — still fail-open
+    # #61 axis-B: alert when daemon is unreachable and an active roster exists.
+    # B3 commit/approve gates require the daemon — they're bypassed during downtime.
+    # Writing to stderr makes the bypass-window visible without blocking the tool.
+    if _is_roster_active() and ("unreachable" in reason or "timeout" in reason):
+        try:
+            print(
+                f"[Themis] ⚠️  daemon unreachable — enforcement bypassed "
+                "(B3 commit/approve gates NOT active). "
+                "Run `khimaira monitor start` to restore enforcement.",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
     sys.exit(0)
 
 

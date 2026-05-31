@@ -902,7 +902,9 @@ def test_check_known_member_in_member_roles_chat_unresolvable_blocks(
     importlib.reload(themis_api)
 
     # non_inferable: L1 miss, L2 miss (not creator), L3 miss (janice-0 → not in registry)
-    # L4 fires: member_roles_dict is present → sentinel → BLOCK
+    # L4 fires: member_roles_dict is present → sentinel → BLOCK.
+    # (#61) themis_check retries durable-read before calling _call_engine; retry also
+    # returns _UNRESOLVABLE (role still absent) → IN-UNRESOLVABLE-RETRY (privileged-block).
     r = themis_client.post(
         "/api/themis/check",
         json={"session_id": non_inferable, "tool_name": "Edit", "tool_input": {}},
@@ -910,22 +912,24 @@ def test_check_known_member_in_member_roles_chat_unresolvable_blocks(
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is False
-    assert body["violation"]["rule_id"] == "IN-UNRESOLVABLE"
+    assert body["violation"]["rule_id"] in ("IN-UNRESOLVABLE", "IN-UNRESOLVABLE-RETRY")
     assert body["violation"]["severity"] == "block"
 
 
-def test_check_known_member_in_no_member_roles_chat_unresolvable_is_open(
+def test_check_known_member_in_no_member_roles_chat_unresolvable_blocks(
     isolated_chats, sessions_mod, themis_client
 ):
-    """L4 per-chat gate: a known member in a chat WITHOUT member_roles, whose
-    role cannot be resolved via any layer, gets fail-OPEN (gate blocks sentinel).
-    Proves the per-chat gate prevents bricking non-inferable sessions in legacy chats."""
+    """#61 axis-A: an accepted member in a chat WITHOUT member_roles, whose role
+    cannot be resolved via any layer, now BLOCKS (IN-UNRESOLVABLE sentinel).
+
+    The pre-backfill exemption (gate on member_roles_dict) is removed — any known
+    roster member with an unresolvable role must fail-closed, not escape enforcement."""
     master = "33333333-cccc-0000-0000-000000000001"
     non_inferable = "44444444-cccc-0000-0000-000000000002"
     _make_session(sessions_mod, master)
     _make_named_session(sessions_mod, non_inferable, "janice-0")  # not role-inferable
 
-    # Create chat WITHOUT member_roles (legacy)
+    # Create chat WITHOUT member_roles (v1-era)
     isolated_chats.create_room(master, [non_inferable], title="no-member-roles-chat")
     chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
     isolated_chats.accept(chat_id, non_inferable)
@@ -934,27 +938,27 @@ def test_check_known_member_in_no_member_roles_chat_unresolvable_is_open(
 
     importlib.reload(themis_api)
 
-    # non_inferable: L1 miss, L2 miss (not creator), L3 miss, L4 gate fails (no member_roles)
-    # → None → fail-open
+    # non_inferable: L1 miss, L2 miss (not creator), L3 miss, L4 fires (no gate now)
+    # → _UNRESOLVABLE → retry also fails (still no role) → privileged-block (Edit)
     r = themis_client.post(
         "/api/themis/check",
         json={"session_id": non_inferable, "tool_name": "Edit", "tool_input": {}},
     )
     assert r.status_code == 200
     body = r.json()
-    assert body["ok"] is True  # fail-open, gate prevented the sentinel
-    assert body["role"] is None
+    assert body["ok"] is False  # known member, unresolvable → blocked
+    assert body["violation"]["rule_id"] in ("IN-UNRESOLVABLE", "IN-UNRESOLVABLE-RETRY")
+    assert body["violation"]["severity"] == "block"
 
 
-def test_check_known_member_in_empty_member_roles_chat_unresolvable_is_open(
+def test_check_known_member_in_empty_member_roles_chat_unresolvable_blocks(
     isolated_chats, sessions_mod, themis_client
 ):
-    """L4 gate: empty dict {} member_roles is semantically absent — treated as fail-OPEN.
+    """#61 axis-A: an accepted member in a chat with an empty {} member_roles dict
+    now BLOCKS — empty {} is falsy but the session is still a known roster member.
 
-    Spec (msg-f0249): gate is bool(chat.meta.member_roles). An empty dict means no roles
-    recorded for anyone — identical to absent — and should NOT brick non-inferable members.
-    Validates that `if member_roles_dict:` (truthy) was used, not `is not None`.
-    """
+    Previously: empty dict was treated as absent → fail-open. After #61: the gate
+    is removed — any known member with unresolvable role fails-closed."""
     master = "77777777-cccc-0000-0000-000000000001"
     non_inferable = "88888888-cccc-0000-0000-000000000002"
     _make_session(sessions_mod, master)
@@ -986,8 +990,85 @@ def test_check_known_member_in_empty_member_roles_chat_unresolvable_is_open(
     )
     assert r.status_code == 200
     body = r.json()
-    assert body["ok"] is True  # empty {} → gate OFF → fail-open (not bricked)
+    assert body["ok"] is False  # known member, empty role dict → blocked
+    assert body["violation"]["rule_id"] in ("IN-UNRESOLVABLE", "IN-UNRESOLVABLE-RETRY")
+    assert body["violation"]["severity"] == "block"
+
+
+def test_unresolvable_known_member_blocked(
+    isolated_chats, sessions_mod, themis_client
+):
+    """Acceptance: session in a room, role=UNRESOLVABLE → blocked (Edit is privileged)."""
+    master = "aaaaaaaa-cccc-0000-0000-000000000001"
+    member = "bbbbbbbb-cccc-0000-0000-000000000002"
+    _make_session(sessions_mod, master)
+    _make_named_session(sessions_mod, member, "no-role-0")  # not role-inferable
+
+    isolated_chats.create_room(master, [member], title="unresolvable-chat")
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    isolated_chats.accept(chat_id, member)
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={"session_id": member, "tool_name": "Edit", "tool_input": {}},
+    )
+    body = r.json()
+    assert body["ok"] is False
+    assert body["violation"]["severity"] == "block"
+
+
+def test_unresolvable_non_roster_allowed(
+    isolated_chats, sessions_mod, themis_client
+):
+    """Acceptance: session NOT in any room → role=None → allowed (no regression)."""
+    _make_session(sessions_mod, "cccccccc-cccc-0000-0000-000000000001")
+    non_member = "dddddddd-cccc-0000-0000-000000000002"
+    _make_session(sessions_mod, non_member)
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+
+    r = themis_client.post(
+        "/api/themis/check",
+        json={"session_id": non_member, "tool_name": "Edit", "tool_input": {}},
+    )
+    body = r.json()
+    assert body["ok"] is True
     assert body["role"] is None
+
+
+def test_membership_check_fail_open(
+    isolated_chats, sessions_mod, themis_client, tmp_path
+):
+    """Acceptance: all chat files fail to load → membership check fail-open → ok=True.
+
+    Simulates a scenario where the chat directory exists but all chat files are
+    malformed. The session resolves to None (no known membership) → allowed."""
+    member = "eeeeeeee-cccc-0000-0000-000000000003"
+    _make_session(sessions_mod, member)
+
+    # Write a corrupt chat file to the isolated chat dir (create dir if needed)
+    chat_dir = isolated_chats._chat_dir()
+    chat_dir.mkdir(parents=True, exist_ok=True)
+    corrupt = chat_dir / "chat-corrupt123abc.jsonl"
+    corrupt.write_text("{{not valid json\n")
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+
+    # member has no valid chats (all corrupt) → resolve returns None → allowed
+    r = themis_client.post(
+        "/api/themis/check",
+        json={"session_id": member, "tool_name": "Edit", "tool_input": {}},
+    )
+    body = r.json()
+    assert body["ok"] is True  # fail-open: no valid room found → non-roster → allow
 
 
 def test_check_engine_runtime_error_fails_closed_without_member_roles(
@@ -1960,3 +2041,94 @@ def test_verdict_role_binding_end_to_end_bypass_closed(isolated_chats, sessions_
     )
     assert r2.status_code == 200
     assert r2.json()["ok"] is True, "Commit must be allowed after real critic APPROVE + verifier SHIP"
+
+
+# ---------------------------------------------------------------------------
+# Role cache coherence: chat_grant_role must invalidate _ROLE_CACHE
+# ---------------------------------------------------------------------------
+
+
+def test_grant_role_invalidates_target_cache(isolated_chats, sessions_mod, themis_client):
+    """chat_grant_role must bust the Themis role cache so the new role is
+    enforced on the very next resolve_session_role call, not after TTL expiry.
+
+    This is the regression test for the cache-coherence bug where a fresh
+    grant wrote to JSONL but Themis kept serving the stale cached role until
+    the 300-second TTL elapsed."""
+    master_id = "aaaaaaaa-0000-0000-0000-000000000001"
+    target_id = "bbbbbbbb-0000-0000-0000-000000000002"
+    _make_session(sessions_mod, master_id)
+    _make_session(sessions_mod, target_id)
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+    themis_api._ROLE_CACHE.clear()
+
+    # Create room with target as agent
+    isolated_chats.create_room(
+        master_id,
+        [target_id],
+        title="t",
+        member_roles={master_id: "master", target_id: "agent"},
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    isolated_chats.accept(chat_id, target_id)
+
+    # Prime the cache: target → "agent"
+    role_before = themis_api.resolve_session_role(target_id)
+    assert role_before == "agent", "pre-condition: target is agent"
+    assert target_id in themis_api._ROLE_CACHE, "cache was populated"
+
+    # Grant a new role; this must invalidate the cache entry
+    isolated_chats.chat_grant_role(chat_id, master_id, target_id, "critic")
+
+    # Cache entry must be gone so the next resolve re-scans JSONL
+    assert target_id not in themis_api._ROLE_CACHE, (
+        "chat_grant_role must evict the target's cache entry; "
+        "without this the stale 'agent' role persists until TTL expiry"
+    )
+
+    # Subsequent resolve picks up the newly-written role from disk
+    role_after = themis_api.resolve_session_role(target_id)
+    assert role_after == "critic", "resolve_session_role must return new role immediately"
+
+
+def test_grant_role_master_swap_invalidates_both_sessions(
+    isolated_chats, sessions_mod, themis_client
+):
+    """Promoting a new master must invalidate BOTH the new master (target)
+    and the demoted old master so neither session carries a stale cached role."""
+    old_master_id = "cccccccc-0000-0000-0000-000000000001"
+    new_master_id = "dddddddd-0000-0000-0000-000000000002"
+    _make_session(sessions_mod, old_master_id)
+    _make_session(sessions_mod, new_master_id)
+
+    from khimaira.monitor.api import themis as themis_api
+
+    importlib.reload(themis_api)
+    themis_api._ROLE_CACHE.clear()
+
+    isolated_chats.create_room(
+        old_master_id,
+        [new_master_id],
+        title="t2",
+        member_roles={old_master_id: "master", new_master_id: "agent"},
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    isolated_chats.accept(chat_id, new_master_id)
+
+    # Prime both cache entries
+    assert themis_api.resolve_session_role(old_master_id) == "master"
+    assert themis_api.resolve_session_role(new_master_id) == "agent"
+
+    # Atomic promote-demote: new_master_id → master; old_master_id → agent
+    isolated_chats.chat_grant_role(chat_id, old_master_id, new_master_id, "master")
+
+    # Both entries must be evicted
+    assert new_master_id not in themis_api._ROLE_CACHE, "promoted session cache must be evicted"
+    assert old_master_id not in themis_api._ROLE_CACHE, "demoted session cache must be evicted"
+
+    # Roles resolve correctly from fresh JSONL scan
+    assert themis_api.resolve_session_role(new_master_id) == "master"
+    assert themis_api.resolve_session_role(old_master_id) == "agent"

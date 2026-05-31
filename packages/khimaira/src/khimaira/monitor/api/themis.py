@@ -190,12 +190,15 @@ def _resolve_role_from_jsonl(sid: str) -> str | None:
             session_name = member.get("session_name", "")
             role = chats.infer_role_from_name(session_name)
         if role is None:
-            # Layer 4: fail-closed gated on member_roles present for this chat.
-            # Chats without member_roles have not had roles recorded yet — fail-open
-            # there until backfill writes member_roles (at which point future calls
-            # resolve via Layer 1, and any genuinely-unresolvable session hits this).
-            if member_roles_dict:
-                unresolvable_member = True
+            # Layer 4: accepted member whose role can't be resolved via L1-L3.
+            # Any accepted member with an unresolvable role is flagged — regardless
+            # of whether this chat has a member_roles dict. The pre-backfill
+            # exemption (gating on member_roles_dict) is removed: member_roles is
+            # now universal across all active chats (#61 axis-A; verified 2026-05-31).
+            # A genuinely non-roster session (not in any chat) returns None later;
+            # a roster session with an unresolvable role returns _UNRESOLVABLE →
+            # _call_engine blocks (after a durable-read retry in themis_check).
+            unresolvable_member = True
             continue
         last_ts = room["messages"][-1]["ts"] if room["messages"] else ""
         candidates.append((last_ts, role))
@@ -440,6 +443,10 @@ def _log_auth_violation(
 # ---------------------------------------------------------------------------
 
 _EDIT_TOOLS: frozenset[str] = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+# Privileged tools blocked for known-roster sessions whose role can't be resolved
+# after a durable-read retry (#61 axis-A). Writes + commits are the high-value
+# actions an unroled session must not be allowed without enforcement.
+_PRIVILEGED_TOOLS: frozenset[str] = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 _CONTENTION_WINDOW_S = 600  # 10 min — "recently touched"
 
 
@@ -661,6 +668,58 @@ def build_router():
         from khimaira.monitor import sessions as sessions_mod  # local import: lazy + avoids circular
 
         role = resolve_session_role(req.session_id)
+
+        # #61 axis-A: retry via durable-read when role is _UNRESOLVABLE.
+        # _UNRESOLVABLE means the session IS in a chat but role can't be determined.
+        # Common cause: stale cached _UNRESOLVABLE entry after role was recently granted.
+        # Strategy: (1) retry bypassing cache — resolves the cache-staleness case and
+        # enforces the real role; (2) if retry also fails → block privileged actions
+        # (writes/commits) only; non-privileged tools still work so the session isn't bricked.
+        if role == _UNRESOLVABLE:
+            _fresh: str | None = _UNRESOLVABLE
+            try:
+                _retry_sid = chats._resolve_or_uuid(req.session_id)
+                _fresh = _resolve_role_from_jsonl(_retry_sid)
+            except Exception:
+                pass  # retry error → _fresh stays _UNRESOLVABLE
+            if _fresh and _fresh != _UNRESOLVABLE:
+                # Stale cache; durable-read resolved the real role — update cache and proceed.
+                try:
+                    _ROLE_CACHE[_retry_sid] = (_fresh, time.monotonic())
+                except Exception:
+                    pass
+                role = _fresh
+            elif _fresh is None:
+                # Session not in any chat after fresh read → genuinely non-roster → allow.
+                role = None
+            else:
+                # Still unresolvable after durable retry — known-roster, role genuinely absent.
+                # Block privileged actions; allow non-privileged (don't full-brick).
+                import re as _re61
+                _is_privileged_call = req.tool_name in _PRIVILEGED_TOOLS or (
+                    req.tool_name == "Bash"
+                    and bool(_re61.search(
+                        r"\bgit\s+commit\b", (req.tool_input or {}).get("command", "")
+                    ))
+                )
+                if _is_privileged_call:
+                    return {
+                        "ok": False,
+                        "role": None,
+                        "violation": {
+                            "rule_id": "IN-UNRESOLVABLE-RETRY",
+                            "name": "ROLE_UNRESOLVABLE_AFTER_RETRY",
+                            "message": (
+                                "🛑 Themis (#61): this session is a known chat member but its "
+                                "role cannot be resolved (durable retry also failed). "
+                                "Privileged actions (writes/commits) blocked until role is "
+                                "explicitly granted via chat_grant_role."
+                            ),
+                            "severity": "block",
+                        },
+                    }
+                # Non-privileged tool: allow — don't brick on a transient resolution failure.
+                return {"ok": True, "role": None}
 
         # --- Assemble conditions_payload (LAZY enrichment per architect design) ---
         conditions_payload: dict = {
