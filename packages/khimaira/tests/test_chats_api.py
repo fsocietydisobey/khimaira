@@ -1412,8 +1412,10 @@ def test_guard4_no_escalation_without_obligation(guard4_env, monkeypatch):
     )
     monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)
 
+    real_list = sessions_mod.list_sessions
+
     def _mock_list(use_cache=True, **kw):
-        rows = sessions_mod.list_sessions(use_cache=False)
+        rows = real_list(use_cache=False)
         for r in rows:
             if r.get("session_id") == lone_sid:
                 r["last_active_age_s"] = 300.0
@@ -1470,4 +1472,252 @@ def test_guard4_debounce_fires_once(guard4_env, monkeypatch):
     assert count_after_second == count_after_first, (
         f"Guard-4 debounce: should not re-fire on second scan. "
         f"First={count_after_first}, second={count_after_second}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Guard-4 refinement tests — 2D pending-gate (Fix A) + obligation-scoped debounce (Fix B)
+# ---------------------------------------------------------------------------
+
+
+def test_guard4_pending_no_begin_alive_does_not_escalate(guard4_env, monkeypatch):
+    """Fix A AC-1: pending + NO-BEGIN + alive → NO escalate (compliant BEGIN-waiting).
+
+    Agent-1's exact false-positive case: the agent is correctly holding until
+    master fires BEGIN. Guard-4 must not penalize this compliance.
+    """
+    import asyncio, uuid
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    assignee_sid = str(uuid.uuid4())
+    _setup_guard4_scenario(chats_mod, sessions_mod, assignee_sid)
+    # No BEGIN fired (pending task, no signal_task_start)
+
+    notices: list = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append(a) or {},
+    )
+
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: True)
+    monkeypatch.setattr(api_mod, "_compute_throttle_ceiling_s", lambda: 60.0)
+
+    real_list = sessions_mod.list_sessions
+
+    def _mock_list(use_cache=True, **kw):
+        rows = real_list(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = 300.0  # > ceiling
+        return rows
+
+    monkeypatch.setattr(sessions_mod, "list_sessions", _mock_list)
+    api_mod._GUARD4_STALLED.clear()
+
+    asyncio.run(api_mod._guard4_check_once())
+
+    assert len(notices) == 0, (
+        "Guard-4 must NOT escalate pending+no-BEGIN+alive (compliant BEGIN-waiting). "
+        f"Got {len(notices)} escalation(s). agent-1's false-positive case."
+    )
+
+
+def test_guard4_pending_no_begin_unknown_does_not_escalate(guard4_env, monkeypatch):
+    """Fix A AC-2: pending + NO-BEGIN + unknown liveness → NO escalate."""
+    import asyncio, uuid
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    assignee_sid = str(uuid.uuid4())
+    _setup_guard4_scenario(chats_mod, sessions_mod, assignee_sid)
+
+    notices: list = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append(a) or {},
+    )
+
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: None)  # unknown
+    monkeypatch.setattr(api_mod, "_compute_throttle_ceiling_s", lambda: 60.0)
+
+    real_list = sessions_mod.list_sessions
+
+    def _mock_list(use_cache=True, **kw):
+        rows = real_list(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = 300.0
+        return rows
+
+    monkeypatch.setattr(sessions_mod, "list_sessions", _mock_list)
+    api_mod._GUARD4_STALLED.clear()
+
+    asyncio.run(api_mod._guard4_check_once())
+
+    assert len(notices) == 0, (
+        "Guard-4 must NOT escalate pending+no-BEGIN+unknown-liveness. "
+        f"Got {len(notices)} escalation(s)."
+    )
+
+
+def test_guard4_pending_no_begin_dead_escalates(guard4_env, monkeypatch):
+    """Fix A AC-3: pending + NO-BEGIN + confirmed-dead → ESCALATE.
+
+    A dead agent never posts a ready-ack → #14a auto-BEGIN can't fire → reassign needed.
+    """
+    import asyncio, uuid
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    assignee_sid = str(uuid.uuid4())
+    _setup_guard4_scenario(chats_mod, sessions_mod, assignee_sid)
+
+    notices: list = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append({"args": a, "kw": kw}) or {},
+    )
+
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)  # dead
+
+    real_list = sessions_mod.list_sessions
+
+    def _mock_list(use_cache=True, **kw):
+        rows = real_list(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = 300.0
+        return rows
+
+    monkeypatch.setattr(sessions_mod, "list_sessions", _mock_list)
+    api_mod._GUARD4_STALLED.clear()
+
+    asyncio.run(api_mod._guard4_check_once())
+
+    assert len(notices) >= 1, (
+        "Guard-4 must escalate pending+no-BEGIN+confirmed-dead (dead agent can't self-recover). "
+        f"Got {len(notices)} escalations."
+    )
+
+
+def test_guard4_pending_begin_fired_alive_escalates(guard4_env, monkeypatch):
+    """Fix A AC-4: pending + BEGIN-fired + not-started + alive → ESCALATE (when > ceiling).
+
+    Agent got BEGIN, #14b nagged it, still not started → wedged → Guard-4 escalates to master.
+    """
+    import asyncio, uuid
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    master_sid = str(uuid.uuid4())
+    assignee_sid = str(uuid.uuid4())
+
+    for sid in (master_sid, assignee_sid):
+        import json
+        sd = sessions_mod._BASE_DIR / sid
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "status.json").write_text(
+            json.dumps({"status": "idle", "name": sid[:8]}), encoding="utf-8"
+        )
+
+    chat_id = chats_mod.create_room(
+        creator_session_id=master_sid,
+        member_session_ids=[assignee_sid],
+        title="begin-test",
+        member_roles={master_sid: "master", assignee_sid: "agent"},
+    )["meta"]["chat_id"]
+    chats_mod.accept(chat_id, assignee_sid)
+    task = chats_mod.create_task(
+        chat_id=chat_id,
+        sender_session_id=master_sid,
+        body="do the thing",
+        assignee_session_id=assignee_sid,
+    )
+    # Fire BEGIN
+    chats_mod.signal_task_start(chat_id, task["id"], master_sid)
+
+    notices: list = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append(a) or {},
+    )
+
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: True)  # alive
+    monkeypatch.setattr(api_mod, "_compute_throttle_ceiling_s", lambda: 60.0)
+
+    real_list = sessions_mod.list_sessions
+
+    def _mock_list(use_cache=True, **kw):
+        rows = real_list(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = 300.0  # > ceiling
+        return rows
+
+    monkeypatch.setattr(sessions_mod, "list_sessions", _mock_list)
+    api_mod._GUARD4_STALLED.clear()
+
+    asyncio.run(api_mod._guard4_check_once())
+
+    assert len(notices) >= 1, (
+        "Guard-4 must escalate pending+BEGIN-fired+alive+silence>ceiling (wedged post-BEGIN). "
+        f"Got {len(notices)} escalations."
+    )
+
+
+def test_guard4_debounce_not_reset_by_activity_blip(guard4_env, monkeypatch):
+    """Fix B AC-9: a legitimate escalation fires ONCE; an activity-blip does NOT re-arm.
+
+    After escalation, if the session briefly becomes active (last_active_age_s drops
+    below MIN_SILENCE_S) but the obligation persists, the next sweep must NOT re-escalate.
+    """
+    import asyncio, uuid
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    assignee_sid = str(uuid.uuid4())
+    _setup_guard4_scenario(chats_mod, sessions_mod, assignee_sid)
+
+    notices: list = []
+    monkeypatch.setattr(
+        "khimaira.monitor.sessions.post_notice",
+        lambda *a, **kw: notices.append(a) or {},
+    )
+
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)  # dead
+
+    silence = [300.0]  # mutable for sweep-by-sweep control
+
+    real_list = sessions_mod.list_sessions
+
+    def _mock_list(use_cache=True, **kw):
+        rows = real_list(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = silence[0]
+        return rows
+
+    monkeypatch.setattr(sessions_mod, "list_sessions", _mock_list)
+    api_mod._GUARD4_STALLED.clear()
+
+    # First sweep → escalates
+    asyncio.run(api_mod._guard4_check_once())
+    count_after_first = len(notices)
+    assert count_after_first >= 1, "First sweep must escalate."
+
+    # Activity-blip: session briefly active (silence drops below MIN_SILENCE_S)
+    silence[0] = 10.0  # below _GUARD4_MIN_SILENCE_S
+    asyncio.run(api_mod._guard4_check_once())
+    # Blip doesn't re-arm the debounce (session still has the same obligation)
+
+    # Session goes silent again beyond ceiling
+    silence[0] = 300.0
+    asyncio.run(api_mod._guard4_check_once())
+    count_after_blip = len(notices)
+
+    assert count_after_blip == count_after_first, (
+        f"Guard-4 debounce must persist through activity-blips. "
+        f"First={count_after_first}, after blip+re-silence={count_after_blip}. "
+        "The obligation hasn't cleared — no re-escalation should fire."
     )

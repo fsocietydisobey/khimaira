@@ -389,10 +389,30 @@ def _is_process_alive_for_session(session_id: str) -> bool | None:
         return None
 
 
+def _was_begin_fired(chat_id: str, task_id: str) -> bool:
+    """Return True if a TASK_SIGNAL start event exists for this task (BEGIN was fired).
+
+    Used by Guard-4 2D pending-gate: a pending task with no BEGIN is compliant-waiting;
+    a pending task WITH BEGIN is begun-but-not-started (potentially wedged).
+    Fail-open: returns False on any read error (pending→no-escalate is the safer default).
+    """
+    try:
+        for line in chats._read(chat_id):
+            if (
+                line.get("kind") == chats.TASK_SIGNAL
+                and line.get("task_id") == task_id
+                and line.get("signal") == "start"
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _get_session_obligations(session_id: str) -> list[dict]:
     """Find tasks where session_id is assignee with status pending or in_progress.
 
-    Scans all chat JSONL files. Returns list of {task_id, chat_id, status}.
+    Scans all chat JSONL files. Returns list of {task_id, chat_id, status, begin_fired}.
     Fail-open: errors scanning a chat are silently skipped.
     """
     obligations: list[dict] = []
@@ -415,11 +435,16 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                                 "task_id": tid,
                                 "assignee_id": line.get("assignee_id"),
                                 "status": line.get("status"),
+                                "begin_fired": False,
                             }
                     elif k == chats.TASK_UPDATE:
                         tid = line.get("task_id")
                         if tid and tid in tasks:
                             tasks[tid]["status"] = line.get("status")
+                    elif k == chats.TASK_SIGNAL and line.get("signal") == "start":
+                        tid = line.get("task_id")
+                        if tid and tid in tasks:
+                            tasks[tid]["begin_fired"] = True
                 for task in tasks.values():
                     if (
                         task.get("assignee_id") == session_id
@@ -429,6 +454,7 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                             "task_id": task["task_id"],
                             "chat_id": chat_id,
                             "status": task["status"],
+                            "begin_fired": task.get("begin_fired", False),
                         })
             except Exception:
                 continue
@@ -498,13 +524,40 @@ def _resolve_intake_session_id(chat_id: str) -> str | None:
 
 
 async def _guard4_check_once() -> None:
-    """Scan sessions for stall conditions; escalate with debounce."""
+    """Scan sessions for stall conditions; escalate with debounce.
+
+    Fix A: 2D pending-gate (BEGIN-fired × liveness).
+    Fix B: obligation-scoped debounce — only clear when the obligation itself clears,
+           not when the session has an activity-blip (prevents re-spam).
+    """
     now = time.time()
 
-    # Sweep stale debounce entries
+    # Sweep stale debounce entries (TTL-based fallback)
     expired = [k for k, ts in _GUARD4_STALLED.items() if now - ts > _GUARD4_STALLED_TTL_S]
     for k in expired:
         _GUARD4_STALLED.pop(k, None)
+
+    # Fix B: clear debounce entries whose obligations have cleared (task no longer active).
+    # Collect current active (session_id, task_id) pairs across all obligations; any stalled
+    # key NOT in the current set means the obligation was closed → re-arm for future stalls.
+    try:
+        current_obligation_keys: set[tuple[str, str]] = set()
+        for sid_key in list(_GUARD4_STALLED.keys()):
+            sid, tid = sid_key
+            # Re-scan obligations for this session and check if this task is still active.
+            active_for_session = {
+                (sid, o["task_id"])
+                for o in _get_session_obligations(sid)
+            }
+            current_obligation_keys |= active_for_session
+        cleared = [
+            k for k in list(_GUARD4_STALLED.keys())
+            if k not in current_obligation_keys
+        ]
+        for k in cleared:
+            _GUARD4_STALLED.pop(k, None)
+    except Exception:
+        pass  # fail-open: stale entries expire via TTL
 
     try:
         from khimaira.monitor import sessions as sessions_mod
@@ -536,28 +589,58 @@ async def _guard4_check_once() -> None:
 
         for obligation in obligations:
             obligation_key = (session_id, obligation["task_id"])
-            if obligation_key in _GUARD4_STALLED:
-                # Check if obligation cleared (session became active again)
-                if last_age_s < _GUARD4_MIN_SILENCE_S:
-                    _GUARD4_STALLED.pop(obligation_key, None)
-                continue  # already escalated; don't re-fire
+            task_status = obligation.get("status")
+            begin_fired = obligation.get("begin_fired", False)
 
-            if alive is False:
-                # Process DEAD → crash → escalate immediately
-                _GUARD4_STALLED[obligation_key] = now
-                await _guard4_escalate(session_id, obligation, session_name, "crash", silence_s)
-            elif alive is True and silence_s <= ceiling:
-                # Process ALIVE, within grace window → suppress (🟡 throttled)
-                pass
-            elif alive is True and silence_s > ceiling:
-                # Process ALIVE but beyond ceiling → possibly hung
-                _GUARD4_STALLED[obligation_key] = now
-                await _guard4_escalate(session_id, obligation, session_name, "hung", silence_s)
+            # Fix B: obligation-scoped debounce — do NOT clear on activity-blips.
+            # Only clear when the obligation itself has cleared (status transitions
+            # to a terminal/non-active state — detected by the obligation no longer
+            # appearing in the obligations list, so once set it stays until it
+            # drops off naturally via the 1h TTL, OR we detect the obligation is gone
+            # by re-scanning — but since we're iterating current obligations,
+            # a key present in _GUARD4_STALLED means the obligation hasn't cleared yet).
+            if obligation_key in _GUARD4_STALLED:
+                continue  # already escalated for this obligation; don't re-fire
+
+            # Fix A: 2D pending-gate (BEGIN-fired × liveness).
+            # pending and in_progress have different stall semantics.
+            if task_status == chats.TASK_PENDING:
+                if not begin_fired:
+                    # pending + NO-BEGIN: compliant BEGIN-waiting (agent told to hold).
+                    # Only escalate if the assignee is CONFIRMED-DEAD (then #14a can't recover).
+                    if alive is False:
+                        # Dead agent + pending + no BEGIN → #14a can't fire (dead never ready-acks)
+                        _GUARD4_STALLED[obligation_key] = now
+                        await _guard4_escalate(
+                            session_id, obligation, session_name, "crash", silence_s
+                        )
+                    # alive=True or alive=None → compliant BEGIN-waiting → don't escalate
+                else:
+                    # pending + BEGIN-FIRED + not-started → wedged post-BEGIN
+                    # #14b banner nags the agent; Guard-4 escalates to master if it persists.
+                    # Escalate regardless of liveness once BEGIN was fired.
+                    if silence_s > ceiling:
+                        reason = "crash" if alive is False else "hung" if alive is True else "unknown"
+                        _GUARD4_STALLED[obligation_key] = now
+                        await _guard4_escalate(
+                            session_id, obligation, session_name, reason, silence_s
+                        )
             else:
-                # alive is None (liveness unknown) — fall back to ceiling check only
-                if silence_s > ceiling:
+                # in_progress: existing three-way logic unchanged.
+                if alive is False:
                     _GUARD4_STALLED[obligation_key] = now
-                    await _guard4_escalate(session_id, obligation, session_name, "unknown", silence_s)
+                    await _guard4_escalate(session_id, obligation, session_name, "crash", silence_s)
+                elif alive is True and silence_s <= ceiling:
+                    pass  # within grace window — suppress (🟡 throttled)
+                elif alive is True and silence_s > ceiling:
+                    _GUARD4_STALLED[obligation_key] = now
+                    await _guard4_escalate(session_id, obligation, session_name, "hung", silence_s)
+                else:  # alive is None
+                    if silence_s > ceiling:
+                        _GUARD4_STALLED[obligation_key] = now
+                        await _guard4_escalate(
+                            session_id, obligation, session_name, "unknown", silence_s
+                        )
 
 
 async def _guard4_watcher() -> None:
