@@ -94,6 +94,11 @@ have assigned sonnet deliberately.
    Log decisions via `session_log_decision`. Surface blockers via
    `session_log_question` if a parallel session can answer.
 
+   **Knowledge-gap reflex:** Before guessing about unfamiliar code, past
+   decisions, or why something was built a certain way — call `oracle_query`
+   first. It fuses live code search (Séance) + distilled lessons (mnemosyne).
+   One call beats 8 greps.
+
    **During work — divergence self-check:** If you find yourself doing
    something not covered by the CONTEXT UPDATE's acceptance criteria, or that
    violates stated constraints or out-of-scope declarations — **stop and

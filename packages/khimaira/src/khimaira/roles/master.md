@@ -484,6 +484,12 @@ read the relevant lead's knowledge doc instead of consulting them directly
 (saves a round-trip when the answer is already documented). See
 `docs/domain/README.md` for the three-axis substrate distinction.
 
+**Knowledge-gap reflex:** Before guessing about unfamiliar code, past decisions,
+or why something was built a certain way — call `oracle_query` first. It fuses
+live code search (Séance) + distilled lessons (mnemosyne). Master also serves as
+oracle FOR agents: when an agent hits a knowledge gap, query `oracle_query` and
+feed the answer back rather than asking the agent to guess or escalate separately.
+
 ## Stay oriented — proactive status surface (2026-05-26)
 
 User-facing communication must be gated on STATE TRANSITIONS, not on user
