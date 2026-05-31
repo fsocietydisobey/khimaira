@@ -941,6 +941,13 @@ class ResumeMasterReq(BaseModel):
     demote_to: str = "agent"
 
 
+class GrantRoleReq(BaseModel):
+    by_session_id: str
+    target_session_id: str
+    role: str
+    demote_to: str = "agent"
+
+
 class RejectReq(BaseModel):
     session_id: str
 
@@ -1363,6 +1370,45 @@ def build_router():
                 code = 409
             elif "not the recorded original master" in msg or "demote_to" in msg:
                 code = 403
+            else:
+                code = 404
+            raise fastapi.HTTPException(code, msg) from exc
+
+    @router.post("/chats/{chat_id}/grant-role")
+    async def grant_role(chat_id: str, req: GrantRoleReq) -> dict:
+        """Phase B v2: master-only role grant. Calls chats.chat_grant_role and
+        immediately invalidates the Themis role cache for the affected sessions
+        so the new role is enforced on the next tool call (no TTL wait)."""
+        try:
+            result = chats.chat_grant_role(
+                chat_id,
+                req.by_session_id,
+                req.target_session_id,
+                req.role,
+                demote_to=req.demote_to,
+            )
+            # chats.chat_grant_role already lazily invalidates the cache, but
+            # belt-and-suspenders: _inval here covers the case where the lazy
+            # import inside chats.py failed silently (fail-open contract).
+            _inval(req.target_session_id)
+            if req.role == chats.ROLE_MASTER:
+                # Master-swap demotes a second session whose id isn't in req.
+                # Clear the entire cache rather than miss the demoted session.
+                try:
+                    from .themis import clear_role_cache
+
+                    clear_role_cache()
+                except Exception:
+                    pass
+            return result
+        except ValueError as exc:
+            msg = str(exc)
+            if "not the master" in msg:
+                code = 403
+            elif "only accepted members" in msg or "Invalid role" in msg:
+                code = 422
+            elif "not in" in msg:
+                code = 422
             else:
                 code = 404
             raise fastapi.HTTPException(code, msg) from exc

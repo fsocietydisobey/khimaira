@@ -1980,3 +1980,67 @@ def test_guard4_debounce_not_reset_by_activity_blip(guard4_env, monkeypatch):
         f"First={count_after_first}, after blip+re-silence={count_after_blip}. "
         "The obligation hasn't cleared — no re-escalation should fire."
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /chats/{chat_id}/grant-role
+# ---------------------------------------------------------------------------
+
+
+def test_post_grant_role_happy_path(chats_api_client):
+    """Master grants a new role to an accepted member → 200 + member_roles updated."""
+    client, chats_mod = chats_api_client
+    # Create room: alice=master, bob=agent
+    resp = client.post(
+        "/api/chats",
+        json={
+            "creator_session_id": "alice",
+            "member_session_ids": ["bob"],
+            "title": "grant-role test",
+            "member_roles": {"alice": "master", "bob": "agent"},
+        },
+    )
+    assert resp.status_code == 200
+    chat_id = resp.json()["meta"]["chat_id"]
+
+    # Bob accepts
+    client.post("/api/chats/{}/accept".format(chat_id), json={"session_id": "bob"})
+
+    # Alice grants bob critic role
+    r = client.post(
+        f"/api/chats/{chat_id}/grant-role",
+        json={
+            "by_session_id": "alice",
+            "target_session_id": "bob",
+            "role": "critic",
+        },
+    )
+    assert r.status_code == 200
+    new_meta = r.json()
+    assert new_meta["member_roles"]["bob"] == "critic"
+
+
+def test_post_grant_role_non_master_returns_403(chats_api_client):
+    """Non-master caller → 403 Forbidden."""
+    client, _ = chats_api_client
+    resp = client.post(
+        "/api/chats",
+        json={
+            "creator_session_id": "alice",
+            "member_session_ids": ["bob"],
+            "title": "grant-role 403 test",
+            "member_roles": {"alice": "master", "bob": "agent"},
+        },
+    )
+    chat_id = resp.json()["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+
+    r = client.post(
+        f"/api/chats/{chat_id}/grant-role",
+        json={
+            "by_session_id": "bob",   # bob is agent, not master
+            "target_session_id": "alice",
+            "role": "agent",
+        },
+    )
+    assert r.status_code == 403
