@@ -321,6 +321,78 @@ def _inject_text_and_submit(window_id: int, text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Wake-gate helpers: pending task / pending invite checks
+# ---------------------------------------------------------------------------
+
+def _session_has_pending_task(session_id: str) -> bool:
+    """Return True if any chat has a task assigned to session_id with status=pending.
+
+    Complements _get_session_obligations (which covers in-progress obligations).
+    Fail-open: returns False on any read error.
+    """
+    try:
+        from khimaira.monitor import chats as chats_mod
+
+        chat_dir = chats_mod._chat_dir()
+        if not chat_dir.exists():
+            return False
+        for chat_path in chat_dir.glob("chat-*.jsonl"):
+            chat_id = chat_path.stem
+            try:
+                tasks: dict[str, dict] = {}
+                for line in chats_mod._read(chat_id):
+                    k = line.get("kind")
+                    if k == chats_mod.TASK:
+                        tid = line.get("id")
+                        if tid:
+                            tasks[tid] = {
+                                "assignee_id": line.get("assignee_id"),
+                                "status": line.get("status"),
+                            }
+                    elif k == chats_mod.TASK_UPDATE:
+                        tid = line.get("task_id")
+                        if tid and tid in tasks:
+                            tasks[tid]["status"] = line.get("status")
+                for task in tasks.values():
+                    if (
+                        task.get("assignee_id") == session_id
+                        and task.get("status") == chats_mod.TASK_PENDING
+                    ):
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _session_has_pending_invite(session_id: str) -> bool:
+    """Return True if any chat has session_id in 'pending' membership state.
+
+    Detects sessions with unaccepted invites so the watcher can prod them to
+    accept. Fail-open: returns False on any read error.
+    """
+    try:
+        from khimaira.monitor import chats as chats_mod
+
+        chat_dir = chats_mod._chat_dir()
+        if not chat_dir.exists():
+            return False
+        for chat_path in chat_dir.glob("chat-*.jsonl"):
+            chat_id = chat_path.stem
+            try:
+                room = chats_mod.load_room(chat_id)
+                member = room["members"].get(session_id)
+                if member and member.get("state") == chats_mod.PENDING:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Per-window decision logic
 # ---------------------------------------------------------------------------
 
@@ -430,7 +502,13 @@ async def _process_window(win: dict[str, Any]) -> None:
         obligations = await asyncio.get_event_loop().run_in_executor(
             None, _get_session_obligations, session_id
         )
-        if not obligations:
+        has_pending_task = await asyncio.get_event_loop().run_in_executor(
+            None, _session_has_pending_task, session_id
+        )
+        has_pending_invite = await asyncio.get_event_loop().run_in_executor(
+            None, _session_has_pending_invite, session_id
+        )
+        if not obligations and not has_pending_task and not has_pending_invite:
             return
 
         rows = sessions_mod.list_sessions(use_cache=True)

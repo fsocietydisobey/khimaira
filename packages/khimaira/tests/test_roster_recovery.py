@@ -347,3 +347,63 @@ class TestProcessWindow:
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_watcher_wakes_session_with_pending_task(self):
+        """Idle session with a pending-not-started task qualifies for wake."""
+        screen = "75% context used\n>"  # below compact threshold, idle
+
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
+            patch.object(rr, "_session_has_pending_task", return_value=True),
+            patch.object(rr, "_session_has_pending_invite", return_value=False),
+            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+            patch("khimaira.monitor.sessions.list_sessions", return_value=[
+                {"session_id": "uuid-1234", "last_active_age_s": 400}
+            ]),
+        ):
+            await rr._process_window(self._win())
+        mock_inject.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_watcher_wakes_session_with_pending_invite(self):
+        """Idle session with a pending chat invite qualifies for wake."""
+        screen = "60% context used\n>"  # below compact threshold, idle
+
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
+            patch.object(rr, "_session_has_pending_task", return_value=False),
+            patch.object(rr, "_session_has_pending_invite", return_value=True),
+            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+            patch("khimaira.monitor.sessions.list_sessions", return_value=[
+                {"session_id": "uuid-1234", "last_active_age_s": 400}
+            ]),
+        ):
+            await rr._process_window(self._win())
+        mock_inject.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_watcher_no_false_wake_no_obligation(self):
+        """Idle session with no task, no invite, no obligation → no wake."""
+        screen = "60% context used\n>"
+
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
+            patch.object(rr, "_session_has_pending_task", return_value=False),
+            patch.object(rr, "_session_has_pending_invite", return_value=False),
+            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+        ):
+            await rr._process_window(self._win())
+        mock_inject.assert_not_called()
