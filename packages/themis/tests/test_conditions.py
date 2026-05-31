@@ -94,6 +94,20 @@ class TestChatMyChatsNotCalledThisTurn:
         }
         assert chat_my_chats_not_called_this_turn(payload) is True
 
+    def test_bootstrap_grace_absent_heartbeat_early(self, monkeypatch):
+        """turn_count=1 (below grace), no heartbeat → False (genuinely bootstrapping)."""
+        import themis.conditions as cond_mod
+        monkeypatch.setattr(cond_mod, "_get_session_tool_call_count", lambda sid: 1)
+        payload = {"session_id": "new-session", "turn_start_ts": self._past(30)}
+        assert chat_my_chats_not_called_this_turn(payload) is False
+
+    def test_never_registered_absent_heartbeat_late(self, monkeypatch):
+        """turn_count=5 (above grace), no heartbeat → True (never-registered violation)."""
+        import themis.conditions as cond_mod
+        monkeypatch.setattr(cond_mod, "_get_session_tool_call_count", lambda sid: 5)
+        payload = {"session_id": "old-session", "turn_start_ts": self._past(30)}
+        assert chat_my_chats_not_called_this_turn(payload) is True
+
 
 class TestNoRecentTopTierConsult:
     def test_returns_true_with_no_consult(self):

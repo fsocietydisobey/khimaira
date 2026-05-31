@@ -1965,6 +1965,20 @@ def chat_grant_role(
     }
     _append(chat_id, new_meta)
 
+    # Invalidate Themis role cache for affected sessions so enforcement
+    # picks up the new role on the NEXT tool call, not after the 300s TTL.
+    # Lazy import avoids a circular dependency (api.themis imports chats);
+    # fail-open mirrors api/chats._inval — a stale cache entry expires via
+    # the 5-min safety TTL at worst.
+    try:
+        from khimaira.monitor.api.themis import invalidate_role_cache  # noqa: PLC0415
+
+        invalidate_role_cache(target_session_id)
+        if demoted_master_sid is not None:
+            invalidate_role_cache(demoted_master_sid)
+    except Exception:
+        pass
+
     # Phase B v1.5: emit role-grant directives. Target always gets one
     # (silent-skipped only if the new role has no ROLE_BUDGET default —
     # currently just `critic`). On master-swap, the demoted prior master
@@ -2393,24 +2407,18 @@ _PPID_TTL_SECONDS = 300  # 5 min — subprocess should fetch within this window
 # ppid → (session_id, registered_at_unix_ts)
 _pending_session_by_ppid: dict[int, tuple[str, float]] = {}
 
-# Durable reverse map: session_id → ppid (Claude Code process PID).
-# Populated at register_session_by_ppid() time; no TTL since it's used
-# for long-running Guard-4 / #13b-light process-liveness checks.
-_session_ppid: dict[str, int] = {}
-
-
 def register_session_by_ppid(ppid: int, session_id: str) -> None:
     """SessionStart hook calls this with the session_id it knows about."""
     import time
 
     _gc_pending_sessions()
     _pending_session_by_ppid[ppid] = (session_id, time.time())
-    _session_ppid[session_id] = ppid
+    sessions_mod.set_session_ppid(session_id, ppid)
 
 
 def get_session_ppid(session_id: str) -> int | None:
     """Return the Claude Code process PID for this session, or None if unknown."""
-    return _session_ppid.get(session_id)
+    return sessions_mod.get_session_ppid(session_id)
 
 
 def lookup_session_by_ppid(ppid: int) -> str | None:

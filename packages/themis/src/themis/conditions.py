@@ -63,6 +63,36 @@ def idle_agents_exist(payload: dict[str, Any]) -> bool:
     return len(agents) > 0
 
 
+# Sessions at turn ≥ BOOTSTRAP_GRACE_TURNS that have never stamped a
+# heartbeat are flagged as never-registered (IN-MASTER-1).  Sessions
+# younger than this are assumed to be genuinely bootstrapping.
+BOOTSTRAP_GRACE_TURNS: int = 3
+
+
+def _get_session_tool_call_count(session_id: str) -> int | None:
+    """Count entries in the session's tool_calls.jsonl as a turn-age proxy.
+
+    Returns None if the file is absent (caller treats as bootstrapping).
+    Reads the XDG_STATE_HOME path directly to avoid a cross-package import.
+    """
+    try:
+        import os
+        from pathlib import Path
+
+        state_root = Path(
+            os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
+        )
+        tool_calls_path = (
+            state_root / "khimaira" / "sessions" / session_id / "tool_calls.jsonl"
+        )
+        if not tool_calls_path.is_file():
+            return None
+        with tool_calls_path.open(encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except Exception:
+        return None
+
+
 def chat_my_chats_not_called_this_turn(payload: dict[str, Any]) -> bool:
     """True only if the heartbeat predates this turn AND no chat_my_chats in recent_tool_calls.
 
@@ -74,18 +104,28 @@ def chat_my_chats_not_called_this_turn(payload: dict[str, Any]) -> bool:
     Violation (True) only when BOTH conditions hold: heartbeat is stale AND
     no chat_my_chats was called this turn.
 
+    Never-registered path: absent heartbeat + session old enough (tool call count
+    >= BOOTSTRAP_GRACE_TURNS) → True (never subscribed, not bootstrapping).
+
     Expects:
+      payload["session_id"]: the session being checked (used for never-registered path).
       payload["subscriber_last_heartbeat"]: ISO-8601 timestamp of last heartbeat.
       payload["turn_start_ts"]: ISO-8601 turn start (UserPromptSubmit hook).
       payload["recent_tool_calls"]: list of {ts, tool, params} dicts (optional).
 
-    Fail-open: absent heartbeat or turn_start → False (can't confirm without both).
+    Fail-open: absent heartbeat or turn_start → False unless never-registered.
     Absent recent_tool_calls → fall through to heartbeat-only check.
     """
     heartbeat_str = payload.get("subscriber_last_heartbeat")
     turn_start_str = payload.get("turn_start_ts")
     if not heartbeat_str or not turn_start_str:
-        return False
+        # Never-registered path: session has been active long enough but never stamped.
+        session_id = payload.get("session_id")
+        if session_id:
+            tool_count = _get_session_tool_call_count(session_id)
+            if tool_count is not None and tool_count >= BOOTSTRAP_GRACE_TURNS:
+                return True  # never registered — flag as violation
+        return False  # genuinely bootstrapping or can't determine age
     try:
         heartbeat = datetime.fromisoformat(heartbeat_str)
         turn_start = datetime.fromisoformat(turn_start_str)

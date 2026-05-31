@@ -224,6 +224,58 @@ def recent_tool_calls(session_id: str, limit: int = 20) -> list[dict]:
     return _read_jsonl(path)[-limit:]
 
 
+# Durable reverse map: session_id → ppid. Populated by set_session_ppid;
+# persisted to status.json so it survives daemon restarts.
+_session_ppid: dict[str, int] = {}
+
+
+def set_session_ppid(session_id: str, ppid: int) -> None:
+    """Record the Claude Code process PID for session_id.
+
+    Persists to status.json["ppid"] so the value survives daemon restarts.
+    Fail-open: persistence errors are swallowed; the in-memory entry is always set.
+    """
+    _session_ppid[session_id] = ppid
+    try:
+        path = _session_dir(session_id) / "status.json"
+        existing: dict = {}
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+        existing["ppid"] = ppid
+        path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        _invalidate_list_sessions_cache()
+    except Exception:
+        pass
+
+
+def get_session_ppid(session_id: str) -> int | None:
+    """Return the Claude Code PID for session_id, or None if unknown.
+
+    Checks the in-memory cache first; falls back to status.json on a cache miss
+    (e.g., after daemon restart). Warms the cache on a successful read-through.
+    """
+    if session_id in _session_ppid:
+        return _session_ppid[session_id]
+    try:
+        sd = _session_dir_read(session_id)
+        if sd is None:
+            return None
+        status_path = sd / "status.json"
+        if not status_path.is_file():
+            return None
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        ppid = data.get("ppid")
+        if ppid is not None:
+            _session_ppid[session_id] = int(ppid)
+            return int(ppid)
+    except Exception:
+        pass
+    return None
+
+
 def write_sse_heartbeat(session_id: str) -> None:
     """Subscriber-side heartbeat. Called from the PostToolUse hook on every tool
     call. Stamps `last_sse_heartbeat` into status.json so daemon can detect

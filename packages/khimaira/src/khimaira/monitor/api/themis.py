@@ -664,6 +664,7 @@ def build_router():
 
         # --- Assemble conditions_payload (LAZY enrichment per architect design) ---
         conditions_payload: dict = {
+            "session_id": req.session_id,
             "recent_tool_calls": req.recent_tool_calls,
             "tool_name": req.tool_name,
             "tool_input": req.tool_input,
