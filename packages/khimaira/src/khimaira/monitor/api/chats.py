@@ -1002,7 +1002,17 @@ def build_router():
     @router.get("/chats")
     async def list_my_chats(session_id: str) -> dict:
         try:
-            return {"chats": chats.my_chats(session_id)}
+            result = {"chats": chats.my_chats(session_id)}
+            # Self-heal IN-MASTER-1: stamp the SSE heartbeat for this session so
+            # Themis sees a fresh heartbeat even when the SSE connection died
+            # (e.g. after /compact). The heartbeat is the signal IN-MASTER-1 uses;
+            # calling chat_my_chats IS the correct fulfillment of that obligation.
+            try:
+                from khimaira.monitor import sessions as sessions_mod
+                sessions_mod.write_sse_heartbeat(session_id)
+            except Exception:
+                pass  # never block the list response
+            return result
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
 

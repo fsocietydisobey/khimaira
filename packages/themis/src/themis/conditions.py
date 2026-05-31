@@ -64,16 +64,23 @@ def idle_agents_exist(payload: dict[str, Any]) -> bool:
 
 
 def chat_my_chats_not_called_this_turn(payload: dict[str, Any]) -> bool:
-    """True if the session's SSE subscriber heartbeat predates the current turn.
+    """True only if the heartbeat predates this turn AND no chat_my_chats in recent_tool_calls.
+
+    Two-path pass:
+      1. Fresh heartbeat (>= turn_start) → False (session is subscribed).
+      2. Stale heartbeat BUT chat_my_chats appears in recent_tool_calls with
+         ts >= turn_start → False (session self-healed this turn via GET /chats).
+
+    Violation (True) only when BOTH conditions hold: heartbeat is stale AND
+    no chat_my_chats was called this turn.
 
     Expects:
-      payload["subscriber_last_heartbeat"]: ISO-8601 timestamp of the last
-        chat_my_chats call for this session (from GET /api/chats/subscribers/<id>).
-      payload["turn_start_ts"]: ISO-8601 timestamp when the current turn began
-        (recorded by UserPromptSubmit hook to ~/.local/state/khimaira/sessions/<id>/turn_start.txt).
+      payload["subscriber_last_heartbeat"]: ISO-8601 timestamp of last heartbeat.
+      payload["turn_start_ts"]: ISO-8601 turn start (UserPromptSubmit hook).
+      payload["recent_tool_calls"]: list of {ts, tool, params} dicts (optional).
 
-    If either key is absent, returns False (fail-closed: can't confirm the
-    condition without both timestamps).
+    Fail-open: absent heartbeat or turn_start → False (can't confirm without both).
+    Absent recent_tool_calls → fall through to heartbeat-only check.
     """
     heartbeat_str = payload.get("subscriber_last_heartbeat")
     turn_start_str = payload.get("turn_start_ts")
@@ -87,7 +94,27 @@ def chat_my_chats_not_called_this_turn(payload: dict[str, Any]) -> bool:
             heartbeat = heartbeat.replace(tzinfo=timezone.utc)
         if turn_start.tzinfo is None:
             turn_start = turn_start.replace(tzinfo=timezone.utc)
-        return heartbeat < turn_start
+        if heartbeat >= turn_start:
+            return False  # heartbeat is fresh — no violation
+        # Heartbeat is stale. Check recent_tool_calls for a chat_my_chats this turn.
+        recent = payload.get("recent_tool_calls")
+        if recent:
+            for call in recent:
+                tool = call.get("tool", "")
+                if "chat_my_chats" not in tool:
+                    continue
+                ts_str = call.get("ts")
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts >= turn_start:
+                        return False  # session called chat_my_chats this turn
+                except ValueError:
+                    continue
+        return True
     except ValueError:
         logger.warning(
             "chat_my_chats_not_called_this_turn: could not parse timestamps "

@@ -97,6 +97,37 @@ def test_get_my_chats_returns_pending_and_accepted(chats_api_client):
     assert chats[0]["my_state"] == "pending"
 
 
+def test_get_my_chats_stamps_sse_heartbeat(chats_api_client):
+    """GET /chats self-heals IN-MASTER-1 by writing last_sse_heartbeat (substrate fix).
+
+    After /compact, PostToolUse stops firing so the SSE heartbeat goes stale.
+    The Themis IN-MASTER-1 condition checks heartbeat against turn_start; a stale
+    heartbeat with no recent chat_my_chats call fires a violation. This test
+    confirms that GET /chats stamps the heartbeat so the condition can't fire
+    immediately after a chat_my_chats call (the two-path fix).
+    """
+    import json as json_mod
+    import importlib
+    from khimaira.monitor import sessions as sessions_mod
+
+    client, _ = chats_api_client
+
+    # Verify no heartbeat yet
+    sd = sessions_mod._session_dir("alice")
+    status_before = json_mod.loads((sd / "status.json").read_text())
+    assert "last_sse_heartbeat" not in status_before
+
+    # GET /chats for alice
+    resp = client.get("/api/chats?session_id=alice")
+    assert resp.status_code == 200
+
+    # Heartbeat should now be present
+    status_after = json_mod.loads((sd / "status.json").read_text())
+    assert "last_sse_heartbeat" in status_after, (
+        "GET /chats must stamp last_sse_heartbeat for the requester (IN-MASTER-1 self-heal)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # accept + send + history
 # ---------------------------------------------------------------------------
