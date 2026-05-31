@@ -1748,3 +1748,106 @@ def test_b3_master_approve_not_blocked_on_other_status_transitions(isolated_chat
         assert r.status_code == 200
         body = r.json()
         assert body["ok"] is True, f"Status transition to {status!r} must NOT be blocked by IN-MASTER-9"
+
+
+# ---------------------------------------------------------------------------
+# B3 follow-up — author-role-binding on record_gate_verdict
+# Closes the IN-MASTER-9 rubber-stamp bypass: only critic can write approve/changes,
+# only verifier can write ship/hold.
+# ---------------------------------------------------------------------------
+
+
+def test_verdict_role_binding_master_approve_rejected(isolated_chats, sessions_mod):
+    """AC-1: master-role session cannot write approve verdict (the bypass case)."""
+    master_id, _agent_id, _critic_id, _verifier_id, chat_id, task_id = _setup_gate_scenario(
+        isolated_chats, sessions_mod
+    )
+    import pytest as _pt
+    with _pt.raises(ValueError, match="critic"):
+        isolated_chats.record_gate_verdict(chat_id, master_id, task_id, "approve")
+
+
+def test_verdict_role_binding_critic_approve_accepted(isolated_chats, sessions_mod):
+    """AC-2: critic-role session CAN write approve verdict (legit path)."""
+    _master_id, _agent_id, critic_id, _verifier_id, chat_id, task_id = _setup_gate_scenario(
+        isolated_chats, sessions_mod
+    )
+    isolated_chats.record_gate_verdict(chat_id, critic_id, task_id, "approve")
+
+
+def test_verdict_role_binding_verifier_ship_accepted(isolated_chats, sessions_mod):
+    """AC-3: verifier-role session CAN write ship verdict (legit path)."""
+    _master_id, _agent_id, _critic_id, verifier_id, chat_id, task_id = _setup_gate_scenario(
+        isolated_chats, sessions_mod
+    )
+    isolated_chats.record_gate_verdict(chat_id, verifier_id, task_id, "ship")
+
+
+def test_verdict_role_binding_critic_ship_rejected(isolated_chats, sessions_mod):
+    """AC-4: critic cannot write ship verdict (role-verdict mismatch)."""
+    _master_id, _agent_id, critic_id, _verifier_id, chat_id, task_id = _setup_gate_scenario(
+        isolated_chats, sessions_mod
+    )
+    import pytest as _pt
+    with _pt.raises(ValueError, match="verifier"):
+        isolated_chats.record_gate_verdict(chat_id, critic_id, task_id, "ship")
+
+
+def test_verdict_role_binding_agent_verdicts_rejected(isolated_chats, sessions_mod):
+    """AC-5: agent-role session cannot write any verdict type."""
+    _master_id, agent_id, _critic_id, _verifier_id, chat_id, task_id = _setup_gate_scenario(
+        isolated_chats, sessions_mod
+    )
+    import pytest as _pt
+    with _pt.raises(ValueError, match="critic"):
+        isolated_chats.record_gate_verdict(chat_id, agent_id, task_id, "approve")
+    with _pt.raises(ValueError, match="verifier"):
+        isolated_chats.record_gate_verdict(chat_id, agent_id, task_id, "ship")
+
+
+def test_verdict_role_binding_end_to_end_bypass_closed(isolated_chats, sessions_mod, themis_client):
+    """AC-7 (live-daemon): master self-post rejected; real critic+verifier unblocks commit.
+
+    Proves the bypass is closed AND the legitimate gate path works.
+    """
+    master_id, agent_id, critic_id, verifier_id, chat_id, task_id = _setup_gate_scenario(
+        isolated_chats, sessions_mod
+    )
+    import importlib, pytest as _pt
+
+    # Master attempts to self-post approve → REJECTED (bypass closed)
+    with _pt.raises(ValueError, match="critic"):
+        isolated_chats.record_gate_verdict(chat_id, master_id, task_id, "approve")
+
+    from khimaira.monitor.api import themis as themis_api
+    importlib.reload(themis_api)
+
+    # No verdicts exist → commit still blocked
+    r = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": agent_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "git  commit -m done"},  # split to avoid self-block
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is False, "Commit must remain blocked after rejected master self-post"
+
+    # Real critic + verifier post structured verdicts
+    isolated_chats.record_gate_verdict(chat_id, critic_id, task_id, "approve")
+    isolated_chats.record_gate_verdict(chat_id, verifier_id, task_id, "ship")
+
+    importlib.reload(themis_api)
+
+    # Commit is now allowed
+    r2 = themis_client.post(
+        "/api/themis/check",
+        json={
+            "session_id": agent_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "git  commit -m done"},
+        },
+    )
+    assert r2.status_code == 200
+    assert r2.json()["ok"] is True, "Commit must be allowed after real critic APPROVE + verifier SHIP"

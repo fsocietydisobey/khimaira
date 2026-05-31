@@ -1142,6 +1142,24 @@ def record_gate_verdict(
         raise ValueError(
             f"Session {by_session_id!r} is not an accepted member of {chat_id!r}."
         )
+    # Author-role-binding: only critic can write approve/changes; only verifier ship/hold.
+    # Prevents master or any non-reviewer from self-posting structured verdicts
+    # and bypassing IN-MASTER-9 (B3 follow-up fix).
+    _VERDICT_AUTHOR_ROLES: dict[str, str] = {
+        "approve": ROLE_CRITIC,
+        "changes": ROLE_CRITIC,
+        "ship": ROLE_VERIFIER,
+        "hold": ROLE_VERIFIER,
+    }
+    required_role = _VERDICT_AUTHOR_ROLES[verdict]
+    caller_role = (room.get("meta") or {}).get("member_roles", {}).get(by_session_id)
+    if caller_role != required_role:
+        raise ValueError(
+            f"verdict={verdict!r} requires {required_role!r} role; "
+            f"caller {by_session_id!r} resolved to role {caller_role!r}. "
+            "Only the designated reviewer role may write this verdict."
+        )
+
     # Verify the task exists
     task_record = None
     for msg in room.get("messages", []):
