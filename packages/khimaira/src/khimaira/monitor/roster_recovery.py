@@ -90,8 +90,17 @@ def _kitty(
     input_text: str | None = None,
     timeout: float = 5.0,
 ) -> str | None:
-    """Run ``kitty @ <args>``; return stdout or None on any failure."""
-    cmd = ["kitty", "@", *args]
+    """Run ``kitty @ <args>``; return stdout or None on any failure.
+
+    When ``KITTY_LISTEN_ON`` is set (always the case under the daemon, which
+    runs without a controlling TTY), passes ``--to=<socket>`` so kitty uses
+    the IPC socket directly instead of trying to open /dev/tty.
+    """
+    listen = os.environ.get("KITTY_LISTEN_ON")
+    if listen:
+        cmd = ["kitty", "@", f"--to={listen}", *args]
+    else:
+        cmd = ["kitty", "@", *args]
     try:
         r = subprocess.run(
             cmd,
@@ -102,10 +111,10 @@ def _kitty(
         )
         if r.returncode == 0:
             return r.stdout
-        _log.debug("kitty @ %s failed (rc=%d): %s", args[0], r.returncode, r.stderr.strip())
+        _log.warning("kitty @ %s failed (rc=%d): %s", args[0], r.returncode, r.stderr.strip())
         return None
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        _log.debug("kitty unavailable: %s", exc)
+        _log.warning("kitty unavailable: %s", exc)
         return None
 
 

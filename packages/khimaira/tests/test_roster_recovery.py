@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch, call
@@ -407,3 +409,93 @@ class TestProcessWindow:
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _kitty — KITTY_LISTEN_ON socket injection (daemon TTY-less path)
+# ---------------------------------------------------------------------------
+
+class TestKittySocketInjection:
+    """_kitty must pass --to=<socket> when KITTY_LISTEN_ON is set.
+
+    The daemon runs without a controlling TTY (forked, no /dev/tty). Bare
+    `kitty @ ls` fails with "open /dev/tty: no such device". The fix is to
+    inject `--to=<socket>` from KITTY_LISTEN_ON so kitty uses the IPC socket
+    directly. These tests exercise cmd-construction without needing a live kitty.
+    """
+
+    def _fake_run_ok(self, captured: list) -> object:
+        def fake_run(cmd, **kwargs):
+            captured.append(list(cmd))
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "[]"
+            return r
+        return fake_run
+
+    def test_cmd_includes_to_when_listen_on_set(self):
+        """When KITTY_LISTEN_ON is set, cmd must contain --to=<value>."""
+        captured: list = []
+        with (
+            patch.dict(os.environ, {"KITTY_LISTEN_ON": "unix:/tmp/kitty-test"}, clear=False),
+            patch("subprocess.run", side_effect=self._fake_run_ok(captured)),
+        ):
+            result = rr._kitty("ls")
+        assert result == "[]"
+        assert captured, "subprocess.run was not called"
+        cmd = captured[0]
+        assert "--to=unix:/tmp/kitty-test" in cmd, (
+            f"Expected --to=unix:/tmp/kitty-test in cmd: {cmd}"
+        )
+        assert "ls" in cmd
+
+    def test_cmd_no_to_when_listen_on_unset(self):
+        """Without KITTY_LISTEN_ON, cmd falls back to bare `kitty @ ls`."""
+        captured: list = []
+        env_without = {k: v for k, v in os.environ.items() if k != "KITTY_LISTEN_ON"}
+        with (
+            patch.dict(os.environ, env_without, clear=True),
+            patch("subprocess.run", side_effect=self._fake_run_ok(captured)),
+        ):
+            result = rr._kitty("ls")
+        assert result == "[]"
+        cmd = captured[0]
+        assert not any(a.startswith("--to=") for a in cmd), (
+            f"--to= should NOT appear without KITTY_LISTEN_ON: {cmd}"
+        )
+
+    def test_daemon_path_uses_socket_not_tty(self):
+        """Simulate daemon call: KITTY_LISTEN_ON set → socket path used."""
+        captured: list = []
+        socket_val = "unix:/tmp/kitty-daemontest"
+        with (
+            patch.dict(os.environ, {"KITTY_LISTEN_ON": socket_val}, clear=False),
+            patch("subprocess.run", side_effect=self._fake_run_ok(captured)),
+        ):
+            result = rr._kitty("ls")
+        assert result is not None, "_kitty returned None — socket injection failed"
+        cmd = captured[0]
+        assert f"--to={socket_val}" in cmd, (
+            f"Daemon path must have --to= in cmd: {cmd}"
+        )
+
+    def test_failure_logged_at_warning_not_debug(self):
+        """Kitty failure must be logged at WARNING (not DEBUG) so daemon issues are visible."""
+        def fake_run_fail(cmd, **kwargs):
+            r = MagicMock()
+            r.returncode = 1
+            r.stdout = ""
+            r.stderr = "open /dev/tty: no such device"
+            return r
+
+        with (
+            patch.dict(os.environ, {"KITTY_LISTEN_ON": "unix:/tmp/kitty-test"}, clear=False),
+            patch("subprocess.run", side_effect=fake_run_fail),
+            patch.object(rr._log, "warning") as mock_warn,
+            patch.object(rr._log, "debug") as mock_debug,
+        ):
+            result = rr._kitty("ls")
+
+        assert result is None
+        mock_warn.assert_called_once()
+        mock_debug.assert_not_called()
