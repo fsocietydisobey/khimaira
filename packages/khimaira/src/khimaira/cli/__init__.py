@@ -22,6 +22,7 @@ from khimaira import __version__
 
 from . import attach as attach_cmd
 from . import bootstrap as bootstrap_cmd
+from . import context as context_cmd
 from . import leads as leads_cmd
 from . import sessions as sessions_cmd
 from . import (
@@ -71,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     themis_cmd.add_subparser(subparsers)
     sessions_cmd.add_subparser(subparsers)
     leads_cmd.add_subparser(subparsers)
+    context_cmd.add_subparser(subparsers)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

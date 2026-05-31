@@ -25,6 +25,7 @@ dependencies = [
     "tree-sitter-javascript",
     "click",
     "pyyaml>=6.0",
+    "ruamel.yaml>=0.18",
 ]
 
 [project.urls]
