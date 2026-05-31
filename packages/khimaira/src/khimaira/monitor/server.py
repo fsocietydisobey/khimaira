@@ -145,6 +145,13 @@ def build_app():
         from .api.chats import _guard4_watcher
         asyncio.create_task(_guard4_watcher())
 
+    # Roster auto-recovery watcher — distills + compacts kitty windows at high
+    # context usage; wakes idle sessions with pending obligations.
+    @app.on_event("startup")
+    async def _start_roster_recovery_watcher() -> None:
+        from . import roster_recovery
+        asyncio.create_task(roster_recovery.watcher_loop())
+
     # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
     # Replay-on-boot recovers stuck-firing tasks; worker tick fires due tasks.
     @app.on_event("startup")
