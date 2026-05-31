@@ -1201,6 +1201,115 @@ def test_p0_file_is_code_condition_registered():
     assert result is False
 
 
+# ---------------------------------------------------------------------------
+# IN-MASTER-1 new pass-path unit tests (substrate fix d5b55e2)
+# Tests for the 2nd pass-path: stale heartbeat + chat_my_chats in
+# recent_tool_calls with ts >= turn_start → no violation.
+# These cover the exact branch that shipped without coverage in d5b55e2.
+# ---------------------------------------------------------------------------
+
+
+def test_in_master_1_stale_hb_with_chat_my_chats_this_turn_passes():
+    """Stale heartbeat + chat_my_chats in recent_tool_calls with ts >= turn_start → False.
+
+    The new 2nd-pass-path: the condition must NOT fire when the session
+    already called chat_my_chats this turn (the self-heal path).
+    """
+    from themis.conditions import evaluate_condition
+
+    result = evaluate_condition("chat_my_chats_not_called_this_turn", {
+        "subscriber_last_heartbeat": "2026-01-01T00:00:00+00:00",  # stale
+        "turn_start_ts": "2026-01-01T01:00:00+00:00",  # well after heartbeat
+        "recent_tool_calls": [
+            {"tool": "mcp__khimaira-chat__chat_my_chats", "ts": "2026-01-01T01:01:00+00:00"},
+        ],
+    })
+    assert result is False, "stale hb + chat_my_chats this turn must NOT fire violation"
+
+
+def test_in_master_1_stale_hb_without_chat_my_chats_fires():
+    """Stale heartbeat + NO chat_my_chats in recent_tool_calls → True (violation).
+
+    The base violation case that the 2nd pass-path must not suppress.
+    """
+    from themis.conditions import evaluate_condition
+
+    result = evaluate_condition("chat_my_chats_not_called_this_turn", {
+        "subscriber_last_heartbeat": "2026-01-01T00:00:00+00:00",
+        "turn_start_ts": "2026-01-01T01:00:00+00:00",
+        "recent_tool_calls": [
+            {"tool": "Bash", "ts": "2026-01-01T01:01:00+00:00"},
+        ],
+    })
+    assert result is True, "stale hb + no chat_my_chats must fire violation"
+
+
+def test_in_master_1_stale_hb_chat_my_chats_before_turn_still_fires():
+    """Stale heartbeat + chat_my_chats with ts < turn_start → True (still violation).
+
+    The ts-boundary case: a chat_my_chats from a PRIOR turn does not count.
+    The condition checks ts >= turn_start; a stale call from before turn start
+    must NOT suppress the violation.
+    """
+    from themis.conditions import evaluate_condition
+
+    result = evaluate_condition("chat_my_chats_not_called_this_turn", {
+        "subscriber_last_heartbeat": "2026-01-01T00:00:00+00:00",
+        "turn_start_ts": "2026-01-01T01:00:00+00:00",
+        "recent_tool_calls": [
+            {"tool": "mcp__khimaira-chat__chat_my_chats", "ts": "2026-01-01T00:59:00+00:00"},
+        ],
+    })
+    assert result is True, "chat_my_chats before turn_start must NOT suppress violation"
+
+
+def test_in_master_1_fresh_heartbeat_no_violation():
+    """Fresh heartbeat (>= turn_start) → False regardless of recent_tool_calls.
+
+    The 1st pass-path (unchanged): fresh heartbeat means subscribed, no violation.
+    """
+    from themis.conditions import evaluate_condition
+
+    result = evaluate_condition("chat_my_chats_not_called_this_turn", {
+        "subscriber_last_heartbeat": "2026-01-01T01:05:00+00:00",  # after turn_start
+        "turn_start_ts": "2026-01-01T01:00:00+00:00",
+        "recent_tool_calls": [],  # empty — irrelevant when heartbeat is fresh
+    })
+    assert result is False, "fresh heartbeat must never fire violation"
+
+
+def test_in_master_1_absent_heartbeat_fail_open():
+    """Absent subscriber_last_heartbeat → False (fail-open).
+
+    A session with no heartbeat at all cannot be judged; fail open.
+    """
+    from themis.conditions import evaluate_condition
+
+    result = evaluate_condition("chat_my_chats_not_called_this_turn", {
+        "turn_start_ts": "2026-01-01T01:00:00+00:00",
+        # no subscriber_last_heartbeat
+    })
+    assert result is False, "absent heartbeat must fail open (False)"
+
+
+def test_in_master_1_ts_exactly_at_turn_start_passes():
+    """chat_my_chats ts == turn_start exactly → False (boundary inclusive).
+
+    ts >= turn_start is the condition; ts exactly equal must also pass.
+    """
+    from themis.conditions import evaluate_condition
+
+    turn_start = "2026-01-01T01:00:00+00:00"
+    result = evaluate_condition("chat_my_chats_not_called_this_turn", {
+        "subscriber_last_heartbeat": "2026-01-01T00:00:00+00:00",  # stale
+        "turn_start_ts": turn_start,
+        "recent_tool_calls": [
+            {"tool": "mcp__khimaira-chat__chat_my_chats", "ts": turn_start},
+        ],
+    })
+    assert result is False, "chat_my_chats at exactly turn_start must pass (boundary inclusive)"
+
+
 def test_p0_no_regression_pure_matcher_rules_still_block(isolated_chats, sessions_mod, themis_client):
     """Pure-matcher rules (no conditions) still block as before P0.
 
