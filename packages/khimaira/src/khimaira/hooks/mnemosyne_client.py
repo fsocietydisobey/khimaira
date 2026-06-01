@@ -8,10 +8,13 @@ so it can run in any subprocess that has the khimaira package importable.
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.request
 
 _MNEMOSYNE_BASE = "http://127.0.0.1:8766"
+
+_log = logging.getLogger(__name__)
 
 
 def distill(
@@ -19,11 +22,19 @@ def distill(
     transcript: str,
     session_slug: str,
     *,
-    timeout: float = 2.0,
+    timeout: float = 30.0,
 ) -> dict | None:
     """POST /distill; return parsed response dict or None on any failure.
 
     Fail-open: URLError, OSError, TimeoutError → None (never raises).
+
+    Timeout is 30s, not 2s: distillation runs an LLM pass over the full
+    transcript server-side. A 50-entry transcript already takes ~2.3s; real
+    session transcripts are 100× larger. A 2s timeout silently failed every
+    real distill — the OSError was caught and reported as None ("unreachable")
+    while the daemon was perfectly healthy. The failure path now logs a
+    warning so a future divergence is audible in the daemon log instead of
+    silently swallowed.
     """
     payload = json.dumps(
         {"domain": domain, "transcript": transcript, "session_slug": session_slug},
@@ -38,7 +49,14 @@ def distill(
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        _log.warning(
+            "mnemosyne distill failed (domain=%r, slug=%r, timeout=%.1fs): %s",
+            domain,
+            session_slug,
+            timeout,
+            exc,
+        )
         return None
 
 
@@ -77,5 +95,6 @@ def query(
         if not answer or "No accumulated memory" in answer:
             return None
         return data
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        _log.warning("mnemosyne query failed (domain=%r): %s", domain, exc)
         return None
