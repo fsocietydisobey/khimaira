@@ -292,6 +292,32 @@ def get_session_ppid(session_id: str) -> int | None:
 _ROSTER_WIND_DOWN_SENTINEL = _BASE_DIR.parent / "roster_wind_down"
 
 
+# ---------------------------------------------------------------------------
+# GAP-5 canonical name-resolution predicate.
+# resolve_active_session: resolves a friendly name → most-recently-active UUID.
+# active_roster_member_ids: defined below (agent-1's implementation, ~line 420).
+# ---------------------------------------------------------------------------
+
+
+def resolve_active_session(name: str) -> str | None:
+    """Resolve a friendly name → the MOST-RECENTLY-ACTIVE session UUID.
+
+    When multiple session dirs share the same name (e.g. 4× 'khimaira-0' from
+    restarts), returns the one with the highest last_active (most recently
+    modified files), not the first alphabetically or by creation time.
+    Stale/phantom dirs must NOT shadow a live session.
+
+    Returns None instead of raising — callers that need an exception should
+    use resolve_session_id() directly.
+
+    Reads durable state only (no cache, no in-memory-global risk).
+    """
+    try:
+        return resolve_session_id(name)
+    except (ValueError, Exception):
+        return None
+
+
 def set_roster_wind_down(active: bool) -> None:
     """Declare or lift a roster wind-down. While active, Guard-4 and Guard-5
     suppress stall-escalation — sessions are intentionally offline, not hung.
@@ -311,6 +337,127 @@ def is_roster_wind_down() -> bool:
     escalate silent sessions during wind-down. Reads the sentinel file each
     call so the daemon picks up an operator's change without a restart."""
     return _ROSTER_WIND_DOWN_SENTINEL.exists()
+
+
+# ---------------------------------------------------------------------------
+# Canonical roster-membership predicate — single source of truth for all Guards
+# ---------------------------------------------------------------------------
+
+# Default window: chats with at least one message in the last 7 days.
+_ROSTER_ACTIVE_CHAT_WINDOW_S: float = float(
+    os.environ.get("KHIMAIRA_ROSTER_ACTIVE_WINDOW_S", str(7 * 24 * 3600))
+)
+
+
+def active_roster_member_ids(
+    active_window_s: float | None = None,
+) -> set[str]:
+    """Return the set of session IDs that are ACCEPTED members of a recently-active chat.
+
+    A session is on the roster iff:
+      1. It is an accepted member of at least one khimaira chat, AND
+      2. That chat has had at least one event (file mtime) within
+         ``active_window_s`` seconds of now.
+
+    Both checks use durable reads — accepted membership from JSONL events,
+    recency from file mtime (no in-memory cache). This makes the predicate
+    consistent across daemon restarts and safe to call from any guard.
+
+    Used by Guard-4, Guard-5, Guard-6, and the watcher so all three agree on
+    exactly who is on the roster. Do NOT roll per-guard membership checks —
+    call this function.
+
+    ``active_window_s`` defaults to ``KHIMAIRA_ROSTER_ACTIVE_WINDOW_S`` (7 days).
+    """
+    if active_window_s is None:
+        active_window_s = _ROSTER_ACTIVE_CHAT_WINDOW_S
+
+    # Lazy import — chats imports sessions, so this must stay inside the function.
+    try:
+        from khimaira.monitor import chats as _chats_mod  # noqa: PLC0415
+    except Exception as exc:
+        # Observable signal: fail-open-to-empty is correct (errs toward under-flag,
+        # not the cross-project false-dark storm), but a PERSISTENT import failure
+        # must be audible — empty-on-error looks identical to empty-because-quiet.
+        log.warning(
+            "active_roster_member_ids: roster computation failed (chats import: %s) — "
+            "returning empty set (degraded, Guard-6/Guard-5 will under-flag not storm)",
+            exc,
+        )
+        return set()
+
+    chat_dir = _chats_mod._chat_dir()
+    if not chat_dir.exists():
+        return set()
+
+    cutoff = time.time() - active_window_s
+    member_ids: set[str] = set()
+    total_chats = 0
+    error_skips = 0
+
+    for chat_path in chat_dir.glob("chat-*.jsonl"):
+        total_chats += 1
+        try:
+            lines = _read_jsonl(chat_path)
+            if not _chat_recently_active(lines, cutoff):
+                continue
+            _fold_accepted_members_from_lines(lines, member_ids)
+        except Exception:
+            error_skips += 1
+            continue  # fail-open: skip unreadable chats
+
+    # Observable signal for the all-chats-fail case: if every chat file raised an
+    # error, the empty result is indistinguishable from "roster genuinely quiet"
+    # unless we emit a warning. Single-file glitches stay correctly silent.
+    if total_chats > 0 and error_skips == total_chats and not member_ids:
+        log.warning(
+            "active_roster_member_ids: ALL %d chat files raised read errors — "
+            "returning empty set (degraded). Single-file errors silenced; "
+            "this all-chats-fail case is audible.",
+            total_chats,
+        )
+
+    return member_ids
+
+
+def _chat_recently_active(lines: list[dict], cutoff: float) -> bool:
+    """True if the most-recent event in ``lines`` has ts ≥ ``cutoff`` (unix seconds).
+
+    Falls back to True on any parse error (fail-open: include ambiguous chats
+    rather than silently dropping active members).
+    """
+    import datetime as _dt
+
+    for line in reversed(lines):
+        ts_str = line.get("ts")
+        if not ts_str:
+            continue
+        try:
+            dt = _dt.datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+            return dt.timestamp() >= cutoff
+        except (ValueError, TypeError):
+            continue
+    return True  # no parseable ts → assume active (fail-open)
+
+
+def _fold_accepted_members_from_lines(lines: list[dict], out: set[str]) -> None:
+    """Fold MEMBER events from JSONL lines into ``out`` (accepted session IDs).
+
+    Final state per session_id: accepted → in out; left/rejected → removed.
+    """
+    accepted: set[str] = set()
+    for line in lines:
+        if line.get("kind") != "member":
+            continue
+        sid = line.get("session_id")
+        if not sid:
+            continue
+        state = line.get("state")
+        if state == "accepted":
+            accepted.add(sid)
+        elif state in ("left", "rejected"):
+            accepted.discard(sid)
+    out.update(accepted)
 
 
 def write_sse_heartbeat(session_id: str) -> None:

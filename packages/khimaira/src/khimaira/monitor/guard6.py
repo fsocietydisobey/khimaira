@@ -39,6 +39,12 @@ _T_DARK_S = float(os.environ.get("KHIMAIRA_DARK_THRESHOLD_S", str(45 * 60)))  # 
 _WATCH_INTERVAL_S = float(os.environ.get("KHIMAIRA_GUARD6_WATCH_S", "300"))  # 5 min sweep
 _BOOTSTRAP_GRACE_S = float(os.environ.get("KHIMAIRA_GUARD6_BOOTSTRAP_S", str(5 * 60)))  # 5 min
 
+# Scoping gate: only include members of chats that have had activity within this window.
+# Prevents cross-project leakage: 16-day-old test sessions, jeevy_portal jp-* sessions,
+# and abandoned seats are NOT in recently-active chats → not swept by Guard-6.
+# Default: 7 days. KHIMAIRA_GUARD6_CHAT_WINDOW_S for operators.
+_ACTIVE_CHAT_WINDOW_S = float(os.environ.get("KHIMAIRA_GUARD6_CHAT_WINDOW_S", str(7 * 24 * 3600)))
+
 # ---------------------------------------------------------------------------
 # Debounce state
 # ---------------------------------------------------------------------------
@@ -54,12 +60,38 @@ _GUARD6_DARK_TTL_S = 4 * 3600.0  # 4-hour fallback expiry
 
 
 def _get_roster_session_ids() -> set[str]:
-    """Return the set of accepted session_ids across all active chats.
+    """Return the canonical set of active roster session_ids.
+
+    Delegates to sessions.active_roster_member_ids() — the single shared predicate
+    (master ruling: all guards + watcher must use ONE definition, not roll their own).
+    Definition: accepted member of a recently-active chat (last-msg-ts < 7d), durable reads.
+
+    Falls back to the recency-filter inline implementation until agent-1 exposes
+    active_roster_member_ids() in sessions.py. Once that lands, this function
+    automatically delegates to it with no further changes needed.
 
     Fail-open: returns empty set on any error.
     """
-    members: set[str] = set()
+    # Try the canonical shared predicate first (agent-1's sessions.py function)
     try:
+        from khimaira.monitor import sessions as sessions_mod
+        result = sessions_mod.active_roster_member_ids()
+        log.info("guard6 roster source: canonical (sessions.active_roster_member_ids)")
+        return result
+    except AttributeError:
+        log.warning(
+            "guard6 roster source: FALLBACK recency-filter "
+            "(sessions.active_roster_member_ids not yet available — agent-1 hasn't landed it)"
+        )
+    except Exception as exc:
+        log.warning("guard6 roster source: FALLBACK recency-filter (canonical raised %s)", exc)
+
+    # Fallback: recency-filter inline (same definition; runs until agent-1 lands)
+    members: set[str] = set()
+    now = time.time()
+    try:
+        from datetime import datetime, timezone
+
         from khimaira.monitor import chats as chats_mod
 
         chat_dir = chats_mod._chat_dir()
@@ -68,6 +100,20 @@ def _get_roster_session_ids() -> set[str]:
         for path in chat_dir.glob("chat-*.jsonl"):
             try:
                 room = chats_mod.load_room(path.stem)
+                messages = room.get("messages", [])
+                if not messages:
+                    continue
+                last_ts_str = messages[-1].get("ts", "")
+                if last_ts_str:
+                    try:
+                        last_dt = datetime.fromisoformat(last_ts_str.replace("Z", "+00:00"))
+                        last_ts = last_dt.timestamp()
+                        if (now - last_ts) > _ACTIVE_CHAT_WINDOW_S:
+                            continue  # stale chat — skip
+                    except (ValueError, OSError):
+                        continue
+                else:
+                    continue
                 for sid, m in room.get("members", {}).items():
                     if m.get("state") == chats_mod.ACCEPTED:
                         members.add(sid)

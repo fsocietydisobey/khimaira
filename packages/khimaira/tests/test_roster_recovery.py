@@ -47,8 +47,14 @@ SAMPLE_KITTY_LS = json.dumps([
 # ---------------------------------------------------------------------------
 
 class TestDiscoverRosterWindows:
+    """Tests use _get_roster_member_ids=frozenset() (fail-open/no scoping) so
+    role-parsing tests are independent of live session state."""
+
     def test_parses_role_from_cmdline(self):
-        with patch.object(rr, "_kitty", return_value=SAMPLE_KITTY_LS):
+        with (
+            patch.object(rr, "_kitty", return_value=SAMPLE_KITTY_LS),
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
+        ):
             windows = rr._discover_roster_windows()
         ids = {w["window_id"] for w in windows}
         roles = {w["role"] for w in windows}
@@ -71,7 +77,10 @@ class TestDiscoverRosterWindows:
         data = json.dumps([{"tabs": [{"windows": [
             {"id": 20, "cmdline": ["claude"]},  # no -r flag
         ]}]}])
-        with patch.object(rr, "_kitty", return_value=data):
+        with (
+            patch.object(rr, "_kitty", return_value=data),
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
+        ):
             assert rr._discover_roster_windows() == []
 
     def test_normalizes_prefixed_names(self):
@@ -81,13 +90,61 @@ class TestDiscoverRosterWindows:
             {"id": 30, "cmdline": ["claude-chat", "-r", "jp-agent-1"]},
             {"id": 31, "cmdline": ["claude-chat", "-r", "jp-frontend-lead-1"]},
         ]}]}])
-        with patch.object(rr, "_kitty", return_value=data):
+        with (
+            patch.object(rr, "_kitty", return_value=data),
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
+        ):
             windows = rr._discover_roster_windows()
         roles = {w["role"] for w in windows}
         # infer_role_from_name handles prefix-stripping; roles should be normalized
         # (the exact result depends on _VALID_ROLES, but the raw suffix -1 is gone)
         for w in windows:
             assert not w["role"].endswith("-1"), "Numeric suffix must be stripped"
+
+
+class TestDiscoverRosterWindowsScoping:
+    """Cross-project scoping: only sessions in active_roster_member_ids() pass."""
+
+    KITTY_WITH_MIXED = json.dumps([{"tabs": [{"windows": [
+        {"id": 10, "title": "agent-1", "cmdline": ["bash", "-ic",
+            "cd '/home/_3ntropy/dev/khimaira' && claude-chat -r agent-1 --model sonnet"]},
+        {"id": 20, "title": "jp-backend-lead-1", "cmdline": ["bash", "-ic",
+            "cd '/home/_3ntropy/work/jeevy_portal' && claude-chat -r jp-backend-lead-1 --model sonnet"]},
+        {"id": 30, "title": "master", "cmdline": ["bash", "-ic",
+            "cd '/home/_3ntropy/dev/khimaira' && claude-chat -r khimaira-0 --model opus"]},
+    ]}]}])
+
+    def test_roster_scoped_excludes_other_project(self):
+        """When roster_ids is populated, only sessions in the set pass."""
+        # agent-1 is in the roster; jp-backend-lead-1 is NOT.
+        roster_ids = frozenset(["uuid-agent-1", "uuid-master"])
+        from khimaira.monitor import sessions as sess_mod
+        with (
+            patch.object(rr, "_kitty", return_value=self.KITTY_WITH_MIXED),
+            patch.object(rr, "_get_roster_member_ids", return_value=roster_ids),
+            patch.object(sess_mod, "list_sessions", return_value=[
+                {"name": "agent-1", "session_id": "uuid-agent-1"},
+                # window 30 title="master" → lookup by "master"
+                {"name": "master", "session_id": "uuid-master"},
+            ]),
+        ):
+            windows = rr._discover_roster_windows()
+        ids = {w["window_id"] for w in windows}
+        assert 10 in ids, "agent-1 (roster member) must be included"
+        assert 20 not in ids, "jp-backend-lead-1 (other project) must be excluded"
+        assert 30 in ids, "khimaira-0 (roster member) must be included"
+
+    def test_empty_roster_ids_passes_all(self):
+        """Fail-open: empty roster_ids (canonical unavailable) → all windows pass."""
+        with (
+            patch.object(rr, "_kitty", return_value=self.KITTY_WITH_MIXED),
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
+        ):
+            windows = rr._discover_roster_windows()
+        ids = {w["window_id"] for w in windows}
+        # All windows with a valid role pass when roster_ids is empty
+        assert 10 in ids
+        assert 30 in ids
 
 
 # ---------------------------------------------------------------------------
@@ -896,3 +953,78 @@ class TestProcessWindowHitl:
         # At least one INFO log referencing the HITL action
         logged = " ".join(str(c) for c in mock_log.call_args_list)
         assert "answered" in logged or "hitl" in logged.lower()
+
+
+# ---------------------------------------------------------------------------
+# Lane 5 — name-based session resolution (fixes the ambiguous-role abort)
+# ---------------------------------------------------------------------------
+
+class TestProcessWindowNameResolution:
+    """_process_window resolves session UUID by window NAME (unique), not role
+    (ambiguous when multiple sessions share a role like 'agent')."""
+
+    @pytest.fixture(autouse=True)
+    def clear_debounce(self):
+        rr._DEBOUNCE.clear()
+        yield
+        rr._DEBOUNCE.clear()
+
+    def _win(self, raw_name="agent-2", role="agent", window_id=200):
+        return {"window_id": window_id, "role": role, "raw_name": raw_name,
+                "cmdline": f"claude-chat -r {raw_name}"}
+
+    @pytest.mark.asyncio
+    async def test_name_resolution_used_when_raw_name_present(self):
+        """When raw_name is set, resolve_active_session is called first."""
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_by_name", return_value="uuid-agent-2") as mock_name,
+            patch.object(rr, "_resolve_session_for_role") as mock_role,
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=">"),
+            patch.object(rr, "_compute_context_pct", return_value=50),
+            patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
+            patch.object(rr, "_session_has_pending_task", return_value=False),
+            patch.object(rr, "_session_has_pending_invite", return_value=False),
+        ):
+            await rr._process_window(self._win())
+
+        mock_name.assert_called_once_with("agent-2")
+        mock_role.assert_not_called()  # name succeeded → role fallback not needed
+
+    @pytest.mark.asyncio
+    async def test_role_fallback_when_name_resolution_fails(self):
+        """When resolve_active_session returns None, fall back to role-based."""
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_by_name", return_value=None),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-via-role") as mock_role,
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=">"),
+            patch.object(rr, "_compute_context_pct", return_value=50),
+            patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
+            patch.object(rr, "_session_has_pending_task", return_value=False),
+            patch.object(rr, "_session_has_pending_invite", return_value=False),
+        ):
+            await rr._process_window(self._win())
+
+        mock_role.assert_called_once_with("agent")  # fallback to role
+
+    @pytest.mark.asyncio
+    async def test_no_raw_name_skips_directly_to_role(self):
+        """When raw_name is absent, only role-based resolution is attempted."""
+        win_no_name = {"window_id": 200, "role": "agent", "cmdline": "claude-chat"}
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_by_name") as mock_name,
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-via-role"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=">"),
+            patch.object(rr, "_compute_context_pct", return_value=50),
+            patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
+            patch.object(rr, "_session_has_pending_task", return_value=False),
+            patch.object(rr, "_session_has_pending_invite", return_value=False),
+        ):
+            await rr._process_window(win_no_name)
+
+        mock_name.assert_not_called()  # no raw_name → skip name resolution

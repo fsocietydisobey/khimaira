@@ -215,3 +215,33 @@ async def test_non_roster_session_ignored(isolated_guard6):
         await guard6_mod._guard6_check_once()
 
     assert len(escalated) == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_chat_session_not_dark_flagged(isolated_guard6):
+    """Sessions from stale chats (not in active roster) are NOT dark-flagged.
+
+    The scoping fix: Guard-6 delegates to sessions.active_roster_member_ids()
+    which excludes stale/test/other-project sessions. This test verifies that
+    a dark session NOT in the roster does not trigger an escalation.
+
+    (Fine-grained test of the recency-filter logic is deferred until
+    sessions.active_roster_member_ids() is exposed by agent-1 in sessions.py.)
+    """
+    guard6_mod, sessions_mod, _ = isolated_guard6
+
+    # Session is dark (inactive AND unreachable) but NOT in the roster
+    stale_sid = "22222222-stale-0000-0000-000000000001"
+    sessions_data = [_make_session_row(stale_sid, last_active_age_s=9999)]
+    escalated = []
+
+    with (
+        # Roster only contains other sessions — stale_sid is excluded from scope
+        patch.object(guard6_mod, "_get_roster_session_ids", return_value=set()),
+        patch.object(sessions_mod, "list_sessions", return_value=sessions_data),
+        patch.object(guard6_mod, "_is_reachable", return_value=False),
+        patch.object(guard6_mod, "_guard6_escalate", side_effect=AsyncMock(side_effect=lambda *a, **kw: escalated.append(a))),
+    ):
+        await guard6_mod._guard6_check_once()
+
+    assert len(escalated) == 0, "Session from stale chat must NOT trigger a dark-flag"

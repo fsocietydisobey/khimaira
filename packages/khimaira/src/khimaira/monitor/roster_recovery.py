@@ -165,6 +165,24 @@ def _kitty(
         return None
 
 
+def _get_roster_member_ids() -> frozenset[str]:
+    """Return the set of session IDs that are on THIS roster.
+
+    Delegates to sessions.active_roster_member_ids() (the ONE canonical
+    predicate per master ruling) with a fail-open empty-set fallback.
+    """
+    try:
+        from khimaira.monitor import sessions as _sess
+        fn = getattr(_sess, "active_roster_member_ids", None)
+        if fn is not None:
+            _log.info("roster-recovery: roster source: canonical (active_roster_member_ids)")
+            return frozenset(fn())
+    except Exception:
+        pass
+    _log.warning("roster-recovery: roster source: FALLBACK (active_roster_member_ids unavailable — fail-open, no cross-project scoping)")
+    return frozenset()  # fail-open: return empty set → all windows pass filter until canonical lands
+
+
 def _discover_roster_windows() -> list[dict[str, Any]]:
     """Return roster claude-chat windows as ``[{window_id, role, cmdline}]``.
 
@@ -173,6 +191,10 @@ def _discover_roster_windows() -> list[dict[str, Any]]:
     ``infer_role_from_name`` so the returned ``role`` always matches what is
     stored in ``member_roles`` (e.g. ``agent``, ``jp-agent``, ``frontend-lead``).
     Windows whose name doesn't resolve to a known role are skipped.
+
+    Cross-project scoping: only windows whose session UUID is in
+    active_roster_member_ids() (this daemon's roster) are included. jp-*
+    windows from other projects are excluded.
     """
     raw = _kitty("ls")
     if not raw:
@@ -186,6 +208,24 @@ def _discover_roster_windows() -> list[dict[str, Any]]:
         from khimaira.monitor.chats import infer_role_from_name
     except Exception:
         infer_role_from_name = None  # type: ignore[assignment]
+
+    # Cross-project scoping: only include sessions that are on this daemon's roster.
+    # Fail-open: if the canonical predicate isn't available yet, roster_ids is empty
+    # and the `if roster_ids` guard below lets ALL windows through (safe default until
+    # agent-1 lands active_roster_member_ids).
+    roster_ids = _get_roster_member_ids()
+
+    # Build a name→session_id lookup for membership checks.
+    _session_name_map: dict[str, str] = {}
+    try:
+        from khimaira.monitor import sessions as _sess_mod
+        for row in _sess_mod.list_sessions(use_cache=True):
+            name = row.get("name")
+            sid = row.get("session_id")
+            if name and sid:
+                _session_name_map[name] = sid
+    except Exception:
+        pass
 
     roster: list[dict[str, Any]] = []
     for os_win in data:
@@ -227,8 +267,21 @@ def _discover_roster_windows() -> list[dict[str, Any]]:
                 role = _resolve_role(title_name) or _resolve_role(cmd_name)
                 if not raw_name:
                     continue
-                if role:
-                    roster.append({"window_id": wid, "role": role, "cmdline": joined})
+                if not role:
+                    continue
+
+                # Cross-project filter: if roster_ids is populated, skip windows
+                # whose session UUID is not in this roster.
+                if roster_ids:
+                    session_id = _session_name_map.get(raw_name)
+                    if not session_id or session_id not in roster_ids:
+                        _log.debug(
+                            "roster-recovery: skipping window %d (%r) — not in this roster",
+                            wid, raw_name,
+                        )
+                        continue
+
+                roster.append({"window_id": wid, "role": role, "raw_name": raw_name, "cmdline": joined})
     return roster
 
 
@@ -744,22 +797,66 @@ def _handle_hitl_prompt(
 # Per-window decision logic
 # ---------------------------------------------------------------------------
 
+def _resolve_session_by_name(raw_name: str) -> str | None:
+    """Resolve a window name (e.g. 'agent-2') to a session UUID.
+
+    Uses sessions.resolve_active_session (most-recently-active, durable read)
+    from Lane 3. Falls back to returning None on any failure.
+    """
+    try:
+        from khimaira.monitor import sessions as _sess
+        fn = getattr(_sess, "resolve_active_session", None)
+        if fn is not None:
+            return fn(raw_name)
+    except Exception:
+        pass
+    return None
+
+
 async def _process_window(win: dict[str, Any]) -> None:
     """Assess a single roster window and act if appropriate."""
     window_id: int = win["window_id"]
     role: str = win["role"]
+    raw_name: str = win.get("raw_name") or ""
 
     # Guard (c): global opt-out
     if not _env_enabled():
         return
 
-    # Guard (a): resolve session UUID — never act on window-id alone
-    session_id = await asyncio.get_running_loop().run_in_executor(
-        None, _resolve_session_for_role, role
-    )
+    # Guard (a): resolve session UUID by window NAME (unique, e.g. "agent-2"),
+    # not by role (ambiguous when multiple sessions share a role). This was the
+    # root cause of the "ambiguous target" abort that prevented compaction/wake/HITL
+    # from ever firing: with 11 sessions all role='agent', _resolve_session_for_role
+    # always returned None. The window title is unique — resolve_active_session
+    # resolves it to the most-recently-active UUID.
+    session_id: str | None = None
+    if raw_name:
+        session_id = await asyncio.get_running_loop().run_in_executor(
+            None, _resolve_session_by_name, raw_name
+        )
+        if session_id:
+            _log.debug(
+                "roster-recovery: resolved window %d by name %r → %s",
+                window_id, raw_name, session_id[:8],
+            )
+    if not session_id:
+        # Fallback: role-based resolution (works when only one session holds the role).
+        # Log at WARNING — a silent name→role fallback is a GAP-5 regression risk:
+        # if resolve_active_session returned None for a renamed/dead seat, role-resolve
+        # may route to the old seat again.
+        if raw_name:
+            _log.warning(
+                "roster-recovery: name-resolve failed for %r (window %d) — falling back "
+                "to role=%r (GAP-5 regression risk if seat is dead/renamed)",
+                raw_name, window_id, role,
+            )
+        session_id = await asyncio.get_running_loop().run_in_executor(
+            None, _resolve_session_for_role, role
+        )
     if not session_id:
         _log.debug(
-            "roster-recovery: no session UUID for role=%s window=%d — skip",
+            "roster-recovery: no session UUID for name=%r role=%s window=%d — skip",
+            raw_name,
             role,
             window_id,
         )
