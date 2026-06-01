@@ -179,6 +179,13 @@ def build_app():
         from . import roster_recovery
         asyncio.create_task(roster_recovery.watcher_loop())
 
+    # #14 Auto-dispatch — periodic sweep proposing idle-agent → backlog-task
+    # assignments to master (Hybrid A+ mode). Opt-out: KHIMAIRA_AUTO_DISPATCH=0.
+    @app.on_event("startup")
+    async def _start_auto_dispatch_loop() -> None:
+        from . import auto_dispatch
+        asyncio.create_task(auto_dispatch.auto_dispatch_loop())
+
     # Guard-5 — roster-progress monitor. Fires when ≥K sessions are idle
     # AND a blocking gate has had no state-change >T_stall. Per-session
     # Guard-4 misses this class; Guard-5 catches the emergent standstill.

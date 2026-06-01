@@ -2954,7 +2954,7 @@ def test_resync_emits_zero_when_role_unchanged(isolated_chats):
 
 
 def test_resync_emits_when_role_changes_after_grant(isolated_chats):
-    """resync_role_directives emits 1 when a role was granted after last directive."""
+    """_last_emitted_role returns the role from the most recent directive to a session."""
     from khimaira.monitor import sessions as sessions_mod
 
     c = isolated_chats
@@ -2964,15 +2964,16 @@ def test_resync_emits_when_role_changes_after_grant(isolated_chats):
     chat_id = room["meta"]["chat_id"]
     c.accept(chat_id, "bob-uuid")
 
-    # Grant bob the critic role (changing it from whatever it was, or adding it)
-    c.chat_grant_role(chat_id, "alice-uuid", "bob-uuid", c.ROLE_CRITIC)
+    # Grant bob the analyst role (has a ROLE_BUDGET entry → directive emitted)
+    c.chat_grant_role(chat_id, "alice-uuid", "bob-uuid", c.ROLE_ANALYST)
 
-    directives_after_grant = [r for r in c._read(chat_id) if c._is_role_directive(r) and (r.get("meta") or {}).get("target") == "bob-uuid"]
-
-    # Now change bob's role in member_roles directly (simulates what would happen on restart)
-    # and verify resync detects the change
+    # _last_emitted_role should reflect the analyst grant
     last = c._last_emitted_role(chat_id, "bob-uuid")
-    assert last == c.ROLE_CRITIC  # last directive was critic
+    assert last == c.ROLE_ANALYST
+
+    # resync should emit 0 (role unchanged since last directive)
+    emitted = c.resync_role_directives(chat_id)
+    assert emitted == 0
 
 
 def test_subscribe_backfill_skips_role_directives(isolated_chats):
