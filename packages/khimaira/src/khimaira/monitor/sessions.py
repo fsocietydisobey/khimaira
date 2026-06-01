@@ -1956,9 +1956,22 @@ def list_handoffs_in_scope(session_id: str, cwd: str) -> list[dict]:
     return out
 
 
-def consume_handoffs(session_id: str, cwd: str) -> list[dict]:
-    """Return handoffs matching this session's cwd; mark this session as
-    having read them (no double-surface on session resume).
+def consume_handoffs(
+    session_id: str,
+    cwd: str,
+    mark_read: bool = True,
+) -> list[dict]:
+    """Return handoffs matching this session's cwd.
+
+    Auto-claims ownership (first caller becomes owner) and optionally marks
+    this session as having read the handoff.
+
+    mark_read=True (default): adds session_id to read_by so the handoff
+        won't re-surface on the next SessionStart. Use for explicit acks.
+    mark_read=False: surfaces and auto-claims but does NOT add to read_by —
+        the handoff re-surfaces on every SessionStart until explicitly acked.
+        Use for the SessionStart hook so a session-compaction doesn't lose
+        the handoff body permanently.
 
     Match: handoff.scope_cwd is == cwd OR cwd is a child of scope_cwd
     (so a handoff scoped at /repo/root surfaces in any session working
@@ -2008,17 +2021,19 @@ def consume_handoffs(session_id: str, cwd: str) -> list[dict]:
         if not existing_owner:
             h["owner_session_id"] = session_id
             h["_claim_role"] = "owner"  # transient flag for the hook
+            needs_rewrite = True  # persist the ownership claim regardless of mark_read
         else:
             h["_claim_role"] = "observer"
             h["_owner_session_id"] = existing_owner
 
         matched.append(h)
-        h["read_by"] = read_by + [session_id]
-        needs_rewrite = True
+        if mark_read:
+            h["read_by"] = read_by + [session_id]
+            needs_rewrite = True
 
-    # Rewrite if EITHER we marked something read OR there are expired
-    # entries to drop. Without the second condition, an all-expired file
-    # accumulates forever — the gc only runs when something else happens
+    # Rewrite if EITHER we marked something read (or auto-claimed) OR there
+    # are expired entries to drop. Without the second condition, an all-expired
+    # file accumulates forever — the gc only runs when something else happens
     # to fire, which may never.
     if needs_rewrite or has_expired:
         tmp = _HANDOFFS_PATH.with_suffix(".jsonl.tmp")

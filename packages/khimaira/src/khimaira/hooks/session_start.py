@@ -476,9 +476,16 @@ def _consume_handoffs(session_id: str, cwd: str) -> list[dict]:
     losing the only signal that prior work needs to be picked up.
     """
     # --- HTTP path (preferred) ---
+    # mark_read=false: surface without consuming — handoff re-surfaces on
+    # every SessionStart until the agent explicitly acks it. This prevents
+    # session-compaction from silently losing the handoff body (the premature-
+    # mark-read bug where a compacted session could never recover a handoff
+    # it had "consumed" but not yet acted on).
     cwd_q = urllib.parse.quote(cwd, safe="")
     sid_q = urllib.parse.quote(session_id, safe="")
-    payload = _http_get_json(f"/api/handoffs/consume?session_id={sid_q}&cwd={cwd_q}")
+    payload = _http_get_json(
+        f"/api/handoffs/consume?session_id={sid_q}&cwd={cwd_q}&mark_read=false"
+    )
     if payload is not None:
         handoffs = payload.get("handoffs", [])
         return handoffs if isinstance(handoffs, list) else []
@@ -524,13 +531,14 @@ def _consume_handoffs(session_id: str, cwd: str) -> list[dict]:
         if not existing_owner:
             h["owner_session_id"] = session_id
             h["_claim_role"] = "owner"
+            modified = True  # persist the ownership claim
         else:
             h["_claim_role"] = "observer"
             h["_owner_session_id"] = existing_owner
 
         matched.append(h)
-        h["read_by"] = read_by + [session_id]
-        modified = True
+        # Don't mark read — handoff re-surfaces on every SessionStart until
+        # the agent explicitly acks. Mirrors the HTTP path's mark_read=false.
 
     if modified:
         tmp = _HANDOFFS_PATH.with_suffix(".jsonl.tmp")
@@ -697,7 +705,7 @@ def _format_handoffs(handoffs: list[dict], cwd: str) -> str:
                 f"- [handoff {h['id'][:8]} · {ts} · from {from_id} · "
                 f"OWNED BY session {owner} · {sub_count} subscriber(s)]"
             )
-            lines.append(f"  {text[:400]}{'…' if len(text) > 400 else ''}")
+            lines.append(f"  {text}")
             lines.append("")
         lines.append(
             "**These handoffs are ALREADY OWNED by another session.** Default: "

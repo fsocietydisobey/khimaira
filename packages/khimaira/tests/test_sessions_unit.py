@@ -336,6 +336,54 @@ def test_consume_handoffs_auto_claims_first_consumer_as_owner(isolated_state, tm
     assert second[0]["_owner_session_id"] == "session-A"
 
 
+def test_consume_handoffs_mark_read_false_resurfaces(isolated_state, tmp_path):
+    """mark_read=False: handoff is returned but NOT added to read_by, so it
+    re-surfaces on the next SessionStart call (the W-HANDOFF-TRUNC fix)."""
+    project = tmp_path / "p"
+    project.mkdir()
+    isolated_state.post_handoff(
+        "asker",
+        text="directive from predecessor",
+        scope_cwd=str(project),
+        expires_in_hours=24,
+    )
+
+    # Surface without marking read
+    first = isolated_state.consume_handoffs("session-A", str(project), mark_read=False)
+    assert len(first) == 1
+
+    # Same session — handoff re-surfaces because read_by was NOT updated
+    second = isolated_state.consume_handoffs("session-A", str(project), mark_read=False)
+    assert len(second) == 1
+
+    # Once explicitly acked (mark_read=True), it no longer re-surfaces
+    third = isolated_state.consume_handoffs("session-A", str(project), mark_read=True)
+    assert len(third) == 1
+    fourth = isolated_state.consume_handoffs("session-A", str(project), mark_read=True)
+    assert fourth == []
+
+
+def test_consume_handoffs_mark_read_false_preserves_auto_claim(isolated_state, tmp_path):
+    """mark_read=False still auto-claims ownership (persists to JSONL)."""
+    project = tmp_path / "p"
+    project.mkdir()
+    isolated_state.post_handoff(
+        "asker",
+        text="claim me",
+        scope_cwd=str(project),
+        expires_in_hours=24,
+    )
+
+    result = isolated_state.consume_handoffs("session-A", str(project), mark_read=False)
+    assert result[0]["_claim_role"] == "owner"
+    assert result[0]["owner_session_id"] == "session-A"
+
+    # Second session is observer (claim was persisted despite mark_read=False)
+    obs = isolated_state.consume_handoffs("session-B", str(project), mark_read=False)
+    assert obs[0]["_claim_role"] == "observer"
+    assert obs[0]["_owner_session_id"] == "session-A"
+
+
 def test_subscribe_handoff_idempotent(isolated_state, tmp_path):
     """subscribe_handoff is idempotent — calling twice doesn't duplicate."""
     asker = "asker"

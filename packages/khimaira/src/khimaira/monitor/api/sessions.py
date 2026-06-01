@@ -316,10 +316,19 @@ def build_router():
             raise fastapi.HTTPException(404, str(e))
 
     @router.get("/handoffs/consume")
-    async def consume_handoffs(session_id: str, cwd: str) -> dict:
-        """Return handoffs matching cwd; mark this session_id as having read.
-        First consumer of an unclaimed handoff auto-claims as owner."""
-        return {"handoffs": sessions.consume_handoffs(session_id, cwd)}
+    async def consume_handoffs(
+        session_id: str,
+        cwd: str,
+        mark_read: bool = True,
+    ) -> dict:
+        """Return handoffs matching cwd; auto-claim ownership if unclaimed.
+
+        mark_read=true (default): adds session_id to read_by so the handoff
+            won't re-surface on the next SessionStart.
+        mark_read=false: surfaces without marking read — handoff re-surfaces
+            on every SessionStart until explicitly acked. Used by the hook.
+        """
+        return {"handoffs": sessions.consume_handoffs(session_id, cwd, mark_read=mark_read)}
 
     @router.get("/handoffs/in-scope")
     async def list_handoffs_in_scope(session_id: str, cwd: str) -> dict:
