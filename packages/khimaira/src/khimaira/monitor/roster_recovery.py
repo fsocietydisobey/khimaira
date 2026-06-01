@@ -57,7 +57,10 @@ _COMPACT_COOLDOWN_S = 300.0  # 5 min between compact/wake attempts per window
 # Patterns that indicate the terminal is actively working (NOT idle).
 _BUSY_MARKERS = ("esc to interrupt", "compacting…", "compacting...", "compacting ")
 
-_CONTEXT_PCT_RE = re.compile(r"(\d+)%\s+context\s+used", re.IGNORECASE)
+# Context window per model family (tokens). All current Claude models share 200k;
+# Opus-1M variants use 1M. Overridable via KHIMAIRA_CONTEXT_WINDOW env var.
+_CONTEXT_WINDOW_DEFAULT = 200_000
+_CONTEXT_WINDOW_1M = 1_000_000
 
 # Debounce table: (window_id, action) → last_attempt_ts
 _DEBOUNCE: dict[tuple[int, str], float] = {}
@@ -221,10 +224,53 @@ def _get_screen(window_id: int) -> str | None:
     return _kitty("get-text", f"--match=id:{window_id}")
 
 
-def _parse_context_pct(text: str) -> int | None:
-    """Extract ``NN% context used`` from terminal screen content."""
-    m = _CONTEXT_PCT_RE.search(text)
-    return int(m.group(1)) if m else None
+def _compute_context_pct(session_id: str) -> int | None:
+    """Return context window usage as an integer percentage (0–100), or None on failure.
+
+    Reads the last assistant turn's usage block from the transcript JSONL.
+    This is UI-independent — it works regardless of how Claude Code renders
+    context in the terminal (which does NOT show "NN% context used").
+
+    context_tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+    pct = round(100 * context_tokens / context_window)
+
+    Fail-safe: returns None on any read failure so we never compact blindly.
+    """
+    try:
+        from khimaira.monitor import sessions as _sess
+        transcript = _sess._find_transcript(session_id)
+        if transcript is None or not transcript.is_file():
+            return None
+
+        lines = transcript.read_text(errors="replace").splitlines()
+        for line in reversed(lines):
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if obj.get("type") != "assistant":
+                continue
+            msg = obj.get("message") or {}
+            usage = msg.get("usage")
+            if not isinstance(usage, dict):
+                continue
+
+            # Detect Opus-1M variants; all others use 200k default.
+            model = (msg.get("model") or "").lower()
+            context_window = int(os.environ.get("KHIMAIRA_CONTEXT_WINDOW", "0")) or (
+                _CONTEXT_WINDOW_1M if ("1m" in model or "1000k" in model) else _CONTEXT_WINDOW_DEFAULT
+            )
+
+            context_tokens = (
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
+            )
+            return round(100 * context_tokens / context_window)
+
+        return None
+    except Exception:
+        return None
 
 
 def _is_busy(text: str) -> bool:
@@ -707,7 +753,9 @@ async def _process_window(win: dict[str, Any]) -> None:
                 )
             return  # HITL prompt present — don't compact/wake until it's cleared
 
-    context_pct = _parse_context_pct(text)
+    context_pct = await asyncio.get_event_loop().run_in_executor(
+        None, _compute_context_pct, session_id
+    )
     busy = _is_busy(text)
 
     # -----------------------------------------------------------------------

@@ -2044,3 +2044,345 @@ def test_post_grant_role_non_master_returns_403(chats_api_client):
         },
     )
     assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Guard-5 Part A — gates-as-tasks primitives
+# ---------------------------------------------------------------------------
+
+
+def _setup_room_with_master(client, chats_mod, master="alice", members=("bob",), member_roles=None):
+    """Helper: create a room, accept all members, return chat_id."""
+    roles = member_roles or {master: "master"}
+    resp = client.post(
+        "/api/chats",
+        json={
+            "creator_session_id": master,
+            "member_session_ids": list(members),
+            "title": "guard5-test",
+            "member_roles": roles,
+        },
+    )
+    chat_id = resp.json()["meta"]["chat_id"]
+    for m in members:
+        client.post(f"/api/chats/{chat_id}/accept", json={"session_id": m})
+    return chat_id
+
+
+def test_create_task_with_assignee_role(chats_api_client):
+    """create_task with assignee_role='critic' stores the role-class assignee."""
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client, chats_mod, member_roles={"alice": "master", "bob": "critic"}
+    )
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "Review this",
+            "assignee_role": "critic",
+            "gate_required": False,
+            "gate_for": None,
+            "verdict_role": "critic",
+        },
+    )
+    assert r.status_code == 200
+    task = r.json()
+    assert task["assignee_role"] == "critic"
+    assert task["verdict_role"] == "critic"
+    assert task["gate_for"] is None
+    assert task["status"] == "pending"
+
+
+def test_auto_create_review_tasks_on_done(chats_api_client):
+    """When a gate_required task → done, AUTO-creates critic + verifier review-tasks."""
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client, chats_mod,
+        member_roles={"alice": "master", "bob": "agent"},
+    )
+    # Create a gate_required work-task
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "Do the thing",
+            "assignee_session_id": "bob",
+            "gate_required": True,
+        },
+    )
+    work_task_id = r.json()["id"]
+
+    # bob moves it in_progress
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+
+    # bob marks it done — AUTO-create should fire
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
+    assert r.status_code == 200
+
+    # Check review-tasks were created
+    room = chats_mod.load_room(chat_id)
+    review_tasks = [
+        m for m in room["messages"]
+        if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
+    ]
+    verdict_roles = {t["verdict_role"] for t in review_tasks}
+    assert "critic" in verdict_roles
+    assert "verifier" in verdict_roles
+
+
+def test_master_override_verdict_audited(chats_api_client):
+    """master_override_verdict with reason+trigger → 200 and is_override=True on record."""
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client, chats_mod,
+        member_roles={"alice": "master", "bob": "agent"},
+    )
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={"sender_session_id": "alice", "body": "task for override"},
+    )
+    task_id = r.json()["id"]
+
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks/{task_id}/override-verdict",
+        json={
+            "by_session_id": "alice",
+            "verdict": "approve",
+            "reason": "quorum timed out after 30min, no reachable critic",
+            "trigger": "quorum_timeout",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_override"] is True
+    assert body["override_trigger"] == "quorum_timeout"
+    assert "quorum" in body["override_reason"].lower()
+
+
+def test_master_override_verdict_non_master_blocked(chats_api_client):
+    """Non-master cannot post override verdict → 403."""
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client, chats_mod,
+        member_roles={"alice": "master", "bob": "agent"},
+    )
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={"sender_session_id": "alice", "body": "task"},
+    )
+    task_id = r.json()["id"]
+
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks/{task_id}/override-verdict",
+        json={
+            "by_session_id": "bob",  # bob is agent, not master
+            "verdict": "approve",
+            "reason": "trying to bypass",
+            "trigger": "manual_deadlock",
+        },
+    )
+    assert r.status_code == 403
+
+
+def test_auto_create_review_tasks_no_duplicate_while_open(chats_api_client):
+    """Second AUTO-create doesn't duplicate while prior review-tasks are still OPEN."""
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client, chats_mod,
+        member_roles={"alice": "master", "bob": "agent"},
+    )
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "Do the thing",
+            "assignee_session_id": "bob",
+            "gate_required": True,
+        },
+    )
+    work_task_id = r.json()["id"]
+
+    # First done → creates 2 open review-tasks
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "in_progress"})
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "done"})
+
+    # changes_requested → in_progress → done again (review-tasks still OPEN)
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "alice", "new_status": "changes_requested"})
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "in_progress"})
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "done"})
+
+    # Open review-tasks still exist → no duplicates; should still be exactly 2
+    room = chats_mod.load_room(chat_id)
+    review_tasks = [
+        m for m in room["messages"]
+        if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
+    ]
+    assert len(review_tasks) == 2, f"Expected 2 review-tasks (no dup), got {len(review_tasks)}"
+
+
+def test_gate_bypass_prevented_on_satisfied_prior_round(chats_api_client):
+    """B3 gate-bypass prevention: stale approve+ship from round-1 must NOT satisfy round-2.
+
+    Scenario: critic approves + verifier ships in round-1 → master sends changes_requested
+    despite verdicts → agent re-submits (done again) → gate must NOT be satisfied by
+    the stale round-1 verdicts (that would let un-reviewed changes bypass B3).
+
+    This is the DISTINGUISHING test: dedup-on-ANY vs dedup-on-OPEN diverge ONLY
+    on the satisfied-prior path. 'exactly 2 tasks' passes under both implementations;
+    this test does not.
+    """
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client, chats_mod,
+        members=("bob", "carol"),
+        member_roles={"alice": "master", "bob": "agent", "carol": "critic"},
+    )
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "Do the thing",
+            "assignee_session_id": "bob",
+            "gate_required": True,
+        },
+    )
+    work_task_id = r.json()["id"]
+
+    # Round 1: bob does task → done
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "in_progress"})
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "done"})
+
+    # Round-1 verdicts: critic approves + verifier ships on the WORK-TASK
+    chats_mod.record_gate_verdict(chat_id, "carol", work_task_id, "approve")
+    # Simulate verifier shipping (override role check for test simplicity by
+    # directly inserting a verdict record via _append)
+    import uuid
+    chats_mod._append(chat_id, {
+        "kind": chats_mod.TASK_VERDICT,
+        "event_id": chats_mod._new_event_id(),
+        "ts": chats_mod._now_iso(),
+        "chat_id": chat_id,
+        "task_id": work_task_id,
+        "verdict": "ship",
+        "by_session_id": "alice",  # not a real verifier — test only
+        "by_name": "alice",
+    })
+
+    # Verify round-1 gate is satisfied
+    verdicts_r1 = chats_mod.get_gate_verdicts_by_task("alice", work_task_id)
+    assert isinstance(verdicts_r1, dict)
+    assert verdicts_r1["critic_approved"] is True
+    assert verdicts_r1["verifier_shipped"] is True
+
+    # Master requests changes despite satisfied verdicts → round-2 begins
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "alice", "new_status": "changes_requested"})
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "in_progress"})
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "done"})
+
+    # Round-2 gate must be ABSENT (stale round-1 verdicts invalidated)
+    verdicts_r2 = chats_mod.get_gate_verdicts_by_task("alice", work_task_id)
+    assert verdicts_r2 == "absent", (
+        f"Expected gate ABSENT for round-2 (stale verdicts must be invalidated), got {verdicts_r2}"
+    )
+
+
+def test_auto_create_review_tasks_fresh_on_re_done_after_closed(chats_api_client):
+    """After prior review-tasks are closed, re-done creates fresh obligations."""
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client, chats_mod,
+        member_roles={"alice": "master", "bob": "agent"},
+    )
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "Do the thing",
+            "assignee_session_id": "bob",
+            "gate_required": True,
+        },
+    )
+    work_task_id = r.json()["id"]
+
+    # First done → creates 2 review-tasks
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "in_progress"})
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "done"})
+
+    room = chats_mod.load_room(chat_id)
+    review_task_ids = [
+        m["id"] for m in room["messages"]
+        if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
+    ]
+    assert len(review_task_ids) == 2
+
+    # Close review-tasks (mark them done — simulating reviewer completed them)
+    for rtid in review_task_ids:
+        client.post(f"/api/chats/{chat_id}/tasks/{rtid}/status",
+                    json={"by_session_id": "alice", "new_status": "cancelled"})
+
+    # Work-task: changes_requested → in_progress → done again (review-tasks now CLOSED)
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "alice", "new_status": "changes_requested"})
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "in_progress"})
+    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+                json={"by_session_id": "bob", "new_status": "done"})
+
+    # Should now have 4 review-tasks total (2 closed + 2 fresh)
+    room = chats_mod.load_room(chat_id)
+    all_review_tasks = [
+        m for m in room["messages"]
+        if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
+    ]
+    assert len(all_review_tasks) == 4, f"Expected 4 review-tasks (2 fresh), got {len(all_review_tasks)}"
+
+
+def test_is_reachable_false_when_not_subscribed(chats_api_client):
+    """is_reachable returns False for a session with no open SSE subscription."""
+    client, chats_mod = chats_api_client
+    # alice has no SSE subscriber (test environment — no live /events connection)
+    assert chats_mod.is_reachable("alice") is False
+
+
+def test_guard4_suppressed_during_wind_down(chats_api_client, monkeypatch):
+    """Guard-4 does not escalate when roster is in wind-down."""
+    import asyncio
+    from khimaira.monitor import sessions as sessions_mod
+    from khimaira.monitor.api import chats as api_mod
+
+    importlib.reload(sessions_mod)
+    importlib.reload(api_mod)
+
+    sessions_mod.set_roster_wind_down(True)
+    try:
+        # Patch escalation to verify it never fires
+        escalated = []
+
+        async def _mock_escalate(*args, **kwargs):
+            escalated.append(args)
+
+        monkeypatch.setattr(api_mod, "_guard4_escalate", _mock_escalate)
+
+        asyncio.run(api_mod._guard4_check_once())
+        assert escalated == [], "Guard-4 should not escalate during wind-down"
+    finally:
+        sessions_mod.set_roster_wind_down(False)

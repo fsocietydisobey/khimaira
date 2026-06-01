@@ -36,6 +36,11 @@ import os
 import time
 from typing import Any
 
+from khimaira.monitor.sessions import (
+    is_roster_wind_down as _is_roster_wind_down_shared,
+    set_roster_wind_down as _set_roster_wind_down_shared,
+)
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -59,11 +64,6 @@ _BOOTSTRAP_GRACE_TURNS = 3
 # Shared daemon state
 # ---------------------------------------------------------------------------
 
-# True while the roster is in a declared wind-down.  Set/cleared by the API
-# layer when master calls the wind-down/resume endpoint (Part B of Guard-5's
-# wind-down primitive; daemon-global so Guard-4 can also read it).
-_ROSTER_WIND_DOWN: bool = False
-
 # Debounce: gate_key → timestamp of last escalation.  Re-armed when the gate
 # state-changes (verdict posted / task status changes / new event).
 # gate_key = (chat_id, task_id)
@@ -72,15 +72,15 @@ _GUARD5_STALLED_TTL_S = 2 * 3600.0  # 2-hour fallback expiry
 
 
 def set_wind_down(active: bool) -> None:
-    """Daemon API: enter/exit roster wind-down mode.  Both Guard-4 and Guard-5
-    check _ROSTER_WIND_DOWN before escalating."""
-    global _ROSTER_WIND_DOWN
-    _ROSTER_WIND_DOWN = active
+    """Daemon API: enter/exit roster wind-down mode. Both Guard-4 and Guard-5
+    check the shared flag before escalating (Guard-5 Part A: implement once,
+    consume everywhere — flag lives in sessions.py)."""
+    _set_roster_wind_down_shared(active)
     log.info("guard5: roster wind-down = %s", active)
 
 
 def is_wind_down() -> bool:
-    return _ROSTER_WIND_DOWN
+    return _is_roster_wind_down_shared()
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +447,7 @@ async def _guard5_escalate(
 
 async def _guard5_check_once() -> None:
     """One sweep: scan for blocking gates, count idle sessions, escalate."""
-    if _ROSTER_WIND_DOWN:
+    if _is_roster_wind_down_shared():
         return
 
     now = time.time()

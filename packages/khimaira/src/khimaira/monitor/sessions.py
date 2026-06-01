@@ -276,6 +276,30 @@ def get_session_ppid(session_id: str) -> int | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Roster wind-down flag — shared signal for Guard-4 + Guard-5 suppression.
+# When the roster is deliberately offline (declared wind-down), both guards
+# must pause their stall-clocks to avoid false-positive escalations (the
+# 18h overnight ping class: in_progress sessions silently offline = normal
+# wind-down, not a hang). Implemented once here; consumed everywhere.
+# ---------------------------------------------------------------------------
+
+_roster_wind_down: bool = False
+
+
+def set_roster_wind_down(active: bool) -> None:
+    """Declare or lift a roster wind-down. While active, Guard-4 and Guard-5
+    suppress stall-escalation — sessions are intentionally offline, not hung."""
+    global _roster_wind_down
+    _roster_wind_down = active
+
+
+def is_roster_wind_down() -> bool:
+    """True when the roster is in a declared wind-down. Guards should not
+    escalate silent sessions during wind-down."""
+    return _roster_wind_down
+
+
 def write_sse_heartbeat(session_id: str) -> None:
     """Subscriber-side heartbeat. Called from the PostToolUse hook on every tool
     call. Stamps `last_sse_heartbeat` into status.json so daemon can detect

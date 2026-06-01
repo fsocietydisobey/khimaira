@@ -410,13 +410,182 @@ def _was_begin_fired(chat_id: str, task_id: str) -> bool:
     return False
 
 
+def session_has_task_obligation(
+    task: dict,
+    current_task_status: str,
+    resolved_session_id: str,
+    gate_verdict_satisfied: bool | None = None,
+) -> bool:
+    """Canonical obligation-membership predicate — shared by _get_session_obligations,
+    Guard-4, Guard-5, and the watcher wake-gate (_session_has_pending_task).
+
+    Returns True when resolved_session_id owes this task as an obligation:
+    - Named assignee: task's assignee_id == resolved_session_id
+    - Role-class assignee: task's assignee_role == session's resolved role
+    Task must be open (pending or in_progress).
+
+    gate_verdict_satisfied: for review-tasks (gate_for set):
+      - None: no gate check (caller lacks verdict context; use for simple wake checks)
+      - True: gate already satisfied → NOT an obligation
+      - False: gate not yet satisfied → IS an obligation
+
+    DESIGN: session_role is resolved INTERNALLY via resolve_session_role to ensure
+    both named and role-class callers get the same resolution path. Avoids the
+    divergence class where different callers compute role differently and the
+    "shared" predicate silently disagrees.
+    """
+    open_statuses = {chats.TASK_PENDING, chats.TASK_IN_PROGRESS}
+    if current_task_status not in open_statuses:
+        return False
+
+    # Gate-verdict check is part of the OBLIGATION DEFINITION for review-tasks.
+    # A review-task whose verdict is already satisfied is NOT an obligation —
+    # review-tasks are not auto-closed on verdict posting (audit-grade: record_gate_verdict
+    # appends TASK_VERDICT only, never calls update_task_status).
+    # When gate_verdict_satisfied is None (caller lacks verdict context) AND this is
+    # a review-task (gate_for set), conservatively return False — let _get_session_obligations
+    # (which computes gate_verdict_satisfied inline) handle it. This avoids false-wakes.
+    is_review_task = bool(task.get("gate_for"))
+    if is_review_task:
+        if gate_verdict_satisfied is None:
+            return False  # caller must provide verdict state for review-tasks
+        if gate_verdict_satisfied is True:
+            return False  # already satisfied — not an obligation
+
+    # Named-assignee check
+    if task.get("assignee_id") == resolved_session_id:
+        return True
+
+    # Role-class check — resolve role internally so both callers get the same result
+    task_assignee_role = task.get("assignee_role")
+    if task_assignee_role:
+        try:
+            from .themis import resolve_session_role
+            session_role = resolve_session_role(resolved_session_id)
+            if session_role == task_assignee_role:
+                return True
+        except Exception:
+            pass  # fail-open: if role can't be resolved, skip role-class match
+
+    return False
+
+
+def _find_chat_master(chat_id: str) -> str | None:
+    """Return the master session_id for a chat, or None if not found."""
+    try:
+        room = chats.load_room(chat_id)
+        member_roles = (room.get("meta") or {}).get("member_roles") or {}
+        for sid, role in member_roles.items():
+            if role == chats.ROLE_MASTER:
+                return sid
+        # v1 fallback: created_by
+        return (room.get("meta") or {}).get("created_by")
+    except Exception:
+        return None
+
+
+def _auto_create_review_tasks(
+    chat_id: str,
+    work_task_id: str,
+    by_session_id: str,
+) -> None:
+    """Guard-5 Part A: AUTO-create role-class review-tasks when a gate_required task → done.
+
+    Creates one review-task per verdict_role (critic + verifier) as obligation-wrappers.
+    Each review-task carries gate_for=work_task_id and verdict_role so that:
+    - _get_session_obligations picks them up for role-holders
+    - Guard-4/#14/roster_recovery gain gate-stall visibility for free
+
+    The review-task obligation CLEARS when get_gate_verdicts(work_task_id) shows that
+    role's verdict present — the existing B3 verdict machinery; no duplication.
+
+    Fail-open: if the work-task doesn't have gate_required=True, or if any task already
+    exists for that verdict_role+gate_for pair, skips silently.
+    """
+    try:
+        # Check if the work-task has gate_required=True
+        work_task: dict | None = None
+        for line in chats._read(chat_id):
+            if line.get("kind") == chats.TASK and line.get("id") == work_task_id:
+                work_task = line
+                break
+        if work_task is None or not work_task.get("gate_required"):
+            return
+
+        # Check which OPEN review-tasks already exist for this work-task.
+        # Dedup only on open tasks (pending/in_progress) — a satisfied/closed
+        # review-task should allow a fresh review obligation on re-done.
+        # Fold status updates to find the current status per task.
+        review_task_statuses: dict[str, str] = {}  # task_id → current status
+        review_task_roles: dict[str, str] = {}      # task_id → verdict_role
+        for line in chats._read(chat_id):
+            k = line.get("kind")
+            if k == chats.TASK and line.get("gate_for") == work_task_id:
+                tid = line.get("id")
+                vr = line.get("verdict_role")
+                if tid and vr:
+                    review_task_statuses[tid] = line.get("status", chats.TASK_PENDING)
+                    review_task_roles[tid] = vr
+            elif k == chats.TASK_UPDATE:
+                tid = line.get("task_id")
+                if tid in review_task_statuses:
+                    review_task_statuses[tid] = line.get("status", review_task_statuses[tid])
+
+        open_statuses = {chats.TASK_PENDING, chats.TASK_IN_PROGRESS}
+        existing_verdict_roles: set[str] = {
+            review_task_roles[tid]
+            for tid, status in review_task_statuses.items()
+            if status in open_statuses
+        }
+
+        # Find the master to send review-task creation as (create_task requires master)
+        master_sid = _find_chat_master(chat_id)
+        if not master_sid:
+            return  # can't create review-tasks without a master
+
+        # Create review-tasks for critic and verifier if not already present
+        for verdict_role in (chats.ROLE_CRITIC, chats.ROLE_VERIFIER):
+            if verdict_role in existing_verdict_roles:
+                continue
+            body = (
+                f"🔍 Review gate for task {work_task_id} — "
+                f"{verdict_role} verdict required.\n\n"
+                f"Original task: {(work_task.get('body') or '')[:200]}"
+            )
+            try:
+                chats.create_task(
+                    chat_id,
+                    master_sid,
+                    body,
+                    assignee_role=verdict_role,
+                    gate_for=work_task_id,
+                    verdict_role=verdict_role,
+                )
+            except Exception:
+                pass  # fail-open per review-task
+    except Exception:
+        pass  # fail-open: AUTO-create is best-effort
+
+
 def _get_session_obligations(session_id: str) -> list[dict]:
     """Find tasks where session_id is assignee with status pending or in_progress.
 
     Scans all chat JSONL files. Returns list of {task_id, chat_id, status, begin_fired}.
+    Guard-5 Part A: also includes open review-tasks where assignee_role matches the
+    session's current role (role-class obligations). A review-task is OPEN until
+    get_gate_verdicts(gate_for) shows that verdict_role's verdict is present.
     Fail-open: errors scanning a chat are silently skipped.
     """
     obligations: list[dict] = []
+    # Guard-5: resolve the session's current role for role-class obligation matching.
+    # Fail-open: if role can't be resolved, only named-assignee obligations apply.
+    session_role: str | None = None
+    try:
+        from .themis import resolve_session_role
+        session_role = resolve_session_role(session_id)
+    except Exception:
+        pass
+
     try:
         chat_dir = chats._chat_dir()
         if not chat_dir.exists():
@@ -427,6 +596,7 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                 # Fold task state from the JSONL without calling load_room first
                 # (avoids member validation for a read-only scan).
                 tasks: dict[str, dict] = {}
+                verdicts: dict[str, dict] = {}  # task_id → {critic_approved, verifier_shipped}
                 for line in chats._read(chat_id):
                     k = line.get("kind")
                     if k == chats.TASK:
@@ -435,6 +605,9 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                             tasks[tid] = {
                                 "task_id": tid,
                                 "assignee_id": line.get("assignee_id"),
+                                "assignee_role": line.get("assignee_role"),
+                                "gate_for": line.get("gate_for"),
+                                "verdict_role": line.get("verdict_role"),
                                 "status": line.get("status"),
                                 "begin_fired": False,
                             }
@@ -446,17 +619,69 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                         tid = line.get("task_id")
                         if tid and tid in tasks:
                             tasks[tid]["begin_fired"] = True
+                    elif k == chats.TASK_VERDICT:
+                        # Track verdicts for review-task open-check
+                        ref_tid = line.get("task_id")
+                        if ref_tid:
+                            v = verdicts.setdefault(ref_tid, {
+                                "critic_approved": False,
+                                "verifier_shipped": False,
+                            })
+                            verdict_val = line.get("verdict", "")
+                            if verdict_val == "approve":
+                                v["critic_approved"] = True
+                            elif verdict_val == "changes":
+                                v["critic_approved"] = False
+                            elif verdict_val == "ship":
+                                v["verifier_shipped"] = True
+                            elif verdict_val == "hold":
+                                v["verifier_shipped"] = False
+
                 for task in tasks.values():
-                    if (
-                        task.get("assignee_id") == session_id
-                        and task.get("status") in (chats.TASK_PENDING, chats.TASK_IN_PROGRESS)
-                    ):
+                    status = task.get("status")
+                    if status not in (chats.TASK_PENDING, chats.TASK_IN_PROGRESS):
+                        continue
+
+                    # Named-assignee obligation (existing behavior)
+                    if task.get("assignee_id") == session_id:
                         obligations.append({
                             "task_id": task["task_id"],
                             "chat_id": chat_id,
-                            "status": task["status"],
+                            "status": status,
                             "begin_fired": task.get("begin_fired", False),
                         })
+                        continue
+
+                    # Guard-5 Part A: role-class review-task obligation.
+                    # A session with role R has an obligation for any open review-task
+                    # whose assignee_role==R AND whose gate verdict isn't yet satisfied.
+                    task_verdict_role = task.get("verdict_role")
+                    task_assignee_role = task.get("assignee_role")
+                    gate_for = task.get("gate_for")
+                    if (
+                        session_role
+                        and task_assignee_role == session_role
+                        and gate_for
+                        and task_verdict_role
+                    ):
+                        # Open iff the relevant verdict hasn't landed on the work-task.
+                        gate_v = verdicts.get(gate_for, {})
+                        verdict_satisfied = (
+                            gate_v.get("critic_approved")
+                            if task_verdict_role == chats.ROLE_CRITIC
+                            else gate_v.get("verifier_shipped")
+                            if task_verdict_role == chats.ROLE_VERIFIER
+                            else False
+                        )
+                        if not verdict_satisfied:
+                            obligations.append({
+                                "task_id": task["task_id"],
+                                "chat_id": chat_id,
+                                "status": status,
+                                "begin_fired": task.get("begin_fired", False),
+                                "gate_for": gate_for,
+                                "verdict_role": task_verdict_role,
+                            })
             except Exception:
                 continue
     except Exception:
@@ -724,7 +949,17 @@ async def _guard4_check_once() -> None:
     Fix A: 2D pending-gate (BEGIN-fired × liveness).
     Fix B: obligation-scoped debounce — only clear when the obligation itself clears,
            not when the session has an activity-blip (prevents re-spam).
+    Guard-5 Part A: suppress during declared roster wind-down (sessions intentionally
+    offline should not be escalated as hung — the 18h overnight false-positive class).
     """
+    # Wind-down suppression — the roster is deliberately offline; don't escalate.
+    try:
+        from khimaira.monitor.sessions import is_roster_wind_down
+        if is_roster_wind_down():
+            return
+    except Exception:
+        pass  # fail-open: if the flag can't be read, continue with normal check
+
     now = time.time()
 
     # Sweep stale debounce entries (TTL-based fallback)
@@ -885,7 +1120,18 @@ class CreateTaskReq(BaseModel):
     sender_session_id: str
     body: str
     assignee_session_id: str | None = None
+    assignee_role: str | None = None  # Guard-5: role-class assignee
+    gate_required: bool = False       # Guard-5: auto-create review-tasks on done
+    gate_for: str | None = None       # Guard-5: review-task references this work-task
+    verdict_role: str | None = None   # Guard-5: "critic"|"verifier"
     private: bool = False  # v1.9.2: hide from non-assignee in chat_history
+
+
+class MasterOverrideVerdictReq(BaseModel):
+    by_session_id: str
+    verdict: str       # "approve" | "changes" | "ship" | "hold"
+    reason: str        # non-empty — audited, never silent
+    trigger: str       # "quorum_timeout" | "manual_deadlock"
 
 
 class UpdateTaskStatusReq(BaseModel):
@@ -1175,6 +1421,10 @@ def build_router():
                 req.sender_session_id,
                 req.body,
                 assignee_session_id=req.assignee_session_id,
+                assignee_role=req.assignee_role,
+                gate_required=req.gate_required,
+                gate_for=req.gate_for,
+                verdict_role=req.verdict_role,
                 private=req.private,
             )
         except ValueError as exc:
@@ -1183,7 +1433,7 @@ def build_router():
     @router.post("/chats/{chat_id}/tasks/{task_id}/status")
     async def update_task_status(chat_id: str, task_id: str, req: UpdateTaskStatusReq) -> dict:
         try:
-            return chats.update_task_status(
+            result = chats.update_task_status(
                 chat_id,
                 task_id,
                 req.by_session_id,
@@ -1195,6 +1445,44 @@ def build_router():
             # 403 for permission errors (master-only transitions); 404 for unknown task
             msg = str(exc)
             code = 403 if any(w in msg for w in ("creator", "assignee", "transition")) else 404
+            raise fastapi.HTTPException(code, msg) from exc
+
+        # Guard-5 Part A: AUTO-create review-tasks when gate_required task → done.
+        if req.new_status == chats.TASK_DONE:
+            try:
+                _auto_create_review_tasks(chat_id, task_id, req.by_session_id)
+            except Exception:
+                pass  # fail-open: AUTO-create is best-effort
+        return result
+
+    @router.post("/chats/{chat_id}/tasks/{task_id}/override-verdict")
+    async def master_override_verdict(
+        chat_id: str, task_id: str, req: MasterOverrideVerdictReq
+    ) -> dict:
+        """Audited gate-close for master — quorum-timeout escape valve (Guard-5 Part A).
+
+        Posts a TASK_VERDICT with is_override=True + reason + trigger. IN-MASTER-9
+        permits this when the audited fields are present. Only master may call this.
+        trigger ∈ {quorum_timeout, manual_deadlock}. reason must be non-empty.
+        """
+        try:
+            return chats.master_override_verdict(
+                chat_id,
+                req.by_session_id,
+                task_id,
+                req.verdict,
+                req.reason,
+                req.trigger,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            # Distinguish validation errors (400) from auth errors (403)
+            is_validation = (
+                "Invalid trigger" in msg
+                or "Invalid verdict" in msg
+                or "reason must be non-empty" in msg
+            )
+            code = 400 if is_validation else 403
             raise fastapi.HTTPException(code, msg) from exc
 
     @router.post("/chats/{chat_id}/tasks/{task_id}/signal-start")

@@ -861,6 +861,10 @@ def create_task(
     sender_session_id: str,
     body: str,
     assignee_session_id: str | None = None,
+    assignee_role: str | None = None,
+    gate_required: bool = False,
+    gate_for: str | None = None,
+    verdict_role: str | None = None,
     *,
     private: bool = False,
 ) -> dict[str, Any]:
@@ -869,6 +873,17 @@ def create_task(
 
     `private=True`: task hidden from non-assignee members in chat_history.
     Requires assignee_session_id (private task with no assignee is meaningless).
+
+    Guard-5 Part A additions:
+    - `assignee_role`: role-class assignee ("critic"/"verifier"/etc). Obligation binds
+       to the ROLE, satisfiable by any holder. Use instead of assignee_session_id for
+       review-tasks so a dead/wedged named reviewer can't deadlock the gate.
+    - `gate_required=True`: daemon will AUTO-create review-tasks (one per verdict_role
+       that lacks an existing task) when this task transitions to done.
+    - `gate_for`: str task_id — this task is a review-gate for that work-task. Set by
+       the daemon when auto-creating review-tasks; marks the obligation-wrapper shape.
+    - `verdict_role`: "critic"|"verifier" — which role produces the verdict that closes
+       this review-task. Used by _get_session_obligations role-class scanning.
 
     Phase B v2: observers cannot create tasks.
     """
@@ -927,14 +942,21 @@ def create_task(
         # to=[assignee] normalises the private filter path so history() can
         # use a single check across all private record types.
         "to": [assignee_resolved] if private and assignee_resolved else None,
+        # Guard-5 Part A fields
+        "assignee_role": assignee_role,
+        "gate_required": gate_required,
+        "gate_for": gate_for,
+        "verdict_role": verdict_role,
     }
     _append(chat_id, record)
     log.info(
-        "chats: task %s created in %s by %s (assignee=%s)",
+        "chats: task %s created in %s by %s (assignee=%s assignee_role=%s gate_required=%s)",
         record["id"],
         chat_id,
         sender_session_id,
         assignee_resolved or "(none)",
+        assignee_role or "(none)",
+        gate_required,
     )
     return record
 
@@ -1186,6 +1208,81 @@ def record_gate_verdict(
     return record
 
 
+_VERDICT_TRIGGER_QUORUM = "quorum_timeout"
+_VERDICT_TRIGGER_MANUAL = "manual_deadlock"
+_VERDICT_TRIGGERS: frozenset[str] = frozenset({_VERDICT_TRIGGER_QUORUM, _VERDICT_TRIGGER_MANUAL})
+
+
+def master_override_verdict(
+    chat_id: str,
+    by_session_id: str,
+    task_id: str,
+    verdict: str,
+    reason: str,
+    trigger: str,
+) -> dict[str, Any]:
+    """Audited gate-close for master — unifies master-collapse + B3-emergency-bypass.
+
+    Guard-5 Part A: when a review-gate stalls (quorum-timeout or verified deadlock),
+    master can self-post an override verdict with explicit reason + trigger. This is
+    the quorum-timeout escape valve — NOT a rubber-stamp bypass.
+
+    IN-MASTER-9 permits this verdict when is_override=True + reason + trigger are
+    present on the TASK_VERDICT record. A bare verdict (missing these) is still blocked.
+
+    Only the chat master may call this. trigger ∈ {quorum_timeout, manual_deadlock}.
+    reason must be non-empty (the override is logged, never silent).
+    """
+    by_session_id = _resolve_or_uuid(by_session_id)
+    valid_verdicts = frozenset({"approve", "changes", "ship", "hold"})
+    if verdict not in valid_verdicts:
+        raise ValueError(
+            f"Invalid verdict {verdict!r}; must be one of {sorted(valid_verdicts)}"
+        )
+    if trigger not in _VERDICT_TRIGGERS:
+        raise ValueError(
+            f"Invalid trigger {trigger!r}; must be one of {sorted(_VERDICT_TRIGGERS)}"
+        )
+    if not reason or not reason.strip():
+        raise ValueError("reason must be non-empty — the override must be auditable.")
+
+    room = load_room(chat_id)
+    if not _is_master(room, by_session_id):
+        raise ValueError(
+            f"Session {by_session_id!r} is not the master of {chat_id!r}; "
+            f"only the master can post an override verdict."
+        )
+
+    task_record = None
+    for msg in room.get("messages", []):
+        if msg.get("kind") == TASK and msg.get("id") == task_id:
+            task_record = msg
+            break
+    if task_record is None:
+        raise ValueError(f"No task with id={task_id!r} in {chat_id!r}.")
+
+    member = room["members"].get(by_session_id)
+    record = {
+        "kind": TASK_VERDICT,
+        "event_id": _new_event_id(),
+        "ts": _now_iso(),
+        "chat_id": chat_id,
+        "task_id": task_id,
+        "verdict": verdict,
+        "by_session_id": by_session_id,
+        "by_name": member.get("session_name") or by_session_id[:8] if member else by_session_id[:8],
+        "is_override": True,
+        "override_reason": reason.strip(),
+        "override_trigger": trigger,
+    }
+    _append(chat_id, record)
+    log.warning(
+        "chats: OVERRIDE verdict task=%s verdict=%r trigger=%r reason=%r by=%s in=%s",
+        task_id, verdict, trigger, reason, by_session_id, chat_id,
+    )
+    return record
+
+
 # Sentinel constants for the tri-state gate-verdict lookup.
 _GATE_ABSENT = "absent"
 _GATE_ERROR = "error"
@@ -1258,12 +1355,28 @@ def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
         if best_task is None:
             return None  # no active task → ad-hoc commit allowed
 
-        # Step 2: scan for verdict events
+        # Step 2: scan for verdict events — only from the CURRENT done round.
+        # Guard-5 Part A: changes_requested invalidates prior-round verdicts.
+        # When a work-task goes done→changes_requested→in_progress→done again,
+        # stale round-1 verdicts must not satisfy the round-2 gate (B3 gate bypass).
+        # Fix: find the timestamp of the most recent 'done' transition; only count
+        # TASK_VERDICT events AFTER that timestamp (the current review round).
         task_id = best_task.get("id")
         try:
             room = load_room(best_chat_id)
         except Exception:
             return _GATE_ERROR
+
+        # Find the most recent 'done' transition timestamp for this task.
+        last_done_ts: str = ""
+        for msg in room.get("messages", []):
+            kind = msg.get("kind")
+            if kind == TASK and msg.get("id") == task_id:
+                if msg.get("status") == TASK_DONE:
+                    last_done_ts = max(last_done_ts, msg.get("ts", ""))
+            elif kind == TASK_UPDATE and msg.get("task_id") == task_id:
+                if (msg.get("status") or msg.get("new_status")) == TASK_DONE:
+                    last_done_ts = max(last_done_ts, msg.get("ts", ""))
 
         critic_verdict: str | None = None
         verifier_verdict: str | None = None
@@ -1271,6 +1384,9 @@ def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
             if msg.get("kind") != TASK_VERDICT:
                 continue
             if msg.get("task_id") != task_id:
+                continue
+            # Skip verdicts from prior rounds (before the current done transition).
+            if last_done_ts and msg.get("ts", "") < last_done_ts:
                 continue
             v = msg.get("verdict")
             if v in ("approve", "changes"):
@@ -1324,7 +1440,17 @@ def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] |
             member = room["members"].get(sid)
             if not member or member["state"] != ACCEPTED:
                 continue
-            # Scan verdicts
+            # Find the most recent 'done' transition timestamp (Guard-5 Part A: invalidation).
+            last_done_ts_by: str = ""
+            for msg in room.get("messages", []):
+                kind = msg.get("kind")
+                if kind == TASK and msg.get("id") == task_id and msg.get("status") == TASK_DONE:
+                    last_done_ts_by = max(last_done_ts_by, msg.get("ts", ""))
+                elif kind == TASK_UPDATE and msg.get("task_id") == task_id:
+                    if (msg.get("status") or msg.get("new_status")) == TASK_DONE:
+                        last_done_ts_by = max(last_done_ts_by, msg.get("ts", ""))
+
+            # Scan verdicts from the current done round only.
             critic_verdict: str | None = None
             verifier_verdict: str | None = None
             for msg in room.get("messages", []):
@@ -1332,6 +1458,8 @@ def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] |
                     continue
                 if msg.get("task_id") != task_id:
                     continue
+                if last_done_ts_by and msg.get("ts", "") < last_done_ts_by:
+                    continue  # prior-round verdict — skip
                 v = msg.get("verdict")
                 if v in ("approve", "changes"):
                     critic_verdict = v
@@ -2388,6 +2516,27 @@ async def assign_batch(
 
 # session_id → set[asyncio.Queue]. One queue per active subscription.
 _subscribers: dict[str, set[asyncio.Queue]] = {}
+
+
+def is_reachable(session_id: str) -> bool:
+    """Return True if session_id has a live SSE subscription (open /events connection).
+
+    Uses the daemon-side _subscribers registry — ground truth (open stream = reachable).
+    A session with at least one active queue is subscribed and can receive events.
+
+    _resolve_or_uuid is load-bearing: subscribe() keys _subscribers by the resolved UUID
+    (chats.py:2573); is_reachable must resolve identically or name-vs-UUID mismatches
+    produce false negatives (session looks unreachable when it's connected).
+
+    Caveat: lags a silent TCP-drop by ≤15s — the drop is detected on the next failed
+    ping (ping=15 in EventSourceResponse), which cancels the generator and runs the
+    finally that discards the queue. Negligible vs T_stall (minutes).
+    """
+    try:
+        sid = _resolve_or_uuid(session_id)
+    except Exception:
+        return False
+    return bool(_subscribers.get(sid))
 
 
 # ---------------------------------------------------------------------------

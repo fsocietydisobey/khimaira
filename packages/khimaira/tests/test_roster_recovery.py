@@ -91,21 +91,106 @@ class TestDiscoverRosterWindows:
 
 
 # ---------------------------------------------------------------------------
-# _parse_context_pct
+# _compute_context_pct (transcript-token based — replaces terminal-scrape)
 # ---------------------------------------------------------------------------
 
-class TestParseContextPct:
-    def test_parses_percent(self):
-        assert rr._parse_context_pct("  87% context used · /model sonnet") == 87
+def _make_transcript_jsonl(usage: dict, model: str = "claude-sonnet-4-6") -> str:
+    """Return a minimal transcript JSONL with one assistant message."""
+    import json as _json
+    record = {
+        "type": "assistant",
+        "message": {
+            "model": model,
+            "usage": usage,
+        },
+    }
+    return _json.dumps(record) + "\n"
 
-    def test_parses_100(self):
-        assert rr._parse_context_pct("100% context used") == 100
 
-    def test_returns_none_when_absent(self):
-        assert rr._parse_context_pct("some other text") is None
+class TestComputeContextPct:
+    def _run(self, usage: dict, model: str = "claude-sonnet-4-6", env_override: str | None = None) -> int | None:
+        content = _make_transcript_jsonl(usage, model)
+        mock_path = MagicMock()
+        mock_path.is_file.return_value = True
+        mock_path.read_text.return_value = content
 
-    def test_case_insensitive(self):
-        assert rr._parse_context_pct("42% Context Used") == 42
+        from khimaira.monitor import sessions as sess_mod
+        env = {}
+        if env_override is not None:
+            env["KHIMAIRA_CONTEXT_WINDOW"] = env_override
+        with (
+            patch.object(sess_mod, "_find_transcript", return_value=mock_path),
+            patch.dict(os.environ, env, clear=False),
+        ):
+            return rr._compute_context_pct("dummy-session-id")
+
+    def test_basic_usage(self):
+        # 170_000 / 200_000 = 85%
+        result = self._run({
+            "input_tokens": 100_000,
+            "cache_creation_input_tokens": 50_000,
+            "cache_read_input_tokens": 20_000,
+            "output_tokens": 500,
+        })
+        assert result == 85
+
+    def test_full_context(self):
+        result = self._run({
+            "input_tokens": 200_000,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        })
+        assert result == 100
+
+    def test_empty_usage_returns_zero(self):
+        result = self._run({
+            "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        })
+        assert result == 0
+
+    def test_no_transcript_returns_none(self):
+        from khimaira.monitor import sessions as sess_mod
+        with patch.object(sess_mod, "_find_transcript", return_value=None):
+            assert rr._compute_context_pct("dummy") is None
+
+    def test_missing_usage_returns_none(self):
+        content = '{"type": "assistant", "message": {"model": "claude-sonnet-4-6"}}\n'
+        mock_path = MagicMock()
+        mock_path.is_file.return_value = True
+        mock_path.read_text.return_value = content
+        from khimaira.monitor import sessions as sess_mod
+        with patch.object(sess_mod, "_find_transcript", return_value=mock_path):
+            assert rr._compute_context_pct("dummy") is None
+
+    def test_env_context_window_override(self):
+        # 100_000 / 400_000 = 25%
+        result = self._run(
+            {"input_tokens": 100_000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+            env_override="400000",
+        )
+        assert result == 25
+
+    def test_below_threshold(self):
+        # 168_000 / 200_000 = 84% — below 85%
+        result = self._run({
+            "input_tokens": 100_000,
+            "cache_creation_input_tokens": 50_000,
+            "cache_read_input_tokens": 18_000,
+        })
+        assert result is not None and result == 84
+
+    def test_at_threshold(self):
+        # 172_000 / 200_000 = 86% — above 85%
+        result = self._run({
+            "input_tokens": 100_000,
+            "cache_creation_input_tokens": 50_000,
+            "cache_read_input_tokens": 22_000,
+        })
+        assert result is not None and result >= 85
 
 
 # ---------------------------------------------------------------------------
@@ -199,12 +284,13 @@ class TestProcessWindow:
 
     @pytest.mark.asyncio
     async def test_compact_when_at_threshold(self):
-        screen = "87% context used\n>"
+        screen = ">"
         with (
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=87),
             patch.object(rr, "_distill_session", new_callable=AsyncMock),
             patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
         ):
@@ -215,7 +301,7 @@ class TestProcessWindow:
     async def test_distill_called_before_compact(self):
         """Verify distill-before-compact ordering (data-safety invariant)."""
         call_order: list[str] = []
-        screen = "92% context used\n>"
+        screen = ">"
 
         async def mock_distill(sid, role):
             call_order.append("distill")
@@ -229,6 +315,7 @@ class TestProcessWindow:
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=92),
             patch.object(rr, "_distill_session", side_effect=mock_distill),
             patch.object(rr, "_inject_text_and_submit", side_effect=mock_inject),
         ):
@@ -240,12 +327,13 @@ class TestProcessWindow:
 
     @pytest.mark.asyncio
     async def test_skips_when_busy(self):
-        screen = "88% context used\nesc to interrupt"
+        screen = "esc to interrupt"
         with (
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=88),
             patch.object(rr, "_inject_text_and_submit") as mock_inject,
         ):
             await rr._process_window(self._win())
@@ -253,12 +341,13 @@ class TestProcessWindow:
 
     @pytest.mark.asyncio
     async def test_skips_when_below_threshold(self):
-        screen = "70% context used\n>"
+        screen = ">"
         with (
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=70),
             patch.object(rr, "_inject_text_and_submit") as mock_inject,
         ):
             await rr._process_window(self._win())
@@ -266,7 +355,7 @@ class TestProcessWindow:
 
     @pytest.mark.asyncio
     async def test_debounce_suppresses_second_compact(self):
-        screen = "90% context used\n>"
+        screen = ">"
         rr._DEBOUNCE[(10, "compact")] = time.time()  # already compacted recently
 
         with (
@@ -274,6 +363,7 @@ class TestProcessWindow:
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=90),
             patch.object(rr, "_inject_text_and_submit") as mock_inject,
         ):
             await rr._process_window(self._win())
@@ -332,8 +422,8 @@ class TestProcessWindow:
     async def test_aborts_compact_if_window_becomes_busy_during_distill(self):
         """After distill completes, window may have started working — re-check."""
         screens = iter([
-            "90% context used\n>",          # initial check: idle
-            "90% context used\nesc to interrupt",  # re-check after distill: busy
+            ">",                    # initial check: idle
+            "esc to interrupt",     # re-check after distill: busy
         ])
 
         async def mock_distill(sid, role):
@@ -344,6 +434,7 @@ class TestProcessWindow:
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_get_screen", side_effect=screens),
+            patch.object(rr, "_compute_context_pct", return_value=90),
             patch.object(rr, "_distill_session", side_effect=mock_distill),
             patch.object(rr, "_inject_text_and_submit") as mock_inject,
         ):
@@ -353,13 +444,14 @@ class TestProcessWindow:
     @pytest.mark.asyncio
     async def test_watcher_wakes_session_with_pending_task(self):
         """Idle session with a pending-not-started task qualifies for wake."""
-        screen = "75% context used\n>"  # below compact threshold, idle
+        screen = ">"  # below compact threshold, idle
 
         with (
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=60),
             patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
             patch.object(rr, "_session_has_pending_task", return_value=True),
             patch.object(rr, "_session_has_pending_invite", return_value=False),
@@ -374,13 +466,14 @@ class TestProcessWindow:
     @pytest.mark.asyncio
     async def test_watcher_wakes_session_with_pending_invite(self):
         """Idle session with a pending chat invite qualifies for wake."""
-        screen = "60% context used\n>"  # below compact threshold, idle
+        screen = ">"  # below compact threshold, idle
 
         with (
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=60),
             patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
             patch.object(rr, "_session_has_pending_task", return_value=False),
             patch.object(rr, "_session_has_pending_invite", return_value=True),
@@ -395,13 +488,14 @@ class TestProcessWindow:
     @pytest.mark.asyncio
     async def test_watcher_no_false_wake_no_obligation(self):
         """Idle session with no task, no invite, no obligation → no wake."""
-        screen = "60% context used\n>"
+        screen = ">"
 
         with (
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=60),
             patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
             patch.object(rr, "_session_has_pending_task", return_value=False),
             patch.object(rr, "_session_has_pending_invite", return_value=False),
