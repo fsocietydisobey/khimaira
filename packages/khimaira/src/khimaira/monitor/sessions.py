@@ -284,20 +284,33 @@ def get_session_ppid(session_id: str) -> int | None:
 # wind-down, not a hang). Implemented once here; consumed everywhere.
 # ---------------------------------------------------------------------------
 
-_roster_wind_down: bool = False
+# Persisted as a sentinel FILE (not an in-process global). An in-memory global
+# is invisible across processes: an operator setting it in one process never
+# reaches the daemon's guard loops in another. The sentinel is cross-process and
+# survives a daemon restart (a wind-down spanning a restart stays in effect).
+# Derived from _BASE_DIR so it honors XDG_STATE_HOME (test-isolatable).
+_ROSTER_WIND_DOWN_SENTINEL = _BASE_DIR.parent / "roster_wind_down"
 
 
 def set_roster_wind_down(active: bool) -> None:
     """Declare or lift a roster wind-down. While active, Guard-4 and Guard-5
-    suppress stall-escalation — sessions are intentionally offline, not hung."""
-    global _roster_wind_down
-    _roster_wind_down = active
+    suppress stall-escalation — sessions are intentionally offline, not hung.
+
+    Operators may equivalently ``touch``/``rm`` the sentinel directly:
+    ``$XDG_STATE_HOME/khimaira/roster_wind_down`` (default
+    ``~/.local/state/khimaira/roster_wind_down``)."""
+    if active:
+        _ROSTER_WIND_DOWN_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+        _ROSTER_WIND_DOWN_SENTINEL.touch(exist_ok=True)
+    else:
+        _ROSTER_WIND_DOWN_SENTINEL.unlink(missing_ok=True)
 
 
 def is_roster_wind_down() -> bool:
     """True when the roster is in a declared wind-down. Guards should not
-    escalate silent sessions during wind-down."""
-    return _roster_wind_down
+    escalate silent sessions during wind-down. Reads the sentinel file each
+    call so the daemon picks up an operator's change without a restart."""
+    return _ROSTER_WIND_DOWN_SENTINEL.exists()
 
 
 def write_sse_heartbeat(session_id: str) -> None:
