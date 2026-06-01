@@ -38,7 +38,9 @@ ACCEPTED = "accepted"
 REJECTED = "rejected"  # invitee declined; can be re-invited later
 LEFT = "left"
 REMOVED = "removed"
-TRANSFERRED_OUT = "transferred-out"  # session handed membership to another via transfer_membership
+TRANSFERRED_OUT = (
+    "transferred-out"  # session handed membership to another via transfer_membership
+)
 
 # Sender id used for daemon-synthesized system messages (e.g. the
 # transfer_membership broadcast). Stable constant so future audit /
@@ -114,9 +116,18 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
     ROLE_OBSERVER: {"model": "haiku", "effort": "low"},
     ROLE_ARCHITECT: {"model": "opus", "effort": "max"},  # synthesis/design sidecar
     ROLE_INTAKE: {"model": "sonnet", "effort": "medium"},  # user-facing front-end
-    ROLE_ANALYST: {"model": "opus", "effort": "max"},  # spec disambiguation, idle-by-default
-    ROLE_VERIFIER: {"model": "opus", "effort": "max"},  # test coverage gate, idle-by-default
-    ROLE_TRACKER: {"model": "haiku", "effort": "medium"},  # checklist curator + Linear filer
+    ROLE_ANALYST: {
+        "model": "opus",
+        "effort": "max",
+    },  # spec disambiguation, idle-by-default
+    ROLE_VERIFIER: {
+        "model": "opus",
+        "effort": "max",
+    },  # test coverage gate, idle-by-default
+    ROLE_TRACKER: {
+        "model": "haiku",
+        "effort": "medium",
+    },  # checklist curator + Linear filer
     # Domain leads: sonnet/medium default; escalate to opus only for rare decomposition-heavy
     # initiatives (per lead-role.md.j2 convention). Entries here must match the themis rule
     # yaml filenames in packages/themis/src/themis/rules/ — ROLE_BUDGET keys must be in
@@ -199,8 +210,10 @@ def _cursors_path() -> Path:
 # backfills from there with no loss.
 # ---------------------------------------------------------------------------
 
-_CURSORS: dict[tuple[str, str], str] = {}  # (session_id, chat_id) → last yielded event_id
-_CURSORS_DIRTY: bool = False               # true when _CURSORS has unsaved changes
+_CURSORS: dict[tuple[str, str], str] = (
+    {}
+)  # (session_id, chat_id) → last yielded event_id
+_CURSORS_DIRTY: bool = False  # true when _CURSORS has unsaved changes
 
 
 def _cursor_for(session_id: str, chat_id: str) -> str | None:
@@ -264,8 +277,10 @@ def save_cursors() -> None:
 
     now_ts = datetime.now(UTC).isoformat()
     lines = [
-        json.dumps({"session_id": sid, "chat_id": cid, "last_event_id": eid, "ts": now_ts},
-                   separators=(",", ":"))
+        json.dumps(
+            {"session_id": sid, "chat_id": cid, "last_event_id": eid, "ts": now_ts},
+            separators=(",", ":"),
+        )
         for (sid, cid), eid in _CURSORS.items()
     ]
 
@@ -393,56 +408,52 @@ def _is_role_directive(record: dict[str, Any]) -> bool:
     )
 
 
-def _last_emitted_role(chat_id: str, session_id: str) -> str | None:
-    """Return the role from the most recent role_directive emitted to session_id in chat_id."""
-    result: str | None = None
-    for line in _read(chat_id):
-        if not _is_role_directive(line):
-            continue
-        meta = line.get("meta") or {}
-        if meta.get("target") == session_id:
-            result = meta.get("role")
-    return result
+def gc_role_directives_in_chat(chat_id: str) -> int:
+    """Compact role_directive bloat: keep only the latest directive per target,
+    drop historical duplicates. All other records are preserved exactly.
+    Returns count of records dropped.
 
-
-def resync_role_directives(chat_id: str) -> int:
-    """Idempotent startup re-broadcast: emit one role_directive per member only
-    if their current role differs from what was last emitted. Returns count emitted.
-
-    Called at daemon startup so reconnecting sessions get one fresh directive
-    instead of replaying the accumulated historic ones from the backfill.
-    Per-chat scoped — no cross-chat leakage.
+    Role-directive emission is event-driven (role-change points), never periodic.
+    Historic duplicates accumulate when storms or repeated grants fire; this
+    GC de-dupes them so the JSONL stays lean.
     """
+    path = _chat_path(chat_id)
+    if not path.exists():
+        return 0
+    lines = _read(chat_id)
+    # Pass 1: find the index of the LAST role_directive per target session.
+    last_idx_per_target: dict[str, int] = {}
+    for i, line in enumerate(lines):
+        if _is_role_directive(line):
+            target = (line.get("meta") or {}).get("target", "")
+            if target:
+                last_idx_per_target[target] = i
+    # Pass 2: build the compacted list — drop all but the last per target.
+    keep_set = set(last_idx_per_target.values())
+    compacted = []
+    dropped = 0
+    for i, line in enumerate(lines):
+        if _is_role_directive(line):
+            target = (line.get("meta") or {}).get("target", "")
+            if target and i not in keep_set:
+                dropped += 1
+                continue  # drop historical duplicate
+        compacted.append(line)
+    if dropped == 0:
+        return 0
+    # Atomic rewrite via temp file + rename (same pattern as sessions.py).
+    tmp = path.with_suffix(".jsonl.gc_tmp")
     try:
-        room = load_room(chat_id)
-    except ValueError:
-        return 0
-    member_roles = (room.get("meta") or {}).get("member_roles") or {}
-    emitted = 0
-    for raw_sid, role in member_roles.items():
-        # member_roles keys are UUIDs, but resolve defensively for safety
-        try:
-            sid = _resolve_or_uuid(raw_sid)
-        except Exception:
-            sid = raw_sid
-        last = _last_emitted_role(chat_id, sid)
-        if last != role:
-            _emit_role_directive(chat_id, sid, role)
-            emitted += 1
-    return emitted
+        import json as _json
 
-
-def resync_role_directives_for_all_chats() -> int:
-    """Call resync_role_directives for every chat. Returns total emitted."""
-    total = 0
-    if not _chat_dir().exists():
-        return 0
-    for path in _chat_dir().glob("chat-*.jsonl"):
-        try:
-            total += resync_role_directives(path.stem)
-        except Exception:
-            pass
-    return total
+        with tmp.open("w") as fh:
+            for rec in compacted:
+                fh.write(_json.dumps(rec, separators=(",", ":")) + "\n")
+        tmp.rename(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return dropped
 
 
 def _is_master(room: dict[str, Any], sid: str) -> bool:
@@ -509,7 +520,9 @@ def _resolve_or_uuid(session_id_or_name: str) -> str:
     return sessions_mod.resolve_session_id(session_id_or_name)
 
 
-def derive_chat_id(member_session_ids: list[str], fresh_suffix: str | None = None) -> str:
+def derive_chat_id(
+    member_session_ids: list[str], fresh_suffix: str | None = None
+) -> str:
     """sha256 over sorted-members + optional fresh_suffix → 12-char prefix."""
     sorted_members = sorted(member_session_ids)
     payload = "|".join(sorted_members) + "|" + (fresh_suffix or "")
@@ -542,7 +555,8 @@ def load_room(chat_id: str) -> dict[str, Any]:
             existing.update(
                 {
                     "session_id": sid,
-                    "session_name": line.get("session_name") or existing.get("session_name"),
+                    "session_name": line.get("session_name")
+                    or existing.get("session_name"),
                     "state": line["state"],
                     "last_transition_ts": line["ts"],
                     "last_transition_event_id": line["event_id"],
@@ -698,7 +712,8 @@ def invite(chat_id: str, by_session_id: str, invitee_session_id: str) -> dict[st
         "ts": _now_iso(),
         "chat_id": chat_id,
         "session_id": invitee_session_id,
-        "session_name": _resolve_session_name(invitee_session_id) or invitee_session_id[:8],
+        "session_name": _resolve_session_name(invitee_session_id)
+        or invitee_session_id[:8],
         "state": PENDING,
         "invited_by": by_session_id,
     }
@@ -1264,14 +1279,20 @@ def record_gate_verdict(
     }
     _append(chat_id, record)
     log.info(
-        "chats: task %s verdict=%r by %s in %s", task_id, verdict, by_session_id, chat_id
+        "chats: task %s verdict=%r by %s in %s",
+        task_id,
+        verdict,
+        by_session_id,
+        chat_id,
     )
     return record
 
 
 _VERDICT_TRIGGER_QUORUM = "quorum_timeout"
 _VERDICT_TRIGGER_MANUAL = "manual_deadlock"
-_VERDICT_TRIGGERS: frozenset[str] = frozenset({_VERDICT_TRIGGER_QUORUM, _VERDICT_TRIGGER_MANUAL})
+_VERDICT_TRIGGERS: frozenset[str] = frozenset(
+    {_VERDICT_TRIGGER_QUORUM, _VERDICT_TRIGGER_MANUAL}
+)
 
 
 def master_override_verdict(
@@ -1331,7 +1352,11 @@ def master_override_verdict(
         "task_id": task_id,
         "verdict": verdict,
         "by_session_id": by_session_id,
-        "by_name": member.get("session_name") or by_session_id[:8] if member else by_session_id[:8],
+        "by_name": (
+            member.get("session_name") or by_session_id[:8]
+            if member
+            else by_session_id[:8]
+        ),
         "is_override": True,
         "override_reason": reason.strip(),
         "override_trigger": trigger,
@@ -1339,7 +1364,12 @@ def master_override_verdict(
     _append(chat_id, record)
     log.warning(
         "chats: OVERRIDE verdict task=%s verdict=%r trigger=%r reason=%r by=%s in=%s",
-        task_id, verdict, trigger, reason, by_session_id, chat_id,
+        task_id,
+        verdict,
+        trigger,
+        reason,
+        by_session_id,
+        chat_id,
     )
     return record
 
@@ -1505,7 +1535,11 @@ def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] |
             last_done_ts_by: str = ""
             for msg in room.get("messages", []):
                 kind = msg.get("kind")
-                if kind == TASK and msg.get("id") == task_id and msg.get("status") == TASK_DONE:
+                if (
+                    kind == TASK
+                    and msg.get("id") == task_id
+                    and msg.get("status") == TASK_DONE
+                ):
                     last_done_ts_by = max(last_done_ts_by, msg.get("ts", ""))
                 elif kind == TASK_UPDATE and msg.get("task_id") == task_id:
                     if (msg.get("status") or msg.get("new_status")) == TASK_DONE:
@@ -1616,7 +1650,9 @@ def set_auto_accept(session_id: str, allowlist: list[str]) -> dict[str, Any]:
     payload = {"allow": list(allowlist), "updated_at": _now_iso()}
     name = _resolve_session_name(session_id)
     if name:
-        _auto_accept_by_name_path(name).write_text(json.dumps(payload), encoding="utf-8")
+        _auto_accept_by_name_path(name).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
         log.info(
             "chats: set auto-accept for %s (by-name=%s) → %d allowed peers",
             session_id,
@@ -1714,7 +1750,9 @@ def history(
     msgs = room["messages"]
     if since_event_id:
         # Skip everything up to and including since_event_id.
-        idx = next((i for i, m in enumerate(msgs) if m.get("event_id") == since_event_id), None)
+        idx = next(
+            (i for i, m in enumerate(msgs) if m.get("event_id") == since_event_id), None
+        )
         if idx is not None:
             msgs = msgs[idx + 1 :]
     # Private-message filter: records with private=True are only visible to
@@ -1935,7 +1973,9 @@ def transfer_membership(
         )
         sys_msg_event_type = "deputize"
     else:
-        sys_msg_body = f"📦 {from_name} transferred this chat to {to_name} — full context handoff"
+        sys_msg_body = (
+            f"📦 {from_name} transferred this chat to {to_name} — full context handoff"
+        )
         sys_msg_event_type = "transfer"
     sys_msg = {
         "kind": MSG,
@@ -2019,7 +2059,9 @@ def set_creator(chat_id: str, new_creator_session_id: str) -> dict[str, Any]:
 
     current_creator = room["meta"].get("created_by")
     if current_creator:
-        current_state = (room["members"].get(current_creator) or {}).get("state", "non-member")
+        current_state = (room["members"].get(current_creator) or {}).get(
+            "state", "non-member"
+        )
         if current_state != TRANSFERRED_OUT:
             raise ValueError(
                 f"Current creator {current_creator!r} state is {current_state!r}, not "
@@ -2092,7 +2134,9 @@ def chat_grant_role(
     if role not in _VALID_ROLES:
         raise ValueError(f"Invalid role {role!r}. Valid roles: {sorted(_VALID_ROLES)}.")
     if demote_to not in _VALID_ROLES:
-        raise ValueError(f"Invalid demote_to {demote_to!r}. Valid roles: {sorted(_VALID_ROLES)}.")
+        raise ValueError(
+            f"Invalid demote_to {demote_to!r}. Valid roles: {sorted(_VALID_ROLES)}."
+        )
     if demote_to == ROLE_MASTER:
         raise ValueError(
             "demote_to cannot be 'master' — single-master-with-delegation "
@@ -2184,7 +2228,11 @@ def chat_grant_role(
         target_session_id,
         role,
         by_session_id,
-        " (first explicit write — materialized implicit master)" if first_explicit_write else "",
+        (
+            " (first explicit write — materialized implicit master)"
+            if first_explicit_write
+            else ""
+        ),
     )
     return new_meta
 
@@ -2224,7 +2272,9 @@ def chat_resume_master(
         chat_grant_role)
     """
     if demote_to not in _VALID_ROLES:
-        raise ValueError(f"Invalid demote_to {demote_to!r}. Valid roles: {sorted(_VALID_ROLES)}.")
+        raise ValueError(
+            f"Invalid demote_to {demote_to!r}. Valid roles: {sorted(_VALID_ROLES)}."
+        )
     if demote_to == ROLE_MASTER:
         raise ValueError(
             "demote_to cannot be 'master' — single-master-with-delegation "
@@ -2298,7 +2348,11 @@ def chat_resume_master(
         "chats: resume_master chat=%s donor=%s demoted_vice=%s",
         chat_id,
         by_session_id,
-        current_master if current_master and current_master != by_session_id else "(none)",
+        (
+            current_master
+            if current_master and current_master != by_session_id
+            else "(none)"
+        ),
     )
     return new_meta
 
@@ -2370,9 +2424,13 @@ def my_chats(session_id: str) -> list[dict[str, Any]]:
                 "chat_id": chat_id,
                 "title": room["meta"].get("title"),
                 "my_state": member["state"],
-                "member_count": sum(1 for m in room["members"].values() if m["state"] == ACCEPTED),
+                "member_count": sum(
+                    1 for m in room["members"].values() if m["state"] == ACCEPTED
+                ),
                 "message_count": len(room["messages"]),
-                "last_message_ts": room["messages"][-1]["ts"] if room["messages"] else None,
+                "last_message_ts": (
+                    room["messages"][-1]["ts"] if room["messages"] else None
+                ),
             }
         )
     out.sort(key=lambda c: c["last_message_ts"] or "", reverse=True)
@@ -2617,6 +2675,7 @@ _PPID_TTL_SECONDS = 300  # 5 min — subprocess should fetch within this window
 # ppid → (session_id, registered_at_unix_ts)
 _pending_session_by_ppid: dict[int, tuple[str, float]] = {}
 
+
 def register_session_by_ppid(ppid: int, session_id: str) -> None:
     """SessionStart hook calls this with the session_id it knows about."""
     import time
@@ -2819,9 +2878,11 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
         # backfill entirely — they should only receive real-time messages.
         # The original behavior for fresh subscribes is preserved here.
         has_reconnect_hint = since_event_id is not None
-        any_cursor = any(_cursor_for(session_id, m["chat_id"]) is not None
-                         for m in my_chats(session_id)
-                         if m.get("my_state") == ACCEPTED)
+        any_cursor = any(
+            _cursor_for(session_id, m["chat_id"]) is not None
+            for m in my_chats(session_id)
+            if m.get("my_state") == ACCEPTED
+        )
         if has_reconnect_hint or any_cursor:
             for chat_meta in my_chats(session_id):
                 if chat_meta.get("my_state") != ACCEPTED:
@@ -2833,7 +2894,11 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
                 if cursor is not None:
                     # Daemon-side cursor wins. Events after the cursor position.
                     idx = next(
-                        (i for i, line in enumerate(lines) if line.get("event_id") == cursor),
+                        (
+                            i
+                            for i, line in enumerate(lines)
+                            if line.get("event_id") == cursor
+                        ),
                         None,
                     )
                     start = idx + 1 if idx is not None else max(0, len(lines) - 50)
@@ -2847,11 +2912,15 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
                     # (the prior bug: since_event_id belongs to a different chat)
                     # → deliver last 50 instead of silently skipping.
                     idx = next(
-                        (i for i, line in enumerate(lines) if line.get("event_id") == since_event_id),
+                        (
+                            i
+                            for i, line in enumerate(lines)
+                            if line.get("event_id") == since_event_id
+                        ),
                         None,
                     )
                     if idx is not None:
-                        for line in lines[idx + 1:]:
+                        for line in lines[idx + 1 :]:
                             if _is_role_directive(line):
                                 continue
                             yield line

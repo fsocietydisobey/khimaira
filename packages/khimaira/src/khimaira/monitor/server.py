@@ -42,12 +42,21 @@ def _print_banner(projects, connections_by_project) -> None:
         file=sys.stderr,
     )
     if not projects:
-        print("  (no langgraph projects discovered in khimaira roots registry)", file=sys.stderr)
+        print(
+            "  (no langgraph projects discovered in khimaira roots registry)",
+            file=sys.stderr,
+        )
     for project in projects:
         conns = connections_by_project.get(project.path)
-        print(f"  • {project.name} ({project.detected_via}) — {project.path}", file=sys.stderr)
+        print(
+            f"  • {project.name} ({project.detected_via}) — {project.path}",
+            file=sys.stderr,
+        )
         if conns is None or (not conns.postgres and not conns.sqlite):
-            print("      (no checkpointer detected — threads view will be empty)", file=sys.stderr)
+            print(
+                "      (no checkpointer detected — threads view will be empty)",
+                file=sys.stderr,
+            )
             continue
         for pg in conns.postgres:
             print(f"      postgres {pg.var}: {pg.host}/{pg.database}", file=sys.stderr)
@@ -86,9 +95,13 @@ def build_app():
     from .api import topology as topology_api
     from .api import usage as usage_api
 
-    app.include_router(projects_api.build_router(projects, connections_by_project), prefix="/api")
+    app.include_router(
+        projects_api.build_router(projects, connections_by_project), prefix="/api"
+    )
     app.include_router(topology_api.build_router(projects), prefix="/api")
-    app.include_router(threads_api.build_router(connections_by_project, projects), prefix="/api")
+    app.include_router(
+        threads_api.build_router(connections_by_project, projects), prefix="/api"
+    )
     app.include_router(api_routes_api.build_router(projects), prefix="/api")
     app.include_router(fc_api.build_router(projects), prefix="/api")
     app.include_router(drift_api.build_router(projects), prefix="/api")
@@ -108,49 +121,13 @@ def build_app():
     @app.on_event("startup")
     async def _load_chat_cursors() -> None:
         from .chats import load_cursors
-        load_cursors()
 
-    # Idempotent role-directive resync — emit ONE fresh role_directive per
-    # member per chat only when their current role differs from the last
-    # emitted directive. This replaces the historic-backfill storm (where
-    # every reconnect replayed all accumulated role_directives from the
-    # JSONL) with a single change-only emit. Zero directives on a restart
-    # with no role changes; one per changed member otherwise.
-    # TARGET-BY-UUID: member_roles keys are UUIDs; _resolve_or_uuid in
-    # resync_role_directives guards against any stale name keys.
-    @app.on_event("startup")
-    async def _resync_role_directives() -> None:
-        import logging
-        import asyncio
-        import os
-        _log = logging.getLogger(__name__)
-        # DISABLED by default (KHIMAIRA_ROLE_RESYNC!=1). The startup re-broadcast
-        # was storming EVERY chat — including other projects' rosters sharing this
-        # daemon (jeevy_portal) — on every restart, and the emit-on-change check
-        # mis-fires on a fresh daemon (no in-memory last-emitted state → all read
-        # as "changed" → full re-emit). Roles persist durably in member_roles, so
-        # existing sessions never needed re-broadcasting. Re-enable only once the
-        # change-detection reads durable last-emitted state, not in-memory.
-        if os.environ.get("KHIMAIRA_ROLE_RESYNC", "0") != "1":
-            _log.info("chats: startup role resync DISABLED (cross-roster storm fix; set KHIMAIRA_ROLE_RESYNC=1 to re-enable)")
-            return
-        # Brief delay: SSE subscribers aren't connected at startup, so the
-        # broadcast in _emit_role_directive would land in empty queues.
-        # Wait one event-loop tick to allow the MCP subprocess to reconnect.
-        await asyncio.sleep(2)
-        try:
-            from .chats import resync_role_directives_for_all_chats
-            n = await asyncio.to_thread(resync_role_directives_for_all_chats)
-            if n:
-                _log.info("chats: startup role resync emitted %d directive(s)", n)
-            else:
-                _log.info("chats: startup role resync — no role changes, 0 directives emitted")
-        except Exception as exc:
-            _log.warning("chats: startup role resync failed: %s", exc)
+        load_cursors()
 
     @app.on_event("shutdown")
     async def _save_chat_cursors() -> None:
         from .chats import save_cursors
+
         save_cursors()
 
     # Periodic cursor persist — flush _CURSORS to disk every 8 seconds.
@@ -162,6 +139,7 @@ def build_app():
 
         async def _loop() -> None:
             import khimaira.monitor.chats as _chats
+
             while True:
                 await asyncio.sleep(8)
                 if _chats._CURSORS_DIRTY:
@@ -174,6 +152,7 @@ def build_app():
     @app.on_event("startup")
     async def _start_overdue_watcher() -> None:
         from .api.chats import _overdue_watcher
+
         asyncio.create_task(_overdue_watcher())
 
     # Guard-4 + #13b-light watcher — escalates sessions silent-while-obligated
@@ -181,6 +160,7 @@ def build_app():
     @app.on_event("startup")
     async def _start_guard4_watcher() -> None:
         from .api.chats import _guard4_watcher
+
         asyncio.create_task(_guard4_watcher())
 
     # Roster auto-recovery watcher — distills + compacts kitty windows at high
@@ -188,6 +168,7 @@ def build_app():
     @app.on_event("startup")
     async def _start_roster_recovery_watcher() -> None:
         from . import roster_recovery
+
         asyncio.create_task(roster_recovery.watcher_loop())
 
     # #14 Auto-dispatch — periodic sweep proposing idle-agent → backlog-task
@@ -195,6 +176,7 @@ def build_app():
     @app.on_event("startup")
     async def _start_auto_dispatch_loop() -> None:
         from . import auto_dispatch
+
         asyncio.create_task(auto_dispatch.auto_dispatch_loop())
 
     # Guard-5 — roster-progress monitor. Fires when ≥K sessions are idle
@@ -203,6 +185,7 @@ def build_app():
     @app.on_event("startup")
     async def _start_guard5_watcher() -> None:
         from . import guard5
+
         asyncio.create_task(guard5.guard5_loop())
 
     # Guard-6 — heartbeat-liveness detector. Fires when a roster member has
@@ -211,6 +194,7 @@ def build_app():
     @app.on_event("startup")
     async def _start_guard6_watcher() -> None:
         from . import guard6
+
         asyncio.create_task(guard6.guard6_loop())
 
     # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
@@ -236,8 +220,15 @@ def build_app():
             import subprocess
 
             register_cmd = [
-                "claude", "mcp", "add", "khimaira-chat", "-s", "user", "--",
-                "bash", "-lc",
+                "claude",
+                "mcp",
+                "add",
+                "khimaira-chat",
+                "-s",
+                "user",
+                "--",
+                "bash",
+                "-lc",
                 "uv --directory ~/dev/khimaira run khimaira-chat 2>>/tmp/khimaira-chat.log",
             ]
             while True:
@@ -245,12 +236,17 @@ def build_app():
                     proc = await asyncio.to_thread(
                         subprocess.run,
                         ["claude", "mcp", "list"],
-                        capture_output=True, text=True, timeout=10.0,
+                        capture_output=True,
+                        text=True,
+                        timeout=10.0,
                     )
                     if "khimaira-chat" not in (proc.stdout or ""):
                         await asyncio.to_thread(
                             subprocess.run,
-                            register_cmd, capture_output=True, text=True, timeout=10.0,
+                            register_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=10.0,
                         )
                         print(
                             "khimaira monitor: chat-mcp watchdog re-registered khimaira-chat",
@@ -402,6 +398,7 @@ def build_app():
         async def spa(full_path: str):  # noqa: ARG001
             # SPA fallback — serve index.html for any non-API route
             return FileResponse(str(dist / "index.html"))
+
     else:
 
         @app.get("/")

@@ -435,7 +435,10 @@ def test_sanitize_message_body_strips_thinking_tags(isolated_chats):
         c._sanitize_message_body("oops</thinking>") == "oops"
     )  # opening tag missing — still strip
     assert c._sanitize_message_body("body <scratchpad>...</scratchpad>") == "body ..."
-    assert c._sanitize_message_body("<reasoning>X</reasoning>actual reply") == "Xactual reply"
+    assert (
+        c._sanitize_message_body("<reasoning>X</reasoning>actual reply")
+        == "Xactual reply"
+    )
 
 
 def test_send_message_strips_thinking_tags(isolated_chats):
@@ -450,7 +453,9 @@ def test_send_message_strips_thinking_tags(isolated_chats):
     chat_id = room["meta"]["chat_id"]
     c.accept(chat_id, "bob")
 
-    msg = c.send_message(chat_id, "alice", "Reply: <thinking>x</thinking>actual content")
+    msg = c.send_message(
+        chat_id, "alice", "Reply: <thinking>x</thinking>actual content"
+    )
     assert "<thinking>" not in msg["body"]
     assert "actual content" in msg["body"]
 
@@ -511,7 +516,9 @@ def test_subscribe_replays_pending_invite_when_late(isolated_chats):
 
     received = asyncio.run(run())
     assert any(
-        r.get("kind") == "member" and r.get("state") == "pending" and r.get("session_id") == "bob"
+        r.get("kind") == "member"
+        and r.get("state") == "pending"
+        and r.get("session_id") == "bob"
         for r in received
     )
 
@@ -546,7 +553,9 @@ def test_invite_broadcast_routes_to_invitee(isolated_chats):
     received = asyncio.run(run())
     # Should receive bob's own member-pending record.
     assert any(
-        r.get("kind") == "member" and r.get("state") == "pending" and r.get("session_id") == "bob"
+        r.get("kind") == "member"
+        and r.get("state") == "pending"
+        and r.get("session_id") == "bob"
         for r in received
     )
 
@@ -642,7 +651,9 @@ def test_subscribe_skips_messages_for_pending_members(isolated_chats):
 
     received = asyncio.run(run())
     # The pending-invite catch-up record should be present.
-    assert any(r.get("kind") == "member" and r.get("state") == "pending" for r in received)
+    assert any(
+        r.get("kind") == "member" and r.get("state") == "pending" for r in received
+    )
     # But NO chat message should have been delivered.
     assert not any(r.get("kind") == "msg" for r in received)
 
@@ -711,7 +722,9 @@ def test_create_task_records_pending_status(isolated_chats):
 
     c = isolated_chats
     chat_id = _setup_two_member_chat(c, sessions_mod)
-    task = c.create_task(chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid"
+    )
     assert task["status"] == c.TASK_PENDING
     assert task["assignee_id"] == "bob-uuid"
     assert task["id"].startswith("task-")
@@ -755,7 +768,9 @@ def test_task_status_lifecycle_happy_path(isolated_chats):
 
     c = isolated_chats
     chat_id = _setup_two_member_chat(c, sessions_mod)
-    task = c.create_task(chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid"
+    )
     tid = task["id"]
     c.update_task_status(chat_id, tid, "bob-uuid", c.TASK_IN_PROGRESS)
     c.update_task_status(chat_id, tid, "bob-uuid", c.TASK_DONE)
@@ -776,7 +791,9 @@ def test_task_non_assignee_cannot_progress(isolated_chats):
     chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
     c.accept(chat_id, "bob-uuid")
     c.accept(chat_id, "carol-uuid")
-    task = c.create_task(chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid"
+    )
     with pytest.raises(ValueError, match="not authorized"):
         c.update_task_status(chat_id, task["id"], "carol-uuid", c.TASK_IN_PROGRESS)
 
@@ -786,7 +803,9 @@ def test_task_non_master_cannot_approve(isolated_chats):
 
     c = isolated_chats
     chat_id = _setup_two_member_chat(c, sessions_mod)
-    task = c.create_task(chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid"
+    )
     c.update_task_status(chat_id, task["id"], "bob-uuid", c.TASK_IN_PROGRESS)
     c.update_task_status(chat_id, task["id"], "bob-uuid", c.TASK_DONE)
     with pytest.raises(ValueError, match="not authorized"):
@@ -798,11 +817,15 @@ def test_task_changes_requested_can_resume(isolated_chats):
 
     c = isolated_chats
     chat_id = _setup_two_member_chat(c, sessions_mod)
-    task = c.create_task(chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid"
+    )
     tid = task["id"]
     c.update_task_status(chat_id, tid, "bob-uuid", c.TASK_IN_PROGRESS)
     c.update_task_status(chat_id, tid, "bob-uuid", c.TASK_DONE)
-    c.update_task_status(chat_id, tid, "alice-uuid", c.TASK_CHANGES_REQUESTED, note="redo X")
+    c.update_task_status(
+        chat_id, tid, "alice-uuid", c.TASK_CHANGES_REQUESTED, note="redo X"
+    )
     c.update_task_status(chat_id, tid, "bob-uuid", c.TASK_IN_PROGRESS)
     assert c.task_status(chat_id, "alice-uuid")[0]["status"] == c.TASK_IN_PROGRESS
 
@@ -812,7 +835,9 @@ def test_task_invalid_transition_raises(isolated_chats):
 
     c = isolated_chats
     chat_id = _setup_two_member_chat(c, sessions_mod)
-    task = c.create_task(chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid"
+    )
     with pytest.raises(ValueError, match="Invalid transition"):
         c.update_task_status(chat_id, task["id"], "bob-uuid", c.TASK_DONE)
 
@@ -932,7 +957,9 @@ def test_get_auto_accept_prefers_by_name_for_named_session(isolated_chats):
     assert payload["allow"] == ["bob", "carol"]
 
 
-def test_apply_auto_accept_by_name_returns_applied_true_when_file_exists(isolated_chats):
+def test_apply_auto_accept_by_name_returns_applied_true_when_file_exists(
+    isolated_chats,
+):
     """apply_auto_accept_by_name (called at chat MCP subprocess boot)
     surfaces the by-name allowlist for a freshly-named session."""
     from khimaira.monitor import sessions as sessions_mod
@@ -1104,9 +1131,9 @@ def test_transfer_membership_propagates_creator_role(isolated_chats):
     c.transfer_membership(chat_id, "alice", "carol")
 
     fresh_room = c.load_room(chat_id)
-    assert fresh_room["meta"]["created_by"] == "carol", (
-        "master role must transfer with membership when the source is the creator"
-    )
+    assert (
+        fresh_room["meta"]["created_by"] == "carol"
+    ), "master role must transfer with membership when the source is the creator"
     assert fresh_room["meta"]["created_by_name"] == "carol"
     # Sanity: member-state transitions still happen normally.
     assert fresh_room["members"]["alice"]["state"] == c.TRANSFERRED_OUT
@@ -1149,8 +1176,12 @@ def test_signal_task_start_records_signal(isolated_chats):
 
     c = isolated_chats
     chat_id = _setup_two_member_chat(c, sessions_mod)
-    task = c.create_task(chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid")
-    rec = c.signal_task_start(chat_id, task["id"], "alice-uuid", note="cleared to start")
+    task = c.create_task(
+        chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid"
+    )
+    rec = c.signal_task_start(
+        chat_id, task["id"], "alice-uuid", note="cleared to start"
+    )
     assert rec["kind"] == c.TASK_SIGNAL
     assert rec["signal"] == "start"
     assert rec["task_id"] == task["id"]
@@ -1178,7 +1209,9 @@ def test_signal_task_start_requires_master(isolated_chats):
     chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
     c.accept(chat_id, "bob-uuid")
     c.accept(chat_id, "carol-uuid")
-    task = c.create_task(chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid"
+    )
     # Carol is accepted but isn't the master — must be rejected.
     with pytest.raises(ValueError, match="not the master"):
         c.signal_task_start(chat_id, task["id"], "carol-uuid")
@@ -1191,7 +1224,9 @@ def test_signal_task_start_rejects_non_pending(isolated_chats):
 
     c = isolated_chats
     chat_id = _setup_two_member_chat(c, sessions_mod)
-    task = c.create_task(chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "do thing", assignee_session_id="bob-uuid"
+    )
     c.update_task_status(chat_id, task["id"], "bob-uuid", c.TASK_IN_PROGRESS)
     with pytest.raises(ValueError, match="not 'pending'"):
         c.signal_task_start(chat_id, task["id"], "alice-uuid")
@@ -1384,7 +1419,9 @@ def test_grant_role_demote_to_observer_kwarg(isolated_chats):
     c = isolated_chats
     chat_id = _setup_v1_chat(c, sessions_mod, "alice", "bob")
 
-    result = c.chat_grant_role(chat_id, "alice", "bob", c.ROLE_MASTER, demote_to=c.ROLE_OBSERVER)
+    result = c.chat_grant_role(
+        chat_id, "alice", "bob", c.ROLE_MASTER, demote_to=c.ROLE_OBSERVER
+    )
 
     roles = result["member_roles"]
     assert roles["bob"] == c.ROLE_MASTER
@@ -1523,7 +1560,9 @@ def test_observer_cannot_create_or_update_tasks(isolated_chats):
     # Observer cannot update task status — even for tasks they're notionally
     # assigned to (the grant pre-dates the role demotion in this contrived
     # scenario, but the observer gate is the load-bearing check).
-    task = c.create_task(chat_id, "alice-uuid", "work", assignee_session_id="alice-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "work", assignee_session_id="alice-uuid"
+    )
     with pytest.raises(ValueError, match="observer"):
         c.update_task_status(chat_id, task["id"], "bob-uuid", c.TASK_IN_PROGRESS)
 
@@ -1573,7 +1612,9 @@ def test_critic_can_send_and_read_but_not_approve(isolated_chats):
     assert any(m.get("body") == "I think this needs more polish" for m in history)
 
     # Critic CANNOT approve a task — master gate still applies.
-    task = c.create_task(chat_id, "alice-uuid", "work", assignee_session_id="alice-uuid")
+    task = c.create_task(
+        chat_id, "alice-uuid", "work", assignee_session_id="alice-uuid"
+    )
     c.update_task_status(chat_id, task["id"], "alice-uuid", c.TASK_IN_PROGRESS)
     c.update_task_status(chat_id, task["id"], "alice-uuid", c.TASK_DONE)
     with pytest.raises(ValueError, match="not authorized"):
@@ -1721,7 +1762,9 @@ def test_set_creator_emits_master_directive(isolated_chats):
     pre_count = len(_directives(c, chat_id))
     c.set_creator(chat_id, "bob-uuid")
     post = _directives(c, chat_id)
-    assert len(post) == pre_count + 1, "set_creator should emit exactly one master directive"
+    assert (
+        len(post) == pre_count + 1
+    ), "set_creator should emit exactly one master directive"
 
     d = post[-1]
     assert d["to"] == ["bob-uuid"]
@@ -1753,7 +1796,9 @@ def test_transfer_membership_master_swap_emits_directive(isolated_chats):
     pre_count = len(_directives(c, chat_id))
     c.transfer_membership(chat_id, "alice-uuid", "dave-uuid")
     post = _directives(c, chat_id)
-    assert len(post) == pre_count + 1, "master-transfer should emit exactly one directive"
+    assert (
+        len(post) == pre_count + 1
+    ), "master-transfer should emit exactly one directive"
 
     d = post[-1]
     assert d["to"] == ["dave-uuid"]
@@ -1780,9 +1825,9 @@ def test_transfer_membership_non_master_emits_no_directive(isolated_chats):
     _make_session(sessions_mod, "dave-uuid", "dave")
     pre_count = len(_directives(c, chat_id))
     c.transfer_membership(chat_id, "bob-uuid", "dave-uuid")
-    assert len(_directives(c, chat_id)) == pre_count, (
-        "non-master transfer must NOT emit a role directive"
-    )
+    assert (
+        len(_directives(c, chat_id)) == pre_count
+    ), "non-master transfer must NOT emit a role directive"
 
 
 # ---------------------------------------------------------------------------
@@ -1965,9 +2010,9 @@ def test_transfer_membership_as_deputize_keeps_donor_accepted(isolated_chats):
     c.transfer_membership(chat_id, "alice", "vice", as_deputize=True)
 
     fresh = c.load_room(chat_id)
-    assert fresh["members"]["alice"]["state"] == c.ACCEPTED, (
-        "as_deputize=True must preserve donor's ACCEPTED state (LOCK v3 D10)"
-    )
+    assert (
+        fresh["members"]["alice"]["state"] == c.ACCEPTED
+    ), "as_deputize=True must preserve donor's ACCEPTED state (LOCK v3 D10)"
     assert fresh["members"]["vice"]["state"] == c.ACCEPTED
     # Sanity: the marker still landed (kwarg's primary META effect).
     assert fresh["meta"]["deputized_original_master"] == "alice"
@@ -2001,9 +2046,9 @@ def test_transfer_membership_default_does_not_set_meta_field(isolated_chats):
     c.transfer_membership(chat_id, "alice", "dave")
 
     fresh = c.load_room(chat_id)
-    assert "deputized_original_master" not in fresh["meta"], (
-        "regular transfer (as_deputize=False) must not write the deputize marker"
-    )
+    assert (
+        "deputized_original_master" not in fresh["meta"]
+    ), "regular transfer (as_deputize=False) must not write the deputize marker"
     # Sanity: regular terminal transfer still flips donor to TRANSFERRED_OUT.
     # The kwarg's two effects (marker + skip-out) are both gated; without
     # the kwarg, neither fires.
@@ -2206,9 +2251,9 @@ def test_non_creator_transfer_silently_ignores_as_deputize_marker(isolated_chats
     # Creator unchanged — alice still owns master role.
     assert fresh["meta"]["created_by"] == "alice"
     # Skip-out-record effect still applied — bob stays ACCEPTED.
-    assert fresh["members"]["bob"]["state"] == c.ACCEPTED, (
-        "as_deputize=True's skip-donor-out applies regardless of creator status"
-    )
+    assert (
+        fresh["members"]["bob"]["state"] == c.ACCEPTED
+    ), "as_deputize=True's skip-donor-out applies regardless of creator status"
     assert fresh["members"]["vice"]["state"] == c.ACCEPTED
 
 
@@ -2363,7 +2408,9 @@ def test_assign_batch_fires_begin_when_all_acked(isolated_chats):
     assert result["missing_acks"] == []
     assert set(result["acks"].keys()) == {"agent-a", "agent-b"}
     begin_msgs = [
-        r for r in c._read(chat_id) if (r.get("body") or "").startswith("🟢 ALL AGENTS CONFIRMED")
+        r
+        for r in c._read(chat_id)
+        if (r.get("body") or "").startswith("🟢 ALL AGENTS CONFIRMED")
     ]
     assert len(begin_msgs) == 1
 
@@ -2444,7 +2491,9 @@ def _setup_three_member_chat(c, sessions_mod):
     observer_id = "priv-observer"
     for sid in (master_id, agent_id, observer_id):
         _make_session(sessions_mod, sid)
-    chat_id = c.create_room(master_id, [agent_id, observer_id], title="private test")["meta"]["chat_id"]
+    chat_id = c.create_room(master_id, [agent_id, observer_id], title="private test")[
+        "meta"
+    ]["chat_id"]
     c.accept(chat_id, agent_id)
     c.accept(chat_id, observer_id)
     return chat_id, master_id, agent_id, observer_id
@@ -2455,7 +2504,9 @@ def test_private_message_visible_to_recipient_and_sender(isolated_chats):
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
 
-    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(c, sessions_mod)
+    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(
+        c, sessions_mod
+    )
     c.send_message(chat_id, master_id, "secret note", to=[agent_id], private=True)
 
     # Sender (master) sees it
@@ -2476,14 +2527,18 @@ def test_private_message_visible_to_master_for_audit(isolated_chats):
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
 
-    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(c, sessions_mod)
+    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(
+        c, sessions_mod
+    )
     # agent sends a private message targeting observer (not master)
-    c.send_message(chat_id, agent_id, "agent whisper to observer", to=[observer_id], private=True)
+    c.send_message(
+        chat_id, agent_id, "agent whisper to observer", to=[observer_id], private=True
+    )
 
     master_history = c.history(chat_id, master_id)
-    assert any(m.get("private") for m in master_history), (
-        "master must see all private messages for audit"
-    )
+    assert any(
+        m.get("private") for m in master_history
+    ), "master must see all private messages for audit"
 
 
 def test_private_message_requires_to_field(isolated_chats):
@@ -2503,7 +2558,9 @@ def test_private_task_hidden_from_non_assignee(isolated_chats):
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
 
-    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(c, sessions_mod)
+    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(
+        c, sessions_mod
+    )
     c.create_task(
         chat_id,
         master_id,
@@ -2518,7 +2575,9 @@ def test_private_task_hidden_from_non_assignee(isolated_chats):
 
     # Non-assignee observer does NOT see it
     observer_history = c.history(chat_id, observer_id)
-    assert not any(m.get("kind") == "task" and m.get("private") for m in observer_history)
+    assert not any(
+        m.get("kind") == "task" and m.get("private") for m in observer_history
+    )
 
     # Master (sender + audit) sees it
     master_history = c.history(chat_id, master_id)
@@ -2550,9 +2609,9 @@ def test_topology_flat_mode_send_to_visible_to_all(isolated_chats):
 
     # Non-recipient observer still sees it — flat mode has no implicit private
     observer_history = c.history(chat_id, observer_id)
-    assert any(m.get("body") == "flat broadcast" for m in observer_history), (
-        "flat topology: send_to without explicit private is NOT private — all members see it"
-    )
+    assert any(
+        m.get("body") == "flat broadcast" for m in observer_history
+    ), "flat topology: send_to without explicit private is NOT private — all members see it"
 
 
 def test_topology_hierarchical_mode_send_to_defaults_private(isolated_chats):
@@ -2566,7 +2625,10 @@ def test_topology_hierarchical_mode_send_to_defaults_private(isolated_chats):
     for sid in (master_id, agent_id, observer_id):
         _make_session(sessions_mod, sid)
     chat_id = c.create_room(
-        master_id, [agent_id, observer_id], title="hierarchical chat", topology="hierarchical"
+        master_id,
+        [agent_id, observer_id],
+        title="hierarchical chat",
+        topology="hierarchical",
     )["meta"]["chat_id"]
     c.accept(chat_id, agent_id)
     c.accept(chat_id, observer_id)
@@ -2597,9 +2659,9 @@ def test_topology_missing_field_defaults_to_flat_backward_compat(isolated_chats)
     for sid in (master_id, agent_id, observer_id):
         _make_session(sessions_mod, sid)
     # create_room called without topology — must behave as flat
-    chat_id = c.create_room(
-        master_id, [agent_id, observer_id], title="legacy chat"
-    )["meta"]["chat_id"]
+    chat_id = c.create_room(master_id, [agent_id, observer_id], title="legacy chat")[
+        "meta"
+    ]["chat_id"]
     c.accept(chat_id, agent_id)
     c.accept(chat_id, observer_id)
 
@@ -2607,9 +2669,9 @@ def test_topology_missing_field_defaults_to_flat_backward_compat(isolated_chats)
 
     # Observer sees it — no topology field → flat default → no implicit private
     observer_history = c.history(chat_id, observer_id)
-    assert any(m.get("body") == "legacy msg" for m in observer_history), (
-        "no topology field → flat behavior (backward-compat): non-recipient observer sees the message"
-    )
+    assert any(
+        m.get("body") == "legacy msg" for m in observer_history
+    ), "no topology field → flat behavior (backward-compat): non-recipient observer sees the message"
 
 
 def test_topology_hierarchical_explicit_private_false_overrides_default(isolated_chats):
@@ -2623,13 +2685,18 @@ def test_topology_hierarchical_explicit_private_false_overrides_default(isolated
     for sid in (master_id, agent_id, observer_id):
         _make_session(sessions_mod, sid)
     chat_id = c.create_room(
-        master_id, [agent_id, observer_id], title="override test", topology="hierarchical"
+        master_id,
+        [agent_id, observer_id],
+        title="override test",
+        topology="hierarchical",
     )["meta"]["chat_id"]
     c.accept(chat_id, agent_id)
     c.accept(chat_id, observer_id)
 
     # Explicit private=False must override the hierarchical topology default
-    c.send_message(chat_id, master_id, "public in hierarchy", to=[agent_id], private=False)
+    c.send_message(
+        chat_id, master_id, "public in hierarchy", to=[agent_id], private=False
+    )
 
     # Observer sees it — explicit False wins over topology default
     observer_history = c.history(chat_id, observer_id)
@@ -2648,7 +2715,9 @@ def test_private_task_hidden_from_non_assignee_in_task_status(isolated_chats):
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
 
-    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(c, sessions_mod)
+    chat_id, master_id, agent_id, observer_id = _setup_three_member_chat(
+        c, sessions_mod
+    )
     c.create_task(
         chat_id,
         master_id,
@@ -2685,7 +2754,9 @@ def test_infer_role_from_name_unknown(isolated_chats):
 
 def test_infer_role_from_name_prefixed_lead(isolated_chats):
     """rsplit inference resolves multi-segment lead names (S2 class test)."""
-    assert isolated_chats.infer_role_from_name("jp-frontend-lead-1") == "jp-frontend-lead"
+    assert (
+        isolated_chats.infer_role_from_name("jp-frontend-lead-1") == "jp-frontend-lead"
+    )
 
 
 def test_infer_role_from_name_person_name_is_none(isolated_chats):
@@ -2726,7 +2797,10 @@ def test_chat_grant_role_accepts_all_registry_roles(isolated_chats):
     _make_session(sessions_mod, target_id, "target")
 
     room = isolated_chats.create_room(
-        master_id, [target_id], title="registry-test", member_roles={master_id: "master"}
+        master_id,
+        [target_id],
+        title="registry-test",
+        member_roles={master_id: "master"},
     )
     chat_id = room["meta"]["chat_id"]
     isolated_chats.accept(chat_id, target_id)
@@ -2777,7 +2851,9 @@ def test_master_can_cancel_pending_task(isolated_chats):
     chat_id = c.my_chats("master-uuid")[0]["chat_id"]
     c.accept(chat_id, "agent-uuid")
 
-    task = c.create_task(chat_id, "master-uuid", "stale work", assignee_session_id="agent-uuid")
+    task = c.create_task(
+        chat_id, "master-uuid", "stale work", assignee_session_id="agent-uuid"
+    )
     assert task["status"] == c.TASK_PENDING
 
     result = c.update_task_status(chat_id, task["id"], "master-uuid", c.TASK_CANCELLED)
@@ -2795,7 +2871,9 @@ def test_master_can_cancel_in_progress_task(isolated_chats):
     chat_id = c.my_chats("master-uuid")[0]["chat_id"]
     c.accept(chat_id, "agent-uuid")
 
-    task = c.create_task(chat_id, "master-uuid", "abandoned work", assignee_session_id="agent-uuid")
+    task = c.create_task(
+        chat_id, "master-uuid", "abandoned work", assignee_session_id="agent-uuid"
+    )
     c.update_task_status(chat_id, task["id"], "agent-uuid", c.TASK_IN_PROGRESS)
 
     result = c.update_task_status(chat_id, task["id"], "master-uuid", c.TASK_CANCELLED)
@@ -2814,7 +2892,9 @@ def test_assignee_cannot_cancel_task(isolated_chats):
     chat_id = c.my_chats("master-uuid")[0]["chat_id"]
     c.accept(chat_id, "agent-uuid")
 
-    task = c.create_task(chat_id, "master-uuid", "work", assignee_session_id="agent-uuid")
+    task = c.create_task(
+        chat_id, "master-uuid", "work", assignee_session_id="agent-uuid"
+    )
 
     with pytest.raises(ValueError, match="not authorized"):
         c.update_task_status(chat_id, task["id"], "agent-uuid", c.TASK_CANCELLED)
@@ -2910,51 +2990,82 @@ def test_is_master_explicit_role_is_authoritative_over_created_by(isolated_chats
 
 
 # ---------------------------------------------------------------------------
-# Role-broadcast idempotency (Lane 4 — GAP-6 role-storm fix)
+# Role-broadcast idempotency + GC (Lane 4 / storm cleanup)
+# CLAUDE.md: role-directive emission is event-driven (role-change points), never periodic.
 # ---------------------------------------------------------------------------
 
 
-def test_resync_emits_directive_when_role_changed(isolated_chats):
-    """resync_role_directives emits one directive per member when no prior directive exists."""
+def test_role_directive_emission_is_event_driven(isolated_chats):
+    """Regression guard: role_directives are only emitted at role-change events.
+    Loading a chat (simulating daemon startup) MUST NOT emit new directives.
+    """
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    room = c.create_room(
+        "alice-uuid", [], title="t", member_roles={"alice-uuid": c.ROLE_MASTER}
+    )
+    chat_id = room["meta"]["chat_id"]
+
+    count_before = len([r for r in c._read(chat_id) if c._is_role_directive(r)])
+
+    # Simulated startup: load_room must not side-effect new directives
+    c.load_room(chat_id)
+
+    count_after = len([r for r in c._read(chat_id) if c._is_role_directive(r)])
+    assert count_after == count_before, "load_room must not emit role_directives"
+
+
+def test_role_directive_emitted_on_create_room(isolated_chats):
+    """role_directive IS emitted at create_room (event-driven, role assigned)."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    room = c.create_room(
+        "alice-uuid", [], title="t", member_roles={"alice-uuid": c.ROLE_MASTER}
+    )
+    chat_id = room["meta"]["chat_id"]
+
+    directives = [r for r in c._read(chat_id) if c._is_role_directive(r)]
+    assert len(directives) == 1
+    assert directives[0]["to"] == ["alice-uuid"]
+    assert directives[0]["meta"]["role"] == c.ROLE_MASTER
+
+
+def test_subscribe_backfill_skips_role_directives(isolated_chats):
+    """subscribe() backfill replay must NOT include role_directive records.
+    They are suppressed to prevent restart replay noise.
+    """
     from khimaira.monitor import sessions as sessions_mod
 
     c = isolated_chats
     _make_session(sessions_mod, "alice-uuid", "alice")
     _make_session(sessions_mod, "bob-uuid", "bob")
-    room = c.create_room("alice-uuid", ["bob-uuid"], title="t", member_roles={"alice-uuid": c.ROLE_MASTER, "bob-uuid": c.ROLE_AGENT})
+    room = c.create_room(
+        "alice-uuid",
+        ["bob-uuid"],
+        title="t",
+        member_roles={"alice-uuid": c.ROLE_MASTER, "bob-uuid": c.ROLE_AGENT},
+    )
     chat_id = room["meta"]["chat_id"]
     c.accept(chat_id, "bob-uuid")
 
-    # Clear any directives emitted during create_room so we test resync in isolation
-    pre = [r for r in c._read(chat_id) if c._is_role_directive(r)]
-    pre_count = len(pre)
+    # Confirm role_directives are in the JSONL
+    directives = [r for r in c._read(chat_id) if c._is_role_directive(r)]
+    assert len(directives) > 0, "must have some role_directives to test filtering"
 
-    emitted = c.resync_role_directives(chat_id)
-    after = [r for r in c._read(chat_id) if c._is_role_directive(r)]
-
-    # resync should emit 0 (already emitted for alice at create_room) for master
-    # and 1 for bob (agent role, no prior directive to bob)
-    assert emitted >= 0  # exact count depends on ROLE_BUDGET coverage
-    assert len(after) >= pre_count  # can only add, never subtract
-
-
-def test_resync_emits_zero_when_role_unchanged(isolated_chats):
-    """resync_role_directives emits ZERO directives when all roles already match last emitted."""
-    from khimaira.monitor import sessions as sessions_mod
-
-    c = isolated_chats
-    _make_session(sessions_mod, "alice-uuid", "alice")
-    room = c.create_room("alice-uuid", [], title="t", member_roles={"alice-uuid": c.ROLE_MASTER})
-    chat_id = room["meta"]["chat_id"]
-
-    # alice is already master and got a directive at create_room
-    # A second resync should emit 0 (no change)
-    emitted = c.resync_role_directives(chat_id)
-    assert emitted == 0
+    # The backfill filter: _is_role_directive must be True for these records
+    # (subscribe() uses `if _is_role_directive(line): continue`)
+    for line in c._read(chat_id):
+        if c._is_role_directive(line):
+            assert (line.get("meta") or {}).get("event_type") == "role_directive"
+            break
 
 
-def test_resync_emits_when_role_changes_after_grant(isolated_chats):
-    """_last_emitted_role returns the role from the most recent directive to a session."""
+def test_gc_role_directives_drops_historical_dupes(isolated_chats):
+    """gc_role_directives_in_chat keeps only the latest directive per target."""
     from khimaira.monitor import sessions as sessions_mod
 
     c = isolated_chats
@@ -2964,78 +3075,47 @@ def test_resync_emits_when_role_changes_after_grant(isolated_chats):
     chat_id = room["meta"]["chat_id"]
     c.accept(chat_id, "bob-uuid")
 
-    # Grant bob the analyst role (has a ROLE_BUDGET entry → directive emitted)
+    # Grant bob several roles in sequence → multiple directives for bob
     c.chat_grant_role(chat_id, "alice-uuid", "bob-uuid", c.ROLE_ANALYST)
+    c.chat_grant_role(chat_id, "alice-uuid", "bob-uuid", c.ROLE_AGENT)
 
-    # _last_emitted_role should reflect the analyst grant
-    last = c._last_emitted_role(chat_id, "bob-uuid")
-    assert last == c.ROLE_ANALYST
+    bob_directives_before = [
+        r
+        for r in c._read(chat_id)
+        if c._is_role_directive(r) and (r.get("meta") or {}).get("target") == "bob-uuid"
+    ]
+    assert len(bob_directives_before) >= 2, "need at least 2 directives to test GC"
 
-    # resync should emit 0 (role unchanged since last directive)
-    emitted = c.resync_role_directives(chat_id)
-    assert emitted == 0
+    dropped = c.gc_role_directives_in_chat(chat_id)
+    assert dropped > 0
+
+    bob_directives_after = [
+        r
+        for r in c._read(chat_id)
+        if c._is_role_directive(r) and (r.get("meta") or {}).get("target") == "bob-uuid"
+    ]
+    assert len(bob_directives_after) == 1
+    # The LAST role granted (agent) is kept
+    assert bob_directives_after[0]["meta"]["role"] == c.ROLE_AGENT
 
 
-def test_subscribe_backfill_skips_role_directives(isolated_chats):
-    """subscribe() backfill replay must NOT include role_directive records.
-    They are suppressed to prevent the restart role-storm.
-    """
+def test_gc_role_directives_preserves_non_directive_records(isolated_chats):
+    """gc_role_directives_in_chat must not touch any non-role_directive records."""
     from khimaira.monitor import sessions as sessions_mod
-    import asyncio
 
     c = isolated_chats
     _make_session(sessions_mod, "alice-uuid", "alice")
     _make_session(sessions_mod, "bob-uuid", "bob")
-    room = c.create_room("alice-uuid", ["bob-uuid"], title="t", member_roles={"alice-uuid": c.ROLE_MASTER, "bob-uuid": c.ROLE_AGENT})
+    room = c.create_room("alice-uuid", ["bob-uuid"], title="t")
     chat_id = room["meta"]["chat_id"]
     c.accept(chat_id, "bob-uuid")
+    c.send_message(chat_id, "alice-uuid", "hello world")
 
-    # Confirm role_directives are in the JSONL
-    directives = [r for r in c._read(chat_id) if c._is_role_directive(r)]
-    assert len(directives) > 0, "must have some role_directives to test filtering"
+    non_directive_before = [r for r in c._read(chat_id) if not c._is_role_directive(r)]
 
-    # Subscribe as bob with a reconnect hint pointing before all records
-    async def collect_backfill():
-        records = []
-        # Use a fake since_event_id that won't match any record → triggers last-50 fallback
-        gen = c.subscribe("bob-uuid", since_event_id="nonexistent-event-id")
-        # Collect from the backfill phase (before the blocking queue.get())
-        # We need to cancel after the backfill is done
-        try:
-            async for record in gen:
-                records.append(record)
-                # Only collect the pre-queue records (backfill)
-                break  # first record after backfill is a queue.get() — break after one live msg
-        except StopAsyncIteration:
-            pass
-        except Exception:
-            pass
-        return records
+    c.gc_role_directives_in_chat(chat_id)
 
-    # The simpler test: just verify that _is_role_directive works as a filter
-    for line in c._read(chat_id):
-        if c._is_role_directive(line):
-            # The filter in subscribe would skip this
-            assert c._is_role_directive(line)  # sanity check
-            break
-
-
-def test_restart_zero_role_directives_when_unchanged(isolated_chats):
-    """Simulated restart: resync emits 0 directives when roles haven't changed."""
-    from khimaira.monitor import sessions as sessions_mod
-
-    c = isolated_chats
-    _make_session(sessions_mod, "alice-uuid", "alice")
-    room = c.create_room("alice-uuid", [], title="t", member_roles={"alice-uuid": c.ROLE_MASTER})
-    chat_id = room["meta"]["chat_id"]
-
-    # Record directive count after initial create
-    count_after_create = len([r for r in c._read(chat_id) if c._is_role_directive(r)])
-
-    # Simulate restart: run resync (same role, no change)
-    emitted = c.resync_role_directives(chat_id)
-    assert emitted == 0
-
-    # JSONL directive count unchanged
-    count_after_resync = len([r for r in c._read(chat_id) if c._is_role_directive(r)])
-    assert count_after_resync == count_after_create
+    non_directive_after = [r for r in c._read(chat_id) if not c._is_role_directive(r)]
+    assert len(non_directive_after) == len(non_directive_before)
+    for before, after in zip(non_directive_before, non_directive_after):
+        assert before["event_id"] == after["event_id"]

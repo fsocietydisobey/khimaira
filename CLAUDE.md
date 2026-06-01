@@ -221,6 +221,27 @@ check whether the daemon was restarted between observation and query.
 The cost dashboard, slow-call alerts, and trace waterfall all read
 from the same in-memory store; all are affected the same way.
 
+## Chat / role-directive
+
+### role-directive emission is event-driven, never periodic
+
+`_emit_role_directive` in `chats.py` fires at role-change points only:
+`create_room`, `chat_grant_role`, `chat_set_creator`, `chat_transfer_membership`.
+
+**Never add a startup re-broadcast or periodic timer.** We shipped a
+`khimaira-role-reminder.timer` systemd unit that ran a broadcast every
+10 min and caused 2048+ duplicate directives across 22 chats
+(including cross-roster to janice). The root cause was treating roles
+as un-durable state that needed refreshing — they aren't.
+
+**Roles are durable** (stored in `chat.meta.member_roles`). A session
+that reconnects after a daemon restart will receive its role from the
+Themis `resolve_session_role` path on its next tool call. No re-broadcast
+is needed.
+
+If role_directive bloat accumulates, use `gc_role_directives_in_chat(chat_id)`
+to compact to the latest directive per member.
+
 ## Documentation
 
 ### Test files are docs
