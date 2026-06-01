@@ -160,6 +160,14 @@ def build_app():
         from . import guard5
         asyncio.create_task(guard5.guard5_loop())
 
+    # Guard-6 — heartbeat-liveness detector. Fires when a roster member has
+    # gone dark (no activity) regardless of whether it owes anything.
+    # Complements Guard-4 (obligation-only) and Guard-5 (gate-only).
+    @app.on_event("startup")
+    async def _start_guard6_watcher() -> None:
+        from . import guard6
+        asyncio.create_task(guard6.guard6_loop())
+
     # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
     # Replay-on-boot recovers stuck-firing tasks; worker tick fires due tasks.
     @app.on_event("startup")
