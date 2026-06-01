@@ -231,6 +231,15 @@ def _compute_context_pct(session_id: str) -> int | None:
     This is UI-independent — it works regardless of how Claude Code renders
     context in the terminal (which does NOT show "NN% context used").
 
+    Context window detection:
+    - KHIMAIRA_CONTEXT_WINDOW env override (always takes precedence)
+    - High-water-mark: if the MAX observed context_tokens across the transcript
+      exceeds 200k, this session has a 1M window (CC's only context tier above
+      200k). A roster session at 256k definitely has a 1M window; "claude-sonnet-4-6"
+      in the model string does NOT indicate window size — that is a runtime/account
+      setting not encoded in the model ID.
+    - Otherwise: 200k default.
+
     context_tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
     pct = round(100 * context_tokens / context_window)
 
@@ -243,32 +252,48 @@ def _compute_context_pct(session_id: str) -> int | None:
             return None
 
         lines = transcript.read_text(errors="replace").splitlines()
-        for line in reversed(lines):
+
+        # First pass: compute the high-water-mark context_tokens to infer the window.
+        max_ctx = 0
+        last_ctx: int | None = None
+        for line in lines:
             try:
                 obj = json.loads(line)
             except (json.JSONDecodeError, ValueError):
                 continue
             if obj.get("type") != "assistant":
                 continue
-            msg = obj.get("message") or {}
-            usage = msg.get("usage")
+            usage = (obj.get("message") or {}).get("usage")
             if not isinstance(usage, dict):
                 continue
-
-            # Detect Opus-1M variants; all others use 200k default.
-            model = (msg.get("model") or "").lower()
-            context_window = int(os.environ.get("KHIMAIRA_CONTEXT_WINDOW", "0")) or (
-                _CONTEXT_WINDOW_1M if ("1m" in model or "1000k" in model) else _CONTEXT_WINDOW_DEFAULT
-            )
-
-            context_tokens = (
+            ctx = (
                 int(usage.get("input_tokens") or 0)
                 + int(usage.get("cache_creation_input_tokens") or 0)
                 + int(usage.get("cache_read_input_tokens") or 0)
             )
-            return round(100 * context_tokens / context_window)
+            if ctx > max_ctx:
+                max_ctx = ctx
+            last_ctx = ctx
 
-        return None
+        if last_ctx is None:
+            return None  # no usage records found
+
+        # Determine context window.
+        # Roster sessions run Claude Code at 1M context — use 1M as the safe default.
+        # Under-estimating the window causes PREMATURE compaction (irreversible data loss);
+        # over-estimating means CC's own auto-compact is the backstop (recoverable).
+        # Direction matters: always err toward the LARGER window.
+        env_override = os.environ.get("KHIMAIRA_CONTEXT_WINDOW")
+        if env_override:
+            context_window = int(env_override)
+        elif max_ctx > _CONTEXT_WINDOW_DEFAULT:
+            # High-water-mark confirms 1M (belt-and-suspenders for non-roster sessions).
+            context_window = _CONTEXT_WINDOW_1M
+        else:
+            # Fresh 1M session or unknown → default to 1M (safe, avoids premature compact).
+            context_window = _CONTEXT_WINDOW_1M
+
+        return round(100 * last_ctx / context_window)
     except Exception:
         return None
 
@@ -331,7 +356,7 @@ async def _distill_session(session_id: str, role: str) -> None:
     """Trigger mnemosyne distillation for the session (fail-open)."""
     try:
         # Run in executor to avoid blocking the event loop on file I/O
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _distill_sync, session_id, role)
     except Exception as exc:
         _log.debug("roster-recovery: distill error for %s: %s", session_id[:8], exc)
@@ -426,7 +451,9 @@ def _inject_text_and_submit(window_id: int, text: str) -> bool:
 def _session_has_pending_task(session_id: str) -> bool:
     """Return True if any chat has a task assigned to session_id with status=pending.
 
-    Complements _get_session_obligations (which covers in-progress obligations).
+    Complements _get_session_obligations (which covers in-progress obligations and
+    role-class review-tasks). The wake-gate ORs both, so role-class tasks are caught
+    by _get_session_obligations; this function covers named-assignee pending tasks.
     Fail-open: returns False on any read error.
     """
     try:
@@ -714,7 +741,7 @@ async def _process_window(win: dict[str, Any]) -> None:
         return
 
     # Guard (a): resolve session UUID — never act on window-id alone
-    session_id = await asyncio.get_event_loop().run_in_executor(
+    session_id = await asyncio.get_running_loop().run_in_executor(
         None, _resolve_session_for_role, role
     )
     if not session_id:
@@ -730,7 +757,7 @@ async def _process_window(win: dict[str, Any]) -> None:
         return
 
     # Read window screen
-    text = await asyncio.get_event_loop().run_in_executor(None, _get_screen, window_id)
+    text = await asyncio.get_running_loop().run_in_executor(None, _get_screen, window_id)
     if text is None:
         return
 
@@ -743,7 +770,7 @@ async def _process_window(win: dict[str, Any]) -> None:
             action_key = (window_id, "hitl")
             last_attempt = _DEBOUNCE.get(action_key, 0.0)
             if time.time() - last_attempt >= _COMPACT_COOLDOWN_S:
-                result = await asyncio.get_event_loop().run_in_executor(
+                result = await asyncio.get_running_loop().run_in_executor(
                     None, _handle_hitl_prompt, window_id, session_id, role, hitl_prompt
                 )
                 _DEBOUNCE[action_key] = time.time()
@@ -753,7 +780,7 @@ async def _process_window(win: dict[str, Any]) -> None:
                 )
             return  # HITL prompt present — don't compact/wake until it's cleared
 
-    context_pct = await asyncio.get_event_loop().run_in_executor(
+    context_pct = await asyncio.get_running_loop().run_in_executor(
         None, _compute_context_pct, session_id
     )
     busy = _is_busy(text)
@@ -794,7 +821,7 @@ async def _process_window(win: dict[str, Any]) -> None:
         await _distill_session(session_id, role)
 
         # Guard (b): re-check after async distill — session may have started work
-        text_after = await asyncio.get_event_loop().run_in_executor(
+        text_after = await asyncio.get_running_loop().run_in_executor(
             None, _get_screen, window_id
         )
         if text_after and _is_busy(text_after):
@@ -805,7 +832,7 @@ async def _process_window(win: dict[str, Any]) -> None:
             return
 
         # Guard (b) + TOCTOU: inject /compact with buffer-verify before submit
-        submitted = await asyncio.get_event_loop().run_in_executor(
+        submitted = await asyncio.get_running_loop().run_in_executor(
             None, _inject_text_and_submit, window_id, "/compact"
         )
         if submitted:
@@ -828,13 +855,13 @@ async def _process_window(win: dict[str, Any]) -> None:
         from khimaira.monitor.api.chats import _get_session_obligations
         from khimaira.monitor import sessions as sessions_mod
 
-        obligations = await asyncio.get_event_loop().run_in_executor(
+        obligations = await asyncio.get_running_loop().run_in_executor(
             None, _get_session_obligations, session_id
         )
-        has_pending_task = await asyncio.get_event_loop().run_in_executor(
+        has_pending_task = await asyncio.get_running_loop().run_in_executor(
             None, _session_has_pending_task, session_id
         )
-        has_pending_invite = await asyncio.get_event_loop().run_in_executor(
+        has_pending_invite = await asyncio.get_running_loop().run_in_executor(
             None, _session_has_pending_invite, session_id
         )
         if not obligations and not has_pending_task and not has_pending_invite:
@@ -854,7 +881,7 @@ async def _process_window(win: dict[str, Any]) -> None:
             return
 
         wake_msg = "⏰ resume: call chat_my_chats + act on your pending task"
-        submitted = await asyncio.get_event_loop().run_in_executor(
+        submitted = await asyncio.get_running_loop().run_in_executor(
             None, _inject_text_and_submit, window_id, wake_msg
         )
         if submitted:
@@ -877,7 +904,7 @@ async def check_once() -> None:
     """Single sweep of all discovered roster windows."""
     if not _env_enabled():
         return
-    windows = await asyncio.get_event_loop().run_in_executor(
+    windows = await asyncio.get_running_loop().run_in_executor(
         None, _discover_roster_windows
     )
     for win in windows:

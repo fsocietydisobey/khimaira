@@ -124,24 +124,55 @@ class TestComputeContextPct:
         ):
             return rr._compute_context_pct("dummy-session-id")
 
-    def test_basic_usage(self):
-        # 170_000 / 200_000 = 85%
+    def test_fresh_session_uses_1m_default(self):
+        # 170_000 / 1_000_000 = 17% — fresh 1M session below 200k high-water uses 1M default
         result = self._run({
             "input_tokens": 100_000,
             "cache_creation_input_tokens": 50_000,
             "cache_read_input_tokens": 20_000,
             "output_tokens": 500,
         })
-        assert result == 85
+        # Must NOT read 85% (that would be the dangerous 200k-default false-positive)
+        assert result == 17, f"Fresh session below 200k must use 1M default, got {result}%"
 
-    def test_full_context(self):
+    def test_1m_window_via_high_water_mark(self):
+        """Session that previously exceeded 200k infers 1M window for all turns."""
+        import json as _json
+        # Two turns: first has 250k (establishes 1M window), second has 50k.
+        turn1 = _json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-4-6",
+            "usage": {"input_tokens": 250_000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}})
+        turn2 = _json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-4-6",
+            "usage": {"input_tokens": 50_000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}})
+        content = turn1 + "\n" + turn2 + "\n"
+        mock_path = MagicMock()
+        mock_path.is_file.return_value = True
+        mock_path.read_text.return_value = content
+        from khimaira.monitor import sessions as sess_mod
+        with patch.object(sess_mod, "_find_transcript", return_value=mock_path):
+            result = rr._compute_context_pct("dummy")
+        # 50_000 / 1_000_000 = 5%  (last turn's ctx / window inferred from max)
+        assert result == 5
+
+    def test_full_context_1m(self):
+        # 1_000_000 / 1_000_000 = 100% (1M window via high-water-mark)
         result = self._run({
-            "input_tokens": 200_000,
+            "input_tokens": 1_000_000,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0,
             "output_tokens": 0,
         })
         assert result == 100
+
+    def test_context_above_200k_uses_1m_window(self):
+        """When current turn's context exceeds 200k, 1M window is used."""
+        result = self._run({
+            "input_tokens": 256_000,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        })
+        # 256_000 / 1_000_000 = 26%  (not 128%)
+        assert result == 26
 
     def test_empty_usage_returns_zero(self):
         result = self._run({
@@ -174,23 +205,24 @@ class TestComputeContextPct:
         )
         assert result == 25
 
-    def test_below_threshold(self):
-        # 168_000 / 200_000 = 84% — below 85%
+    def test_fresh_session_ramp_simulation(self):
+        """Fresh 1M session at 170k reads ~17% NOT 85% — prevents premature compaction."""
         result = self._run({
             "input_tokens": 100_000,
             "cache_creation_input_tokens": 50_000,
-            "cache_read_input_tokens": 18_000,
+            "cache_read_input_tokens": 20_000,  # total = 170k, below 200k high-water
         })
-        assert result is not None and result == 84
+        # 170_000 / 1_000_000 = 17% — safe, not 85% (which would wrongly trigger compact)
+        assert result == 17, f"Fresh 1M session at 170k must read ~17%, not 85%: got {result}%"
 
-    def test_at_threshold(self):
-        # 172_000 / 200_000 = 86% — above 85%
+    def test_threshold_at_1m_window(self):
+        # 850_000 / 1_000_000 = 85% — at compact threshold
         result = self._run({
-            "input_tokens": 100_000,
-            "cache_creation_input_tokens": 50_000,
-            "cache_read_input_tokens": 22_000,
+            "input_tokens": 850_000,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
         })
-        assert result is not None and result >= 85
+        assert result is not None and result == 85
 
 
 # ---------------------------------------------------------------------------
