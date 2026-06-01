@@ -122,7 +122,18 @@ def build_app():
     async def _resync_role_directives() -> None:
         import logging
         import asyncio
+        import os
         _log = logging.getLogger(__name__)
+        # DISABLED by default (KHIMAIRA_ROLE_RESYNC!=1). The startup re-broadcast
+        # was storming EVERY chat — including other projects' rosters sharing this
+        # daemon (jeevy_portal) — on every restart, and the emit-on-change check
+        # mis-fires on a fresh daemon (no in-memory last-emitted state → all read
+        # as "changed" → full re-emit). Roles persist durably in member_roles, so
+        # existing sessions never needed re-broadcasting. Re-enable only once the
+        # change-detection reads durable last-emitted state, not in-memory.
+        if os.environ.get("KHIMAIRA_ROLE_RESYNC", "0") != "1":
+            _log.info("chats: startup role resync DISABLED (cross-roster storm fix; set KHIMAIRA_ROLE_RESYNC=1 to re-enable)")
+            return
         # Brief delay: SSE subscribers aren't connected at startup, so the
         # broadcast in _emit_role_directive would land in empty queues.
         # Wait one event-loop tick to allow the MCP subprocess to reconnect.
