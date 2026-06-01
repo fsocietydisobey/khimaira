@@ -384,6 +384,67 @@ def _emit_role_directive(
     )
 
 
+def _is_role_directive(record: dict[str, Any]) -> bool:
+    """True if this record is a role_directive system message."""
+    return (
+        record.get("kind") == MSG
+        and record.get("sender_id") == SYSTEM_SENDER_ID
+        and (record.get("meta") or {}).get("event_type") == "role_directive"
+    )
+
+
+def _last_emitted_role(chat_id: str, session_id: str) -> str | None:
+    """Return the role from the most recent role_directive emitted to session_id in chat_id."""
+    result: str | None = None
+    for line in _read(chat_id):
+        if not _is_role_directive(line):
+            continue
+        meta = line.get("meta") or {}
+        if meta.get("target") == session_id:
+            result = meta.get("role")
+    return result
+
+
+def resync_role_directives(chat_id: str) -> int:
+    """Idempotent startup re-broadcast: emit one role_directive per member only
+    if their current role differs from what was last emitted. Returns count emitted.
+
+    Called at daemon startup so reconnecting sessions get one fresh directive
+    instead of replaying the accumulated historic ones from the backfill.
+    Per-chat scoped — no cross-chat leakage.
+    """
+    try:
+        room = load_room(chat_id)
+    except ValueError:
+        return 0
+    member_roles = (room.get("meta") or {}).get("member_roles") or {}
+    emitted = 0
+    for raw_sid, role in member_roles.items():
+        # member_roles keys are UUIDs, but resolve defensively for safety
+        try:
+            sid = _resolve_or_uuid(raw_sid)
+        except Exception:
+            sid = raw_sid
+        last = _last_emitted_role(chat_id, sid)
+        if last != role:
+            _emit_role_directive(chat_id, sid, role)
+            emitted += 1
+    return emitted
+
+
+def resync_role_directives_for_all_chats() -> int:
+    """Call resync_role_directives for every chat. Returns total emitted."""
+    total = 0
+    if not _chat_dir().exists():
+        return 0
+    for path in _chat_dir().glob("chat-*.jsonl"):
+        try:
+            total += resync_role_directives(path.stem)
+        except Exception:
+            pass
+    return total
+
+
 def _is_master(room: dict[str, Any], sid: str) -> bool:
     """Phase B v2 master check.
 
@@ -2777,6 +2838,8 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
                     )
                     start = idx + 1 if idx is not None else max(0, len(lines) - 50)
                     for line in lines[start:]:
+                        if _is_role_directive(line):
+                            continue  # suppress backfill replay — idempotent resync handles this
                         yield line
                 elif since_event_id:
                     # No daemon-side cursor: treat Last-Event-ID as a per-chat hint.
@@ -2789,15 +2852,21 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
                     )
                     if idx is not None:
                         for line in lines[idx + 1:]:
+                            if _is_role_directive(line):
+                                continue
                             yield line
                     else:
                         for line in lines[-50:]:
+                            if _is_role_directive(line):
+                                continue
                             yield line
                 else:
                     # Session IS reconnecting (other chats have cursors) but this
                     # specific chat has neither cursor nor hint. Deliver last 50
                     # so missed messages aren't silently dropped.
                     for line in lines[-50:]:
+                        if _is_role_directive(line):
+                            continue
                         yield line
         while True:
             record = await queue.get()

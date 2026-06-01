@@ -110,6 +110,33 @@ def build_app():
         from .chats import load_cursors
         load_cursors()
 
+    # Idempotent role-directive resync — emit ONE fresh role_directive per
+    # member per chat only when their current role differs from the last
+    # emitted directive. This replaces the historic-backfill storm (where
+    # every reconnect replayed all accumulated role_directives from the
+    # JSONL) with a single change-only emit. Zero directives on a restart
+    # with no role changes; one per changed member otherwise.
+    # TARGET-BY-UUID: member_roles keys are UUIDs; _resolve_or_uuid in
+    # resync_role_directives guards against any stale name keys.
+    @app.on_event("startup")
+    async def _resync_role_directives() -> None:
+        import logging
+        import asyncio
+        _log = logging.getLogger(__name__)
+        # Brief delay: SSE subscribers aren't connected at startup, so the
+        # broadcast in _emit_role_directive would land in empty queues.
+        # Wait one event-loop tick to allow the MCP subprocess to reconnect.
+        await asyncio.sleep(2)
+        try:
+            from .chats import resync_role_directives_for_all_chats
+            n = await asyncio.to_thread(resync_role_directives_for_all_chats)
+            if n:
+                _log.info("chats: startup role resync emitted %d directive(s)", n)
+            else:
+                _log.info("chats: startup role resync — no role changes, 0 directives emitted")
+        except Exception as exc:
+            _log.warning("chats: startup role resync failed: %s", exc)
+
     @app.on_event("shutdown")
     async def _save_chat_cursors() -> None:
         from .chats import save_cursors
