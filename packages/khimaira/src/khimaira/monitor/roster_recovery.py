@@ -196,24 +196,37 @@ def _discover_roster_windows() -> list[dict[str, Any]]:
                     continue
                 cmdline: list[str] = [str(c) for c in (win.get("cmdline") or [])]
                 joined = " ".join(cmdline)
-                # Must be a claude-chat invocation with a -r <name> flag.
+                # Must be a claude-chat invocation.
                 if "claude" not in joined:
                     continue
-                raw_name: str | None = None
-                for i, arg in enumerate(cmdline):
-                    if arg == "-r" and i + 1 < len(cmdline):
-                        raw_name = cmdline[i + 1]
-                        break
+                # Resolve the session name. Windows launch as
+                #   bash -ic "... claude-chat -r <name> ..."
+                # so the -r/-n value is buried INSIDE the shell command string,
+                # NOT a standalone argv token — scanning argv for `-r` never
+                # matched, so this returned 0 windows and the ENTIRE watcher
+                # (compaction/wake/HITL) was a silent no-op. Resolve the name from
+                # two reliable signals and use whichever maps to a known role:
+                #   (1) the window TITLE, which is set to the session name
+                #       (e.g. "analyst-1", "jp-agent-1", "khimaira-0"); and
+                #   (2) a regex pull of -r/-n <name> from the command string.
+                title_name = (win.get("title") or "").strip() or None
+                _m = re.search(r"claude-chat\b[^\n]*?\s-(?:r|n)\s+(\S+)", joined)
+                cmd_name = _m.group(1) if _m else None
+
+                def _resolve_role(nm: str | None) -> str | None:
+                    if not nm:
+                        return None
+                    if infer_role_from_name is not None:
+                        return infer_role_from_name(nm)
+                    parts = nm.rsplit("-", 1)
+                    return parts[0] if (len(parts) == 2 and parts[1].isdigit()) else nm
+
+                # Prefer the title; fall back to the command-string name. Use
+                # whichever resolves to a role so a stray title can't drop a window.
+                raw_name = title_name or cmd_name
+                role = _resolve_role(title_name) or _resolve_role(cmd_name)
                 if not raw_name:
                     continue
-                # Normalize through infer_role_from_name to handle prefixed names
-                # (jp-agent-1 → jp-agent, jp-frontend-lead-1 → jp-frontend-lead).
-                if infer_role_from_name is not None:
-                    role = infer_role_from_name(raw_name)
-                else:
-                    # Fallback: strip trailing -N suffix manually
-                    parts = raw_name.rsplit("-", 1)
-                    role = parts[0] if (len(parts) == 2 and parts[1].isdigit()) else raw_name
                 if role:
                     roster.append({"window_id": wid, "role": role, "cmdline": joined})
     return roster
