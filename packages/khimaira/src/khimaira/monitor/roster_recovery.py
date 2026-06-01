@@ -62,6 +62,36 @@ _CONTEXT_PCT_RE = re.compile(r"(\d+)%\s+context\s+used", re.IGNORECASE)
 # Debounce table: (window_id, action) → last_attempt_ts
 _DEBOUNCE: dict[tuple[int, str], float] = {}
 
+# ---------------------------------------------------------------------------
+# HITL auto-answering configuration
+# ---------------------------------------------------------------------------
+
+# Guard A — destructive denylist: any match → ESCALATE, never auto-answer.
+_HITL_DENYLIST: list[re.Pattern[str]] = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"rm\s+-[rRfF]*[fF]",               # rm -rf / -fr
+        r"git\s+push\s+(.*\s)?--force",      # git push --force
+        r"git\s+push\s+(.*\s+)?-f\b",        # git push -f
+        r"git\s+reset\s+(.*\s+)?--hard",     # git reset --hard
+        r"\bDROP\s+(TABLE|DATABASE)\b",      # SQL destructive
+        r"\bsudo\b",                         # sudo
+        r"\bmkfs\b",                         # mkfs
+        r"\bdd\b.*\bif=",                   # dd if=
+        r":\(\)\s*\{[^}]*\}[^;]*;",         # fork bomb :(){};
+        r"chmod\s+-R\s+777",                 # chmod -R 777
+        r">\s*/dev/sd",                      # > /dev/sd*
+    ]
+]
+
+# Prompt patterns that indicate a Claude Code HITL permission dialog.
+_HITL_PROMPT_RE = re.compile(
+    r"(Do you want|❯\s*1\.|^\s*1\.\s+(Yes|Allow|Proceed)|\(y/n\)|Continue\?|Allow this action)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Roles that hold NO_FILE_EDIT permission; file-edit prompts on these → escalate.
+_NO_FILE_EDIT_ROLES = frozenset(["analyst", "observer", "tracker"])
+
 
 # ---------------------------------------------------------------------------
 # Environment / opt-out
@@ -72,9 +102,23 @@ def _env_enabled() -> bool:
     return os.environ.get("KHIMAIRA_ROSTER_RECOVERY", "1") != "0"
 
 
+def _env_auto_hitl_enabled() -> bool:
+    """Return False if the HITL auto-answering kill-switch is set."""
+    return os.environ.get("KHIMAIRA_AUTO_HITL", "1") != "0"
+
+
 def _session_nocompact_path(session_id: str) -> Path:
     xdg = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
     return Path(xdg) / "khimaira" / "sessions" / session_id / ".nocompact"
+
+
+def _session_nohitl_path(session_id: str) -> Path:
+    xdg = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(xdg) / "khimaira" / "sessions" / session_id / ".nohitl"
+
+
+def _session_hitl_opt_out(session_id: str) -> bool:
+    return _session_nohitl_path(session_id).exists()
 
 
 def _session_opt_out(session_id: str) -> bool:
@@ -402,6 +446,215 @@ def _session_has_pending_invite(session_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# HITL auto-answering helpers
+# ---------------------------------------------------------------------------
+
+def _detect_hitl_prompt(text: str) -> dict[str, str] | None:
+    """Return {raw_block, answer_key, kind} if text looks like a HITL permission dialog.
+
+    Detection: screen contains one of the Claude Code prompt markers. The
+    answer_key is the key to inject: "1" for numbered options (prefer the
+    "don't ask again" option when present), "y" for yes/no dialogs.
+    Returns None when no prompt is found.
+    """
+    if not _HITL_PROMPT_RE.search(text):
+        return None
+
+    # Prefer numbered "don't ask again / allow session" option (option 1)
+    if re.search(r"❯\s*1\.", text) or re.search(r"^\s*1\.\s+(Yes|Allow|Proceed)", text, re.MULTILINE):
+        answer_key, kind = "1", "numbered"
+    elif re.search(r"\(y/n\)", text, re.IGNORECASE):
+        answer_key, kind = "y", "yes_no"
+    elif re.search(r"Continue\?", text, re.IGNORECASE):
+        answer_key, kind = "y", "continue"
+    else:
+        # Matched the RE but kind is unrecognised → bias-to-escalate
+        answer_key, kind = "1", "unknown"
+
+    return {"raw_block": text[-600:], "answer_key": answer_key, "kind": kind}
+
+
+def _check_destructive(text: str) -> str | None:
+    """Guard A: return the first matching denylist snippet, or None if clean."""
+    for pat in _HITL_DENYLIST:
+        m = pat.search(text)
+        if m:
+            return m.group(0)
+    return None
+
+
+def _get_session_active_task_body(session_id: str) -> str | None:
+    """Return the body of the most recent in-progress task assigned to this session."""
+    try:
+        import json
+        from khimaira.monitor.chats import _CHAT_DIR, TASK_IN_PROGRESS  # type: ignore[attr-defined]
+
+        latest_body: str | None = None
+        for chat_file in sorted(_CHAT_DIR.glob("chat-*.jsonl")):
+            try:
+                lines = chat_file.read_text().splitlines()
+            except OSError:
+                continue
+            tasks: dict[str, dict] = {}
+            for line in lines:
+                try:
+                    ev = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                kind = ev.get("kind", "")
+                tid = ev.get("task_id")
+                if not tid:
+                    continue
+                if kind == "task":
+                    tasks[tid] = ev
+                elif kind == "task_update" and tid in tasks:
+                    tasks[tid] = {**tasks[tid], "status": ev.get("status", tasks[tid].get("status"))}
+            for task in tasks.values():
+                if (task.get("assignee_id") == session_id
+                        and task.get("status") == TASK_IN_PROGRESS):
+                    latest_body = task.get("body") or ""
+        return latest_body
+    except Exception:
+        return None
+
+
+def _is_in_task_scope(prompt_text: str, task_body: str | None) -> bool:
+    """Guard B: heuristic check that the prompted action is within the task's scope.
+
+    Bias-to-escalate: returns False (escalate) whenever scope cannot be confirmed.
+    """
+    if not task_body:
+        return False  # no task body → can't verify → escalate
+
+    # Extract file/path references from the prompt
+    path_matches = re.findall(
+        r"(?:file|path|Edit|Write)\s*[:]\s*([^\s\n]+)|`([^`\n]+\.[a-z]{1,6})`",
+        prompt_text, re.IGNORECASE,
+    )
+    prompt_paths = [m[0] or m[1] for m in path_matches if m[0] or m[1]]
+
+    if not prompt_paths:
+        return False  # no path in prompt → can't verify → escalate
+
+    for path in prompt_paths:
+        filename = path.split("/")[-1]
+        if filename and len(filename) > 3 and filename in task_body:
+            return True
+        # Check the last 3 path components for breadth
+        for part in [p for p in path.split("/") if p][-3:]:
+            if len(part) > 3 and part in task_body:
+                return True
+
+    return False  # could not confirm → escalate
+
+
+def _role_blocks_file_edit(role: str, prompt_text: str) -> bool:
+    """Guard C: return True if role cannot perform the prompted file edit."""
+    if role not in _NO_FILE_EDIT_ROLES:
+        return False
+    # Prompt is for a file edit?
+    if re.search(r"\b(Edit|Write|MultiEdit|NotebookEdit)\b", prompt_text, re.IGNORECASE):
+        return True
+    if re.search(r"file.*\.(py|ts|tsx|js|jsx|yaml|yml|json|md|txt)\b", prompt_text):
+        return True
+    return False
+
+
+def _find_master_session_for_hitl() -> str | None:
+    """Return the master's session_id for HITL escalation notices."""
+    try:
+        from khimaira.monitor.chats import load_room, ROLE_MASTER
+        room = load_room("chat-fdf7c4cbd3bd")
+        member_roles: dict[str, str] = room["meta"].get("member_roles") or {}
+        for sid, r in member_roles.items():
+            if r == ROLE_MASTER:
+                return sid
+    except Exception:
+        pass
+    return None
+
+
+def _escalate_hitl(
+    window_id: int,
+    session_id: str,
+    role: str,
+    prompt_text: str,
+    reason: str,
+) -> None:
+    """Post a notice to master that a HITL prompt was NOT auto-answered."""
+    try:
+        from khimaira.monitor import sessions as sess_mod
+        master_id = _find_master_session_for_hitl()
+        preview = prompt_text.strip()[:200].replace("\n", " | ")
+        msg = (
+            f"⚠️ HITL prompt NOT auto-answered — agent {role} (window {window_id}) "
+            f"reason: {reason}. "
+            f"Prompt: {preview!r} — session {session_id[:8]} HOLDING; respond manually."
+        )
+        if master_id:
+            sess_mod.post_notice(
+                target_session_id=master_id,
+                text=msg,
+                from_session_id=session_id,
+                fire_desktop_notify=True,
+            )
+        _log.info(
+            "roster-hitl: ESCALATE window=%d role=%s session=%s reason=%r",
+            window_id, role, session_id[:8], reason,
+        )
+    except Exception as exc:
+        _log.warning("roster-hitl: escalation notice failed: %s", exc)
+
+
+def _handle_hitl_prompt(
+    window_id: int,
+    session_id: str,
+    role: str,
+    prompt: dict[str, str],
+) -> str:
+    """Run Guards A/B/C/D. Inject answer or escalate. Return action taken."""
+    raw = prompt["raw_block"]
+    answer_key = prompt["answer_key"]
+    kind = prompt["kind"]
+
+    # Guard A: destructive denylist
+    danger = _check_destructive(raw)
+    if danger:
+        _escalate_hitl(window_id, session_id, role, raw, f"destructive-marker: {danger!r}")
+        return "escalated"
+
+    # Guard B: in-task-scope
+    task_body = _get_session_active_task_body(session_id)
+    if not _is_in_task_scope(raw, task_body):
+        _escalate_hitl(window_id, session_id, role, raw, "out-of-scope or scope-unverifiable")
+        return "escalated"
+
+    # Guard C: role-permits
+    if _role_blocks_file_edit(role, raw):
+        _escalate_hitl(window_id, session_id, role, raw, f"role {role!r} does not permit file-edit")
+        return "escalated"
+
+    # Guard D: bias-to-escalate for unrecognised prompt kind
+    if kind == "unknown":
+        _escalate_hitl(window_id, session_id, role, raw, "unrecognised prompt type")
+        return "escalated"
+
+    # All guards passed — inject the answer
+    submitted = _inject_text_and_submit(window_id, answer_key)
+    if submitted:
+        _log.info(
+            "roster-hitl: ANSWERED window=%d role=%s session=%s key=%r kind=%s",
+            window_id, role, session_id[:8], answer_key, kind,
+        )
+        return "answered"
+
+    _log.warning(
+        "roster-hitl: inject failed window=%d role=%s", window_id, role
+    )
+    return "skipped"
+
+
+# ---------------------------------------------------------------------------
 # Per-window decision logic
 # ---------------------------------------------------------------------------
 
@@ -434,6 +687,25 @@ async def _process_window(win: dict[str, Any]) -> None:
     text = await asyncio.get_event_loop().run_in_executor(None, _get_screen, window_id)
     if text is None:
         return
+
+    # -----------------------------------------------------------------------
+    # HITL path: detect permission dialog and auto-answer or escalate (first)
+    # -----------------------------------------------------------------------
+    if _env_auto_hitl_enabled() and not _session_hitl_opt_out(session_id):
+        hitl_prompt = _detect_hitl_prompt(text)
+        if hitl_prompt is not None:
+            action_key = (window_id, "hitl")
+            last_attempt = _DEBOUNCE.get(action_key, 0.0)
+            if time.time() - last_attempt >= _COMPACT_COOLDOWN_S:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, _handle_hitl_prompt, window_id, session_id, role, hitl_prompt
+                )
+                _DEBOUNCE[action_key] = time.time()
+                _log.info(
+                    "roster-hitl: %s window=%d role=%s session=%s",
+                    result, window_id, role, session_id[:8],
+                )
+            return  # HITL prompt present — don't compact/wake until it's cleared
 
     context_pct = _parse_context_pct(text)
     busy = _is_busy(text)

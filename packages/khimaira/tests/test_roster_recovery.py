@@ -499,3 +499,274 @@ class TestKittySocketInjection:
         assert result is None
         mock_warn.assert_called_once()
         mock_debug.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# HITL auto-answering
+# ---------------------------------------------------------------------------
+
+NUMBERED_PROMPT = (
+    "⚡ Edit file: packages/khimaira/src/khimaira/monitor/api/themis.py\n"
+    "Do you want to proceed?\n"
+    "❯ 1. Yes, and don't ask again for this session\n"
+    "  2. Yes\n"
+    "  3. No, and tell Claude what to do differently\n"
+)
+
+YES_NO_PROMPT = (
+    "Do you want to run this command?\n"
+    "  bash -c 'echo hello'\n"
+    "(y/n) "
+)
+
+DESTRUCTIVE_PROMPT = (
+    "Do you want to run this command?\n"
+    "  bash -c 'rm -rf /tmp/foo'\n"
+    "❯ 1. Yes\n"
+    "  2. No\n"
+)
+
+OUT_OF_SCOPE_PROMPT = (
+    "⚡ Edit file: packages/other_package/secret.py\n"
+    "❯ 1. Yes\n"
+    "  2. No\n"
+)
+
+TASK_BODY_THEMIS = "Implement #61 — fix line 197 in api/themis.py (the if member_roles_dict gate)"
+
+
+class TestDetectHitlPrompt:
+    def test_detects_numbered_prompt(self):
+        result = rr._detect_hitl_prompt(NUMBERED_PROMPT)
+        assert result is not None
+        assert result["kind"] == "numbered"
+        assert result["answer_key"] == "1"
+
+    def test_detects_yes_no_prompt(self):
+        result = rr._detect_hitl_prompt(YES_NO_PROMPT)
+        assert result is not None
+        assert result["kind"] == "yes_no"
+        assert result["answer_key"] == "y"
+
+    def test_returns_none_for_normal_screen(self):
+        normal = "60% context used\n> Writing some code...\n"
+        assert rr._detect_hitl_prompt(normal) is None
+
+    def test_returns_none_for_busy_screen(self):
+        busy = "esc to interrupt\n85% context used"
+        assert rr._detect_hitl_prompt(busy) is None
+
+
+class TestCheckDestructive:
+    def test_detects_rm_rf(self):
+        assert rr._check_destructive("rm -rf /tmp/foo") is not None
+
+    def test_detects_git_force_push(self):
+        assert rr._check_destructive("git push origin main --force") is not None
+
+    def test_detects_git_reset_hard(self):
+        assert rr._check_destructive("git reset --hard HEAD~1") is not None
+
+    def test_detects_drop_table(self):
+        assert rr._check_destructive("DROP TABLE users") is not None
+
+    def test_detects_sudo(self):
+        assert rr._check_destructive("sudo rm -f /etc/foo") is not None
+
+    def test_clean_returns_none(self):
+        assert rr._check_destructive("echo hello world") is None
+
+    def test_git_push_without_force_is_clean(self):
+        assert rr._check_destructive("git push origin main") is None
+
+
+class TestIsInTaskScope:
+    def test_in_scope_when_filename_in_task(self):
+        assert rr._is_in_task_scope(NUMBERED_PROMPT, TASK_BODY_THEMIS) is True
+
+    def test_out_of_scope_when_different_file(self):
+        assert rr._is_in_task_scope(OUT_OF_SCOPE_PROMPT, TASK_BODY_THEMIS) is False
+
+    def test_no_task_body_escalates(self):
+        assert rr._is_in_task_scope(NUMBERED_PROMPT, None) is False
+
+    def test_no_path_in_prompt_escalates(self):
+        assert rr._is_in_task_scope("Do you want to proceed?\n❯ 1. Yes\n", TASK_BODY_THEMIS) is False
+
+
+class TestRoleBlocksFileEdit:
+    def test_analyst_blocked_on_edit(self):
+        assert rr._role_blocks_file_edit("analyst", "Edit file: foo.py") is True
+
+    def test_analyst_blocked_on_write(self):
+        assert rr._role_blocks_file_edit("analyst", "Write to foo.py") is True
+
+    def test_agent_not_blocked(self):
+        assert rr._role_blocks_file_edit("agent", "Edit file: foo.py") is False
+
+    def test_architect_not_blocked(self):
+        assert rr._role_blocks_file_edit("architect", "Edit file: foo.py") is False
+
+    def test_observer_blocked(self):
+        assert rr._role_blocks_file_edit("observer", "Edit file: foo.py") is True
+
+
+class TestHandleHitlPrompt:
+    def _make_prompt(self, raw=NUMBERED_PROMPT):
+        return rr._detect_hitl_prompt(raw)
+
+    def test_benign_in_scope_answered(self):
+        prompt = self._make_prompt(NUMBERED_PROMPT)
+        with (
+            patch.object(rr, "_check_destructive", return_value=None),
+            patch.object(rr, "_get_session_active_task_body", return_value=TASK_BODY_THEMIS),
+            patch.object(rr, "_is_in_task_scope", return_value=True),
+            patch.object(rr, "_role_blocks_file_edit", return_value=False),
+            patch.object(rr, "_inject_text_and_submit", return_value=True),
+        ):
+            result = rr._handle_hitl_prompt(100, "uuid-1234", "agent", prompt)
+        assert result == "answered"
+
+    def test_destructive_marker_escalated(self):
+        prompt = self._make_prompt(DESTRUCTIVE_PROMPT)
+        with (
+            patch.object(rr, "_check_destructive", return_value="rm -rf"),
+            patch.object(rr, "_escalate_hitl") as mock_esc,
+        ):
+            result = rr._handle_hitl_prompt(100, "uuid-1234", "agent", prompt)
+        assert result == "escalated"
+        mock_esc.assert_called_once()
+        assert "destructive-marker" in mock_esc.call_args[0][4]
+
+    def test_out_of_scope_escalated(self):
+        prompt = self._make_prompt(OUT_OF_SCOPE_PROMPT)
+        with (
+            patch.object(rr, "_check_destructive", return_value=None),
+            patch.object(rr, "_get_session_active_task_body", return_value=TASK_BODY_THEMIS),
+            patch.object(rr, "_is_in_task_scope", return_value=False),
+            patch.object(rr, "_escalate_hitl") as mock_esc,
+        ):
+            result = rr._handle_hitl_prompt(100, "uuid-1234", "agent", prompt)
+        assert result == "escalated"
+        mock_esc.assert_called_once()
+
+    def test_role_mismatch_escalated(self):
+        prompt = self._make_prompt()
+        with (
+            patch.object(rr, "_check_destructive", return_value=None),
+            patch.object(rr, "_get_session_active_task_body", return_value=TASK_BODY_THEMIS),
+            patch.object(rr, "_is_in_task_scope", return_value=True),
+            patch.object(rr, "_role_blocks_file_edit", return_value=True),
+            patch.object(rr, "_escalate_hitl") as mock_esc,
+        ):
+            result = rr._handle_hitl_prompt(100, "uuid-1234", "analyst", prompt)
+        assert result == "escalated"
+        mock_esc.assert_called_once()
+
+    def test_unknown_prompt_kind_escalated(self):
+        unknown_prompt = {"raw_block": "some text\nDo you want", "answer_key": "1", "kind": "unknown"}
+        with (
+            patch.object(rr, "_check_destructive", return_value=None),
+            patch.object(rr, "_get_session_active_task_body", return_value=TASK_BODY_THEMIS),
+            patch.object(rr, "_is_in_task_scope", return_value=True),
+            patch.object(rr, "_role_blocks_file_edit", return_value=False),
+            patch.object(rr, "_escalate_hitl") as mock_esc,
+        ):
+            result = rr._handle_hitl_prompt(100, "uuid-1234", "agent", unknown_prompt)
+        assert result == "escalated"
+        mock_esc.assert_called_once()
+
+    def test_opt_out_env_skips_hitl(self):
+        """KHIMAIRA_AUTO_HITL=0 disables HITL processing."""
+        assert rr._env_auto_hitl_enabled() is True
+        env_without = {k: v for k, v in os.environ.items() if k != "KHIMAIRA_AUTO_HITL"}
+        env_without["KHIMAIRA_AUTO_HITL"] = "0"
+        with patch.dict(os.environ, env_without, clear=True):
+            assert rr._env_auto_hitl_enabled() is False
+
+
+class TestProcessWindowHitl:
+    """Integration: _process_window routes to HITL when a prompt is detected."""
+
+    def _win(self):
+        return {"window_id": 100, "role": "agent"}
+
+    @pytest.mark.asyncio
+    async def test_hitl_prompt_triggers_hitl_not_compact(self):
+        """A HITL prompt at >85% context → HITL path, NOT /compact."""
+        screen = NUMBERED_PROMPT + "\n85% context used\n"
+
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_env_auto_hitl_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_session_hitl_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt", return_value="answered") as mock_hitl,
+            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+        ):
+            await rr._process_window(self._win())
+
+        mock_hitl.assert_called_once()
+        # /compact must NOT have been injected
+        for call_args in mock_inject.call_args_list:
+            assert "/compact" not in str(call_args)
+
+    @pytest.mark.asyncio
+    async def test_no_hitl_when_opt_out(self):
+        """HITL processing skipped when session has .nohitl marker."""
+        screen = NUMBERED_PROMPT
+
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_env_auto_hitl_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_session_hitl_opt_out", return_value=True),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt") as mock_hitl,
+        ):
+            await rr._process_window(self._win())
+
+        mock_hitl.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_hitl_when_globally_disabled(self):
+        """KHIMAIRA_AUTO_HITL=0 → HITL handler not called."""
+        screen = NUMBERED_PROMPT
+
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_env_auto_hitl_enabled", return_value=False),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt") as mock_hitl,
+        ):
+            await rr._process_window(self._win())
+
+        mock_hitl.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_audit_log_written_for_answer(self):
+        """Answered HITL generates INFO audit log entry."""
+        screen = NUMBERED_PROMPT
+        # Clear debounce so the HITL path isn't gated by a previous test's cooldown.
+        rr._DEBOUNCE.pop((100, "hitl"), None)
+
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_env_auto_hitl_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_session_hitl_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt", return_value="answered"),
+            patch.object(rr._log, "info") as mock_log,
+        ):
+            await rr._process_window(self._win())
+
+        # At least one INFO log referencing the HITL action
+        logged = " ".join(str(c) for c in mock_log.call_args_list)
+        assert "answered" in logged or "hitl" in logged.lower()

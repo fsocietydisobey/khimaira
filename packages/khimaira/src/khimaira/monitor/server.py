@@ -152,6 +152,14 @@ def build_app():
         from . import roster_recovery
         asyncio.create_task(roster_recovery.watcher_loop())
 
+    # Guard-5 — roster-progress monitor. Fires when ≥K sessions are idle
+    # AND a blocking gate has had no state-change >T_stall. Per-session
+    # Guard-4 misses this class; Guard-5 catches the emergent standstill.
+    @app.on_event("startup")
+    async def _start_guard5_watcher() -> None:
+        from . import guard5
+        asyncio.create_task(guard5.guard5_loop())
+
     # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
     # Replay-on-boot recovers stuck-firing tasks; worker tick fires due tasks.
     @app.on_event("startup")
