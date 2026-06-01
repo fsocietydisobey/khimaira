@@ -21,9 +21,10 @@ v2 additions:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -314,10 +315,66 @@ class OracleQueryReq(BaseModel):
     question: str
     project: str
     scope: str = "all"
-    mode: str = "context"
+    mode: Literal["context", "synthesis"] = "context"
     # v2 additions
     prompt_class: str = "architecture"
     project_path: str | None = None  # enables Scarlet, context.yaml, CLAUDE.md sources
+    analyzer: Any = None  # optional callable(context, question) -> str; injected for synthesis mode
+
+
+_SYNTHESIS_SYSTEM = (
+    "You are a codebase oracle assistant. "
+    "Given the context sections below, answer the user's question directly and concisely. "
+    "Cite file paths and line numbers from the context when relevant. "
+    "If the context doesn't contain enough information, say so."
+)
+
+
+async def _synthesize_answer(
+    context: str, question: str, analyzer: Any = None
+) -> str | None:
+    """Compose a synthesized answer from context + question.
+
+    If *analyzer* is provided and callable it is used directly:
+      - async callables are awaited
+      - sync callables are called in a thread via asyncio.to_thread
+
+    When *analyzer* is None the function attempts to call the Anthropic API via
+    the ``anthropic`` SDK (best-effort — fail-open on ImportError or API error).
+
+    Returns None on any failure so the caller can include it as-is (None ⟹ not
+    included in the response, preserving backward compatibility).
+    """
+    try:
+        if callable(analyzer):
+            if inspect.iscoroutinefunction(analyzer):
+                return await analyzer(context, question)
+            return await asyncio.to_thread(analyzer, context, question)
+
+        # Default: anthropic SDK. load_dotenv first so .env credentials win over
+        # any inherited shell env (security rule: load_dotenv(override=True) before
+        # any key read). The SDK reads ANTHROPIC_API_KEY from environment directly.
+        import anthropic  # type: ignore[import-untyped]
+        from dotenv import load_dotenv
+
+        load_dotenv(override=True)
+        # SDK raises anthropic.AuthenticationError when key is absent — caught below.
+        client = anthropic.AsyncAnthropic()
+        message = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=_SYNTHESIS_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"<context>\n{context}\n</context>\n\nQuestion: {question}",
+                }
+            ],
+        )
+        return message.content[0].text if message.content else None
+    except Exception as exc:
+        logger.debug("oracle: synthesis failed: %s", exc)
+        return None
 
 
 def build_router():
@@ -422,14 +479,19 @@ def build_router():
             claude_mds=claude_mds or None,
         )
 
+        synthesis: str | None = None
+        if req.mode == "synthesis":
+            synthesis = await _synthesize_answer(context, req.question, req.analyzer)
+
         return {
-            "mode": "context",
+            "mode": req.mode,
             "context": context,
             "citations": citations,
             "stores_hit": stores_hit,
             "sources_empty": sources_empty,
             "degraded": degraded,
             "seance_index_note": _SEANCE_STALENESS_NOTE,
+            "synthesis": synthesis,
         }
 
     return router
