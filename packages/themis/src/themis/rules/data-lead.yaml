@@ -1,26 +1,10 @@
 # Themis rules — data-lead role
 # Conditions are AND-combined only. No OR/NOT support in Phase 1.
+# Inherits: IN-DATA-LEAD-BASE-1 (NO_DIRECT_CODING, locked) +
+#            IN-DATA-LEAD-BASE-2 (NO_GIT_COMMIT, locked)
 role: data-lead
+extends: data-lead.base
 invariants:
-  - id: IN-DATA-LEAD-1
-    name: NO_FILE_EDIT_OUTSIDE_DATA
-    severity: block
-    matchers:
-      - tool: Edit
-        tool_input_field:
-          field: file_path
-          pattern: '^(?!.*(?:packages/khimaira/src/khimaira/monitor/sessions\.py|packages/khimaira/src/khimaira/monitor/chats\.py|packages/khimaira/src/khimaira/monitor/discovery/|packages/khimaira/tests/test_sessions_|packages/khimaira/tests/test_chats_|packages/khimaira/tests/test_schema_|packages/khimaira/src/khimaira/roles/data\-lead\.md|docs/domain/data\-knowledge\.md)).+'
-      - tool: Write
-        tool_input_field:
-          field: file_path
-          pattern: '^(?!.*(?:packages/khimaira/src/khimaira/monitor/sessions\.py|packages/khimaira/src/khimaira/monitor/chats\.py|packages/khimaira/src/khimaira/monitor/discovery/|packages/khimaira/tests/test_sessions_|packages/khimaira/tests/test_chats_|packages/khimaira/tests/test_schema_|packages/khimaira/src/khimaira/roles/data\-lead\.md|docs/domain/data\-knowledge\.md)).+'
-    message: |
-      🛑 Themis IN-DATA-LEAD-1 (NO_FILE_EDIT_OUTSIDE_DATA): data-lead
-      attempted to edit a file outside the data domain. Edits restricted to
-      the paths listed in the data-lead role doc's Domain scope section.
-      Cross-domain work: flag to master, who defines the contract. Direct
-      cross-domain edits violate the domain-lead boundary.
-
   - id: IN-DATA-LEAD-2
     name: NO_STANDALONE_AGENTS
     severity: block

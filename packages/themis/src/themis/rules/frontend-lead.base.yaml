@@ -1,0 +1,34 @@
+# Themis rules — frontend-lead BASE
+# Shared by: frontend-lead.yaml, jp-frontend-lead.yaml
+# Extended via: extends: frontend-lead.base
+# Security-invariants (locked: true) — instances CANNOT override or disable.
+role: frontend-lead.base
+invariants:
+  - id: IN-FRONTEND-LEAD-BASE-1
+    name: NO_DIRECT_CODING
+    severity: block
+    locked: true
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+      - tool: NotebookEdit
+    message: |
+      🛑 Themis IN-FRONTEND-LEAD-BASE-1 (NO_DIRECT_CODING): frontend-lead cannot
+      make direct file edits. Lead roles coordinate and delegate implementation
+      to agents via chat_task_create + chat_send_to. Propose the change;
+      master dispatches it to an authorized agent.
+
+  - id: IN-FRONTEND-LEAD-BASE-2
+    name: NO_GIT_COMMIT
+    severity: block
+    locked: true
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+commit\b'
+    message: |
+      🛑 Themis IN-FRONTEND-LEAD-BASE-2 (NO_GIT_COMMIT): frontend-lead cannot
+      commit directly. Lead roles delegate commits to agents after
+      critic APPROVE + verifier SHIP gate has closed.

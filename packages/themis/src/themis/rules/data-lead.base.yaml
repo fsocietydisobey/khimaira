@@ -1,0 +1,34 @@
+# Themis rules — data-lead BASE
+# Shared by: data-lead.yaml, jp-data-lead.yaml
+# Extended via: extends: data-lead.base
+# Security-invariants (locked: true) — instances CANNOT override or disable.
+role: data-lead.base
+invariants:
+  - id: IN-DATA-LEAD-BASE-1
+    name: NO_DIRECT_CODING
+    severity: block
+    locked: true
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+      - tool: NotebookEdit
+    message: |
+      🛑 Themis IN-DATA-LEAD-BASE-1 (NO_DIRECT_CODING): data-lead cannot
+      make direct file edits. Lead roles coordinate and delegate implementation
+      to agents via chat_task_create + chat_send_to. Propose the change;
+      master dispatches it to an authorized agent.
+
+  - id: IN-DATA-LEAD-BASE-2
+    name: NO_GIT_COMMIT
+    severity: block
+    locked: true
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+commit\b'
+    message: |
+      🛑 Themis IN-DATA-LEAD-BASE-2 (NO_GIT_COMMIT): data-lead cannot
+      commit directly. Lead roles delegate commits to agents after
+      critic APPROVE + verifier SHIP gate has closed.

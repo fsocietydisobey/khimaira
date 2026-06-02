@@ -1,26 +1,10 @@
 # Themis rules — backend-lead role
 # Conditions are AND-combined only. No OR/NOT support in Phase 1.
+# Inherits: IN-BACKEND-LEAD-BASE-1 (NO_DIRECT_CODING, locked) +
+#            IN-BACKEND-LEAD-BASE-2 (NO_GIT_COMMIT, locked)
 role: backend-lead
+extends: backend-lead.base
 invariants:
-  - id: IN-BACKEND-LEAD-1
-    name: NO_FILE_EDIT_OUTSIDE_BACKEND
-    severity: block
-    matchers:
-      - tool: Edit
-        tool_input_field:
-          field: file_path
-          pattern: '^(?!.*(?:packages/khimaira/src/khimaira/monitor/|packages/khimaira/src/khimaira/hooks/|packages/khimaira/src/khimaira/mcp_calls/|packages/khimaira/src/khimaira/attach/|packages/themis/src/themis/|packages/khimaira/tests/|packages/specter/src/specter/server\.py|packages/khimaira/src/khimaira/roles/backend\-lead\.md|docs/domain/backend\-knowledge\.md)).+'
-      - tool: Write
-        tool_input_field:
-          field: file_path
-          pattern: '^(?!.*(?:packages/khimaira/src/khimaira/monitor/|packages/khimaira/src/khimaira/hooks/|packages/khimaira/src/khimaira/mcp_calls/|packages/khimaira/src/khimaira/attach/|packages/themis/src/themis/|packages/khimaira/tests/|packages/specter/src/specter/server\.py|packages/khimaira/src/khimaira/roles/backend\-lead\.md|docs/domain/backend\-knowledge\.md)).+'
-    message: |
-      🛑 Themis IN-BACKEND-LEAD-1 (NO_FILE_EDIT_OUTSIDE_BACKEND): backend-lead
-      attempted to edit a file outside the backend domain. Edits restricted to
-      the paths listed in the backend-lead role doc's Domain scope section.
-      Cross-domain work: flag to master, who defines the contract. Direct
-      cross-domain edits violate the domain-lead boundary.
-
   - id: IN-BACKEND-LEAD-2
     name: NO_STANDALONE_AGENTS
     severity: block

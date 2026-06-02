@@ -200,7 +200,8 @@ class TestLoadRules:
         """
         from themis.data import _RULES_DIR
 
-        roles_from_dir = [p.stem for p in _RULES_DIR.glob("*.yaml")]
+        # Exclude *.base.yaml files — those are base-layer templates, not assignable roles.
+        roles_from_dir = [p.stem for p in _RULES_DIR.glob("*.yaml") if not p.stem.endswith(".base")]
         assert roles_from_dir, "No .yaml files found in rules dir — sync_leads may not have run"
         for role in roles_from_dir:
             rs = load_rules(role)

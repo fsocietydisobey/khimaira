@@ -310,78 +310,70 @@ def test_intake_md_contains_domain_signal():
 
 
 def test_in_backend_lead_themis_rules_present():
-    """Phase 1 regression guard: IN-BACKEND-LEAD-1/2 must be defined."""
-    content = (THEMIS_RULES / "backend-lead.yaml").read_text()
-    assert "IN-BACKEND-LEAD-1" in content
-    assert "NO_FILE_EDIT_OUTSIDE_BACKEND" in content
-    assert "IN-BACKEND-LEAD-2" in content
-    assert "NO_STANDALONE_AGENTS" in content
+    """Regression guard (post-inheritance refactor): backend-lead's write-gate
+    lives in the LOCKED base (`backend-lead.base.yaml`); the instance inherits it
+    via `extends:`. (Replaces the old NO_FILE_EDIT_OUTSIDE_BACKEND domain-
+    restrictor, removed when leads moved to coordinate-and-delegate.)"""
+    base = (THEMIS_RULES / "backend-lead.base.yaml").read_text()
+    assert "NO_DIRECT_CODING" in base
+    assert "NO_GIT_COMMIT" in base
+    assert "locked: true" in base
+    instance = (THEMIS_RULES / "backend-lead.yaml").read_text()
+    assert "extends: backend-lead.base" in instance
 
 
 def test_in_data_lead_themis_rules_present():
-    """Phase 1 regression guard: IN-DATA-LEAD-1/2 must be defined."""
-    content = (THEMIS_RULES / "data-lead.yaml").read_text()
-    assert "IN-DATA-LEAD-1" in content
-    assert "NO_FILE_EDIT_OUTSIDE_DATA" in content
-    assert "IN-DATA-LEAD-2" in content
-    assert "NO_STANDALONE_AGENTS" in content
+    """Regression guard (post-inheritance refactor): data-lead's write-gate lives
+    in the LOCKED base (`data-lead.base.yaml`); the instance inherits it via
+    `extends:`. (Replaces the old NO_FILE_EDIT_OUTSIDE_DATA domain-restrictor.)"""
+    base = (THEMIS_RULES / "data-lead.base.yaml").read_text()
+    assert "NO_DIRECT_CODING" in base
+    assert "NO_GIT_COMMIT" in base
+    assert "locked: true" in base
+    instance = (THEMIS_RULES / "data-lead.yaml").read_text()
+    assert "extends: data-lead.base" in instance
 
 
-def test_editing_leads_have_cross_cutting_rules():
-    """Parity guard: every write-capable lead yaml must carry each cross-cutting
-    rule by NAME (not by per-lead-prefixed ID).
+def test_leads_inherit_locked_write_gate():
+    """Parity guard (post-inheritance refactor): every *-lead.base yaml carries
+    the LOCKED NO_DIRECT_CODING + NO_GIT_COMMIT security rules, and every lead
+    INSTANCE inherits them via `extends:`.
 
-    "Editing lead" = lead yaml that does NOT contain a NO_FILE_EDIT block.
-    Derives the set from the yamls themselves — new editing leads auto-join.
-    Excludes read-only roles (analyst/critic/verifier/observer/tracker/master/
-    intake/agent/architect + propose-only leads that only carry a -PO rule).
-
-    Cross-cutting rule set (explicit, not inferred — membership is a deliberate
-    decision per architect, not "whatever happens to be on all leads today"):
-      - PATH_CONTENTION: Guard-2 (#54) — every editing role can contend on files.
-
-    Catches the Guard-2 gap (PATH_CONTENTION missed on frontend-lead.yaml,
-    passed 1114 tests, caught only by critic's manual read).
+    Replaces the old PATH_CONTENTION-parity guard: under the inheritance model
+    leads no longer edit directly (NO_DIRECT_CODING blocks all Edit/Write), so
+    the cross-cutting guarantee is the locked write-gate inherited from the base.
+    Catches a lead that doesn't inherit the gate (the new "lead missing the
+    cross-cutting rule" failure — same spirit as the Guard-2 PATH_CONTENTION gap
+    that passed 1114 tests, caught only by critic's manual read).
     """
-    # Cross-cutting rules that EVERY editing lead must carry (by rule NAME).
-    # Add new universal rules here when they're deliberately designated as such.
-    CROSS_CUTTING_RULE_NAMES = {"PATH_CONTENTION"}
-
     import re as _re
 
-    lead_yamls = sorted(THEMIS_RULES.glob("*-lead*.yaml"))
-    assert lead_yamls, "No lead yamls found — check THEMIS_RULES path"
+    # Every lead BASE must carry the LOCKED write-gate (both rules locked so an
+    # instance can neither override nor disable them — the escalation guard).
+    base_yamls = sorted(THEMIS_RULES.glob("*-lead.base.yaml"))
+    assert base_yamls, "No *-lead.base.yaml files found — inheritance bases missing"
+    for base in base_yamls:
+        content = base.read_text()
+        assert "NO_DIRECT_CODING" in content, f"{base.name}: missing NO_DIRECT_CODING"
+        assert "NO_GIT_COMMIT" in content, f"{base.name}: missing NO_GIT_COMMIT"
+        # Both security invariants must be locked: true.
+        assert content.count("locked: true") >= 2, (
+            f"{base.name}: NO_DIRECT_CODING + NO_GIT_COMMIT must both be locked: true"
+        )
 
-    # A lead is "editing" if it does NOT have a BLANKET NO_FILE_EDIT rule
-    # (i.e. name: NO_FILE_EDIT with no further suffix). Domain-scoped rules
-    # like NO_FILE_EDIT_OUTSIDE_BACKEND are restrictions, not blanket bans —
-    # those leads still edit within their domain and need PATH_CONTENTION.
-    # Propose-only leads (NO_FILE_EDIT_PROPOSE_ONLY) are also excluded since
-    # Themis-gates their writes.
-    _BLANKET_NOEDIT = _re.compile(r"name:\s+NO_FILE_EDIT\s*$", _re.MULTILINE)
-    _PROPOSE_ONLY = _re.compile(r"name:\s+NO_FILE_EDIT_PROPOSE_ONLY", _re.MULTILINE)
-
-    editing_leads = []
-    for path in lead_yamls:
-        content = path.read_text()
-        if not _BLANKET_NOEDIT.search(content) and not _PROPOSE_ONLY.search(content):
-            editing_leads.append(path)
-
-    assert editing_leads, (
-        "No editing-lead yamls found (all have NO_FILE_EDIT). "
-        "Check that the write-capable leads are included."
-    )
-
-    missing: list[str] = []
-    for path in editing_leads:
-        content = path.read_text()
-        for rule_name in CROSS_CUTTING_RULE_NAMES:
-            if rule_name not in content:
-                missing.append(f"{path.name}: missing {rule_name!r}")
-
-    assert not missing, (
-        "Cross-cutting rule parity failure — editing leads must carry all "
-        "cross-cutting rules:\n" + "\n".join(f"  {m}" for m in missing)
+    # Every lead INSTANCE yaml must inherit a base via `extends:`.
+    instance_leads = [
+        p for p in sorted(THEMIS_RULES.glob("*-lead.yaml"))
+        if not p.name.endswith(".base.yaml")
+    ]
+    assert instance_leads, "No lead instance yamls found"
+    missing_extends = [
+        path.name for path in instance_leads
+        if not _re.search(r"^extends:\s*\S+", path.read_text(), _re.MULTILINE)
+    ]
+    assert not missing_extends, (
+        "Lead instances must inherit the locked write-gate via `extends:`:\n"
+        + "\n".join(f"  {m}" for m in missing_extends)
     )
 
 

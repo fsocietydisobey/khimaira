@@ -1,8 +1,9 @@
 # Themis rules — frontend-lead role
 # Khimaira's own frontend-lead (not jeevy-specific).
-# No domain-restriction rules at this time — khimaira has no frontend subtree.
-# File required so Themis can load the role without FileNotFoundError.
+# Inherits: IN-FRONTEND-LEAD-BASE-1 (NO_DIRECT_CODING, locked) +
+#            IN-FRONTEND-LEAD-BASE-2 (NO_GIT_COMMIT, locked)
 role: frontend-lead
+extends: frontend-lead.base
 invariants:
   - id: IN-FRONTEND-LEAD-1
     name: PATH_CONTENTION
