@@ -382,3 +382,36 @@ That's the only post tracker makes on bootstrap. No further commentary.
   master once via chat.
 - **Duplicate Linear issues.** Always list_issues with a title fragment
   before filing.
+
+
+## Auto-distill
+
+At the end of each sweep, tracker distills high-signal decisions into mnemosyne
+so they persist across session boundaries.
+
+**Trigger:** after each STATE.md sweep AND whenever any roster agent marks a
+task done AND that agent has logged ≥1 new decision since the last distill.
+
+**Source:** `session_recent_decisions()` across all roster members (reuse the
+decisions already read during the sweep — no extra fetch).
+
+**Filter (distill if ANY criterion is true):**
+1. Decision came from a high-signal role: architect, analyst, critic, master.
+2. `why` field is longer than 80 chars (well-reasoned decisions are load-bearing).
+3. Decision text or `why` contains engineering-significance keywords:
+   `class`, `pattern`, `architecture`, `invariant`, `rule`, `fix`, `bug`,
+   `regression`, `refactor`, `security`, `breach`, `gate`, `enforcement`,
+   `design`.
+4. Multi-agent convergence: another session logged a decision with overlapping
+   keywords in the same batch (signals cross-session consensus worth preserving).
+
+**Dedup watermark:** per-session `last_distilled_ts` stored in STATE.md.
+Decisions at or before the watermark are skipped. After distilling, advance
+the watermark for each session whose decisions were submitted.
+
+**Sink:** `khimaira_distill(domain="khimaira", transcript=<formatted decisions>,
+session_slug="tracker-<ts>")` via mnemosyne_client.distill(). Scoped to
+current project. Fail-open (distill failure does not block the sweep).
+
+**Machine-readable spec:** `tracker_patterns.py` — `should_distill_decision()`,
+`filter_decisions_for_distill()`, `format_decisions_for_distill()`.
