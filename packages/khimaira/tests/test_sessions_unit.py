@@ -97,7 +97,9 @@ def test_search_archive_substring(isolated_state):
     """search_archive matches body substring case-insensitively."""
     target = "target-3"
     isolated_state.log_decision(target, "init", "")
-    isolated_state.post_notice(target, text="Roboflow concurrency check", from_session_id="me")
+    isolated_state.post_notice(
+        target, text="Roboflow concurrency check", from_session_id="me"
+    )
     isolated_state.post_notice(target, text="something unrelated", from_session_id="me")
     isolated_state.pending_notes(target, mark_read=True)
 
@@ -120,7 +122,9 @@ def test_notice_scope_cwd_surfaces_to_matching_session(isolated_state, tmp_path)
         scope_cwd=str(project),
     )
 
-    pending = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(project))
+    pending = isolated_state.pending_notes(
+        target, mark_read=False, session_cwd=str(project)
+    )
     assert len(pending) == 1
     assert pending[0]["text"] == "scoped to proj-a"
 
@@ -141,11 +145,15 @@ def test_notice_scope_cwd_withheld_from_mismatched_session(isolated_state, tmp_p
         scope_cwd=str(proj_a),
     )
 
-    pending = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(proj_b))
+    pending = isolated_state.pending_notes(
+        target, mark_read=False, session_cwd=str(proj_b)
+    )
     assert pending == [], "cross-project notice must not surface to wrong cwd"
 
     # Verify the note is still in inbox (not consumed by the mismatched read).
-    pending_a = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(proj_a))
+    pending_a = isolated_state.pending_notes(
+        target, mark_read=False, session_cwd=str(proj_a)
+    )
     assert len(pending_a) == 1, "notice must remain available for the correct cwd"
 
 
@@ -156,9 +164,13 @@ def test_notice_no_scope_cwd_surfaces_to_any_session(isolated_state, tmp_path):
     proj = tmp_path / "some-project"
     proj.mkdir()
 
-    isolated_state.post_notice(target, text="global broadcast", from_session_id="sender")
+    isolated_state.post_notice(
+        target, text="global broadcast", from_session_id="sender"
+    )
 
-    pending = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(proj))
+    pending = isolated_state.pending_notes(
+        target, mark_read=False, session_cwd=str(proj)
+    )
     assert len(pending) == 1
     assert pending[0]["text"] == "global broadcast"
 
@@ -178,7 +190,9 @@ def test_notice_scope_cwd_surfaces_to_child_path(isolated_state, tmp_path):
         scope_cwd=str(parent),
     )
 
-    pending = isolated_state.pending_notes(target, mark_read=False, session_cwd=str(child))
+    pending = isolated_state.pending_notes(
+        target, mark_read=False, session_cwd=str(child)
+    )
     assert len(pending) == 1, "child cwd must match parent scope_cwd"
 
 
@@ -297,7 +311,9 @@ def test_broadcast_returns_immediately_when_no_subscribers(isolated_state, tmp_p
         expires_in_hours=24,
     )
     isolated_state.consume_handoffs("owner", str(project))  # claim ownership
-    isolated_state.log_decision("subscriber-1", "init", "")  # materialize but DON'T subscribe
+    isolated_state.log_decision(
+        "subscriber-1", "init", ""
+    )  # materialize but DON'T subscribe
 
     # Time log_decision — should be fast (no broadcast work)
     t0 = time.perf_counter()
@@ -363,7 +379,9 @@ def test_consume_handoffs_mark_read_false_resurfaces(isolated_state, tmp_path):
     assert fourth == []
 
 
-def test_consume_handoffs_mark_read_false_preserves_auto_claim(isolated_state, tmp_path):
+def test_consume_handoffs_mark_read_false_preserves_auto_claim(
+    isolated_state, tmp_path
+):
     """mark_read=False still auto-claims ownership (persists to JSONL)."""
     project = tmp_path / "p"
     project.mkdir()
@@ -1012,3 +1030,145 @@ def test_no_orphan_dirs_created_by_cross_session_write(isolated_state):
                 f"Cross-session write created an orphan non-UUID dir: {d.name!r}. "
                 "This is a regression of the routing bug fixed in task #63."
             )
+
+
+# ---------------------------------------------------------------------------
+# P2 — chat-scoped + roster-scoped resolver tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_session_id_chat_scoped_finds_member(isolated_state):
+    """Chat-scoped resolution finds a session that is an accepted member."""
+    import importlib
+    from khimaira.monitor import chats as chats_mod
+
+    importlib.reload(chats_mod)
+
+    s = isolated_state
+    # Create sessions with names in status.json
+    sid_a = "aaaa0000-0000-0000-0000-000000000001"
+    sid_b = "bbbb0000-0000-0000-0000-000000000002"
+    for sid, name in [(sid_a, "alice"), (sid_b, "bob")]:
+        d = s._session_dir(sid)
+        (d / "status.json").write_text(json.dumps({"name": name, "status": "idle"}))
+
+    # Create a chat with both members
+    room = chats_mod.create_room(sid_a, [sid_b], title="t")
+    chat_id = room["meta"]["chat_id"]
+    chats_mod.accept(chat_id, sid_b)
+
+    # Chat-scoped: resolve "bob" within the chat
+    result = s.resolve_session_id("bob", chat_id=chat_id)
+    assert result == sid_b
+
+
+def test_resolve_session_id_chat_scoped_aborts_on_ambiguity(isolated_state):
+    """Chat-scoped aborts when two accepted members share the same name."""
+    import importlib
+    from khimaira.monitor import chats as chats_mod
+
+    importlib.reload(chats_mod)
+
+    s = isolated_state
+    sid_a = "aaaa0000-0000-0000-0000-000000000001"
+    sid_b = "bbbb0000-0000-0000-0000-000000000002"
+    sid_c = "cccc0000-0000-0000-0000-000000000003"
+    for sid, name in [(sid_a, "alice"), (sid_b, "duplicate"), (sid_c, "duplicate")]:
+        d = s._session_dir(sid)
+        (d / "status.json").write_text(json.dumps({"name": name, "status": "idle"}))
+
+    room = chats_mod.create_room(sid_a, [sid_b, sid_c], title="t")
+    chat_id = room["meta"]["chat_id"]
+    chats_mod.accept(chat_id, sid_b)
+    chats_mod.accept(chat_id, sid_c)
+
+    with pytest.raises(ValueError, match="Ambiguous"):
+        s.resolve_session_id("duplicate", chat_id=chat_id)
+
+
+def test_resolve_session_id_roster_scoped_finds_member(isolated_state):
+    """Roster-scoped resolution finds a session in an active roster chat."""
+    import importlib
+    from khimaira.monitor import chats as chats_mod
+
+    importlib.reload(chats_mod)
+
+    s = isolated_state
+    sid_a = "aaaa0000-0000-0000-0000-000000000001"
+    sid_b = "bbbb0000-0000-0000-0000-000000000002"
+    for sid, name in [(sid_a, "alice"), (sid_b, "bob")]:
+        d = s._session_dir(sid)
+        (d / "status.json").write_text(json.dumps({"name": name, "status": "idle"}))
+
+    room = chats_mod.create_room(sid_a, [sid_b], title="t")
+    chat_id = room["meta"]["chat_id"]
+    chats_mod.accept(chat_id, sid_b)
+
+    # Roster-scoped (no chat_id): finds "bob" in the active roster
+    result = s.resolve_session_id("bob")
+    assert result == sid_b
+
+
+def test_resolve_session_id_roster_scoped_aborts_on_ambiguity(isolated_state):
+    """Roster-scoped aborts when two roster members share the same name."""
+    import importlib
+    from khimaira.monitor import chats as chats_mod
+
+    importlib.reload(chats_mod)
+
+    s = isolated_state
+    sid_a = "aaaa0000-0000-0000-0000-000000000001"
+    sid_b = "bbbb0000-0000-0000-0000-000000000002"
+    sid_c = "cccc0000-0000-0000-0000-000000000003"
+    for sid, name in [(sid_a, "alice"), (sid_b, "dup"), (sid_c, "dup")]:
+        d = s._session_dir(sid)
+        (d / "status.json").write_text(json.dumps({"name": name, "status": "idle"}))
+
+    room = chats_mod.create_room(sid_a, [sid_b, sid_c], title="t")
+    chat_id = room["meta"]["chat_id"]
+    chats_mod.accept(chat_id, sid_b)
+    chats_mod.accept(chat_id, sid_c)
+
+    with pytest.raises(ValueError, match="Ambiguous"):
+        s.resolve_session_id("dup")
+
+
+def test_resolve_session_id_global_fallback_when_not_in_roster(isolated_state):
+    """A session not in any roster chat falls back to global scan, no ambiguity abort."""
+    s = isolated_state
+    # Session with a name but NOT in any chat (no roster membership)
+    sid = "aaaa0000-0000-0000-0000-000000000001"
+    d = s._session_dir(sid)
+    (d / "status.json").write_text(
+        json.dumps({"name": "solo-session", "status": "idle"})
+    )
+
+    # Should find it via global fallback
+    result = s.resolve_session_id("solo-session")
+    assert result == sid
+
+
+def test_resolve_session_id_drops_global_mtime_guess(isolated_state):
+    """GAP-5 regression: ≥2 roster-members with same name must abort, NOT mtime-guess."""
+    import importlib
+    from khimaira.monitor import chats as chats_mod
+
+    importlib.reload(chats_mod)
+
+    s = isolated_state
+    sid_a = "aaaa0000-0000-0000-0000-000000000001"
+    sid_b = "bbbb0000-0000-0000-0000-000000000002"
+    sid_c = "cccc0000-0000-0000-0000-000000000003"
+    # Two sessions with the same name "agent"
+    for sid, name in [(sid_a, "master"), (sid_b, "agent"), (sid_c, "agent")]:
+        d = s._session_dir(sid)
+        (d / "status.json").write_text(json.dumps({"name": name, "status": "idle"}))
+
+    room = chats_mod.create_room(sid_a, [sid_b, sid_c], title="t")
+    chat_id = room["meta"]["chat_id"]
+    chats_mod.accept(chat_id, sid_b)
+    chats_mod.accept(chat_id, sid_c)
+
+    # Roster-scoped: MUST abort, not guess by mtime
+    with pytest.raises(ValueError, match="Ambiguous"):
+        s.resolve_session_id("agent")

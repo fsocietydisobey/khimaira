@@ -497,7 +497,7 @@ _ACK_RE = re.compile(
 )
 
 
-def _resolve_or_uuid(session_id_or_name: str) -> str:
+def _resolve_or_uuid(session_id_or_name: str, *, chat_id: str | None = None) -> str:
     """Resolve a session name → UUID, OR accept a UUID verbatim.
 
     `_resolve_or_uuid` requires the session's state dir to
@@ -507,17 +507,23 @@ def _resolve_or_uuid(session_id_or_name: str) -> str:
     chat lazy-registration design depends on accepting that id even
     before the session has any other state.
 
-    Resolution order:
+    Resolution order (P2):
       1. If the input matches a canonical UUID format → trust it
          verbatim. Cost: a chat targeted at a non-existent UUID is
          silently a no-op (no subscriber to deliver to). Acceptable
          wart for the lazy-registration win.
-      2. Otherwise treat as a friendly name → resolve via the standard
-         path; raises if the name doesn't match any session.
+      2. CHAT-SCOPED when chat_id is provided → resolve within that
+         chat's accepted members; ≥2 same-named → abort.
+      3. ROSTER-SCOPED when chat_id is None → resolve within
+         active_roster_member_ids (MEMBERSHIP); ≥2 → abort.
+      4. Legacy global fallback when roster empty (test isolation /
+         first-run).
+    Pass chat_id from the calling function whenever a chat context is
+    available — this is the P2 routing fix.
     """
     if _UUID_RE.match(session_id_or_name):
         return session_id_or_name
-    return sessions_mod.resolve_session_id(session_id_or_name)
+    return sessions_mod.resolve_session_id(session_id_or_name, chat_id=chat_id)
 
 
 def derive_chat_id(
@@ -691,7 +697,7 @@ def create_room(
 
 def invite(chat_id: str, by_session_id: str, invitee_session_id: str) -> dict[str, Any]:
     """Add a new member in `pending` state. Caller must be an accepted member."""
-    by_session_id = _resolve_or_uuid(by_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
     invitee_session_id = _resolve_or_uuid(invitee_session_id)
     room = load_room(chat_id)
     members = room["members"]
@@ -724,7 +730,7 @@ def invite(chat_id: str, by_session_id: str, invitee_session_id: str) -> dict[st
 
 def accept(chat_id: str, session_id: str) -> dict[str, Any]:
     """Move a pending member to accepted. Required before they receive notifications."""
-    session_id = _resolve_or_uuid(session_id)
+    session_id = _resolve_or_uuid(session_id, chat_id=chat_id)
     room = load_room(chat_id)
     member = room["members"].get(session_id)
     if not member:
@@ -753,7 +759,7 @@ def accept(chat_id: str, session_id: str) -> dict[str, Any]:
 def reject(chat_id: str, session_id: str) -> dict[str, Any]:
     """Decline a pending invite. The chat continues without this session;
     creator can re-invite later if desired."""
-    session_id = _resolve_or_uuid(session_id)
+    session_id = _resolve_or_uuid(session_id, chat_id=chat_id)
     room = load_room(chat_id)
     member = room["members"].get(session_id)
     if not member:
@@ -837,7 +843,7 @@ def send_message(
     raises ValueError. Critic role behaves identically to agent for write
     paths — opinion-only role, label visible in member listings.
     """
-    sender_session_id = _resolve_or_uuid(sender_session_id)
+    sender_session_id = _resolve_or_uuid(sender_session_id, chat_id=chat_id)
     if private is True and not to:
         raise ValueError(
             "private=True requires a non-empty `to` list — "
@@ -865,7 +871,7 @@ def send_message(
     if to:
         resolved_to = []
         for r in to:
-            rid = _resolve_or_uuid(r)
+            rid = _resolve_or_uuid(r, chat_id=chat_id)
             rmember = room["members"].get(rid)
             if not rmember or rmember["state"] != ACCEPTED:
                 rstate = (rmember or {}).get("state", "non-member")
@@ -963,7 +969,7 @@ def create_task(
 
     Phase B v2: observers cannot create tasks.
     """
-    sender_session_id = _resolve_or_uuid(sender_session_id)
+    sender_session_id = _resolve_or_uuid(sender_session_id, chat_id=chat_id)
     if private and assignee_session_id is None:
         raise ValueError(
             "private=True requires assignee_session_id — "
@@ -1056,7 +1062,7 @@ def update_task_status(
     Phase B v2: observers cannot update task status (no write paths for
     observer role).
     """
-    by_session_id = _resolve_or_uuid(by_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
     room = load_room(chat_id)
     member = room["members"].get(by_session_id)
     if not member or member["state"] != ACCEPTED:
@@ -1158,7 +1164,7 @@ def signal_task_start(
     The `signal` field is hardcoded to "start" in v1 — leaves room for future
     signals (priority bump, deadline warning, abandonment) without renaming.
     """
-    by_session_id = _resolve_or_uuid(by_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
     room = load_room(chat_id)
     member = room["members"].get(by_session_id)
     if not member or member["state"] != ACCEPTED:
@@ -1228,7 +1234,7 @@ def record_gate_verdict(
     records that `get_gate_verdicts` reads back to compute the tri-state
     (present+complete | absent | error) for the B3 commit/approve gate.
     """
-    by_session_id = _resolve_or_uuid(by_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
     valid_verdicts = frozenset({"approve", "changes", "ship", "hold"})
     if verdict not in valid_verdicts:
         raise ValueError(
@@ -1315,7 +1321,7 @@ def master_override_verdict(
     Only the chat master may call this. trigger ∈ {quorum_timeout, manual_deadlock}.
     reason must be non-empty (the override is logged, never silent).
     """
-    by_session_id = _resolve_or_uuid(by_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
     valid_verdicts = frozenset({"approve", "changes", "ship", "hold"})
     if verdict not in valid_verdicts:
         raise ValueError(
@@ -1578,7 +1584,7 @@ def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] |
 def task_status(chat_id: str, requester_session_id: str) -> list[dict[str, Any]]:
     """Return all tasks in this chat with their current folded status.
     Requester must be an accepted member."""
-    requester_session_id = _resolve_or_uuid(requester_session_id)
+    requester_session_id = _resolve_or_uuid(requester_session_id, chat_id=chat_id)
     room = load_room(chat_id)
     member = room["members"].get(requester_session_id)
     if not member or member["state"] != ACCEPTED:
@@ -1739,7 +1745,7 @@ def history(
     since_event_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return messages visible to requester. Must be an accepted member."""
-    requester_session_id = _resolve_or_uuid(requester_session_id)
+    requester_session_id = _resolve_or_uuid(requester_session_id, chat_id=chat_id)
     room = load_room(chat_id)
     member = room["members"].get(requester_session_id)
     if not member or member["state"] != ACCEPTED:
@@ -1779,7 +1785,7 @@ def leave(chat_id: str, session_id: str) -> dict[str, Any]:
     Closes the v1 footgun where a creator's chat_leave made `done →
     approved` unreachable for the rest of the chat's lifetime.
     """
-    session_id = _resolve_or_uuid(session_id)
+    session_id = _resolve_or_uuid(session_id, chat_id=chat_id)
     room = load_room(chat_id)
     member = room["members"].get(session_id)
     if not member:
@@ -1868,7 +1874,7 @@ def transfer_membership(
             if `to` resolves to no known session (404), or if `to` is
             already ACCEPTED in this chat (409 — would be a no-op clash).
     """
-    from_session_id = _resolve_or_uuid(from_session_id)
+    from_session_id = _resolve_or_uuid(from_session_id, chat_id=chat_id)
     to_session_id = _resolve_or_uuid(to_session_id)
     room = load_room(chat_id)
 
@@ -2128,8 +2134,8 @@ def chat_grant_role(
       - `demote_to` is not in _VALID_ROLES
       - `demote_to == ROLE_MASTER` (closes the quorum loophole)
     """
-    by_session_id = _resolve_or_uuid(by_session_id)
-    target_session_id = _resolve_or_uuid(target_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
+    target_session_id = _resolve_or_uuid(target_session_id, chat_id=chat_id)
 
     if role not in _VALID_ROLES:
         raise ValueError(f"Invalid role {role!r}. Valid roles: {sorted(_VALID_ROLES)}.")
@@ -2281,7 +2287,7 @@ def chat_resume_master(
             "invariant requires at most one session holds master at a time."
         )
 
-    by_session_id = _resolve_or_uuid(by_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
     room = load_room(chat_id)
     existing_meta = dict(room.get("meta") or {})
     deputized_donor = existing_meta.get("deputized_original_master")
@@ -2387,7 +2393,7 @@ def delete(chat_id: str, by_session_id: str) -> dict[str, Any]:
     """Archive the chat JSONL. Only the master can call this (v2:
     `_is_master` reads `member_roles`; v1-era chats fall back to
     `created_by`)."""
-    by_session_id = _resolve_or_uuid(by_session_id)
+    by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
     room = load_room(chat_id)
     if not _is_master(room, by_session_id):
         creator = room["meta"].get("created_by")
@@ -2550,7 +2556,7 @@ async def assign_batch(
     import time
 
     t0 = time.monotonic()
-    from_session_id = _resolve_or_uuid(from_session_id)
+    from_session_id = _resolve_or_uuid(from_session_id, chat_id=chat_id)
     room = load_room(chat_id)
     member = room["members"].get(from_session_id)
     if not member or member["state"] != ACCEPTED:

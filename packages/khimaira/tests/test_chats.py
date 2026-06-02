@@ -3119,3 +3119,24 @@ def test_gc_role_directives_preserves_non_directive_records(isolated_chats):
     assert len(non_directive_after) == len(non_directive_before)
     for before, after in zip(non_directive_before, non_directive_after):
         assert before["event_id"] == after["event_id"]
+
+
+def test_resolve_or_uuid_chat_scoped_via_chats(isolated_chats):
+    """_resolve_or_uuid with chat_id resolves within that chat's members (P2)."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    sid_a = "aaaa0000-0000-0000-0000-000000000001"
+    sid_b = "bbbb0000-0000-0000-0000-000000000002"
+    for sid, name in [(sid_a, "alice"), (sid_b, "bob")]:
+        d = sessions_mod._session_dir(sid)
+        (d / "status.json").write_text(
+            json.dumps({"name": name, "status": "idle"}), encoding="utf-8"
+        )
+
+    room = c.create_room(sid_a, [sid_b], title="t")
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, sid_b)
+
+    result = c._resolve_or_uuid("bob", chat_id=chat_id)
+    assert result == sid_b

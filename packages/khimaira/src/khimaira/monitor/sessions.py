@@ -420,6 +420,62 @@ def active_roster_member_ids(
     return member_ids
 
 
+def _active_roster_for_resolution(
+    active_window_s: float | None = None,
+) -> tuple[set[str], bool]:
+    """Like active_roster_member_ids but exposes the error flag for P2 resolution.
+
+    Returns (member_ids, had_error):
+      - had_error=True means the computation failed (import/read error); the caller
+        should NOT silently revert to the GAP-5 global-heuristic since that would
+        re-open the bug P2 closes. Instead, log a strong warning and fall through
+        with more caution.
+      - had_error=False + member_ids={} → genuinely empty (first-run / no active chats).
+      - had_error=False + member_ids={...} → valid scoped roster.
+    """
+    if active_window_s is None:
+        active_window_s = _ROSTER_ACTIVE_CHAT_WINDOW_S
+
+    try:
+        from khimaira.monitor import chats as _chats_mod  # noqa: PLC0415
+    except Exception as exc:
+        log.warning(
+            "active_roster_for_resolution: chats import error (%s) — "
+            "resolution will fall back to global heuristic (GAP-5 window open).",
+            exc,
+        )
+        return set(), True
+
+    chat_dir = _chats_mod._chat_dir()
+    if not chat_dir.exists():
+        return set(), False
+
+    cutoff = time.time() - active_window_s
+    member_ids: set[str] = set()
+    total_chats = 0
+    error_skips = 0
+
+    for chat_path in chat_dir.glob("chat-*.jsonl"):
+        total_chats += 1
+        try:
+            lines = _read_jsonl(chat_path)
+            if not _chat_recently_active(lines, cutoff):
+                continue
+            _fold_accepted_members_from_lines(lines, member_ids)
+        except Exception:
+            error_skips += 1
+            continue
+
+    had_error = total_chats > 0 and error_skips == total_chats and not member_ids
+    if had_error:
+        log.warning(
+            "active_roster_for_resolution: ALL %d chat files raised read errors — "
+            "resolver will fall back to global heuristic (GAP-5 window open).",
+            total_chats,
+        )
+    return member_ids, had_error
+
+
 def _chat_recently_active(lines: list[dict], cutoff: float) -> bool:
     """True if the most-recent event in ``lines`` has ts ≥ ``cutoff`` (unix seconds).
 
@@ -789,33 +845,63 @@ def get_workspace(session_id: str) -> str:
     return ws
 
 
-def resolve_session_id(query: str) -> str:
-    """Map a user-friendly query → exact session_id (UUID).
+def _find_by_name_in_candidates(name: str, candidate_ids: set[str]) -> str:
+    """Search candidate_ids for exactly one session with status.json name == name.
 
-    Resolution order:
-      1. If query is an existing session_id (directory exists), return as-is.
-      2. Otherwise, search every session's status.json for a `name` match;
-         if multiple sessions share the name, return the most-recently-active.
-      3. Otherwise, raise ValueError with a helpful message.
+    Returns the UUID if exactly one matches.
+    Raises ValueError on ambiguity (≥2) or not-found (0).
 
-    Used by the read-side tools (state, pending_notes, post_answer) so users
-    can pass either UUIDs or names interchangeably.
+    Also handles legacy test fixtures where the session_id IS the name
+    (non-UUID dir, no name in status.json): if name matches a sid directly
+    and the dir exists, treat that as a match.
     """
-    # Fast path: if query is already a UUID4, return it directly.
-    # Only enter name-search if query is NOT UUID-shaped — this prevents
-    # the self-perpetuating-loop bug where a friendly-named dir (created by
-    # the old _session_dir side-effect) causes step 1 to short-circuit
-    # name resolution and return the wrong identifier.
-    if _is_uuid(query) and (_BASE_DIR / query).is_dir():
-        return query
+    matches: list[str] = []
+    for sid in candidate_ids:
+        # Primary check: status.json has name == query
+        status_path = _BASE_DIR / sid / "status.json"
+        if status_path.is_file():
+            try:
+                s = json.loads(status_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                s = {}
+            if s.get("name") == name:
+                matches.append(sid)
+                continue
 
-    # Name-based search
-    if not _BASE_DIR.exists():
-        raise ValueError(f"No session named or id'd {query!r} (no sessions exist yet).")
+        # Dirname fallback: for legacy non-UUID session IDs where the
+        # dirname is the session identity (no status.json name field set).
+        # Production sessions always have names in status.json; this only
+        # fires in test fixtures that use bare strings as session IDs.
+        if not _is_uuid(sid) and sid == name and (_BASE_DIR / sid).is_dir():
+            matches.append(sid)
 
-    # Tuple: (has_heartbeat, decisions, mtime, session_id)
-    # Sorts descending — live sessions (heartbeat + decisions) outrank stubs.
-    candidates: list[tuple[int, int, float, str]] = []
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Ambiguous name {name!r}: {len(matches)} sessions match after scoping "
+            f"({matches}). Use a session UUID to be unambiguous. "
+            f"See session_list() to find the right UUID."
+        )
+    raise ValueError(
+        f"No session named {name!r} found in the resolution scope. "
+        f"Use session_list() to see available sessions."
+    )
+
+
+def _resolve_name_global_legacy(name: str) -> str:
+    """Legacy global name-resolution fallback (P2 — no mtime-heuristic guess).
+
+    Finds all sessions with status.json name == ``name`` across ALL session dirs.
+    Returns the single UUID match; ABORTS on ≥2 UUID matches (no mtime-guess —
+    the ambiguity-abort is what kills GAP-5 uniformly across steps 2-3-4);
+    falls back to dirname for legacy non-UUID session IDs (test fixtures only).
+
+    Called when: roster is empty (first-run/test-isolation) OR name not found in
+    the active roster OR roster computation errored.  In a live roster with
+    unambiguous names this path returns exactly 1 UUID match.
+    """
+    matches: list[str] = []
     for d in _BASE_DIR.iterdir():
         if not d.is_dir():
             continue
@@ -826,66 +912,143 @@ def resolve_session_id(query: str) -> str:
             s = json.loads(status_path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if s.get("name") == query:
-            try:
-                mtime = max(
-                    (p.stat().st_mtime for p in d.iterdir() if p.is_file()),
-                    default=0.0,
-                )
-            except OSError:
-                mtime = 0.0
-            decisions_path = d / "decisions.jsonl"
-            decisions = (
-                sum(1 for ln in decisions_path.open() if ln.strip())
-                if decisions_path.exists()
-                else 0
-            )
-            has_heartbeat = 1 if s.get("last_sse_heartbeat") else 0
-            # Prefer UUID-named dirs over friendly-named orphan dirs.
-            # Non-UUID dirnames are relics of the old _session_dir side-effect;
-            # a dir named "khimaira-0" is an orphan, not a real session storage.
-            is_uuid_dir = 1 if _is_uuid(d.name) else 0
-            if not is_uuid_dir:
+        if s.get("name") == name:
+            if not _is_uuid(d.name):
                 log.warning(
                     "resolve_session_id(%r): candidate dir %r is not UUID-shaped — "
                     "likely an orphan created by a routing bug (#63). "
                     "Run `khimaira migrate-orphan-inboxes` to consolidate.",
-                    query,
+                    name,
                     d.name,
                 )
-            candidates.append((is_uuid_dir, has_heartbeat, decisions, mtime, d.name))
+            matches.append(d.name)
 
-    if not candidates:
-        # Last-resort fallback: if query matches a dirname exactly (non-UUID dirname),
-        # return it with a deprecation warning. This handles legacy call sites and
-        # test fixtures that use non-UUID session identifiers.  A UUID-named dir
-        # matching the query would have been returned above; this only fires for
-        # non-UUID dirnames (orphan dirs from the old routing bug).
-        fallback_dir = _BASE_DIR / query
-        if fallback_dir.is_dir() and not _is_uuid(query):
+    if not matches:
+        fallback_dir = _BASE_DIR / name
+        if fallback_dir.is_dir() and not _is_uuid(name):
             log.warning(
                 "resolve_session_id(%r): no name-match found; falling back to dirname. "
                 "This dirname is not UUID-shaped — likely an orphan from routing bug #63. "
                 "Update callers to use UUID session IDs.",
-                query,
+                name,
             )
-            return query
+            return name
         raise ValueError(
-            f"No session named or id'd {query!r}. Use session_list() to see available sessions."
+            f"No session named or id'd {name!r}. Use session_list() to see available sessions."
         )
 
-    # Prefer UUID-named dirs first; then live over stub; then most-recently-active.
-    candidates.sort(reverse=True)
-    _is_uuid_dir, _hb, _dec, _mtime, winner = candidates[0]
-    if _hb == 0 and _dec == 0 and len(candidates) > 1:
-        log.warning(
-            "resolve_session_id(%r): all %d candidates are stubs (no heartbeat, no decisions); "
-            "returning %r — may be a ghost session",
-            query,
-            len(candidates),
-            winner,
+    # P2: abort on ambiguity — never mtime-guess.
+    # ≥2 UUID-named sessions with the same name → ABORT (GAP-5 root closed).
+    # 1-UUID + orphan(s): prefer the UUID — orphans are #63-artifacts, not real
+    # sessions; the test_resolve_session_id_prefers_uuid_dir_over_orphan test
+    # pins this behavior. ≥2-orphan (0 UUID): iterdir-arbitrary (non-production).
+    uuid_matches = [m for m in matches if _is_uuid(m)]
+    if len(uuid_matches) > 1:
+        raise ValueError(
+            f"Ambiguous name {name!r}: {len(uuid_matches)} sessions match globally "
+            f"({uuid_matches}). Use a session UUID to be unambiguous. "
+            f"See session_list() to find the right UUID."
         )
-    return winner
+
+    # Prefer UUID-named dir over non-UUID orphan if both present
+    if uuid_matches:
+        return uuid_matches[0]
+    return matches[0]
+
+
+def resolve_session_id(query: str, *, chat_id: str | None = None) -> str:
+    """Map a user-friendly query → exact session_id (UUID).
+
+    Resolution precedence (P2 — chat-scoped + roster-scoped resolver):
+
+      1. UUID exact + dir-exists → return as-is.
+      2. CHAT-SCOPED (chat_id provided): match within that chat's accepted members.
+         ≥2 same-named accepted members → ABORT (raise ValueError).
+      3. ROSTER-SCOPED (no chat_id, roster non-empty): match within
+         active_roster_member_ids() (MEMBERSHIP = accepted ∩ recent-chat).
+         ≥2 same-named roster members → ABORT (raise ValueError).
+      4. LEGACY FALLBACK (roster empty — first-run or test isolation): fall back
+         to the pre-P2 global mtime heuristic. Active in isolated tests and
+         first-run setups only; in a live roster this path is never taken.
+
+    MEMBERSHIP ≠ DELIVERABILITY: reachability is NOT applied here.  Callers
+    that need reachability filtering (live surfaces: role-broadcast, wake-
+    injection, scheduler-at-fire) must apply ``is_reachable(sid)`` AFTER
+    resolution, at delivery time.  Durable surfaces (post_notice, post_answer,
+    post_handoff) resolve against MEMBERSHIP alone so msgs queue to alive-but-
+    unreachable seats (filtering unreachable = irreversible message-loss).
+    """
+    # 1. Fast path: UUID exact + dir-exists
+    if _is_uuid(query) and (_BASE_DIR / query).is_dir():
+        return query
+
+    if not _BASE_DIR.exists():
+        raise ValueError(f"No session named or id'd {query!r} (no sessions exist yet).")
+
+    # 2. Chat-scoped: caller provided a chat context
+    if chat_id is not None:
+        try:
+            from khimaira.monitor import chats as _chats  # noqa: PLC0415
+
+            room = _chats.load_room(chat_id)
+        except Exception as exc:
+            raise ValueError(
+                f"resolve_session_id({query!r}): cannot load chat {chat_id!r} for "
+                f"chat-scoped resolution — {exc}"
+            ) from exc
+        # Include both accepted AND pending members: a pending member is in the chat
+        # (was invited) and resolution must work before they accept (e.g. accept()
+        # resolves the session_id of the person accepting, who is still pending).
+        chat_members = {
+            sid
+            for sid, member in room["members"].items()
+            if member.get("state") in ("accepted", "pending")
+        }
+        try:
+            return _find_by_name_in_candidates(query, chat_members)
+        except ValueError as exc:
+            raise ValueError(f"In chat {chat_id!r}: {exc}") from exc
+
+    # 3. Roster-scoped: no chat context, use canonical MEMBERSHIP predicate.
+    # AMBIGUITY → abort (≥2 roster members with this name).
+    # NOT-FOUND → fall through to global legacy (session may not yet be in any
+    # recently-active chat — e.g. transfer-to a new member, a just-spawned
+    # session, or a session whose only chat has gone stale). Falling through
+    # on not-found is the safe-direction (avoids irreversible message-loss or
+    # broken operations); the ambiguity-abort is what kills the GAP-5 bug.
+    #
+    # We distinguish error-empty vs genuine-empty to avoid silently re-opening
+    # the GAP-5 bug during transient roster-computation errors (analyst P2 verify).
+    roster, roster_had_error = _active_roster_for_resolution()
+    if roster:
+        try:
+            return _find_by_name_in_candidates(query, roster)
+        except ValueError as exc:
+            err_str = str(exc)
+            if "Ambiguous" in err_str:
+                # Hard abort: ≥2 roster members share this name → never guess.
+                raise
+            # Not found in roster: fall through to global legacy scan.
+
+    # 4. Legacy fallback: roster empty OR name not found in roster.
+    # The global scan finds sessions not yet in any recently-active chat.
+    if not roster:
+        if roster_had_error:
+            log.warning(
+                "resolve_session_id(%r): roster computation FAILED — "
+                "falling back to global mtime-heuristic (GAP-5 window open). "
+                "Fix the roster read error to restore scoped resolution.",
+                query,
+            )
+        else:
+            log.warning(
+                "resolve_session_id(%r): active roster is empty (no recently-active chats). "
+                "Falling back to global mtime-heuristic scan. "
+                "In a live roster this path should not be reached — "
+                "check that khimaira chats are configured.",
+                query,
+            )
+    return _resolve_name_global_legacy(query)
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +1112,9 @@ def post_answer(
         "surface_count": 0,
     }
     _append_jsonl(_session_dir(target_session_id) / "inbox.jsonl", note)
-    desktop_notify.notify_answer(target_session_id, from_session_id, matched.get("text", ""))
+    desktop_notify.notify_answer(
+        target_session_id, from_session_id, matched.get("text", "")
+    )
     log.info(
         "session %s: answer posted by %s for q=%s",
         target_session_id,
@@ -969,7 +1134,9 @@ _USABLE_STATUSES = frozenset(
 )
 
 
-def _compute_effective_status(status: dict | None, last_tool_call_ts: float | None) -> dict:
+def _compute_effective_status(
+    status: dict | None, last_tool_call_ts: float | None
+) -> dict:
     """Return status dict with `effective_status` field added.
 
     Reads KHIMAIRA_DEMOTE_THRESHOLD_S at call time (not module-level) so
@@ -1057,7 +1224,9 @@ def state(session_id: str, recent: int = 10, *, workspace: str | None = None) ->
         "recent_files": files[-recent:],
         "file_touch_count": len(files),
         "open_questions": [q for q in questions if q.get("status") == "open"],
-        "answered_questions": [q for q in questions if q.get("status") == "answered"][-recent:],
+        "answered_questions": [q for q in questions if q.get("status") == "answered"][
+            -recent:
+        ],
     }
 
 
@@ -1078,7 +1247,9 @@ def summary(session_id: str) -> dict:
     decisions_path = sd / "decisions.jsonl"
     files_path = sd / "files_touched.jsonl"
     decision_count = (
-        sum(1 for ln in decisions_path.open() if ln.strip()) if decisions_path.exists() else 0
+        sum(1 for ln in decisions_path.open() if ln.strip())
+        if decisions_path.exists()
+        else 0
     )
     file_touch_count = (
         sum(1 for ln in files_path.open() if ln.strip()) if files_path.exists() else 0
@@ -1246,7 +1417,9 @@ def _extract_text_from_message(msg: Any) -> str:
             tname = msg.get("name", "?")
             args = msg.get("input", {})
             if isinstance(args, dict):
-                arg_summary = ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items())[:300]
+                arg_summary = ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items())[
+                    :300
+                ]
             else:
                 arg_summary = str(args)[:300]
             return f"[tool_use {tname}({arg_summary})]"
@@ -1333,7 +1506,8 @@ def query_transcript(
                         else None
                     ),
                     "is_match": j == idx,
-                    "text_preview": t["_text"][:500] + ("…" if len(t["_text"]) > 500 else ""),
+                    "text_preview": t["_text"][:500]
+                    + ("…" if len(t["_text"]) > 500 else ""),
                 }
             )
         matches.append(
@@ -1889,7 +2063,9 @@ def _broadcast_to_handoff_subscribers(
         handoffs_snapshot = _read_jsonl(_HANDOFFS_PATH)
     except OSError:
         return
-    owned = [h for h in handoffs_snapshot if h.get("owner_session_id") == owner_session_id]
+    owned = [
+        h for h in handoffs_snapshot if h.get("owner_session_id") == owner_session_id
+    ]
     if not owned:
         return
 
@@ -2045,7 +2221,9 @@ def consume_handoffs(
                     f.write(json.dumps(h, separators=(",", ":")) + "\n")
             tmp.replace(_HANDOFFS_PATH)
         except OSError:
-            log.warning("failed to rewrite handoffs.jsonl; read state may double-surface")
+            log.warning(
+                "failed to rewrite handoffs.jsonl; read state may double-surface"
+            )
 
     return matched
 
@@ -2102,9 +2280,9 @@ def post_notice(
         effective = target_status.get("effective_status", "unknown")
         note["target_reachable"] = effective in _USABLE_STATUSES
         note["target_status"] = effective
-        note["target_last_active_iso"] = target_status.get("updated_at") or target_status.get(
-            "last_sse_heartbeat"
-        )
+        note["target_last_active_iso"] = target_status.get(
+            "updated_at"
+        ) or target_status.get("last_sse_heartbeat")
         if not note["target_reachable"]:
             note["reason_if_not_ok"] = target_status.get("demoted_reason") or (
                 f"target status: {effective}"
@@ -2174,7 +2352,9 @@ def surface_inbox_for_hook(
         # scope_cwd filter: leave note untouched if cwd doesn't match.
         note_scope = n.get("scope_cwd") or ""
         if note_scope and cwd_abs:
-            if cwd_abs != note_scope and not cwd_abs.startswith(note_scope.rstrip("/") + "/"):
+            if cwd_abs != note_scope and not cwd_abs.startswith(
+                note_scope.rstrip("/") + "/"
+            ):
                 remaining.append(n)
                 continue
 
@@ -2190,7 +2370,9 @@ def surface_inbox_for_hook(
             remaining.append(n)
 
         copy = dict(n)
-        copy["_remaining_surfaces"] = max(0, _HOOK_AUTO_EXPIRE_AFTER - n["surface_count"])
+        copy["_remaining_surfaces"] = max(
+            0, _HOOK_AUTO_EXPIRE_AFTER - n["surface_count"]
+        )
         surfaced.append(copy)
 
     if modified:
@@ -2337,7 +2519,9 @@ async def wait_for_answer(
             if status == "answered":
                 return q
             if status == "withdrawn":
-                raise ValueError(f"Question {question_id} was withdrawn before being answered.")
+                raise ValueError(
+                    f"Question {question_id} was withdrawn before being answered."
+                )
             break  # found the question but not yet answered; keep polling
         await asyncio.sleep(poll_interval)
 
@@ -2468,7 +2652,9 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
             questions = _read_jsonl(sd / "questions.jsonl")
             open_q = sum(1 for q in questions if q.get("status") == "open")
             status_path = sd / "status.json"
-            status_raw = json.loads(status_path.read_text()) if status_path.exists() else None
+            status_raw = (
+                json.loads(status_path.read_text()) if status_path.exists() else None
+            )
 
             # Compute effective_status for this row (lazy demote).
             recent_calls = recent_tool_calls(sd.name, limit=1)
@@ -2493,10 +2679,14 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
             out.append(
                 {
                     "session_id": sd.name,
-                    "name": (status_raw.get("name") if isinstance(status_raw, dict) else None),
+                    "name": (
+                        status_raw.get("name") if isinstance(status_raw, dict) else None
+                    ),
                     "workspace": ws_value,
                     "last_active": last_mtime,
-                    "last_active_age_s": (time.time() - last_mtime if last_mtime else None),
+                    "last_active_age_s": (
+                        time.time() - last_mtime if last_mtime else None
+                    ),
                     "status": status,
                     "decision_count": decisions,
                     "file_touch_count": files,
@@ -2508,7 +2698,9 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
         return _filter_sessions_by_workspace(out, workspace)
 
 
-def _filter_sessions_by_workspace(rows: list[dict], workspace: str | None) -> list[dict]:
+def _filter_sessions_by_workspace(
+    rows: list[dict], workspace: str | None
+) -> list[dict]:
     """Apply workspace filter to a list_sessions result.
 
     None or "*" returns the full list (no filter). A concrete name
@@ -2620,7 +2812,10 @@ def delete_session(session_id: str, force: bool = False) -> dict:
                 try:
                     room = chats_mod.load_room(chat_id)
                     member = room["members"].get(resolved)
-                    if not member or member["state"] not in (chats_mod.PENDING, chats_mod.ACCEPTED):
+                    if not member or member["state"] not in (
+                        chats_mod.PENDING,
+                        chats_mod.ACCEPTED,
+                    ):
                         continue
                     if chats_mod._is_master(room, resolved):
                         chats_skipped_master.append(chat_id)
@@ -2644,7 +2839,9 @@ def delete_session(session_id: str, force: bool = False) -> dict:
         shutil.rmtree(session_dir, ignore_errors=True)
 
     _invalidate_list_sessions_cache()
-    log.info("session %s (%s) deleted (had_decisions=%s)", resolved, name, decision_count > 0)
+    log.info(
+        "session %s (%s) deleted (had_decisions=%s)", resolved, name, decision_count > 0
+    )
 
     return {
         "deleted": True,
