@@ -1102,3 +1102,35 @@ class TestReadOnlySafeAllowlist:
         # means the render is ambiguous → escalate.
         assert rr._is_read_only_safe("Bash(ls │ rm)") is False
         assert rr._is_read_only_safe("Bash(ls\xa0-la)") is False
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit detection (window-scanner). Keyed on CC's literal error strings,
+# wrap-tolerant (the window wraps long lines mid-phrase). MUST NOT fire on
+# discussion-of-rate-limits (the meta-false-positive).
+# ---------------------------------------------------------------------------
+
+class TestRateLimitDetect:
+    def test_real_server_429_render_wrapped(self):
+        # Actual captured render (agent-2, 2026-06-02) — wraps "limiting\n  requests".
+        real = (
+            "  ⎿  API Error: Server is temporarily limiting\n"
+            "     requests (not your usage limit) · Rate\n"
+            "     limited"
+        )
+        assert rr._detect_rate_limit(real) is True
+
+    def test_usage_cap_render_wrapped(self):
+        cap = "● Claude usage limit\n  reached. Your limit will reset at 3pm."
+        assert rr._detect_rate_limit(cap) is True
+
+    @pytest.mark.parametrize("text", [
+        "@khimaira-0 — task: build the rate-limit detection window-scanner",
+        "agent-2 was rate limited. we are still not catching this?",
+        "🔧 FIX rate-limit detection (frontend-lead-1) — the tracker is blind",
+        "discussing the rate limit and how Rate limited errors render",
+    ])
+    def test_discussion_does_not_false_positive(self, text):
+        # The chat is full of "rate limit(ed)" discussion — the detector keys on
+        # CC's literal API-error phrases, not the generic term.
+        assert rr._detect_rate_limit(text) is False

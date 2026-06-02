@@ -53,6 +53,7 @@ _COMPACT_THRESHOLD = int(os.environ.get("KHIMAIRA_ROSTER_COMPACT_PCT", "85"))
 _IDLE_MIN_S = float(os.environ.get("KHIMAIRA_ROSTER_IDLE_MIN_S", "300"))  # 5 min
 _WATCH_INTERVAL_S = float(os.environ.get("KHIMAIRA_ROSTER_WATCH_S", "60"))
 _COMPACT_COOLDOWN_S = 300.0  # 5 min between compact/wake attempts per window
+_RATE_LIMIT_COOLDOWN_S = 600.0  # 10 min between rate-limit escalations per window
 
 # Patterns that indicate the terminal is actively working (NOT idle).
 _BUSY_MARKERS = ("esc to interrupt", "compacting…", "compacting...", "compacting ")
@@ -948,6 +949,72 @@ def _resolve_session_by_name(raw_name: str) -> str | None:
     return None
 
 
+# --- Rate-limit detection (window-scanner) -----------------------------------
+# A roster agent hit by a server-side rate limit (429) or the usage cap STOPS
+# mid-turn and sits idle. No reliable transcript api_error record is written
+# (frontend-lead's audit: the 5h cap + the "Server is temporarily limiting"
+# 429 don't materialise as scannable transcript records), so the signal is the
+# RENDERED error in the window. Real captured render (agent-2, 2026-06-02):
+#   "⎿ API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+# Key on CC's LITERAL error strings, NOT bare "rate limit" — that appears in
+# task discussion (incl. this very feature's chatter) and would false-positive.
+# \s+ (not literal spaces) between words: the window WRAPS long lines, inserting
+# a newline + indent mid-phrase ("...limiting\n     requests"), so literal-space
+# matching misses the real render. \s+ spans the wrap. (Caught by testing the
+# actual captured render, not an assumed one — premise-vs-runtime.)
+_RATE_LIMIT_RE = re.compile(
+    r"Server\s+is\s+temporarily\s+limiting\s+requests"
+    r"|Claude\s+usage\s+limit\s+reached"
+    r"|upgrade\s+to\s+increase\s+your\s+usage\s+limit",
+    re.IGNORECASE,
+)
+
+
+def _detect_rate_limit(text: str) -> bool:
+    """True if the window scrollback shows a CC rate-limit / usage-cap error."""
+    return bool(_RATE_LIMIT_RE.search(text))
+
+
+def _get_screen_scrollback(window_id: int, tail_lines: int = 220) -> str | None:
+    """Read a generous slice of the window's SCROLLBACK (not just the visible
+    screen). A rate-limit error scrolls off-screen the moment chat messages
+    arrive (observed: agent-2's error was ~180 lines above the visible tail
+    after the Guard-5 flood), so the visible screen alone misses it. Returns
+    the last ``tail_lines`` of the full buffer, or None on read failure."""
+    full = _kitty("get-text", f"--match=id:{window_id}", "--extent=all")
+    if full is None:
+        return None
+    lines = full.splitlines()
+    return "\n".join(lines[-tail_lines:])
+
+
+def _escalate_rate_limit(window_id: int, session_id: str, role: str) -> None:
+    """Notify master that a roster session is rate-limited + stalled mid-turn."""
+    try:
+        from khimaira.monitor import sessions as sess_mod
+        master_id = _find_master_session_for_hitl()
+        msg = (
+            f"🚦 RATE-LIMITED — {role} (window {window_id}, session {session_id[:8]}) "
+            f"hit a server rate-limit / usage cap and STOPPED mid-turn (idle). "
+            f"Interactive window — the daemon can't auto-resume; it RECOVERS when "
+            f"the limit clears (re-prompt it) or needs a manual retry. Detected "
+            f"from the window render (no reliable transcript record is written)."
+        )
+        if master_id:
+            sess_mod.post_notice(
+                target_session_id=master_id,
+                text=msg,
+                from_session_id=session_id,
+                fire_desktop_notify=True,
+            )
+        _log.info(
+            "roster-ratelimit: ESCALATE window=%d role=%s session=%s",
+            window_id, role, session_id[:8],
+        )
+    except Exception as exc:
+        _log.warning("roster-ratelimit: escalation notice failed: %s", exc)
+
+
 async def _process_window(win: dict[str, Any]) -> None:
     """Assess a single roster window and act if appropriate."""
     window_id: int = win["window_id"]
@@ -1005,6 +1072,22 @@ async def _process_window(win: dict[str, Any]) -> None:
     text = await asyncio.get_running_loop().run_in_executor(None, _get_screen, window_id)
     if text is None:
         return
+
+    # -----------------------------------------------------------------------
+    # Rate-limit path: a rate-limited / usage-capped agent stops mid-turn and
+    # sits idle. Scan the SCROLLBACK (the error scrolls off the visible screen
+    # when chat messages arrive) and escalate to master. Debounced per window.
+    # -----------------------------------------------------------------------
+    rl_action = (window_id, "ratelimit")
+    if time.time() - _DEBOUNCE.get(rl_action, 0.0) >= _RATE_LIMIT_COOLDOWN_S:
+        scrollback = await asyncio.get_running_loop().run_in_executor(
+            None, _get_screen_scrollback, window_id
+        )
+        if scrollback and _detect_rate_limit(scrollback):
+            await asyncio.get_running_loop().run_in_executor(
+                None, _escalate_rate_limit, window_id, session_id, role
+            )
+            _DEBOUNCE[rl_action] = time.time()
 
     # -----------------------------------------------------------------------
     # HITL path: detect permission dialog and auto-answer or escalate (first)
