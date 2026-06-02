@@ -101,22 +101,26 @@ graph TD
   D --> F{1 match?}
   E --> G{1 match?}
   F -- yes --> R
-  G -- yes --> H{Live surface?}
-  H -- yes --> I{Reachable?}
-  H -- no --> R
-  I -- yes --> R
-  I -- no --> J["ABORT / raise<br/>(unreachable, queue durable)"]
+  G -- yes --> R
   F -- 0 --> K["ABORT / raise<br/>(unknown name)"]
   G -- 0 --> K
-  F -- "≥2" --> L["ABORT / raise<br/>(ambiguous — request disambiguation)"]
+  F -- "≥2" --> L["ABORT / raise<br/>(ambiguous — disambiguate)"]
   G -- "≥2" --> L
+  R --> S["UUID returned to caller"]
+  S --> T{Live surface?<br/>role-broadcast / wake<br/>/ scheduler}
+  T -- yes --> U{Reachable?<br/>_subscribers check}
+  T -- no --> V["Queue / deliver<br/>(durable — no filter)"]
+  U -- yes --> V
+  U -- no --> W["Skip — live no-op<br/>(delivery continues<br/>to other members)"]
 ```
+
+> **Key:** reachability is applied by the **caller/surface** at delivery time — it is NOT part of the resolver. The resolver returns a UUID from MEMBERSHIP; live surfaces then apply the `∩ reachable` overlay. Durable surfaces (notice/answer/handoff) skip the overlay entirely and queue to the membership match, even if unreachable.
 
 **DROP the global mtime-heuristic.** The ambiguity-abort already shipped in `roster_recovery._resolve_session_for_role` — generalize it as the resolver default.
 
-**Durable vs live split for step 3 (roster-scoped):**
-- **Durable** (notice/answer/handoff): scope = MEMBERSHIP, **NO** reachability filter. Ambiguity (≥2 alive same-named after scoping) → ABORT/disambiguate, never reachability-guess. P5 ghost-eviction (P3) makes the common case ONE alive seat.
-- **Live** (role-broadcast / wake / scheduler-at-fire-time): scope = MEMBERSHIP ∩ reachable. Unreachable seat after scoping → skip/ABORT, not silent mis-route.
+**Durable vs live split (applied post-resolution by the caller):**
+- **Durable** (notice/answer/handoff/log_question): caller delivers to the resolved UUID with no reachability check. An unreachable-but-alive seat still receives the message in its inbox. Ambiguity (≥2 alive same-named after scoping) → resolver ABORTs — caller must disambiguate, never reachability-guess.
+- **Live** (role-broadcast / wake / scheduler-at-fire-time): caller checks `is_reachable(uuid)` AFTER resolver returns. Unreachable → skip (no-op for that delivery; broadcast continues to other members). This is a per-surface overlay, not a resolver filter.
 
 ---
 
@@ -133,7 +137,7 @@ effective_member_roles = member_roles ∩ MEMBERSHIP
 where `MEMBERSHIP = active_roster_member_ids()` = accepted ∩ recently-active (last-message-ts < 7d, durable reads — agent-1's existing predicate, no reachability filter).
 
 **Benefits:**
-- Reversible by construction — no mutation of member_roles required. A session that re-registers / resumes activity auto-re-enters the derived view. No false-permanent-evict.
+- **Reversible by construction** — no mutation of member_roles required. A session that re-registers / resumes activity auto-re-enters the derived view. No false-permanent-evict.
 - Role-assignment is retained in member_roles — re-entry restores the role automatically.
 - Collapses the three-membership-view divergence into one definition: member_roles and session_list become inputs to the view, not independent truths.
 - Role-broadcast and resolver target the intersection, not raw member_roles → eliminates the storm-amplifier targeting ghost entries.
