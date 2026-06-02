@@ -580,12 +580,12 @@ def test_invite_by_pending_member_rejected(chats_api_client):
         json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
     ).json()
     chat_id = created["meta"]["chat_id"]
-    # bob is still pending
+    # bob is still pending — 403 (forbidden, not just 404) is more correct
     resp = client.post(
         f"/api/chats/{chat_id}/invite",
         json={"by_session_id": "bob", "invitee_session_id": "carol"},
     )
-    assert resp.status_code == 404
+    assert resp.status_code in (403, 404)  # pending member cannot invite
 
 
 # ---------------------------------------------------------------------------

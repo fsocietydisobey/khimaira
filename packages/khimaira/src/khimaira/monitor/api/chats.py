@@ -100,7 +100,8 @@ def _session_active_within(session_id: str, window_s: float) -> bool:
         recent = sessions_mod.recent_tool_calls(session_id, limit=1)
         if (
             recent
-            and (now - _ts_float(recent[0].get("ts", "1970-01-01T00:00:00+00:00"))) < window_s
+            and (now - _ts_float(recent[0].get("ts", "1970-01-01T00:00:00+00:00")))
+            < window_s
         ):
             return True
         touches = (
@@ -110,7 +111,8 @@ def _session_active_within(session_id: str, window_s: float) -> bool:
         )
         if (
             touches
-            and (now - _ts_float(touches[0].get("ts", "1970-01-01T00:00:00+00:00"))) < window_s
+            and (now - _ts_float(touches[0].get("ts", "1970-01-01T00:00:00+00:00")))
+            < window_s
         ):
             return True
     except Exception:
@@ -206,7 +208,9 @@ async def _maybe_supersede_presumed_dead(sender_id: str) -> None:
             pass
 
 
-async def _register_expected_reply(from_id: str, to_ids: list[str], chat_id: str = "") -> None:
+async def _register_expected_reply(
+    from_id: str, to_ids: list[str], chat_id: str = ""
+) -> None:
     async with _REGISTRY_LOCK:
         ts = time.time()
         for to_id in to_ids:
@@ -222,7 +226,9 @@ async def _register_expected_reply(from_id: str, to_ids: list[str], chat_id: str
             }
 
 
-async def _resolve_expected_reply(from_id: str, to_ids: list[str], chat_id: str = "") -> None:
+async def _resolve_expected_reply(
+    from_id: str, to_ids: list[str], chat_id: str = ""
+) -> None:
     async with _REGISTRY_LOCK:
         for to_id in to_ids:
             _EXPECTED_REPLIES.pop((from_id, to_id), None)
@@ -332,7 +338,9 @@ async def _overdue_watcher() -> None:
 # ---------------------------------------------------------------------------
 
 _GUARD4_WATCH_INTERVAL = 60.0  # seconds between scans
-_GUARD4_STALLED: dict[tuple[str, str], float] = {}  # (session_id, obligation_id) → escalation_ts
+_GUARD4_STALLED: dict[tuple[str, str], float] = (
+    {}
+)  # (session_id, obligation_id) → escalation_ts
 _GUARD4_STALLED_TTL_S = 3600.0  # clear debounce entries after 1h
 _GUARD4_MIN_SILENCE_S = 120.0  # ignore sessions silent < 2min (normal idle)
 
@@ -380,6 +388,7 @@ def _is_process_alive_for_session(session_id: str) -> bool | None:
         # Prefer psutil if available (cross-platform)
         try:
             import psutil
+
             return psutil.pid_exists(ppid)
         except ImportError:
             pass
@@ -461,6 +470,7 @@ def session_has_task_obligation(
     if task_assignee_role:
         try:
             from .themis import resolve_session_role
+
             session_role = resolve_session_role(resolved_session_id)
             if session_role == task_assignee_role:
                 return True
@@ -517,7 +527,7 @@ def _auto_create_review_tasks(
         # review-task should allow a fresh review obligation on re-done.
         # Fold status updates to find the current status per task.
         review_task_statuses: dict[str, str] = {}  # task_id → current status
-        review_task_roles: dict[str, str] = {}      # task_id → verdict_role
+        review_task_roles: dict[str, str] = {}  # task_id → verdict_role
         for line in chats._read(chat_id):
             k = line.get("kind")
             if k == chats.TASK and line.get("gate_for") == work_task_id:
@@ -529,7 +539,9 @@ def _auto_create_review_tasks(
             elif k == chats.TASK_UPDATE:
                 tid = line.get("task_id")
                 if tid in review_task_statuses:
-                    review_task_statuses[tid] = line.get("status", review_task_statuses[tid])
+                    review_task_statuses[tid] = line.get(
+                        "status", review_task_statuses[tid]
+                    )
 
         open_statuses = {chats.TASK_PENDING, chats.TASK_IN_PROGRESS}
         existing_verdict_roles: set[str] = {
@@ -582,6 +594,7 @@ def _get_session_obligations(session_id: str) -> list[dict]:
     session_role: str | None = None
     try:
         from .themis import resolve_session_role
+
         session_role = resolve_session_role(session_id)
     except Exception:
         pass
@@ -596,7 +609,9 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                 # Fold task state from the JSONL without calling load_room first
                 # (avoids member validation for a read-only scan).
                 tasks: dict[str, dict] = {}
-                verdicts: dict[str, dict] = {}  # task_id → {critic_approved, verifier_shipped}
+                verdicts: dict[str, dict] = (
+                    {}
+                )  # task_id → {critic_approved, verifier_shipped}
                 for line in chats._read(chat_id):
                     k = line.get("kind")
                     if k == chats.TASK:
@@ -623,10 +638,13 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                         # Track verdicts for review-task open-check
                         ref_tid = line.get("task_id")
                         if ref_tid:
-                            v = verdicts.setdefault(ref_tid, {
-                                "critic_approved": False,
-                                "verifier_shipped": False,
-                            })
+                            v = verdicts.setdefault(
+                                ref_tid,
+                                {
+                                    "critic_approved": False,
+                                    "verifier_shipped": False,
+                                },
+                            )
                             verdict_val = line.get("verdict", "")
                             if verdict_val == "approve":
                                 v["critic_approved"] = True
@@ -644,12 +662,14 @@ def _get_session_obligations(session_id: str) -> list[dict]:
 
                     # Named-assignee obligation (existing behavior)
                     if task.get("assignee_id") == session_id:
-                        obligations.append({
-                            "task_id": task["task_id"],
-                            "chat_id": chat_id,
-                            "status": status,
-                            "begin_fired": task.get("begin_fired", False),
-                        })
+                        obligations.append(
+                            {
+                                "task_id": task["task_id"],
+                                "chat_id": chat_id,
+                                "status": status,
+                                "begin_fired": task.get("begin_fired", False),
+                            }
+                        )
                         continue
 
                     # Guard-5 Part A: role-class review-task obligation.
@@ -669,19 +689,23 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                         verdict_satisfied = (
                             gate_v.get("critic_approved")
                             if task_verdict_role == chats.ROLE_CRITIC
-                            else gate_v.get("verifier_shipped")
-                            if task_verdict_role == chats.ROLE_VERIFIER
-                            else False
+                            else (
+                                gate_v.get("verifier_shipped")
+                                if task_verdict_role == chats.ROLE_VERIFIER
+                                else False
+                            )
                         )
                         if not verdict_satisfied:
-                            obligations.append({
-                                "task_id": task["task_id"],
-                                "chat_id": chat_id,
-                                "status": status,
-                                "begin_fired": task.get("begin_fired", False),
-                                "gate_for": gate_for,
-                                "verdict_role": task_verdict_role,
-                            })
+                            obligations.append(
+                                {
+                                    "task_id": task["task_id"],
+                                    "chat_id": chat_id,
+                                    "status": status,
+                                    "begin_fired": task.get("begin_fired", False),
+                                    "gate_for": gate_for,
+                                    "verdict_role": task_verdict_role,
+                                }
+                            )
             except Exception:
                 continue
     except Exception:
@@ -704,7 +728,9 @@ async def _guard4_escalate(
     if reason == "crash":
         reason_text = "process appears dead (crash)"
     elif reason == "hung":
-        reason_text = f"process alive but silent >{silence_s:.0f}s (possibly hung/paused)"
+        reason_text = (
+            f"process alive but silent >{silence_s:.0f}s (possibly hung/paused)"
+        )
     else:
         reason_text = f"silent >{silence_s:.0f}s with obligation (liveness unknown)"
 
@@ -716,6 +742,7 @@ async def _guard4_escalate(
 
     try:
         from khimaira.monitor.chats import _post_synthetic_message
+
         await _post_synthetic_message(chat_id, body)
     except Exception:
         pass
@@ -827,9 +854,7 @@ def _chats_for_session(session_id: str) -> list[str]:
     return out
 
 
-async def _handle_throttle_escalation(
-    session_id: str, payload: dict
-) -> dict:
+async def _handle_throttle_escalation(session_id: str, payload: dict) -> dict:
     """Process a terminal-overload detection from a session's Stop hook.
 
     Universal 🟡 alert; obligation-scoped harder escalation; per-session
@@ -869,7 +894,9 @@ async def _handle_throttle_escalation(
     detail = payload.get("message") or "service overloaded"
 
     def _notify(chat_id: str, body: str) -> None:
-        target = _resolve_intake_session_id(chat_id) or _resolve_master_session_id(chat_id)
+        target = _resolve_intake_session_id(chat_id) or _resolve_master_session_id(
+            chat_id
+        )
         if target:
             try:
                 sessions_mod.post_notice(
@@ -885,6 +912,7 @@ async def _handle_throttle_escalation(
     try:
         from khimaira.monitor.chats import _post_synthetic_message as _post_msg
     except Exception:
+
         async def _post_msg(chat_id, body, kind=None):  # type: ignore[assignment]
             return None
 
@@ -907,7 +935,10 @@ async def _handle_throttle_escalation(
             if count >= _THROTTLE_ESCALATE_AFTER_N:
                 try:
                     await _guard4_escalate(
-                        session_id, obligation, name, "hung",
+                        session_id,
+                        obligation,
+                        name,
+                        "hung",
                         _THROTTLE_COOLDOWN_S * count,
                     )
                 except Exception:
@@ -955,6 +986,7 @@ async def _guard4_check_once() -> None:
     # Wind-down suppression — the roster is deliberately offline; don't escalate.
     try:
         from khimaira.monitor.sessions import is_roster_wind_down
+
         if is_roster_wind_down():
             return
     except Exception:
@@ -963,7 +995,9 @@ async def _guard4_check_once() -> None:
     now = time.time()
 
     # Sweep stale debounce entries (TTL-based fallback)
-    expired = [k for k, ts in _GUARD4_STALLED.items() if now - ts > _GUARD4_STALLED_TTL_S]
+    expired = [
+        k for k, ts in _GUARD4_STALLED.items() if now - ts > _GUARD4_STALLED_TTL_S
+    ]
     for k in expired:
         _GUARD4_STALLED.pop(k, None)
 
@@ -976,13 +1010,11 @@ async def _guard4_check_once() -> None:
             sid, tid = sid_key
             # Re-scan obligations for this session and check if this task is still active.
             active_for_session = {
-                (sid, o["task_id"])
-                for o in _get_session_obligations(sid)
+                (sid, o["task_id"]) for o in _get_session_obligations(sid)
             }
             current_obligation_keys |= active_for_session
         cleared = [
-            k for k in list(_GUARD4_STALLED.keys())
-            if k not in current_obligation_keys
+            k for k in list(_GUARD4_STALLED.keys()) if k not in current_obligation_keys
         ]
         for k in cleared:
             _GUARD4_STALLED.pop(k, None)
@@ -991,6 +1023,7 @@ async def _guard4_check_once() -> None:
 
     try:
         from khimaira.monitor import sessions as sessions_mod
+
         session_rows = sessions_mod.list_sessions(use_cache=True)
     except Exception:
         return
@@ -1014,7 +1047,9 @@ async def _guard4_check_once() -> None:
         silence_s = float(last_age_s)
         status_raw = row.get("status") or {}
         session_name = (
-            status_raw.get("name") or status_raw.get("effective_status") or session_id[:8]
+            status_raw.get("name")
+            or status_raw.get("effective_status")
+            or session_id[:8]
         )
 
         for obligation in obligations:
@@ -1050,7 +1085,11 @@ async def _guard4_check_once() -> None:
                     # #14b banner nags the agent; Guard-4 escalates to master if it persists.
                     # Escalate regardless of liveness once BEGIN was fired.
                     if silence_s > ceiling:
-                        reason = "crash" if alive is False else "hung" if alive is True else "unknown"
+                        reason = (
+                            "crash"
+                            if alive is False
+                            else "hung" if alive is True else "unknown"
+                        )
                         _GUARD4_STALLED[obligation_key] = now
                         await _guard4_escalate(
                             session_id, obligation, session_name, reason, silence_s
@@ -1059,12 +1098,16 @@ async def _guard4_check_once() -> None:
                 # in_progress: existing three-way logic unchanged.
                 if alive is False:
                     _GUARD4_STALLED[obligation_key] = now
-                    await _guard4_escalate(session_id, obligation, session_name, "crash", silence_s)
+                    await _guard4_escalate(
+                        session_id, obligation, session_name, "crash", silence_s
+                    )
                 elif alive is True and silence_s <= ceiling:
                     pass  # within grace window — suppress (🟡 throttled)
                 elif alive is True and silence_s > ceiling:
                     _GUARD4_STALLED[obligation_key] = now
-                    await _guard4_escalate(session_id, obligation, session_name, "hung", silence_s)
+                    await _guard4_escalate(
+                        session_id, obligation, session_name, "hung", silence_s
+                    )
                 else:  # alive is None
                     if silence_s > ceiling:
                         _GUARD4_STALLED[obligation_key] = now
@@ -1097,12 +1140,20 @@ class CreateRoomReq(BaseModel):
     title: str | None = None
     fresh: bool = False
     topology: str = "flat"  # v1.9.5: flat | hierarchical | custom
-    member_roles: dict[str, str] | None = None  # session_id → role; written to meta at creation
+    member_roles: dict[str, str] | None = (
+        None  # session_id → role; written to meta at creation
+    )
 
 
 class InviteReq(BaseModel):
     by_session_id: str
     invitee_session_id: str
+    role: str | None = None  # #3: optional atomic role-binding at invite time
+
+
+class RemoveMemberReq(BaseModel):
+    by_session_id: str  # must be master
+    target_session_id: str  # member to evict
 
 
 class AcceptReq(BaseModel):
@@ -1113,7 +1164,9 @@ class SendReq(BaseModel):
     sender_session_id: str
     body: str
     to: list[str] | None = None  # Phase B: optional per-recipient addressing
-    private: bool | None = None  # v1.9.2: hide from non-recipients; None = topology default
+    private: bool | None = (
+        None  # v1.9.2: hide from non-recipients; None = topology default
+    )
 
 
 class CreateTaskReq(BaseModel):
@@ -1121,17 +1174,17 @@ class CreateTaskReq(BaseModel):
     body: str
     assignee_session_id: str | None = None
     assignee_role: str | None = None  # Guard-5: role-class assignee
-    gate_required: bool = False       # Guard-5: auto-create review-tasks on done
-    gate_for: str | None = None       # Guard-5: review-task references this work-task
-    verdict_role: str | None = None   # Guard-5: "critic"|"verifier"
+    gate_required: bool = False  # Guard-5: auto-create review-tasks on done
+    gate_for: str | None = None  # Guard-5: review-task references this work-task
+    verdict_role: str | None = None  # Guard-5: "critic"|"verifier"
     private: bool = False  # v1.9.2: hide from non-assignee in chat_history
 
 
 class MasterOverrideVerdictReq(BaseModel):
     by_session_id: str
-    verdict: str       # "approve" | "changes" | "ship" | "hold"
-    reason: str        # non-empty — audited, never silent
-    trigger: str       # "quorum_timeout" | "manual_deadlock"
+    verdict: str  # "approve" | "changes" | "ship" | "hold"
+    reason: str  # non-empty — audited, never silent
+    trigger: str  # "quorum_timeout" | "manual_deadlock"
 
 
 class UpdateTaskStatusReq(BaseModel):
@@ -1252,6 +1305,78 @@ def build_router():
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
 
+    @router.get("/chats/{chat_id}/members/{session_id}/status")
+    async def member_status(chat_id: str, session_id: str) -> dict:
+        """#10: Return the authoritative membership state from the chat JSONL.
+
+        The chat daemon is the single source of truth for membership state.
+        Use this to reconcile any session_state view against the real state.
+        """
+        try:
+            sid = chats._resolve_or_uuid(session_id, chat_id=chat_id)
+            room = chats.load_room(chat_id)
+            member = room["members"].get(sid)
+            if not member:
+                raise fastapi.HTTPException(
+                    404, f"Session {session_id!r} is not a member of {chat_id!r}."
+                )
+            return {
+                "session_id": sid,
+                "chat_id": chat_id,
+                "state": member.get("state"),
+                "invited_by": member.get("invited_by"),
+            }
+        except fastapi.HTTPException:
+            raise
+        except ValueError as exc:
+            raise fastapi.HTTPException(404, str(exc)) from exc
+
+    @router.post("/chats/{chat_id}/nudge-pending")
+    async def nudge_pending(chat_id: str, req: InviteReq) -> dict:
+        """#10: Master re-broadcasts an invite notification to a pending invitee.
+
+        A dormant pending-invitee can't be woken from outside — this lets master
+        re-send the invite SSE event so the session sees it on its next turn.
+        Idempotent: the member state stays PENDING; this only re-fires the broadcast.
+        """
+        try:
+            by_session_id = chats._resolve_or_uuid(req.by_session_id, chat_id=chat_id)
+            target_id = chats._resolve_or_uuid(req.invitee_session_id, chat_id=chat_id)
+            room = chats.load_room(chat_id)
+
+            # Only master/accepted members can nudge
+            if room["members"].get(by_session_id, {}).get("state") != chats.ACCEPTED:
+                raise fastapi.HTTPException(
+                    403, f"{by_session_id!r} is not an accepted member of {chat_id!r}"
+                )
+
+            target = room["members"].get(target_id)
+            if not target or target.get("state") != chats.PENDING:
+                raise fastapi.HTTPException(
+                    422,
+                    f"Session {target_id!r} is not pending in {chat_id!r}; "
+                    f"nudge only applies to pending invitees.",
+                )
+
+            # Re-broadcast the invite record so the target's SSE subscriber sees it.
+            invite_record = {
+                "kind": chats.MEMBER,
+                "event_id": chats._new_event_id(),
+                "ts": chats._now_iso(),
+                "chat_id": chat_id,
+                "session_id": target_id,
+                "session_name": target.get("session_name"),
+                "state": chats.PENDING,
+                "invited_by": target.get("invited_by"),
+                "nudged_by": by_session_id,
+            }
+            chats._broadcast(chat_id, invite_record)
+            return {"nudged": target_id, "chat_id": chat_id}
+        except fastapi.HTTPException:
+            raise
+        except ValueError as exc:
+            raise fastapi.HTTPException(404, str(exc)) from exc
+
     @router.get("/chats")
     async def list_my_chats(session_id: str) -> dict:
         try:
@@ -1262,6 +1387,7 @@ def build_router():
             # calling chat_my_chats IS the correct fulfillment of that obligation.
             try:
                 from khimaira.monitor import sessions as sessions_mod
+
                 sessions_mod.write_sse_heartbeat(session_id)
             except Exception:
                 pass  # never block the list response
@@ -1308,7 +1434,9 @@ def build_router():
         last_event_id = request.headers.get("last-event-id")
 
         async def event_generator():
-            async for record in chats.subscribe(session_id, since_event_id=last_event_id):
+            async for record in chats.subscribe(
+                session_id, since_event_id=last_event_id
+            ):
                 if await request.is_disconnected():
                     break
                 yield {
@@ -1349,9 +1477,45 @@ def build_router():
     @router.post("/chats/{chat_id}/invite")
     async def invite_member(chat_id: str, req: InviteReq) -> dict:
         try:
-            return chats.invite(chat_id, req.by_session_id, req.invitee_session_id)
+            result = chats.invite(
+                chat_id,
+                req.by_session_id,
+                req.invitee_session_id,
+                role=req.role,
+            )
+            # If role was bound, invalidate the invitee's Themis role cache.
+            if req.role is not None:
+                _inval(req.invitee_session_id)
+            return result
         except ValueError as exc:
-            raise fastapi.HTTPException(404, str(exc)) from exc
+            msg = str(exc)
+            if "not registered" in msg:
+                code = 422
+            elif "not an accepted member" in msg:
+                code = 403
+            else:
+                code = 404
+            raise fastapi.HTTPException(code, msg) from exc
+
+    @router.delete("/chats/{chat_id}/members/{target_session_id}")
+    async def remove_member(
+        chat_id: str, target_session_id: str, req: RemoveMemberReq
+    ) -> dict:
+        """#2 remove-member: master evicts a member, discards their SSE subscriber."""
+        try:
+            result = chats.remove_member(chat_id, req.by_session_id, target_session_id)
+            # Invalidate the removed session's Themis role cache.
+            _inval(target_session_id)
+            return result
+        except ValueError as exc:
+            msg = str(exc)
+            if "not the master" in msg:
+                code = 403
+            elif "not a member" in msg:
+                code = 404
+            else:
+                code = 422
+            raise fastapi.HTTPException(code, msg) from exc
 
     @router.post("/chats/{chat_id}/accept")
     async def accept_invite(chat_id: str, req: AcceptReq) -> dict:
@@ -1393,11 +1557,17 @@ def build_router():
         while True:
             try:
                 result = chats.send_message(
-                    chat_id, req.sender_session_id, req.body, to=req.to, private=req.private
+                    chat_id,
+                    req.sender_session_id,
+                    req.body,
+                    to=req.to,
+                    private=req.private,
                 )
                 # Register only for targeted sends — broadcasts don't expect a reply.
                 if req.to:
-                    await _register_expected_reply(req.sender_session_id, req.to, chat_id)
+                    await _register_expected_reply(
+                        req.sender_session_id, req.to, chat_id
+                    )
                 return result
             except ValueError as exc:
                 msg = str(exc)
@@ -1431,7 +1601,9 @@ def build_router():
             raise fastapi.HTTPException(403, str(exc)) from exc
 
     @router.post("/chats/{chat_id}/tasks/{task_id}/status")
-    async def update_task_status(chat_id: str, task_id: str, req: UpdateTaskStatusReq) -> dict:
+    async def update_task_status(
+        chat_id: str, task_id: str, req: UpdateTaskStatusReq
+    ) -> dict:
         try:
             result = chats.update_task_status(
                 chat_id,
@@ -1444,7 +1616,11 @@ def build_router():
         except ValueError as exc:
             # 403 for permission errors (master-only transitions); 404 for unknown task
             msg = str(exc)
-            code = 403 if any(w in msg for w in ("creator", "assignee", "transition")) else 404
+            code = (
+                403
+                if any(w in msg for w in ("creator", "assignee", "transition"))
+                else 404
+            )
             raise fastapi.HTTPException(code, msg) from exc
 
         # Guard-5 Part A: AUTO-create review-tasks when gate_required task → done.
@@ -1486,9 +1662,13 @@ def build_router():
             raise fastapi.HTTPException(code, msg) from exc
 
     @router.post("/chats/{chat_id}/tasks/{task_id}/signal-start")
-    async def signal_task_start(chat_id: str, task_id: str, req: SignalTaskStartReq) -> dict:
+    async def signal_task_start(
+        chat_id: str, task_id: str, req: SignalTaskStartReq
+    ) -> dict:
         try:
-            return chats.signal_task_start(chat_id, task_id, req.by_session_id, note=req.note)
+            return chats.signal_task_start(
+                chat_id, task_id, req.by_session_id, note=req.note
+            )
         except ValueError as exc:
             msg = str(exc)
             if "No task" in msg:
@@ -1501,10 +1681,14 @@ def build_router():
             raise fastapi.HTTPException(code, msg) from exc
 
     @router.post("/chats/{chat_id}/tasks/{task_id}/verdict")
-    async def record_gate_verdict(chat_id: str, task_id: str, req: RecordGateVerdictReq) -> dict:
+    async def record_gate_verdict(
+        chat_id: str, task_id: str, req: RecordGateVerdictReq
+    ) -> dict:
         """Write a structured gate-verdict (B3). critic: approve/changes; verifier: ship/hold."""
         try:
-            return chats.record_gate_verdict(chat_id, req.by_session_id, task_id, req.verdict)
+            return chats.record_gate_verdict(
+                chat_id, req.by_session_id, task_id, req.verdict
+            )
         except ValueError as exc:
             msg = str(exc)
             code = 404 if "No task" in msg else 400 if "Invalid verdict" in msg else 403
@@ -1595,7 +1779,9 @@ def build_router():
             if not sid:
                 continue
             if sid not in name_cache:
-                name_cache[sid] = _resolve_sender_name(sid, msg.get("sender_name", sid[:8]))
+                name_cache[sid] = _resolve_sender_name(
+                    sid, msg.get("sender_name", sid[:8])
+                )
             msg["sender_name"] = name_cache[sid]
         return {"messages": msgs}
 
@@ -1654,7 +1840,10 @@ def build_router():
             return result
         except ValueError as exc:
             msg = str(exc)
-            if "not currently deputized" in msg or "no deputized_original_master" in msg:
+            if (
+                "not currently deputized" in msg
+                or "no deputized_original_master" in msg
+            ):
                 code = 409
             elif "not the recorded original master" in msg or "demote_to" in msg:
                 code = 403

@@ -497,6 +497,51 @@ _ACK_RE = re.compile(
 )
 
 
+def _assert_session_registered(session_id: str) -> None:
+    """Raise ValueError if session_id is not in the session registry.
+
+    Closes the phantom-member gap (#1): prevents adding non-existent sessions to
+    a chat, which would create silent phantoms (session_post_notice 404s, no SSE
+    delivery, Themis can't resolve role for them).
+
+    LAZY-REGISTRATION EXCEPTION: if session_id is UUID-shaped (the canonical
+    form from SessionStart), we warn but do NOT raise. Fresh sessions that just
+    registered via SessionStart don't have a state dir yet — the lazy-registration
+    design explicitly allows inviting them before they've written any state. The
+    phantom risk for UUID-shaped IDs is low (callers must know the UUID).
+
+    For non-UUID names, there's no lazy-registration exception — a name that
+    doesn't resolve to a registered session is a genuine phantom.
+    """
+    if _UUID_RE.match(session_id):
+        # UUID fast-path: apply lazy-registration exception — warn if no dir but
+        # don't block. A fresh session from SessionStart has no dir yet.
+        try:
+            sd = sessions_mod._session_dir_read(session_id)
+        except Exception:
+            sd = None
+        if sd is None:
+            log.warning(
+                "chats: session %r has no registry state dir (fresh/phantom?) — "
+                "adding to chat anyway (lazy-registration). "
+                "If this session never registers, post_notice will fail silently.",
+                session_id,
+            )
+        return
+
+    # Non-UUID names: must resolve to a registered session.
+    try:
+        sd = sessions_mod._session_dir_read(session_id)
+    except Exception:
+        sd = None
+    if sd is None:
+        raise ValueError(
+            f"Session {session_id!r} is not registered (no session state found). "
+            f"Only registered sessions can be added to a chat. "
+            f"Ensure the session has registered via SessionStart or chat_my_chats first."
+        )
+
+
 def _resolve_or_uuid(session_id_or_name: str, *, chat_id: str | None = None) -> str:
     """Resolve a session name → UUID, OR accept a UUID verbatim.
 
@@ -620,7 +665,12 @@ def create_room(
             f"Invalid topology {topology!r}. Valid values: {sorted(_VALID_TOPOLOGIES)}."
         )
     creator_session_id = _resolve_or_uuid(creator_session_id)
+    # #1 phantom-member guard: validate creator exists in the registry.
+    _assert_session_registered(creator_session_id)
     resolved_members = [_resolve_or_uuid(m) for m in member_session_ids]
+    # #1 phantom-member guard: validate all initial members exist.
+    for sid in resolved_members:
+        _assert_session_registered(sid)
     if creator_session_id not in resolved_members:
         resolved_members.append(creator_session_id)
 
@@ -695,12 +745,27 @@ def create_room(
     return load_room(chat_id)
 
 
-def invite(chat_id: str, by_session_id: str, invitee_session_id: str) -> dict[str, Any]:
-    """Add a new member in `pending` state. Caller must be an accepted member."""
+def invite(
+    chat_id: str,
+    by_session_id: str,
+    invitee_session_id: str,
+    *,
+    role: str | None = None,
+) -> dict[str, Any]:
+    """Add a new member in `pending` state. Caller must be an accepted member.
+
+    `role`: optional; if provided, atomically binds the invitee's role in
+    `member_roles` at invite-time (#3 role-binding). This closes the bypass
+    where a role-unbound lead could skip the NO_DIRECT_CODING enforcement gate
+    (Themis resolves role→None → lead-base rules never load → Edit passes through).
+    Belt-and-suspenders: #61 UNRESOLVABLE-blocking also applies to unbound roster
+    members, so even an unbound invite still blocks after accept.
+    """
     by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
     invitee_session_id = _resolve_or_uuid(invitee_session_id)
     room = load_room(chat_id)
     members = room["members"]
+    # Check caller's membership BEFORE registry validation (better error messages).
     if members.get(by_session_id, {}).get("state") != ACCEPTED:
         raise ValueError(
             f"Session {by_session_id!r} is not an accepted member of {chat_id!r}; "
@@ -712,6 +777,32 @@ def invite(chat_id: str, by_session_id: str, invitee_session_id: str) -> dict[st
             f"Session {invitee_session_id!r} is already a {existing['state']} "
             f"member of {chat_id!r}."
         )
+
+    # #1 phantom-member guard: invitee must be in the session registry.
+    # (Checked after caller-membership so that error is surfaced first.)
+    _assert_session_registered(invitee_session_id)
+
+    # #3 ATOMIC ROLE-BINDING: if a role is provided, write it to member_roles now
+    # so the invitee is never role-unbound. member_roles is authoritative for Themis.
+    if role is not None:
+        existing_meta = room["meta"]
+        meta_patch: dict[str, Any] = {
+            "kind": META,
+            "event_id": _new_event_id(),
+            "ts": _now_iso(),
+            "chat_id": chat_id,
+        }
+        member_roles = dict(existing_meta.get("member_roles") or {})
+        member_roles[invitee_session_id] = role
+        meta_patch["member_roles"] = member_roles
+        _append(chat_id, meta_patch)
+        log.info(
+            "chats: invite bound role=%s for %s in %s",
+            role,
+            invitee_session_id,
+            chat_id,
+        )
+
     record = {
         "kind": MEMBER,
         "event_id": _new_event_id(),
@@ -1813,6 +1904,66 @@ def leave(chat_id: str, session_id: str) -> dict[str, Any]:
     }
     _append(chat_id, record)
     log.info("chats: %s left %s", session_id, chat_id)
+    return record
+
+
+def remove_member(
+    chat_id: str, by_session_id: str, target_session_id: str
+) -> dict[str, Any]:
+    """Master/creator evicts `target_session_id` from the chat (#2 remove-member).
+
+    Transitions target to REMOVED state AND discards them from _subscribers
+    (reachability hygiene: a removed member must not read is_reachable=True).
+
+    Only the chat's current master may remove members — creators who have
+    transferred master should first reclaim master if they need to evict.
+
+    `by_session_id` must be an accepted master. Target must be an accepted
+    or pending member. Master cannot evict themselves — use `leave()`.
+    """
+    by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
+    target_session_id = _resolve_or_uuid(target_session_id, chat_id=chat_id)
+    room = load_room(chat_id)
+
+    if not _is_master(room, by_session_id):
+        raise ValueError(
+            f"Session {by_session_id!r} is not the master of {chat_id!r}; "
+            f"only the master can remove members."
+        )
+    if by_session_id == target_session_id:
+        raise ValueError(
+            f"Master cannot remove themselves from {chat_id!r}. Use leave() instead."
+        )
+
+    target_member = room["members"].get(target_session_id)
+    if not target_member:
+        raise ValueError(
+            f"Session {target_session_id!r} is not a member of {chat_id!r}."
+        )
+    if target_member.get("state") in (LEFT, REMOVED):
+        raise ValueError(
+            f"Session {target_session_id!r} is already in state "
+            f"{target_member['state']!r}; nothing to remove."
+        )
+
+    record = {
+        "kind": MEMBER,
+        "event_id": _new_event_id(),
+        "ts": _now_iso(),
+        "chat_id": chat_id,
+        "session_id": target_session_id,
+        "session_name": target_member.get("session_name"),
+        "state": REMOVED,
+        "removed_by": by_session_id,
+    }
+    _append(chat_id, record)
+
+    # Reachability hygiene: discard the removed session's SSE subscriber so
+    # is_reachable(target) stops returning True for a removed member.
+    # This mirrors the P3 design's "eviction must un-subscribe from _subscribers".
+    _subscribers.pop(target_session_id, None)
+
+    log.info("chats: %s removed %s from %s", by_session_id, target_session_id, chat_id)
     return record
 
 

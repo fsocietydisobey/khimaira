@@ -3140,3 +3140,109 @@ def test_resolve_or_uuid_chat_scoped_via_chats(isolated_chats):
 
     result = c._resolve_or_uuid("bob", chat_id=chat_id)
     assert result == sid_b
+
+
+# ---------------------------------------------------------------------------
+# Membership integrity (#1 phantom, #2 remove-member, #3 role-binding, #10)
+# ---------------------------------------------------------------------------
+
+
+def test_create_room_rejects_unregistered_name(isolated_chats):
+    """#1: create_room rejects a non-UUID name that isn't in the session registry."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+    _make_session(sessions_mod, "alice-uuid", "alice")
+
+    # "totally-unknown-name" is not in the registry → ValueError at resolution
+    with pytest.raises(ValueError):
+        c.create_room("alice-uuid", ["totally-unknown-name"])
+
+
+def test_invite_rejects_unregistered_name(isolated_chats):
+    """#1: invite rejects a non-UUID invitee name not in the session registry."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    room = c.create_room("alice-uuid", [])
+    chat_id = room["meta"]["chat_id"]
+    # alice is auto-accepted as creator
+
+    with pytest.raises(ValueError):
+        # "ghost-name" doesn't resolve → rejected
+        c.invite(chat_id, "alice-uuid", "ghost-name")
+
+
+def test_invite_accepts_fresh_uuid_without_dir(isolated_chats):
+    """#1 lazy-registration exception: UUID invitees without dirs are warned but accepted."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    room = c.create_room("alice-uuid", [])
+    chat_id = room["meta"]["chat_id"]
+    # alice is auto-accepted as creator — no need to call accept()
+
+    fresh_uuid = "cccc0000-0000-0000-0000-000000000003"
+    # Should NOT raise — lazy-registration for UUID-shaped IDs
+    record = c.invite(chat_id, "alice-uuid", fresh_uuid)
+    assert record["state"] == c.PENDING
+
+
+def test_remove_member_evicts_and_unsubscribes(isolated_chats):
+    """#2: remove_member transitions to REMOVED and discards from _subscribers."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    room = c.create_room("alice-uuid", ["bob-uuid"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+
+    # Simulate bob having an SSE subscriber
+    import asyncio
+    q = asyncio.Queue()
+    c._subscribers.setdefault("bob-uuid", set()).add(q)
+    assert c.is_reachable("bob-uuid")
+
+    record = c.remove_member(chat_id, "alice-uuid", "bob-uuid")
+    assert record["state"] == c.REMOVED
+
+    # Bob should be removed from _subscribers (reachability hygiene)
+    assert not c.is_reachable("bob-uuid")
+
+    # The member state in the room should be REMOVED
+    room2 = c.load_room(chat_id)
+    assert room2["members"]["bob-uuid"]["state"] == c.REMOVED
+
+
+def test_remove_member_non_master_rejected(isolated_chats):
+    """#2: only master can remove members."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    _make_session(sessions_mod, "carol-uuid", "carol")
+    room = c.create_room("alice-uuid", ["bob-uuid", "carol-uuid"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+    c.accept(chat_id, "carol-uuid")
+
+    with pytest.raises(ValueError, match="not the master"):
+        c.remove_member(chat_id, "bob-uuid", "carol-uuid")
+
+
+def test_invite_with_role_binds_atomically(isolated_chats):
+    """#3: invite with role= writes member_roles atomically."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    room = c.create_room("alice-uuid", [])
+    chat_id = room["meta"]["chat_id"]
+    # alice is auto-accepted as creator
+
+    c.invite(chat_id, "alice-uuid", "bob-uuid", role=c.ROLE_ANALYST)
+
+    # Role must be in member_roles immediately after invite (not after accept)
+    room2 = c.load_room(chat_id)
+    member_roles = room2["meta"].get("member_roles") or {}
+    assert member_roles.get("bob-uuid") == c.ROLE_ANALYST
