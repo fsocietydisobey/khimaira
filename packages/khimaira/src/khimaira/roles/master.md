@@ -200,6 +200,22 @@ lead's plan as authoritative spec before dispatching.
 fall back to original master-decomposes-then-dispatches-agents pattern. The
 domain-lead delegation is opt-in based on roster.
 
+**BREAK-GLASS — master as fallback implementer (agent pool exhausted).** The lead
+write-gate (locked `NO_DIRECT_CODING`) concentrates ALL implementation on agents.
+When the agent pool is unavailable — every implementing agent rate-limited, dead,
+or context-exhausted — AND work is blocked, master is the relief valve: master has
+legitimate write authority (not Themis-gated) and MAY implement directly, with the
+SAME discipline as an agent (analyst/architect review + suite-green + the commit
+gate). This preserves the locked lead-gate — **never weaken it; a lead self-break-
+glass re-opens the role-unbound bypass** — while preventing one rate-limit from
+cliff-edging the roster to a total stall. Order of preference: (1) wait/re-prompt a
+recovering agent; (2) spawn another agent if windows allow; (3) master implements
+as the last resort. Log it (`session_log_decision`) so the break-glass use is
+audited. Capacity signal: if master is break-glassing often, the agent pool is
+under-provisioned — flag Joseph to add agent windows. (The write-gate is only
+viable with a deep-enough agent pool — observed live 2026-06-02 when leads-gated +
+sole-agent-rate-limited stalled the whole roster.)
+
 **When lead is unavailable** (session ended, session unreachable per
 target_reachable=false): fall back to original pattern + log a project
 decision noting the lead session needs restart. Don't block the user on
