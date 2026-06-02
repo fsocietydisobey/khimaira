@@ -745,6 +745,133 @@ def _escalate_hitl(
         _log.warning("roster-hitl: escalation notice failed: %s", exc)
 
 
+# --- Guard B-bypass: read-only-safe command allowlist -----------------------
+#
+# A HITL permission prompt for a provably non-destructive, read-only command
+# (git status, ls, cat, grep without a pipe, find without -exec …) is safe to
+# auto-answer regardless of task scope — it can't mutate anything. This closes
+# the dominant escalation case (every benign `find`/`grep`/`git status` that
+# Guard B can't match to the task body).
+#
+# SECURITY MODEL (per analyst-1's bug-class enumeration): a POSITIVE allowlist
+# that FAILS CLOSED, never a blocklist. Auto-answer ONLY when ALL hold:
+#   (a) the command extracts cleanly as a single `Bash(<cmd>)` with no nested
+#       parens / newlines / box-border leakage,
+#   (b) ZERO shell metacharacters (no chaining/pipe/redirect/substitution),
+#   (c) the bare executable is in a tiny hardcoded read-only set
+#       (git → a read-only subcommand only),
+#   (d) no write-capable flags (find -exec/-delete …),
+#   (e) no env-prefix (VAR=val cmd — PATH/LD_PRELOAD hijack),
+#   (f) no sensitive-path read (/etc, ~/.ssh, .env, credentials …).
+# Anything else → return False → fall through to the normal scope/role guards
+# → escalate to human. A needless escalation is recoverable; an auto-approved
+# `rm -rf` is not.
+_HITL_READONLY_VERBS = frozenset({
+    "ls", "cat", "head", "tail", "wc", "find", "grep", "rg", "tree", "file",
+    "stat", "pwd", "echo", "which", "basename", "dirname", "realpath", "du",
+})
+_GIT_READONLY_SUBCMDS = frozenset({
+    "status", "log", "diff", "show", "branch", "blame", "rev-parse", "ls-files",
+})
+# find actions that write/execute. Matched by PREFIX (not exact) so variants
+# like -fprint0 / -execdir / -okdir can't slip an exact-token check.
+_FIND_WRITE_PREFIXES = ("-exec", "-ok", "-fprint", "-fls")
+_FIND_WRITE_EXACT = frozenset({"-delete"})
+# git write-mode flags on otherwise-read subcommands: --output writes a file
+# (diff/show), branch -d/-D/-m/-M/-u/-f mutate refs, -c/-C config-inject, etc.
+# git is allowed ONLY when none of these (and for `branch`, no flag at all).
+_GIT_WRITE_FLAGS = frozenset({
+    "-o", "--output", "-d", "-D", "-m", "-M", "-u", "-f", "--force",
+    "--edit-description", "--set-upstream-to", "--unset-upstream",
+    "-c", "-C", "--create-reflog", "--amend",
+})
+# PINNED ASSUMPTIONS (analyst-1 + architect-1 adversarial review) — the
+# bounded blocklist is complete-by-construction ONLY while these hold; a
+# violation should re-trigger this audit, not silently widen the auto-approve:
+#  1. VERSION: the allowed read-git-subcommands have `--output`/`-o` as their
+#     ONLY in-flag write vector, and find's write/exec actions are the closed
+#     set matched by _FIND_WRITE_PREFIXES + _FIND_WRITE_EXACT. Re-audit on a
+#     git/find version bump that could add a write-flag to a read-subcommand.
+#  2. REPO-TRUST: git diff/show auto-approve is safe BECAUSE the repo is
+#     trusted (khimaira / jeevy_portal). In an UNTRUSTED checkout a repo-local
+#     `.gitconfig` ([diff] external=evil / core.pager=cmd / GIT_EXTERNAL_DIFF)
+#     executes on `git diff` — invisible to a command-string allowlist. If
+#     auto-HITL ever runs over untrusted checkouts, drop git from the allowlist.
+# Shell metacharacters that enable chaining / pipe / redirect / substitution /
+# subshell. ANY occurrence → not provably safe → escalate. Box-border (│),
+# nbsp (\xa0) and backslash mean the extraction is ambiguous → also escalate.
+_HITL_UNSAFE_CHARS = ";|&<>$`(){}\\│\xa0\n\r\t"
+_HITL_SENSITIVE_PATH_RE = re.compile(
+    r"/etc/|/root/|\.ssh|id_rsa|id_ed25519|\.env\b|shadow|\.aws|\.bashrc|\.zshrc|"
+    r"credentials|\.pgpass|secret",
+    re.IGNORECASE,
+)
+_HITL_BASH_CMD_RE = re.compile(r"Bash\(([^()\n\r]+)\)")
+
+
+def _extract_bash_command(raw_block: str) -> str | None:
+    """Extract a single clean `Bash(<cmd>)` command, or None if not unambiguous.
+
+    Requires the command to contain no nested parens / newlines (those would
+    indicate substitution or a multi-line/box-wrapped render → ambiguous →
+    escalate). Returns the inner command string stripped, else None.
+    """
+    m = _HITL_BASH_CMD_RE.search(raw_block)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _is_read_only_safe(raw_block: str) -> bool:
+    """Guard B-bypass: True only for a provably non-destructive read-only command.
+
+    Fail-closed positive allowlist — see the SECURITY MODEL note above. Any
+    extraction ambiguity, metacharacter, unknown executable, write-flag,
+    env-prefix, or sensitive-path read returns False (→ escalate).
+    """
+    cmd = _extract_bash_command(raw_block)
+    if not cmd:
+        return False
+    # (b) zero shell metacharacters / ambiguity markers
+    if any(ch in cmd for ch in _HITL_UNSAFE_CHARS):
+        return False
+    # (f) sensitive-path read
+    if _HITL_SENSITIVE_PATH_RE.search(cmd):
+        return False
+    tokens = cmd.split()
+    if not tokens:
+        return False
+    exe = tokens[0]
+    # (e) env-prefix (VAR=val cmd) / PATH-hijack — executable must be a bare name
+    if "=" in exe or "/" in exe:
+        return False
+    if exe == "git":
+        # (c) git allowed only with a read-only subcommand — AND flag-aware,
+        # because several "read" subcommands have write modes via flags.
+        if len(tokens) < 2 or tokens[1] not in _GIT_READONLY_SUBCMDS:
+            return False
+        sub, rest = tokens[1], tokens[2:]
+        # `git branch` mutates with ANY argument (creates/deletes/renames a
+        # ref); it's read-only ONLY when bare (`git branch` = list).
+        if sub == "branch":
+            return not rest
+        # Other read subcommands: reject write-mode flags. --output / -o write a
+        # file (diff/show); guard the --output=<path> form too.
+        for t in rest:
+            if t in _GIT_WRITE_FLAGS or t.startswith("--output="):
+                return False
+        return True
+    if exe not in _HITL_READONLY_VERBS:
+        return False
+    # (d) flag-aware: find must carry no write/execute action. Prefix-matched so
+    # variants (-fprint0, -execdir, -okdir) can't slip an exact-token check.
+    if exe == "find":
+        for t in tokens:
+            if t in _FIND_WRITE_EXACT or any(t.startswith(p) for p in _FIND_WRITE_PREFIXES):
+                return False
+    return True
+
+
 def _handle_hitl_prompt(
     window_id: int,
     session_id: str,
@@ -756,22 +883,30 @@ def _handle_hitl_prompt(
     answer_key = prompt["answer_key"]
     kind = prompt["kind"]
 
-    # Guard A: destructive denylist
+    # Guard A: destructive denylist (hard gate — always applies)
     danger = _check_destructive(raw)
     if danger:
         _escalate_hitl(window_id, session_id, role, raw, f"destructive-marker: {danger!r}")
         return "escalated"
 
-    # Guard B: in-task-scope
-    task_body = _get_session_active_task_body(session_id)
-    if not _is_in_task_scope(raw, task_body):
-        _escalate_hitl(window_id, session_id, role, raw, "out-of-scope or scope-unverifiable")
-        return "escalated"
+    # Read-only-safe allowlist: a provably non-destructive command bypasses the
+    # scope (B) and role (C) checks — it can't mutate anything, so task-scope
+    # and file-edit-role verification are moot. Guard A (above) and Guard D
+    # (below) still apply. Fail-closed: anything not provably safe → False →
+    # normal guards → escalate.
+    read_only_safe = _is_read_only_safe(raw)
 
-    # Guard C: role-permits
-    if _role_blocks_file_edit(role, raw):
-        _escalate_hitl(window_id, session_id, role, raw, f"role {role!r} does not permit file-edit")
-        return "escalated"
+    # Guard B: in-task-scope (skipped for read-only-safe commands)
+    if not read_only_safe:
+        task_body = _get_session_active_task_body(session_id)
+        if not _is_in_task_scope(raw, task_body):
+            _escalate_hitl(window_id, session_id, role, raw, "out-of-scope or scope-unverifiable")
+            return "escalated"
+
+        # Guard C: role-permits (a read-only command edits nothing → moot when safe)
+        if _role_blocks_file_edit(role, raw):
+            _escalate_hitl(window_id, session_id, role, raw, f"role {role!r} does not permit file-edit")
+            return "escalated"
 
     # Guard D: bias-to-escalate for unrecognised prompt kind
     if kind == "unknown":

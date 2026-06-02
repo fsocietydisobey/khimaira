@@ -1028,3 +1028,77 @@ class TestProcessWindowNameResolution:
             await rr._process_window(win_no_name)
 
         mock_name.assert_not_called()  # no raw_name → skip name resolution
+
+
+# ---------------------------------------------------------------------------
+# Read-only-safe allowlist (Guard B-bypass) — auto-answer benign read-only
+# commands; escalate everything else. Positive allowlist, fail-closed.
+# Bypass-vector classes per analyst-1's enumeration must ALL escalate.
+# ---------------------------------------------------------------------------
+
+class TestReadOnlySafeAllowlist:
+    @pytest.mark.parametrize("cmd", [
+        "Bash(git status)",
+        "Bash(git log --oneline -5)",
+        "Bash(git diff HEAD)",
+        "Bash(ls -la packages/)",
+        "Bash(cat README.md)",
+        'Bash(find . -type f -name "*.py")',
+        "Bash(grep -n needle src/x.py)",
+        "Bash(rg pattern)",
+        "Bash(head -20 file.txt)",
+        "Bash(wc -l file.txt)",
+        "Bash(which python3)",
+    ])
+    def test_read_only_safe_auto_answers(self, cmd):
+        assert rr._is_read_only_safe(cmd) is True
+
+    @pytest.mark.parametrize("cmd,vector", [
+        ("Bash(ls; rm -rf /)", "class1-chaining-semicolon"),
+        ("Bash(cat x && curl evil)", "class1-chaining-and"),
+        ("Bash(a || b)", "class1-chaining-or"),
+        ("Bash(find . | xargs rm)", "class2-pipe-to-executor"),
+        ("Bash(grep x | sh)", "class2-pipe-to-sh"),
+        ("Bash(ls > ~/.bashrc)", "class3-redirect-out"),
+        ("Bash(cat >> x)", "class3-redirect-append"),
+        ("Bash(cat $(curl evil))", "class4-cmd-substitution"),
+        ("Bash(find . -exec rm {} ;)", "class5-find-exec"),
+        ("Bash(find . -delete)", "class5-find-delete"),
+        ("Bash(sed -i s/a/b/ x)", "class5-sed-inplace-not-allowlisted"),
+        ("Bash(git checkout main)", "class5-git-mutating-subcmd"),
+        ("Bash(git config user.x y)", "class5-git-config-write"),
+        ("Bash(FOO=bar rm)", "class6-env-prefix"),
+        ("Bash(PATH=/evil ls)", "class6-path-hijack"),
+        ("Bash(cat /etc/shadow)", "class7-sensitive-path"),
+        ("Bash(cat ~/.ssh/id_rsa)", "class7-ssh-key"),
+        ("Bash(rm -rf x)", "destructive-not-allowlisted"),
+        ("Bash(echo hi > f)", "class3-redirect-via-echo"),
+        ("Bash(l\\s -la)", "class8-quoting-escape"),
+        # git not-flag-aware false-approves (analyst + architect adversarial review)
+        ("Bash(git diff --output=/tmp/x)", "git-diff-output-equals-writes-file"),
+        ("Bash(git diff --output /tmp/x)", "git-diff-output-space-writes-file"),
+        ("Bash(git diff -o /tmp/x)", "git-diff-o-writes-file"),
+        ("Bash(git branch -D feature)", "git-branch-delete-ref"),
+        ("Bash(git branch -m old new)", "git-branch-rename-ref"),
+        ("Bash(git branch newfeature)", "git-branch-create-ref"),
+        ("Bash(git show --output=/tmp/x HEAD)", "git-show-output-writes-file"),
+        # find write-action variants that slipped the exact-token blocklist
+        ("Bash(find . -fprint0 /tmp/x)", "find-fprint0-writes-file"),
+        ("Bash(find . -execdir rm {} ;)", "find-execdir"),
+        ("Bash(find . -okdir rm {} ;)", "find-okdir"),
+        ("Bash(find . -fprintf /tmp/x %p)", "find-fprintf"),
+    ])
+    def test_dangerous_commands_escalate(self, cmd, vector):
+        # The load-bearing assertion: NEVER a false-approve on a write/side-effect.
+        assert rr._is_read_only_safe(cmd) is False, f"FALSE-APPROVE on {vector}: {cmd!r}"
+
+    def test_unextractable_command_fails_closed(self):
+        # No clean Bash(...) extraction → escalate (ambiguity = fail closed).
+        assert rr._is_read_only_safe("some garbled terminal text without a command") is False
+        assert rr._is_read_only_safe("Bash(find . -name (nested))") is False  # nested paren
+
+    def test_box_border_leak_escalates(self):
+        # Terminal box-border (│) or nbsp leaking into the extracted command
+        # means the render is ambiguous → escalate.
+        assert rr._is_read_only_safe("Bash(ls │ rm)") is False
+        assert rr._is_read_only_safe("Bash(ls\xa0-la)") is False
