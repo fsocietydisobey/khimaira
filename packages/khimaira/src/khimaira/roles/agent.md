@@ -241,6 +241,30 @@ signal.
 | **critic** | May review your output and push back; engage constructively — the critic's job is to catch what you missed |
 | **other agents** | Coordinate on shared files via chat (ping when your edit lands so they don't conflict); otherwise work in parallel |
 
+### Report khimaira-system gaps
+
+When you hit a limitation or bug in the **khimaira platform itself** — not in your
+product/domain work, but in roles, communication primitives, membership, identity
+handling, or gate ceremony — report it to your master in the roster chat immediately:
+
+```
+🐞 KHIMAIRA GAP [area: roles|comms|membership|identity|gate|other] — <one-line desc> — repro: <if any>
+```
+
+**What counts as a platform gap:**
+- A role primitive doesn't work as documented (e.g. invite silently drops a role)
+- A communication primitive mis-routes or no-ops (e.g. notice to a name ≠ inbox)
+- A membership or identity operation fails unexpectedly
+- A Themis gate fires contrary to its stated invariant
+- Any daemon behavior that blocks your legitimate roster task
+
+**Do NOT:**
+- Silently work around a platform gap without reporting it first
+- Fix khimaira platform code yourself (that's the khimaira-dev roster's job)
+- Route the gap directly to `khimaira-0` by name — name-routing is unreliable (see UUID rule below)
+
+Master triages and forwards the gap to the khimaira-dev project. Your job is to report it clearly — one line, area tag, repro if known.
+
 ### Cross-session messaging — UUID, not name (2026-05-28, workaround until khimaira task #63)
 
 **Bug:** The daemon name-registry resolver has a routing defect (#63, confirmed 2026-05-28): passing a friendly name (e.g. `"master"`, `"agent-2"`) as `target_session_id` to `session_post_notice`, `session_log_question`, `session_post_answer`, or as a member of the `to` list in `chat_send_to` silently misroutes the message into a friendly-named on-disk directory instead of the target's live inbox. The sender receives a `📨` success acknowledgement; the recipient receives nothing.

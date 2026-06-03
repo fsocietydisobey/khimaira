@@ -787,3 +787,49 @@ def test_master_no_direct_code_implementation_themis_rule_exists():
         "Single-master authority section missing from master.md. "
         "See commit 106dc13."
     )
+
+
+# ---------------------------------------------------------------------------
+# Khimaira-system gap reporting channel (task-c8c51ea2ecdf)
+# ---------------------------------------------------------------------------
+
+COMMANDS_DIR = Path.home() / ".claude" / "commands"
+
+
+def test_agent_md_contains_report_gaps_section():
+    """Regression guard: agent.md must have the 'report khimaira-system gaps' convention."""
+    content = (ROLE_DIR / "agent.md").read_text().lower()
+    assert "khimaira gap" in content, (
+        "agent.md missing '🐞 KHIMAIRA GAP' reporting convention. "
+        "See task-c8c51ea2ecdf / roles/agent.md 'Report khimaira-system gaps'."
+    )
+    assert "report khimaira" in content or "report khimaira-system" in content, (
+        "agent.md missing 'Report khimaira-system gaps' section header."
+    )
+
+
+def test_master_md_contains_forward_gaps_section():
+    """Regression guard: master.md must have the 'forward khimaira-system gaps' convention."""
+    content = (ROLE_DIR / "master.md").read_text().lower()
+    assert "forward khimaira" in content or "forward khimaira-system" in content, (
+        "master.md missing 'Forward khimaira-system gaps' section."
+    )
+    assert "scope_cwd" in content, (
+        "master.md 'forward gaps' section missing scope_cwd handoff routing."
+    )
+    assert "cwd is a project discriminator" in content, (
+        "master.md missing the cwd-is-project-discriminator roster invariant note."
+    )
+
+
+def test_khimaira_gaps_command_exists():
+    """Regression guard: /khimaira-gaps command file must exist in ~/.claude/commands/."""
+    cmd_file = COMMANDS_DIR / "khimaira-gaps.md"
+    assert cmd_file.exists(), (
+        f"/khimaira-gaps command missing at {cmd_file}. "
+        "The read-side filter is required for the gap channel to not drown in noise."
+    )
+    content = cmd_file.read_text().lower()
+    assert "khimaira gap" in content, (
+        "khimaira-gaps.md must reference the '🐞 KHIMAIRA GAP' tag filter."
+    )

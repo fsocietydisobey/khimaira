@@ -766,6 +766,44 @@ holding first. The suppression must be explicit in the assignment text.
 | **verifier** | Consult before approving any task that touches tests or safety-critical paths. Send `🔬 VERIFIER CONSULT` privately; verifier returns a coverage verdict (SHIP | GAPS FOUND) before you sign off. |
 | **vice (deputized master)** | You transfer master role via `/khimaira-deputize`; vice resumes with `/khimaira-resume`; they inherit your chat memberships and pending acks |
 
+### Forward khimaira-system gaps
+
+On receiving a `🐞 KHIMAIRA GAP` report from any roster member (in the chat or via
+session_post_notice), master MUST forward it to the khimaira-dev project. Never drop a
+platform gap report — it's not master's call to decide whether a gap is worth filing.
+
+**Forward via cwd-scoped handoff (collision-proof durable channel):**
+
+```python
+session_post_handoff(
+    from_session_id=MY_UUID,
+    text="🐞 KHIMAIRA GAP [area: <area>] — <desc> — repro: <if any>",
+    scope_cwd="/home/_3ntropy/dev/khimaira",  # khimaira repo root
+)
+```
+
+Handoffs keyed to the khimaira cwd surface on any future khimaira-dev session's
+SessionStart, regardless of session names — collision-proof. The khimaira-dev seat
+uses `/khimaira-gaps` to filter only 🐞-tagged items from the handoff backlog (avoids
+noise from the ~570 stale Guard-5 handoffs also in that channel).
+
+**Optional best-effort notice:** also `session_post_notice` to the live khimaira-0 UUID
+if you have it — convenience poke only; the handoff is the channel of record.
+
+**Why cwd-handoff, NOT session_post_notice to khimaira-0 by name:** name-routing is
+unreliable (#63 bug: mis-routes to dead sessions). A cwd-scoped handoff surfaces
+deterministically. Always forward gaps by handoff first; notice is supplementary.
+
+**Master's triage:** dedup obvious duplicates, add repro context if available, then
+always forward. "Not worth filing" is not master's call for platform issues.
+
+**⚠️ Roster invariant — cwd is a project discriminator, not a per-session one.**
+A `scope_cwd=/path/to/khimaira` handoff surfaces on EVERY session working in that
+project, not only the khimaira-dev seat. In a dedicated khimaira-dev roster this is
+fine. In a product roster sitting in the same checkout, it creates cross-surface noise.
+This invariant applies everywhere cwd-based targeting is used: disk-WIP attribution
+(#7), reap-safety, and gap-forwarding all share the same class — cwd ≠ per-seat.
+
 ### Cross-session messaging — UUID, not name (2026-05-28, workaround until khimaira task #63)
 
 **Bug:** The daemon name-registry resolver has a routing defect (#63, confirmed 2026-05-28): passing a friendly name (e.g. `"agent-3"`, `"intake-1"`) as `target_session_id` to `session_post_notice`, `session_log_question`, `session_post_answer`, or as a member of the `to` list in `chat_send_to` silently misroutes the message into a friendly-named on-disk directory instead of the target's live inbox. The sender receives a `📨` success acknowledgement; the recipient receives nothing. 19 confirmed misrouted messages observed 2026-05-28.
