@@ -1084,24 +1084,65 @@ class TestHitlEscalationDedupe:
         assert mock3.call_count == 1, "prompt re-appearance after clear must escalate"
 
     def test_prompt_content_hash_stable_across_identical_renders(self):
-        """Same raw_block → same hash (byte-stable, no volatility)."""
+        """Same raw_block → same hash (extraction is deterministic)."""
         h1 = rr._prompt_content_hash(self.REAL_SHAPED_SCREEN[-600:])
         h2 = rr._prompt_content_hash(self.REAL_SHAPED_SCREEN[-600:])
         assert h1 == h2
 
     def test_prompt_content_hash_differs_for_changed_prompt(self):
-        """Different raw_block content → different hash."""
+        """Different ⚡ tool-call line → different hash."""
         h1 = rr._prompt_content_hash(self.REAL_SHAPED_SCREEN[-600:])
         h2 = rr._prompt_content_hash(self.CHANGED_SCREEN[-600:])
         assert h1 != h2
+
+    def test_prompt_content_hash_ignores_volatile_trailing_chrome(self):
+        """Two renders of the same Edit prompt that differ only in trailing volatile
+        content (token count, elapsed timer) → same hash. This is the key test:
+        the ⚡-line extractor isolates the stable action-line so volatile screen
+        chrome can't cause hash churn → dedupe fires correctly on the real live path."""
+        # Render 1: Edit prompt + trailing token/timer line (render at T+0)
+        render_1 = (
+            "frontend-lead-1\n"
+            "⚡ Edit file: packages/jeevy_portal/src/features/hub/HubLayout.tsx\n"
+            "Do you want to proceed?\n"
+            "❯ 1. Yes, and don't ask again for this session\n"
+            "  2. Yes\n"
+            "  3. No\n"
+            "Frosting… 2m 42s · ↑ 9.0k tokens\n"  # volatile — changes each render
+        )
+        # Render 2: same dialog + different elapsed time (render at T+6min)
+        render_2 = (
+            "frontend-lead-1\n"
+            "⚡ Edit file: packages/jeevy_portal/src/features/hub/HubLayout.tsx\n"
+            "Do you want to proceed?\n"
+            "❯ 1. Yes, and don't ask again for this session\n"
+            "  2. Yes\n"
+            "  3. No\n"
+            "Frosting… 8m 55s · ↑ 9.0k tokens\n"  # different elapsed — hash must not churn
+        )
+        h1 = rr._prompt_content_hash(render_1[-600:])
+        h2 = rr._prompt_content_hash(render_2[-600:])
+        assert h1 == h2, "same ⚡ Edit line with different volatile trailing content must hash identically"
 
     def test_prompt_content_hash_uses_bash_cmd_when_available(self):
         """For Bash prompts, hash is derived from the extracted command (volatile-free)."""
         bash_screen = "Some preamble\nBash(ls -la /tmp)\n❯ 1. Allow this time\n  2. Deny\n"
         h = rr._prompt_content_hash(bash_screen)
-        # The hash should match hashing "ls -la /tmp" (extracted cmd) rather than the full block
         import hashlib
         expected = hashlib.md5("ls -la /tmp".encode(), usedforsecurity=False).hexdigest()
+        assert h == expected
+
+    def test_prompt_content_hash_uses_question_line_for_no_lightning_prompt(self):
+        """For ⚡-less pure-question prompts, hash is derived from the question line."""
+        pure_question = (
+            "Some context text\n"
+            "Do you want to run the test suite?\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+        )
+        h = rr._prompt_content_hash(pure_question)
+        import hashlib
+        expected = hashlib.md5("Do you want to run the test suite?".encode(), usedforsecurity=False).hexdigest()
         assert h == expected
 
 

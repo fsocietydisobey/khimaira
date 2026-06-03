@@ -596,17 +596,43 @@ def _session_has_pending_invite(session_id: str) -> bool:
 # HITL auto-answering helpers
 # ---------------------------------------------------------------------------
 
+# Match "⚡ Edit file: path" / "⚡ Write(...)" — the stable tool-call identifier line.
+# Anchored to end of line (not greedy beyond \n) so volatile trailing chrome
+# (elapsed timers, token counts, cursor noise) on the same line can't contaminate.
+_HITL_TOOL_CALL_RE = re.compile(r"⚡\s+(.+?)(?:\n|$)")
+
+# Match a "Do you want..." / "Continue?" permission question line — fallback for
+# ⚡-less pure-question prompts (no tool-call header).
+_HITL_QUESTION_LINE_RE = re.compile(
+    r"(Do you want[^\n]+|Continue\?[^\n]*|Allow this action[^\n]*)",
+    re.IGNORECASE,
+)
+
+
 def _prompt_content_hash(raw_block: str) -> str:
     """Hash the stable identifying content of a HITL prompt for escalation dedupe.
 
-    Uses the extracted Bash(<cmd>) when available (always volatile-free), falls
-    back to the full raw_block for non-Bash prompts (e.g. Edit/Read dialogs).
-    A stationary Claude Code HITL dialog renders identically across scan cycles
-    (no timers or dynamic fields), so hashing the raw_block directly is safe for
-    the non-Bash case.
+    Three-tier extraction — each tier is volatile-free by construction; no
+    assumption about raw_block byte-stability is required:
+
+    1. Bash prompt: _extract_bash_command() pulls the command out of Bash(<cmd>).
+    2. Non-Bash tool-call prompt (⚡ Edit/Write/Read...): extracts the action line.
+       Volatile trailing chrome (token counts, elapsed timers) can't follow the ⚡
+       line past the first newline — anchored extraction.
+    3. ⚡-less pure-question prompts: extracts the permission-question text line.
     """
-    stable = _extract_bash_command(raw_block) or raw_block
-    return hashlib.md5(stable.encode(), usedforsecurity=False).hexdigest()
+    bash_cmd = _extract_bash_command(raw_block)
+    if bash_cmd:
+        return hashlib.md5(bash_cmd.encode(), usedforsecurity=False).hexdigest()
+    m = _HITL_TOOL_CALL_RE.search(raw_block)
+    if m:
+        return hashlib.md5(m.group(1).strip().encode(), usedforsecurity=False).hexdigest()
+    q = _HITL_QUESTION_LINE_RE.search(raw_block)
+    if q:
+        return hashlib.md5(q.group(1).strip().encode(), usedforsecurity=False).hexdigest()
+    # Fallback: full raw_block (reached only if all extractors fail; the screen-tail
+    # may carry volatile fields — use only as a last resort).
+    return hashlib.md5(raw_block.encode(), usedforsecurity=False).hexdigest()
 
 
 def _detect_hitl_prompt(text: str) -> dict[str, str] | None:
