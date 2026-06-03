@@ -2686,6 +2686,194 @@ def _scan_acks(chat_id: str, task_ids: dict[str, str]) -> dict[str, dict]:
     return found
 
 
+def roster_progress(chat_id: str, requester_session_id: str) -> list[dict[str, Any]]:
+    """Observable-truth aggregator for roster member work state.
+
+    Computes per-member status from OBSERVABLE signals — NOT the manual status
+    string, which goes stale the moment an agent stops updating it. When manual
+    status and observable signals disagree, the disagreement IS surfaced (that gap
+    is the stale-status signal — the janice JEEVY-573 case).
+
+    Signal ranking (encoded in the derived_label — NOT flat):
+    1. disk-WIP (_session_has_recent_wip, 740bc1d) — hook-INDEPENDENT. PRIMARY.
+       Survives an SSE/hook drop; catches silent-completion.
+    2. owed-task state (chat task pending/in_progress/done/approved).
+    3. done-reports (✅ messages in recent chat history) — ASYMMETRIC: present →
+       reliable positive; absent ≠ not-done. disk-WIP is the silent-completion
+       backstop; never infer "not done" from done-msg absence.
+    4. file_touched / last_active — hook-DEPENDENT, SECONDARY liveness hints.
+       file_touched stales EXACTLY when editing-but-deaf (the #7 false-dark); it
+       belongs alongside last_active, NOT alongside disk-WIP.
+
+    FLAG-B: precision bounded by assignee→sid binding. A drifted assignee_session_id
+    (roster-identity drift bug, task-2837) → disk-WIP probe reads the wrong task's
+    files → mis-attribution. Until slot-binding (task-2837 P1) lands, this is a
+    residual surfaced in the output field `assignee_binding_note`.
+    """
+    import time
+
+    requester_session_id = _resolve_or_uuid(requester_session_id, chat_id=chat_id)
+    room = load_room(chat_id)
+    member = room["members"].get(requester_session_id)
+    if not member or member["state"] != ACCEPTED:
+        raise ValueError(
+            f"Session {requester_session_id!r} is not an accepted member of {chat_id!r}."
+        )
+
+    member_roles_map = (room.get("meta") or {}).get("member_roles") or {}
+
+    # Single-pass scan: build owed-task map, task statuses, and done-reports.
+    owed: dict[str, dict] = {}        # assignee_sid → {task_id, body, status}
+    task_statuses: dict[str, str] = {}  # task_id → latest status
+    done_reports: dict[str, str] = {}   # sender_sid → latest ✅ done-report ts
+    for line in _read(chat_id):
+        k = line.get("kind")
+        if k == TASK:
+            assignee = line.get("assignee_id")
+            if assignee:
+                # Last task per assignee wins (latest task creation in JSONL order).
+                owed[assignee] = {
+                    "task_id": line["id"],
+                    "body": line.get("body", ""),
+                    "status": TASK_PENDING,
+                }
+        elif k == "task_update":
+            tid = line.get("task_id", "")
+            if tid:
+                task_statuses[tid] = line.get("status", "")
+        elif k == "msg":
+            body = line.get("body") or ""
+            # ✅ is U+2705; catch both forms.
+            if body.startswith("✅") or body.startswith("✅"):
+                sid = line.get("sender_id", "")
+                if sid:
+                    done_reports[sid] = line.get("ts", "")
+
+    # Apply latest task-status updates.
+    for task in owed.values():
+        if task["task_id"] in task_statuses:
+            task["status"] = task_statuses[task["task_id"]]
+
+    results = []
+    now = time.time()
+
+    for sid, mdata in room["members"].items():
+        if mdata.get("state") != ACCEPTED:
+            continue
+
+        role = member_roles_map.get(sid) or "unknown"
+        session_name = mdata.get("session_name") or sid[:8]
+
+        # ── Manual status (secondary — may be stale) ──
+        manual_status = ""
+        last_active_s: float | None = None
+        try:
+            ss = sessions_mod.state(sid, recent=1)
+            manual_status = (ss.get("status") or {}).get("detail") or ""
+            la_iso = ss.get("last_active")
+            if la_iso:
+                from datetime import datetime as _dt
+
+                last_active_s = now - _dt.fromisoformat(la_iso).timestamp()
+        except Exception:
+            pass
+
+        # ── Owed task ──
+        task_info = owed.get(sid)
+
+        # ── disk-WIP (PRIMARY — hook-independent, per-session-precise) ──
+        has_wip = False
+        assignee_binding_note = ""
+        if task_info:
+            try:
+                from khimaira.monitor.roster_recovery import _session_has_recent_wip
+
+                # Use daemon's project root as fallback; cross-project sessions
+                # need project_root from the session's recorded cwd (FLAG-B follow-up
+                # per architect msg-fa3ba046b93a + analyst criterion-4).
+                project_root = Path.cwd()
+                try:
+                    ws = sessions_mod.state(sid, recent=0).get("workspace")
+                    if ws:
+                        project_root = Path(ws)
+                except Exception:
+                    pass
+                has_wip = _session_has_recent_wip(
+                    sid, task_info["body"], project_root, threshold_s=900.0
+                )
+            except Exception:
+                pass
+            # FLAG-B: signal if the assignee sid might be drifted (task-2837).
+            # We can't detect drift here without slot-binding; just note it.
+            assignee_binding_note = (
+                "assignee-sid may drift pre-task-2837; roster_progress precision "
+                "improves after slot-binding lands"
+            )
+
+        # ── file_touched recency (SECONDARY — hook-dependent) ──
+        last_touch_s: float | None = None
+        try:
+            touches = sessions_mod.recent_touches(sid, limit=1)
+            if touches:
+                from datetime import datetime as _dt
+
+                last_touch_s = now - _dt.fromisoformat(touches[0]["ts"]).timestamp()
+        except Exception:
+            pass
+
+        # ── done-report ──
+        last_done_ts = done_reports.get(sid)
+
+        # ── derived_label (encode signal ranking + no-WIP disambiguation) ──
+        task_status = task_info["status"] if task_info else None
+        if has_wip:
+            derived = "working"
+        elif task_status in (TASK_DONE, TASK_APPROVED):
+            derived = "completed"
+        elif task_status == TASK_IN_PROGRESS and last_done_ts:
+            # Has done-msg even if no WIP → completed (may have stopped after posting)
+            derived = "completed"
+        elif task_status == TASK_IN_PROGRESS:
+            # No WIP, no done-msg, task still in_progress → silent or stalled
+            derived = "stalled-or-silent"
+        elif task_status == TASK_PENDING:
+            derived = "waiting-for-begin"
+        else:
+            derived = "idle"
+
+        # ── stale-status flag (manual vs observable disagreement) ──
+        stale = False
+        if manual_status:
+            ml = manual_status.lower()
+            if derived in ("working", "completed") and any(
+                w in ml for w in ("idle", "standby", "listening")
+            ):
+                stale = True
+            elif derived == "idle" and any(
+                w in ml for w in ("implementing", "working", "in_progress", "researching")
+            ):
+                stale = True
+
+        entry: dict[str, Any] = {
+            "session_id": sid,
+            "name": session_name,
+            "role": role,
+            "owed_task": task_info,
+            "has_recent_wip": has_wip,
+            "last_done_report_ts": last_done_ts,
+            "last_active_s": round(last_active_s, 1) if last_active_s is not None else None,
+            "last_touch_s": round(last_touch_s, 1) if last_touch_s is not None else None,
+            "manual_status": manual_status,
+            "derived_label": derived,
+            "stale_status": stale,
+        }
+        if task_info:
+            entry["assignee_binding_note"] = assignee_binding_note
+        results.append(entry)
+
+    return results
+
+
 # Stagger between BEGIN signals when multiple agents are dispatched simultaneously.
 # Prevents burst API calls all hitting Anthropic in the same second (server-side 429).
 # KHIMAIRA_DISPATCH_STAGGER_S env var overrides; 0 disables. Staggers FIRST call only.

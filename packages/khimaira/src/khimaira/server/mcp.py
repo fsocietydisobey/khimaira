@@ -2823,6 +2823,33 @@ async def session_summary(session_id: str) -> str:
 
 
 @mcp.tool()
+@logged_tool("roster_progress")
+async def roster_progress(chat_id: str, session_id: str) -> str:
+    """Observable-truth aggregator for roster member work state.
+
+    Computes per-member status from OBSERVABLE signals (disk-WIP probe,
+    task state, done-reports) — NOT the manual status string which goes stale
+    the moment an agent stops updating it.
+
+    Key: when manual status and observable signals disagree, BOTH are surfaced.
+    That disagreement IS the stale-status signal. Example: manual="implementing"
+    but task=done + no WIP → stale, label="completed" (the janice JEEVY-573 case).
+
+    Signal ranking (reliability-ordered, not flat):
+    1. disk-WIP — hook-INDEPENDENT; per-session-precise via owed-task-target-files.
+       PRIMARY. Catches silent-completion even when last_active/file_touched stale.
+    2. owed-task state (pending/in_progress/done/approved).
+    3. done-reports (✅ messages) — ASYMMETRIC: present=reliable; absent≠not-done.
+    4. file_touched / last_active — hook-DEPENDENT secondary liveness hints.
+
+    Args:
+        chat_id: the roster chat to aggregate.
+        session_id: requester (must be an accepted member).
+    """
+    return await _monitor_tools.roster_progress(chat_id, session_id)
+
+
+@mcp.tool()
 @logged_tool("session_pending_notes")
 async def session_pending_notes(session_id: str, mark_read: bool = True) -> str:
     """**Inbox read.** Get unread answers other sessions have posted to your

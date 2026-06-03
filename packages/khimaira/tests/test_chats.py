@@ -3382,3 +3382,84 @@ def test_master_can_invite_with_privileged_role(isolated_chats):
     room2 = c.load_room(chat_id)
     member_roles = room2["meta"].get("member_roles") or {}
     assert member_roles.get("bob") == "backend-lead"
+
+
+# ---------------------------------------------------------------------------
+# roster_progress — observable-truth aggregator (task-96c826d8a7c0)
+# ---------------------------------------------------------------------------
+
+
+class TestRosterProgress:
+    """roster_progress returns observable per-member work state from signals.
+
+    Key design constraints (per analyst + architect):
+    - disk-WIP is PRIMARY (hook-independent); file_touched is SECONDARY
+    - No-WIP ambiguity: no-WIP + task-done → "completed", not "idle"
+    - Stale-status flag fires when manual ≠ observable
+    - Agent completes work, manual status unchanged → roster_progress shows completed
+    """
+
+    def _setup(self, c, sessions_mod):
+        for sid in ("master", "agent-a", "agent-b"):
+            _make_session(sessions_mod, sid, sid)
+        room = c.create_room("master", ["agent-a", "agent-b"])
+        chat_id = room["meta"]["chat_id"]
+        c.accept(chat_id, "agent-a")
+        c.accept(chat_id, "agent-b")
+        return chat_id
+
+    def test_no_tasks_all_idle(self, isolated_chats):
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+
+        chat_id = self._setup(c, sessions_mod)
+        result = c.roster_progress(chat_id, "master")
+        assert len(result) == 3  # master + 2 agents
+        labels = {m["name"]: m["derived_label"] for m in result}
+        assert labels["agent-a"] == "idle"
+        assert labels["agent-b"] == "idle"
+
+    def test_task_done_shows_completed_not_idle(self, isolated_chats):
+        """KEY: agent completes work, manual status unchanged → 'completed'."""
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+
+        chat_id = self._setup(c, sessions_mod)
+        task = c.create_task(chat_id, "master", "Implement foo", assignee_session_id="agent-a")
+        c.update_task_status(chat_id, task["id"], "agent-a", c.TASK_IN_PROGRESS)
+        c.update_task_status(chat_id, task["id"], "agent-a", c.TASK_DONE)
+        # agent-a's manual status is still the default (not updated)
+
+        result = c.roster_progress(chat_id, "master")
+        a_entry = next(m for m in result if m["name"] == "agent-a")
+        assert a_entry["derived_label"] == "completed"
+        assert a_entry["owed_task"]["status"] == c.TASK_DONE
+
+    def test_stalled_or_silent_when_in_progress_no_wip_no_done(self, isolated_chats):
+        """No-WIP + in_progress task + no done-msg → stalled-or-silent (not idle)."""
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+
+        chat_id = self._setup(c, sessions_mod)
+        task = c.create_task(chat_id, "master", "Implement bar", assignee_session_id="agent-b")
+        c.update_task_status(chat_id, task["id"], "agent-b", c.TASK_IN_PROGRESS)
+        # No WIP probe possible in isolated test (no real files); _session_has_recent_wip → False
+
+        result = c.roster_progress(chat_id, "master")
+        b_entry = next(m for m in result if m["name"] == "agent-b")
+        assert b_entry["derived_label"] == "stalled-or-silent"
+        assert b_entry["has_recent_wip"] is False
+
+    def test_non_member_raises(self, isolated_chats):
+        """Requester not in chat → ValueError."""
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+
+        for sid in ("master", "ghost"):
+            _make_session(sessions_mod, sid, sid)
+        room = c.create_room("master", [])
+        chat_id = room["meta"]["chat_id"]
+
+        import pytest
+        with pytest.raises(ValueError, match="not an accepted member"):
+            c.roster_progress(chat_id, "ghost")

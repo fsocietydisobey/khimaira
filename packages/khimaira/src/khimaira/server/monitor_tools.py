@@ -1720,3 +1720,55 @@ async def oracle_query(
         parts.append(f"_{note}_")
 
     return "\n\n".join(p for p in parts if p)
+
+
+async def roster_progress(chat_id: str, session_id: str) -> str:
+    """Observable-truth aggregator for roster member work state.
+
+    Returns per-member status from observable signals (disk-WIP, task state,
+    done-reports) rather than the manual status string. Surfaces manual-vs-
+    observable disagreement — that gap IS the stale-status signal.
+    """
+    import json as _json
+    import urllib.parse as _up
+
+    data = _get(
+        f"/api/chats/{_up.quote(chat_id)}/roster-progress"
+        f"?session_id={_up.quote(session_id)}",
+        timeout=15.0,
+    )
+    if isinstance(data, str):
+        return data
+
+    members = data.get("members") or []
+    if not members:
+        return f"No accepted members found in {chat_id}."
+
+    lines = [f"📊 **Roster progress** — {chat_id} ({len(members)} members)\n"]
+    for m in members:
+        name = m.get("name") or m.get("session_id", "?")[:8]
+        role = m.get("role", "?")
+        label = m.get("derived_label", "?")
+        has_wip = m.get("has_recent_wip", False)
+        stale = m.get("stale_status", False)
+        manual = m.get("manual_status") or ""
+        task = m.get("owed_task")
+        done_ts = m.get("last_done_report_ts")
+
+        stale_flag = " ⚠️ STALE-STATUS" if stale else ""
+        wip_flag = " 💾 WIP" if has_wip else ""
+        task_part = ""
+        if task:
+            task_part = (
+                f" | task [{task['status']}]: {(task.get('body') or '')[:60]}"
+            )
+
+        done_part = f" | done-report: {done_ts[:16]}" if done_ts else ""
+        manual_part = f' | manual: "{manual}"' if manual and stale else ""
+
+        lines.append(
+            f"  **{name}** ({role}) → `{label}`{wip_flag}{stale_flag}"
+            f"{task_part}{done_part}{manual_part}"
+        )
+
+    return "\n".join(lines)

@@ -2010,4 +2010,23 @@ def build_router():
             code = 403 if "creator" in msg else 404
             raise fastapi.HTTPException(code, msg) from exc
 
+    @router.get("/chats/{chat_id}/roster-progress")
+    async def roster_progress(
+        chat_id: str,
+        session_id: str,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
+        """Observable-truth aggregator for roster member work state.
+
+        Returns per-member status derived from observable signals (disk-WIP,
+        task state, done-reports) rather than the manual status string. When
+        manual status and observable signals disagree, both are surfaced —
+        the disagreement is the stale-status signal.
+        """
+        actor = _actor_or_body(_actor, session_id, f"/chats/{chat_id}/roster-progress")
+        try:
+            return {"members": chats.roster_progress(chat_id, actor)}
+        except ValueError as exc:
+            raise fastapi.HTTPException(403, str(exc)) from exc
+
     return router
