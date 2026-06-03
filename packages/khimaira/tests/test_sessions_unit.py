@@ -1172,3 +1172,145 @@ def test_resolve_session_id_drops_global_mtime_guess(isolated_state):
     # Roster-scoped: MUST abort, not guess by mtime
     with pytest.raises(ValueError, match="Ambiguous"):
         s.resolve_session_id("agent")
+
+
+# ---------------------------------------------------------------------------
+# Roster-identity Part A — instance-scoped resolver (P1 bridge, 2026-06-03)
+# ---------------------------------------------------------------------------
+
+def test_resolve_session_id_by_slot_format(isolated_state):
+    """Slot-format query '<instance>:<name>' resolves via exact slot match."""
+    import importlib
+    from khimaira.monitor import sessions as sess
+
+    importlib.reload(sess)
+    s = isolated_state
+    instance_id = "inst-aaaa-0001"
+    sid = "aaaa0001-0000-4000-8000-000000000001"
+    d = s._session_dir(sid)
+    (d / "status.json").write_text(json.dumps({
+        "name": "agent-1",
+        "roster_slot": f"{instance_id}:agent-1",
+        "status": "idle",
+    }))
+
+    assert s.resolve_session_id(f"{instance_id}:agent-1") == sid
+
+
+def test_resolve_session_id_caller_instance_disambiguates_homonyms(isolated_state):
+    """caller_instance selects the correct session when two rosters have same name.
+    This is the COLLISION fix: two janice-0s → caller-instance resolves to its own."""
+    import importlib
+    from khimaira.monitor import sessions as sess
+
+    importlib.reload(sess)
+    s = isolated_state
+    inst_a = "inst-aaaa-0001"
+    inst_b = "inst-bbbb-0002"
+    sid_a = "aaaa0001-0000-4000-8000-000000000001"
+    sid_b = "bbbb0002-0000-4000-8000-000000000001"
+
+    for sid, inst in [(sid_a, inst_a), (sid_b, inst_b)]:
+        d = s._session_dir(sid)
+        (d / "status.json").write_text(json.dumps({
+            "name": "janice-0",
+            "roster_slot": f"{inst}:janice-0",
+            "status": "idle",
+        }))
+
+    # With caller_instance=inst_a → resolves to sid_a (its own instance)
+    assert s.resolve_session_id("janice-0", caller_instance=inst_a) == sid_a
+    # With caller_instance=inst_b → resolves to sid_b
+    assert s.resolve_session_id("janice-0", caller_instance=inst_b) == sid_b
+
+
+def test_resolve_session_id_none_branch_mixed_abort_never_silent_pick(isolated_state):
+    """caller_instance=None + mixed stamped/unstamped → abort-with-guidance.
+    NEVER silently pick the stamped one: 'unstamped ≠ dead'; no disambiguation
+    basis without instance context. This is the F2 must-fix applied to the
+    None-branch (analyst TRAP-1 precision note, 2026-06-03)."""
+    import importlib
+    from khimaira.monitor import sessions as sess
+
+    importlib.reload(sess)
+    s = isolated_state
+    # Use valid UUID4 format (third group starts with 4, fourth with [89ab])
+    sid_live = "aaaa0001-0000-4000-8000-000000000001"  # stamped (new instance)
+    sid_old = "bbbb0002-0000-4000-8000-000000000002"   # unstamped (un-migrated, still alive)
+
+    d = s._session_dir(sid_live)
+    (d / "status.json").write_text(json.dumps({
+        "name": "janice-0",
+        "roster_slot": "inst-live:janice-0",
+        "status": "idle",
+    }))
+    d2 = s._session_dir(sid_old)
+    (d2 / "status.json").write_text(json.dumps({
+        "name": "janice-0",
+        "status": "idle",  # no roster_slot — un-migrated
+    }))
+
+    with pytest.raises(ValueError, match="mixed"):
+        s.resolve_session_id("janice-0", caller_instance=None)
+
+
+def test_resolve_session_id_unstamped_caller_migration_seam(isolated_state):
+    """Un-stamped caller (caller_instance=None) still resolves via existing tiers.
+    The P1 bridge migration seam: zero breakage for sessions that haven't been
+    stamped yet — exact current behavior preserved."""
+    import importlib
+    from khimaira.monitor import sessions as sess
+
+    importlib.reload(sess)
+    s = isolated_state
+    sid = "aaaa0001-0000-4000-8000-000000000001"
+    d = s._session_dir(sid)
+    (d / "status.json").write_text(json.dumps({
+        "name": "agent-1",
+        "status": "idle",  # no roster_slot
+    }))
+
+    # No caller_instance → falls through to global legacy → resolves normally
+    assert s.resolve_session_id("agent-1") == sid
+
+
+def test_resolve_session_id_chat_scoped_falls_through_on_not_found(isolated_state):
+    """F3: chat-scoped tier is now a fall-through (not early-return).
+    If a name is NOT in the given chat but IS in the global legacy, it resolves."""
+    import importlib
+    from khimaira.monitor import sessions as sess, chats as chats_mod
+
+    importlib.reload(sess)
+    importlib.reload(chats_mod)
+    s = isolated_state
+
+    master = "aaaa0001-0000-4000-8000-000000000001"
+    member = "bbbb0002-0000-4000-8000-000000000002"
+    outsider = "cccc0003-0000-4000-8000-000000000003"
+
+    for sid, name in [(master, "master"), (member, "agent-1"), (outsider, "agent-2")]:
+        d = s._session_dir(sid)
+        (d / "status.json").write_text(json.dumps({"name": name, "status": "idle"}))
+
+    room = chats_mod.create_room(master, [member], title="t")
+    chat_id = room["meta"]["chat_id"]
+    chats_mod.accept(chat_id, member)
+
+    # agent-2 is NOT in the chat, but falls through to global legacy → resolves
+    result = s.resolve_session_id("agent-2", chat_id=chat_id)
+    assert result == outsider
+
+
+def test_get_and_set_session_slot(isolated_state):
+    """set_session_slot + get_session_slot round-trip."""
+    s = isolated_state
+    sid = "aaaa0001-0000-4000-8000-000000000001"
+    s._session_dir(sid)  # create dir
+
+    assert s.get_session_slot(sid) is None  # unstamped initially
+    s.set_session_slot(sid, "inst-abc:agent-1")
+    assert s.get_session_slot(sid) == "inst-abc:agent-1"
+
+    # Idempotent
+    s.set_session_slot(sid, "inst-abc:agent-1")
+    assert s.get_session_slot(sid) == "inst-abc:agent-1"

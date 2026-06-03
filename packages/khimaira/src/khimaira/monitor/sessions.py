@@ -822,6 +822,36 @@ def set_workspace(session_id: str, workspace: str) -> dict:
     return record
 
 
+def set_session_slot(session_id: str, slot: str) -> dict:
+    """Bind a session to its roster slot (e.g. '<instance_id>:agent-1').
+
+    Called by the daemon at SessionStart when the session announces its
+    KHIMAIRA_ROSTER_SLOT env var. The slot is stored in status.json as
+    'roster_slot' for use by the instance-scoped resolver (resolve_session_id).
+
+    Idempotent: safe to call on every SessionStart reconnect (drift self-heals).
+    Disk-durable: survives daemon restarts (unlike heartbeat in-memory state).
+    """
+    if ":" not in slot:
+        raise ValueError(
+            f"slot {slot!r} must be '<instance_id>:<name>' format (e.g. '<uuid>:agent-1')"
+        )
+    path = _session_dir(session_id) / "status.json"
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    record = {**existing, "roster_slot": slot, "updated_at": _now_iso()}
+    record.setdefault("status", "idle")
+    record.setdefault("detail", "")
+    path.write_text(json.dumps(record, indent=2))
+    _invalidate_list_sessions_cache()
+    log.info("session %s: roster_slot=%r", session_id, slot)
+    return record
+
+
 def get_workspace(session_id: str) -> str:
     """Return the session's workspace, defaulting to `"default"` if unset.
 
@@ -845,15 +875,79 @@ def get_workspace(session_id: str) -> str:
     return ws
 
 
-def _find_by_name_in_candidates(name: str, candidate_ids: set[str]) -> str:
+def get_session_slot(session_id: str) -> str | None:
+    """Return the session's roster slot (e.g. '<instance_id>:agent-1'), or None if unstamped.
+
+    Populated by the daemon's slot-binding at SessionStart (Part C).
+    Returns None for un-stamped sessions (pre-migration or non-roster sessions).
+    The slot field is stored as 'roster_slot' in the session's status.json.
+    """
+    path = _BASE_DIR / session_id / "status.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    slot = data.get("roster_slot")
+    if not isinstance(slot, str) or ":" not in slot:
+        return None
+    return slot
+
+
+def _find_by_slot_globally(slot: str) -> str:
+    """Find a session by its exact roster slot (e.g. '<instance>:agent-1').
+
+    Returns the session_id if exactly one session has roster_slot == slot.
+    Raises ValueError on 0 or ≥2 matches (a consistency error in the latter case).
+    """
+    matches: list[str] = []
+    if not _BASE_DIR.exists():
+        raise ValueError(f"No session with slot {slot!r}")
+    for d in _BASE_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        status_path = d / "status.json"
+        if not status_path.is_file():
+            continue
+        try:
+            s = json.loads(status_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if s.get("roster_slot") == slot:
+            matches.append(d.name)
+
+    if not matches:
+        raise ValueError(f"No session with slot {slot!r}")
+    if len(matches) > 1:
+        raise ValueError(
+            f"Ambiguous slot {slot!r}: {len(matches)} sessions match — "
+            f"slot-binding consistency error ({matches})."
+        )
+    return matches[0]
+
+
+def _find_by_name_in_candidates(
+    name: str,
+    candidate_ids: set[str],
+    *,
+    caller_instance: str | None = None,
+) -> str:
     """Search candidate_ids for exactly one session with status.json name == name.
 
     Returns the UUID if exactly one matches.
     Raises ValueError on ambiguity (≥2) or not-found (0).
 
+    Instance-awareness (roster-identity P1 — 2026-06-03):
+    - caller_instance provided: prefer candidates whose roster_slot matches
+      '<caller_instance>:<name>'; abort if ≥2 match within the same instance.
+    - caller_instance=None + mixed stamped+unstamped candidates: abort with slot
+      guidance — never silently pick the stamped one ("unstamped ≠ dead"; an
+      un-migrated session can still be active; no basis to disambiguate).
+    - caller_instance=None + all-unstamped + ≥2: original abort (today's behavior).
+
     Also handles legacy test fixtures where the session_id IS the name
-    (non-UUID dir, no name in status.json): if name matches a sid directly
-    and the dir exists, treat that as a match.
+    (non-UUID dir, no status.json name field set).
     """
     matches: list[str] = []
     for sid in candidate_ids:
@@ -877,19 +971,54 @@ def _find_by_name_in_candidates(name: str, candidate_ids: set[str]) -> str:
 
     if len(matches) == 1:
         return matches[0]
-    if len(matches) > 1:
+
+    if not matches:
         raise ValueError(
-            f"Ambiguous name {name!r}: {len(matches)} sessions match after scoping "
-            f"({matches}). Use a session UUID to be unambiguous. "
+            f"No session named {name!r} found in the resolution scope. "
+            f"Use session_list() to see available sessions."
+        )
+
+    # ≥2 matches — instance-awareness disambiguates when caller_instance is known.
+    if caller_instance is not None:
+        inst_matches = [
+            m for m in matches
+            if get_session_slot(m) == f"{caller_instance}:{name}"
+        ]
+        if len(inst_matches) == 1:
+            return inst_matches[0]
+        if len(inst_matches) > 1:
+            raise ValueError(
+                f"Ambiguous name {name!r}: {len(inst_matches)} sessions match "
+                f"within instance {caller_instance!r} ({inst_matches}). "
+                f"Use a session UUID to be unambiguous. "
+                f"See session_list() to find the right UUID."
+            )
+        # No instance-match → fall through to mixed/all-unstamped handling below.
+
+    # Categorize by stamped/unstamped for the None-branch safe-abort rule.
+    stamped = [m for m in matches if get_session_slot(m) is not None]
+    unstamped = [m for m in matches if get_session_slot(m) is None]
+
+    if caller_instance is None and stamped and unstamped:
+        # Mixed — "unstamped ≠ dead": an un-migrated session can still be active.
+        # No disambiguation basis without a caller instance → abort with guidance.
+        raise ValueError(
+            f"Ambiguous name {name!r}: {len(matches)} sessions match "
+            f"(mixed stamped/unstamped roster instances — an un-migrated session "
+            f"may still be active). "
+            f"Use a UUID or slot (<instance>:{name}) to disambiguate. "
             f"See session_list() to find the right UUID."
         )
+
+    # All-unstamped ≥2, or all-stamped ≥2 with no caller-instance context.
     raise ValueError(
-        f"No session named {name!r} found in the resolution scope. "
-        f"Use session_list() to see available sessions."
+        f"Ambiguous name {name!r}: {len(matches)} sessions match after scoping "
+        f"({matches}). Use a session UUID to be unambiguous. "
+        f"See session_list() to find the right UUID."
     )
 
 
-def _resolve_name_global_legacy(name: str) -> str:
+def _resolve_name_global_legacy(name: str, *, caller_instance: str | None = None) -> str:
     """Legacy global name-resolution fallback (P2 — no mtime-heuristic guess).
 
     Finds all sessions with status.json name == ``name`` across ALL session dirs.
@@ -897,9 +1026,14 @@ def _resolve_name_global_legacy(name: str) -> str:
     the ambiguity-abort is what kills GAP-5 uniformly across steps 2-3-4);
     falls back to dirname for legacy non-UUID session IDs (test fixtures only).
 
+    Instance-awareness (roster-identity P1): caller_instance disambiguates among
+    homonyms by preferring the candidate whose roster_slot matches the caller's
+    instance. The F2 mixed-abort rule applies here too (same as in
+    _find_by_name_in_candidates — abort must live in this function AND the shared
+    matcher to prevent a mixed-instance pair aborting one tier too early).
+
     Called when: roster is empty (first-run/test-isolation) OR name not found in
-    the active roster OR roster computation errored.  In a live roster with
-    unambiguous names this path returns exactly 1 UUID match.
+    the active roster OR roster computation errored.
     """
     matches: list[str] = []
     for d in _BASE_DIR.iterdir():
@@ -937,12 +1071,39 @@ def _resolve_name_global_legacy(name: str) -> str:
             f"No session named or id'd {name!r}. Use session_list() to see available sessions."
         )
 
-    # P2: abort on ambiguity — never mtime-guess.
-    # ≥2 UUID-named sessions with the same name → ABORT (GAP-5 root closed).
-    # 1-UUID + orphan(s): prefer the UUID — orphans are #63-artifacts, not real
-    # sessions; the test_resolve_session_id_prefers_uuid_dir_over_orphan test
-    # pins this behavior. ≥2-orphan (0 UUID): iterdir-arbitrary (non-production).
     uuid_matches = [m for m in matches if _is_uuid(m)]
+
+    # Instance-awareness: disambiguate ≥2 UUID matches when caller_instance is known.
+    if len(uuid_matches) > 1 and caller_instance is not None:
+        inst_matches = [
+            m for m in uuid_matches
+            if get_session_slot(m) == f"{caller_instance}:{name}"
+        ]
+        if len(inst_matches) == 1:
+            return inst_matches[0]
+        if len(inst_matches) > 1:
+            raise ValueError(
+                f"Ambiguous name {name!r}: {len(inst_matches)} sessions match "
+                f"within instance {caller_instance!r} globally ({inst_matches}). "
+                f"Use a session UUID."
+            )
+
+    # F2: mixed-abort must also live here (not just in _find_by_name_in_candidates).
+    # A dead-unstamped + live-stamped homonym pair seen at this tier must abort-with-
+    # guidance rather than silently preferring the stamped candidate.
+    if len(uuid_matches) > 1 and caller_instance is None:
+        stamped_uuids = [m for m in uuid_matches if get_session_slot(m) is not None]
+        unstamped_uuids = [m for m in uuid_matches if get_session_slot(m) is None]
+        if stamped_uuids and unstamped_uuids:
+            raise ValueError(
+                f"Ambiguous name {name!r}: {len(uuid_matches)} sessions match globally "
+                f"(mixed stamped/unstamped roster instances — an un-migrated session "
+                f"may still be active). "
+                f"Use a UUID or slot (<instance>:{name}) to disambiguate. "
+                f"See session_list() to find the right UUID."
+            )
+
+    # P2: abort on all-UUID ambiguity (GAP-5 root closed).
     if len(uuid_matches) > 1:
         raise ValueError(
             f"Ambiguous name {name!r}: {len(uuid_matches)} sessions match globally "
@@ -950,33 +1111,44 @@ def _resolve_name_global_legacy(name: str) -> str:
             f"See session_list() to find the right UUID."
         )
 
-    # Prefer UUID-named dir over non-UUID orphan if both present
+    # 1-UUID + orphan(s): prefer the UUID — orphans are #63-artifacts.
+    # ≥2-orphan (0 UUID): iterdir-arbitrary (non-production).
     if uuid_matches:
         return uuid_matches[0]
     return matches[0]
 
 
-def resolve_session_id(query: str, *, chat_id: str | None = None) -> str:
+def resolve_session_id(
+    query: str,
+    *,
+    chat_id: str | None = None,
+    caller_instance: str | None = None,
+) -> str:
     """Map a user-friendly query → exact session_id (UUID).
 
-    Resolution precedence (P2 — chat-scoped + roster-scoped resolver):
+    Resolution precedence (P1 roster-identity bridge — 2026-06-03):
 
       1. UUID exact + dir-exists → return as-is.
-      2. CHAT-SCOPED (chat_id provided): match within that chat's accepted members.
-         ≥2 same-named accepted members → ABORT (raise ValueError).
-      3. ROSTER-SCOPED (no chat_id, roster non-empty): match within
-         active_roster_member_ids() (MEMBERSHIP = accepted ∩ recent-chat).
-         ≥2 same-named roster members → ABORT (raise ValueError).
-      4. LEGACY FALLBACK (roster empty — first-run or test isolation): fall back
-         to the pre-P2 global mtime heuristic. Active in isolated tests and
-         first-run setups only; in a live roster this path is never taken.
+      1b. SLOT format '<instance>:<name>' → _find_by_slot_globally (exact slot match).
+      2. INSTANCE-SCOPED (caller_instance provided, bare name): match within the
+         caller's roster instance via roster_slot field. Bare-name = INTRA-instance;
+         cross-instance = slot or UUID. Un-stamped callers (caller_instance=None)
+         skip this tier → exact current behavior (zero-breakage migration seam).
+      3. CHAT-SCOPED (chat_id provided): match within that chat's accepted members.
+         Fall-through on not-found (F3 — early-return → fall-through) so tiers 2+3
+         both run. Ambiguity → ABORT.
+      4. ROSTER-SCOPED (no chat_id, roster non-empty): match within
+         active_roster_member_ids(). Ambiguity → ABORT.
+      5. LEGACY FALLBACK (roster empty — first-run or test isolation).
+
+    Instance-awareness (F1/F2/F3) per architect-1 Phase-A + analyst TRAP-1 clearance.
+    _find_by_name_in_candidates carries the F2 mixed-abort so the collision-prevention
+    applies uniformly at chat-scoped AND roster-scoped tiers (not just legacy).
 
     MEMBERSHIP ≠ DELIVERABILITY: reachability is NOT applied here.  Callers
-    that need reachability filtering (live surfaces: role-broadcast, wake-
-    injection, scheduler-at-fire) must apply ``is_reachable(sid)`` AFTER
-    resolution, at delivery time.  Durable surfaces (post_notice, post_answer,
-    post_handoff) resolve against MEMBERSHIP alone so msgs queue to alive-but-
-    unreachable seats (filtering unreachable = irreversible message-loss).
+    that need reachability filtering must apply ``is_reachable(sid)`` AFTER
+    resolution. Durable surfaces resolve against MEMBERSHIP alone so msgs queue
+    to alive-but-unreachable seats.
     """
     # 1. Fast path: UUID exact + dir-exists
     if _is_uuid(query) and (_BASE_DIR / query).is_dir():
@@ -985,7 +1157,25 @@ def resolve_session_id(query: str, *, chat_id: str | None = None) -> str:
     if not _BASE_DIR.exists():
         raise ValueError(f"No session named or id'd {query!r} (no sessions exist yet).")
 
-    # 2. Chat-scoped: caller provided a chat context
+    # 1b. Slot format: '<instance>:<name>' → direct slot lookup (P1)
+    if ":" in query:
+        try:
+            return _find_by_slot_globally(query)
+        except ValueError:
+            pass  # not found as a slot → fall through to name-based resolution
+
+    # 2. Instance-scoped (P1 bridge): resolve bare name within the caller's instance.
+    # Un-stamped callers (caller_instance=None) skip this tier entirely —
+    # exact current behavior preserved during the migration window.
+    if caller_instance is not None:
+        try:
+            return _find_by_slot_globally(f"{caller_instance}:{query}")
+        except ValueError:
+            pass  # not in caller's instance → fall through
+
+    # 3. Chat-scoped: caller provided a chat context.
+    # CHANGED (F3): was an early-return; now a fall-through so the instance-scoped
+    # tier (2) runs above it. Ambiguity within chat → ABORT; not-found → fall through.
     if chat_id is not None:
         try:
             from khimaira.monitor import chats as _chats  # noqa: PLC0415
@@ -996,33 +1186,30 @@ def resolve_session_id(query: str, *, chat_id: str | None = None) -> str:
                 f"resolve_session_id({query!r}): cannot load chat {chat_id!r} for "
                 f"chat-scoped resolution — {exc}"
             ) from exc
-        # Include both accepted AND pending members: a pending member is in the chat
-        # (was invited) and resolution must work before they accept (e.g. accept()
-        # resolves the session_id of the person accepting, who is still pending).
+        # Include both accepted AND pending members.
         chat_members = {
             sid
             for sid, member in room["members"].items()
             if member.get("state") in ("accepted", "pending")
         }
         try:
-            return _find_by_name_in_candidates(query, chat_members)
+            return _find_by_name_in_candidates(
+                query, chat_members, caller_instance=caller_instance
+            )
         except ValueError as exc:
-            raise ValueError(f"In chat {chat_id!r}: {exc}") from exc
+            if "Ambiguous" in str(exc):
+                raise ValueError(f"In chat {chat_id!r}: {exc}") from exc
+            # Not found in this chat → fall through to roster/legacy.
 
-    # 3. Roster-scoped: no chat context, use canonical MEMBERSHIP predicate.
+    # 4. Roster-scoped: no chat context, use canonical MEMBERSHIP predicate.
     # AMBIGUITY → abort (≥2 roster members with this name).
-    # NOT-FOUND → fall through to global legacy (session may not yet be in any
-    # recently-active chat — e.g. transfer-to a new member, a just-spawned
-    # session, or a session whose only chat has gone stale). Falling through
-    # on not-found is the safe-direction (avoids irreversible message-loss or
-    # broken operations); the ambiguity-abort is what kills the GAP-5 bug.
-    #
-    # We distinguish error-empty vs genuine-empty to avoid silently re-opening
-    # the GAP-5 bug during transient roster-computation errors (analyst P2 verify).
+    # NOT-FOUND → fall through to global legacy.
     roster, roster_had_error = _active_roster_for_resolution()
     if roster:
         try:
-            return _find_by_name_in_candidates(query, roster)
+            return _find_by_name_in_candidates(
+                query, roster, caller_instance=caller_instance
+            )
         except ValueError as exc:
             err_str = str(exc)
             if "Ambiguous" in err_str:
@@ -1030,8 +1217,7 @@ def resolve_session_id(query: str, *, chat_id: str | None = None) -> str:
                 raise
             # Not found in roster: fall through to global legacy scan.
 
-    # 4. Legacy fallback: roster empty OR name not found in roster.
-    # The global scan finds sessions not yet in any recently-active chat.
+    # 5. Legacy fallback: roster empty OR name not found in roster.
     if not roster:
         if roster_had_error:
             log.warning(
@@ -1048,7 +1234,7 @@ def resolve_session_id(query: str, *, chat_id: str | None = None) -> str:
                 "check that khimaira chats are configured.",
                 query,
             )
-    return _resolve_name_global_legacy(query)
+    return _resolve_name_global_legacy(query, caller_instance=caller_instance)
 
 
 # ---------------------------------------------------------------------------
