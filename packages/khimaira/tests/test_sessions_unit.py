@@ -1314,3 +1314,103 @@ def test_get_and_set_session_slot(isolated_state):
     # Idempotent
     s.set_session_slot(sid, "inst-abc:agent-1")
     assert s.get_session_slot(sid) == "inst-abc:agent-1"
+
+
+# ---------------------------------------------------------------------------
+# Part C — slot_resolve + registry (drift-healing + path-7 security bound)
+# ---------------------------------------------------------------------------
+
+def test_slot_resolve_current_sid_returns_self(isolated_state):
+    """Current sid for a slot resolves to itself (already authoritative)."""
+    s = isolated_state
+    sid = "aaaa0001-0000-4000-8000-000000000001"
+    s._session_dir(sid)
+    s.set_session_slot(sid, "inst-abc:agent-1")
+
+    assert s.slot_resolve(sid) == sid
+
+
+def test_slot_resolve_prior_sid_resolves_to_current(isolated_state):
+    """Immediately-prior sid heals reattach: prior → current authoritative sid.
+    This is the DRIFT-fix: a reconnected session with the same slot but a new
+    sid maps the old sid forward to the current one."""
+    s = isolated_state
+    sid_old = "aaaa0001-0000-4000-8000-000000000001"
+    sid_new = "bbbb0002-0000-4000-8000-000000000001"
+
+    # Old session binds the slot
+    s._session_dir(sid_old)
+    s.set_session_slot(sid_old, "inst-abc:agent-1")
+
+    # New session reconnects and claims the same slot (e.g. SessionStart reattach)
+    s._session_dir(sid_new)
+    s.set_session_slot(sid_new, "inst-abc:agent-1")
+
+    # Old sid (now prior) → resolves to new (current)
+    assert s.slot_resolve(sid_old) == sid_new
+    # New sid (current) → resolves to itself
+    assert s.slot_resolve(sid_new) == sid_new
+
+
+def test_slot_resolve_unregistered_sid_returns_none(isolated_state):
+    """A sid not in the registry returns None (INERT — falls through to original)."""
+    s = isolated_state
+    unknown_sid = "cccc0003-0000-4000-8000-000000000003"
+    assert s.slot_resolve(unknown_sid) is None
+
+
+def test_slot_resolve_superseded_real_sid_is_inert_bound_test(isolated_state):
+    """THE LOAD-BEARING SECURITY TEST for the path-7 bound.
+
+    A superseded-ONCE-LEGITIMATE sid (a real prior binding, the harvest target
+    in chat history / handoffs / transfer logs) must be INERT after it falls out
+    of the recent-prior window.
+
+    Scenario: slot transitions s1→s2→s3 (three reattaches).
+    - slot_resolve(s2) → s3 SUCCEEDS (immediately-prior heals reattach)
+    - slot_resolve(s1) → INERT (superseded once-real sid; beyond the bound)
+
+    Under full-history slot_resolve, s1 would resolve → s3 (FAIL — revival attack).
+    Under last-2 bound, s1 is pushed out of prior_sids → INERT (PASS).
+
+    This is NOT the 'arbitrary never-bound sid → inert' trivial case; s1 was a
+    REAL binding and is in the harvestable logs exactly because it was legitimate.
+    (Analyst msg-150a54734399, master msg-5013de992a8a — 2026-06-03)
+    """
+    s = isolated_state
+    slot = "inst-test:agent-1"
+    s1 = "aaaa0001-0000-4000-8000-000000000001"
+    s2 = "bbbb0002-0000-4000-8000-000000000002"
+    s3 = "cccc0003-0000-4000-8000-000000000003"
+
+    # Bind s1 → s2 → s3 (three sequential reattaches to the same slot)
+    for sid in (s1, s2, s3):
+        s._session_dir(sid)
+        s.set_session_slot(sid, slot)
+
+    # s3 is current → resolves to itself
+    assert s.slot_resolve(s3) == s3, "current sid must resolve to itself"
+
+    # s2 is immediately-prior → heals reattach
+    assert s.slot_resolve(s2) == s3, "immediately-prior sid must resolve to current"
+
+    # s1 is SUPERSEDED (pushed out of the recent-prior bound) → INERT
+    # This is the security property: a harvested once-real ancient sid stays dead.
+    assert s.slot_resolve(s1) is None, (
+        "superseded once-legitimate sid must be INERT (old-sid-revival closed by construction)"
+    )
+
+
+def test_slot_resolve_idempotent_rebind_no_prior_churn(isolated_state):
+    """Idempotent rebind (same sid claims slot again) does not add to prior_sids."""
+    s = isolated_state
+    sid = "aaaa0001-0000-4000-8000-000000000001"
+    s._session_dir(sid)
+    s.set_session_slot(sid, "inst-abc:agent-1")
+    s.set_session_slot(sid, "inst-abc:agent-1")  # same sid, same slot
+
+    assert s.slot_resolve(sid) == sid
+    # prior_sids should not contain sid (no self-entry)
+    registry = s._read_slot_registry()
+    entry = registry.get("inst-abc:agent-1", {})
+    assert sid not in entry.get("prior_sids", [])

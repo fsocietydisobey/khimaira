@@ -1291,9 +1291,26 @@ def build_router():
     # ---------------------------------------------------------------------------
 
     async def require_actor(request: Request) -> "str | None":
-        """TM1 actor identity. B.1: header → use it; absent → None (fallback)."""
+        """TM1 actor identity with P1 slot-resolution (path-7 drift-healing).
+
+        B.1: reads X-Session-ID header (env-sourced from CLAUDE_CODE_SESSION_ID).
+        Applies slot_resolve to map a reattached session's old subprocess-bound sid
+        to the slot's current authoritative sid — bounded to recent-prior only
+        (neutral-by-construction: a harvested ancient sid stays INERT).
+        Absent header → None (fallback to body authority-id with WARN, B.1 mode).
+        """
         caller = (request.headers.get("x-session-id") or "").strip()
-        return caller if caller else None
+        if not caller:
+            return None
+        # slot_resolve: if caller is an immediately-prior sid (reattached session),
+        # maps it to the current sid. If caller is already current or not in registry,
+        # returns the caller unchanged. Bounded bound = neutral-by-construction.
+        try:
+            from khimaira.monitor import sessions as _sess_mod
+            current = _sess_mod.slot_resolve(caller)
+            return current if current is not None else caller
+        except Exception:
+            return caller
 
     def _actor_or_body(actor_header: "str | None", body_id: str, path: str) -> str:
         """B.1: prefer header; fall back to body authority-id with WARN.

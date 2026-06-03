@@ -54,6 +54,12 @@ class WorkspaceReq(BaseModel):
     workspace: str
 
 
+class SlotBindReq(BaseModel):
+    """Request body for POST /sessions/{id}/slot (Part C daemon slot-binding)."""
+    slot: str           # KHIMAIRA_ROSTER_SLOT value: '<instance_id>:<name>'
+    window_id: int      # KITTY_WINDOW_ID — used to verify the TRAP-2 token file
+
+
 class AnswerReq(BaseModel):
     question_id: str
     answer: str
@@ -217,6 +223,56 @@ def build_router():
         return {
             "session_id": session_id,
             "workspace": sessions.get_workspace(session_id),
+        }
+
+    @router.post("/sessions/{session_id}/slot")
+    async def post_slot(session_id: str, req: SlotBindReq) -> dict:
+        """Bind a session to its roster slot (Part C — drift-healing).
+
+        TRAP-2 verification: reads the token file at
+        ~/.local/state/khimaira/roster-tokens/<window_id> (written by the
+        roster script at spawn, 0600) and verifies it matches the claimed slot.
+        This ensures the binding is daemon-independently-verifiable — NOT based
+        solely on the session-asserted slot value (TM1 boundary preserved).
+        """
+        import os
+        import pathlib
+
+        # TRAP-2: verify the slot via the roster-script-written token file.
+        # Never trust the session-asserted slot alone.
+        token_dir = pathlib.Path(
+            os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+        ) / "khimaira" / "roster-tokens"
+        token_path = token_dir / str(req.window_id)
+
+        if not token_path.exists():
+            raise fastapi.HTTPException(
+                403,
+                f"TRAP-2: no token file for window {req.window_id}; "
+                "slot binding rejected (token not written by the roster script)."
+            )
+        try:
+            token_slot = token_path.read_text().strip()
+        except OSError as e:
+            raise fastapi.HTTPException(403, f"TRAP-2: cannot read token file: {e}")
+
+        if token_slot != req.slot:
+            raise fastapi.HTTPException(
+                403,
+                f"TRAP-2: claimed slot {req.slot!r} does not match token file "
+                f"{token_slot!r}; binding rejected."
+            )
+
+        try:
+            record = sessions.set_session_slot(session_id, req.slot)
+        except ValueError as e:
+            raise fastapi.HTTPException(422, str(e))
+
+        return {
+            "session_id": session_id,
+            "slot": req.slot,
+            "window_id": req.window_id,
+            "bound": True,
         }
 
     @router.get("/sessions/resolve/{query}")

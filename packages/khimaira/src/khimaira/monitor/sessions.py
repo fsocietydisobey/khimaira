@@ -828,6 +828,7 @@ def set_session_slot(session_id: str, slot: str) -> dict:
     Called by the daemon at SessionStart when the session announces its
     KHIMAIRA_ROSTER_SLOT env var. The slot is stored in status.json as
     'roster_slot' for use by the instance-scoped resolver (resolve_session_id).
+    Also updates the shared slot registry for slot_resolve (drift-healing).
 
     Idempotent: safe to call on every SessionStart reconnect (drift self-heals).
     Disk-durable: survives daemon restarts (unlike heartbeat in-memory state).
@@ -848,8 +849,89 @@ def set_session_slot(session_id: str, slot: str) -> dict:
     record.setdefault("detail", "")
     path.write_text(json.dumps(record, indent=2))
     _invalidate_list_sessions_cache()
+    # Update shared slot registry (bounded prior-sid history for slot_resolve)
+    _update_slot_registry(slot, session_id)
     log.info("session %s: roster_slot=%r", session_id, slot)
     return record
+
+
+# ---------------------------------------------------------------------------
+# Slot registry — shared sid↔slot binding for drift-healing (path-7 Part C)
+# ---------------------------------------------------------------------------
+#
+# The slot registry tracks the current + immediately-prior sids per slot.
+# Bounded to last-2 prior sids (SECURITY: old-sid-revival closed by construction —
+# a harvested ancient sid is not in prior_sids and stays INERT; see analyst
+# msg-46b2dec421ca 2026-06-03 + master addendum msg-b0f6a84b7e1e).
+_SLOT_REGISTRY_MAX_PRIOR = 1  # keep only the immediately-prior sid (last-1 bound)
+
+
+def _slot_registry_path() -> "Path":
+    return _BASE_DIR.parent / "slot-registry.json"
+
+
+def _read_slot_registry() -> "dict[str, dict]":
+    """Read the shared slot registry. Returns {slot: {current_sid, prior_sids, updated_at}}."""
+    path = _slot_registry_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_slot_registry(registry: "dict[str, dict]") -> None:
+    path = _slot_registry_path()
+    path.write_text(json.dumps(registry, indent=2))
+
+
+def _update_slot_registry(slot: str, new_sid: str) -> None:
+    """Update the slot registry when a new sid claims a slot.
+
+    Moves current_sid to prior_sids (bounded to _SLOT_REGISTRY_MAX_PRIOR).
+    If new_sid == current_sid (idempotent re-register), no-ops the prior list.
+    """
+    registry = _read_slot_registry()
+    entry = registry.get(slot, {"current_sid": None, "prior_sids": []})
+    old_current = entry.get("current_sid")
+
+    if old_current and old_current != new_sid:
+        # Rotate: current → head of prior_sids, capped at max
+        prior = [old_current] + [s for s in entry.get("prior_sids", []) if s != new_sid]
+        entry["prior_sids"] = prior[:_SLOT_REGISTRY_MAX_PRIOR]
+    elif not old_current:
+        entry["prior_sids"] = []
+
+    entry["current_sid"] = new_sid
+    entry["updated_at"] = _now_iso()
+    registry[slot] = entry
+    _write_slot_registry(registry)
+
+
+def slot_resolve(sid: str) -> "str | None":
+    """Map any sid → the slot's CURRENT authoritative sid (drift-healing).
+
+    BOUNDED to last-1/2 prior sids (not full history) — NEUTRAL-BY-CONSTRUCTION:
+    a harvested ancient sid is NOT in prior_sids and stays INERT (does not resolve),
+    regardless of the same-uid trust boundary. The revival surface is
+    once-legitimate sids (in chat history / handoffs / transfer logs); the bound
+    keeps them inert once superseded.
+
+    Returns:
+    - sid itself if it is the current_sid for its slot (already authoritative)
+    - the current_sid if sid is in the slot's recent prior_sids (heals reattach)
+    - None if sid is not in the registry or too old (INERT — caller keeps original)
+    """
+    registry = _read_slot_registry()
+    for _slot, entry in registry.items():
+        current = entry.get("current_sid")
+        if current == sid:
+            return sid  # already the authoritative sid
+        if sid in entry.get("prior_sids", []):
+            return current  # immediately-prior → maps to current
+    return None  # not in registry or beyond bound → INERT
 
 
 def get_workspace(session_id: str) -> str:
