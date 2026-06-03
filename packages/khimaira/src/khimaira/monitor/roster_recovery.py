@@ -35,6 +35,7 @@ SAFETY GUARDS (all mandatory, per architect ruling, audit-grade):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -65,6 +66,12 @@ _CONTEXT_WINDOW_1M = 1_000_000
 
 # Debounce table: (window_id, action) → last_attempt_ts
 _DEBOUNCE: dict[tuple[int, str], float] = {}
+
+# Escalation-dedupe table: window_id → content-hash of last-escalated HITL prompt.
+# Prevents the same unresolved prompt from flooding master's inbox every cooldown cycle.
+# Cleared when the prompt disappears (no-HITL scan cycle) so a future re-appearance
+# or a changed prompt escalates fresh.
+_HITL_ESCALATED: dict[int, str] = {}
 
 # ---------------------------------------------------------------------------
 # HITL auto-answering configuration
@@ -589,6 +596,19 @@ def _session_has_pending_invite(session_id: str) -> bool:
 # HITL auto-answering helpers
 # ---------------------------------------------------------------------------
 
+def _prompt_content_hash(raw_block: str) -> str:
+    """Hash the stable identifying content of a HITL prompt for escalation dedupe.
+
+    Uses the extracted Bash(<cmd>) when available (always volatile-free), falls
+    back to the full raw_block for non-Bash prompts (e.g. Edit/Read dialogs).
+    A stationary Claude Code HITL dialog renders identically across scan cycles
+    (no timers or dynamic fields), so hashing the raw_block directly is safe for
+    the non-Bash case.
+    """
+    stable = _extract_bash_command(raw_block) or raw_block
+    return hashlib.md5(stable.encode(), usedforsecurity=False).hexdigest()
+
+
 def _detect_hitl_prompt(text: str) -> dict[str, str] | None:
     """Return {raw_block, answer_key, kind} if text looks like a HITL permission dialog.
 
@@ -1098,15 +1118,33 @@ async def _process_window(win: dict[str, Any]) -> None:
             action_key = (window_id, "hitl")
             last_attempt = _DEBOUNCE.get(action_key, 0.0)
             if time.time() - last_attempt >= _COMPACT_COOLDOWN_S:
-                result = await asyncio.get_running_loop().run_in_executor(
-                    None, _handle_hitl_prompt, window_id, session_id, role, hitl_prompt
-                )
-                _DEBOUNCE[action_key] = time.time()
-                _log.info(
-                    "roster-hitl: %s window=%d role=%s session=%s",
-                    result, window_id, role, session_id[:8],
-                )
+                # Escalation-dedupe: only send the master notice ONCE per unique
+                # prompt per window. A changed prompt (new content) re-escalates;
+                # a cleared prompt (no-HITL cycle) resets the marker.
+                content_hash = _prompt_content_hash(hitl_prompt["raw_block"])
+                if content_hash == _HITL_ESCALATED.get(window_id):
+                    _log.debug(
+                        "roster-hitl: dedupe skip window=%d role=%s (prompt unchanged, already escalated)",
+                        window_id, role,
+                    )
+                else:
+                    result = await asyncio.get_running_loop().run_in_executor(
+                        None, _handle_hitl_prompt, window_id, session_id, role, hitl_prompt
+                    )
+                    _DEBOUNCE[action_key] = time.time()
+                    if result == "escalated":
+                        _HITL_ESCALATED[window_id] = content_hash
+                    else:
+                        _HITL_ESCALATED.pop(window_id, None)
+                    _log.info(
+                        "roster-hitl: %s window=%d role=%s session=%s",
+                        result, window_id, role, session_id[:8],
+                    )
             return  # HITL prompt present — don't compact/wake until it's cleared
+        else:
+            # No HITL prompt this cycle — clear dedupe marker so a future
+            # re-appearance or changed prompt escalates fresh.
+            _HITL_ESCALATED.pop(window_id, None)
 
     context_pct = await asyncio.get_running_loop().run_in_executor(
         None, _compute_context_pct, session_id

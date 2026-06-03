@@ -956,6 +956,156 @@ class TestProcessWindowHitl:
 
 
 # ---------------------------------------------------------------------------
+# HITL escalation dedupe — _HITL_ESCALATED prevents same prompt spamming master
+# ---------------------------------------------------------------------------
+
+class TestHitlEscalationDedupe:
+    """_process_window dedupes escalation: same prompt → one notice; changed
+    prompt → re-escalates; cleared prompt (no-HITL cycle) → resets marker."""
+
+    # Representative HITL screen text: Edit dialog for a specific file.
+    # Constructed to mirror the real Claude Code permission dialog shape that
+    # caused frontend-lead w191 to escalate 26x for the same unresolved prompt.
+    REAL_SHAPED_SCREEN = (
+        "frontend-lead-1\n"
+        "Working on #14 auto-dispatch...\n"
+        "\n"
+        "⚡ Edit file: packages/jeevy_portal/src/features/hub/HubLayout.tsx\n"
+        "Do you want to proceed?\n"
+        "❯ 1. Yes, and don't ask again for this session\n"
+        "  2. Yes\n"
+        "  3. No, and tell Claude what to do differently\n"
+    )
+    CHANGED_SCREEN = (
+        "frontend-lead-1\n"
+        "\n"
+        "⚡ Edit file: packages/jeevy_portal/src/features/auth/LoginPage.tsx\n"
+        "Do you want to proceed?\n"
+        "❯ 1. Yes, and don't ask again for this session\n"
+        "  2. Yes\n"
+        "  3. No, and tell Claude what to do differently\n"
+    )
+
+    def _win(self):
+        return {"window_id": 191, "role": "frontend-lead", "raw_name": "frontend-lead-1",
+                "cmdline": "claude-chat -r frontend-lead-1"}
+
+    @pytest.fixture(autouse=True)
+    def clear_state(self):
+        rr._DEBOUNCE.pop((191, "hitl"), None)
+        rr._HITL_ESCALATED.pop(191, None)
+        yield
+        rr._DEBOUNCE.pop((191, "hitl"), None)
+        rr._HITL_ESCALATED.pop(191, None)
+
+    def _ctx(self, screen, handle_result="escalated"):
+        return (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_env_auto_hitl_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_by_name", return_value="3cf5ee30-uuid"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_session_hitl_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt", return_value=handle_result),
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_prompt_escalates_exactly_once_across_three_cycles(self):
+        """Same HITL prompt across N scan cycles → exactly ONE escalation notice."""
+        screen = self.REAL_SHAPED_SCREEN
+        handle_mock = None
+
+        # Cycle 1: first appearance → should escalate
+        patches = self._ctx(screen)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6] as mock_handle:
+            handle_mock = mock_handle
+            await rr._process_window(self._win())
+
+        assert handle_mock.call_count == 1, "first cycle should call _handle_hitl_prompt"
+        assert rr._HITL_ESCALATED.get(191) is not None, "escalation hash should be stored"
+
+        # Cycle 2: same prompt — debounce cleared so cooldown re-enters, but dedupe should skip
+        rr._DEBOUNCE.pop((191, "hitl"), None)
+        patches2 = self._ctx(screen)
+        with patches2[0], patches2[1], patches2[2], patches2[3], patches2[4], patches2[5], patches2[6] as mock_handle2:
+            await rr._process_window(self._win())
+
+        assert mock_handle2.call_count == 0, "second cycle with same prompt must be deduped"
+
+        # Cycle 3: same prompt again — still deduped
+        rr._DEBOUNCE.pop((191, "hitl"), None)
+        patches3 = self._ctx(screen)
+        with patches3[0], patches3[1], patches3[2], patches3[3], patches3[4], patches3[5], patches3[6] as mock_handle3:
+            await rr._process_window(self._win())
+
+        assert mock_handle3.call_count == 0, "third cycle with same prompt must be deduped"
+
+    @pytest.mark.asyncio
+    async def test_changed_prompt_re_escalates(self):
+        """A new/changed prompt in the same window → escalates again."""
+        # Cycle 1: first prompt escalates
+        rr._DEBOUNCE.pop((191, "hitl"), None)
+        patches = self._ctx(self.REAL_SHAPED_SCREEN)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6] as mock1:
+            await rr._process_window(self._win())
+        assert mock1.call_count == 1
+
+        # Cycle 2: CHANGED prompt in same window — new hash → must re-escalate
+        rr._DEBOUNCE.pop((191, "hitl"), None)
+        patches2 = self._ctx(self.CHANGED_SCREEN)
+        with patches2[0], patches2[1], patches2[2], patches2[3], patches2[4], patches2[5], patches2[6] as mock2:
+            await rr._process_window(self._win())
+        assert mock2.call_count == 1, "changed prompt must escalate again"
+
+    @pytest.mark.asyncio
+    async def test_cleared_prompt_resets_marker_for_fresh_escalation(self):
+        """Prompt clears (no-HITL cycle) → marker removed → re-appearance escalates."""
+        # Cycle 1: prompt escalates, marker stored
+        rr._DEBOUNCE.pop((191, "hitl"), None)
+        patches = self._ctx(self.REAL_SHAPED_SCREEN)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+            await rr._process_window(self._win())
+        assert rr._HITL_ESCALATED.get(191) is not None
+
+        # Cycle 2: NO HITL prompt (idle window) → marker cleared
+        rr._DEBOUNCE.pop((191, "hitl"), None)
+        idle_screen = "frontend-lead-1\nIdling...\n"  # no HITL dialog
+        idle_patches = self._ctx(idle_screen)
+        with idle_patches[0], idle_patches[1], idle_patches[2], idle_patches[3], idle_patches[4], idle_patches[5], idle_patches[6] as mock_idle:
+            await rr._process_window(self._win())
+        assert mock_idle.call_count == 0
+        assert rr._HITL_ESCALATED.get(191) is None, "marker must be cleared on no-HITL cycle"
+
+        # Cycle 3: same prompt reappears → should escalate fresh (marker was cleared)
+        rr._DEBOUNCE.pop((191, "hitl"), None)
+        patches3 = self._ctx(self.REAL_SHAPED_SCREEN)
+        with patches3[0], patches3[1], patches3[2], patches3[3], patches3[4], patches3[5], patches3[6] as mock3:
+            await rr._process_window(self._win())
+        assert mock3.call_count == 1, "prompt re-appearance after clear must escalate"
+
+    def test_prompt_content_hash_stable_across_identical_renders(self):
+        """Same raw_block → same hash (byte-stable, no volatility)."""
+        h1 = rr._prompt_content_hash(self.REAL_SHAPED_SCREEN[-600:])
+        h2 = rr._prompt_content_hash(self.REAL_SHAPED_SCREEN[-600:])
+        assert h1 == h2
+
+    def test_prompt_content_hash_differs_for_changed_prompt(self):
+        """Different raw_block content → different hash."""
+        h1 = rr._prompt_content_hash(self.REAL_SHAPED_SCREEN[-600:])
+        h2 = rr._prompt_content_hash(self.CHANGED_SCREEN[-600:])
+        assert h1 != h2
+
+    def test_prompt_content_hash_uses_bash_cmd_when_available(self):
+        """For Bash prompts, hash is derived from the extracted command (volatile-free)."""
+        bash_screen = "Some preamble\nBash(ls -la /tmp)\n❯ 1. Allow this time\n  2. Deny\n"
+        h = rr._prompt_content_hash(bash_screen)
+        # The hash should match hashing "ls -la /tmp" (extracted cmd) rather than the full block
+        import hashlib
+        expected = hashlib.md5("ls -la /tmp".encode(), usedforsecurity=False).hexdigest()
+        assert h == expected
+
+
+# ---------------------------------------------------------------------------
 # Lane 5 — name-based session resolution (fixes the ambiguous-role abort)
 # ---------------------------------------------------------------------------
 
