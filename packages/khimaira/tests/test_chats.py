@@ -3596,3 +3596,68 @@ class TestDriftHealingAuth:
         # s1 is INERT — send must be denied
         with pytest.raises(ValueError, match="non-member"):
             c.send_message(chat_id, self.S1, "should be denied")
+
+    # master changes_requested: add path-8 healing + inert-denial + path-6 inert explicit
+
+    def test_healing_path8_assignee_reattached_session(self, isolated_chats, monkeypatch, tmp_path):
+        """PATH-8 HEALING: reattached session (s2) can be assigned tasks.
+
+        create_task(assignee=s2) must succeed — s2's membership is resolved via
+        slot-heal (canonical=s1, the bound member key). Without healing, s2 is
+        "not an accepted member" and the task creation fails.
+        """
+        from khimaira.monitor import sessions as sessions_mod
+        c = isolated_chats
+
+        chat_id = self._setup_chat(c, sessions_mod)
+        sessions_mod.set_session_slot(self.S2, self._SLOT)  # s1→s2 reattach
+
+        # s2 should be assignable via slot-heal
+        task = c.create_task(chat_id, self.MASTER, "Implement X", assignee_session_id=self.S2)
+        assert task.get("id"), "create_task must succeed for reattached s2"
+        assert task.get("assignee_id") is not None, "assignee must be bound to the task"
+
+    def test_inert_denial_path8_assignee_superseded_sid(self, isolated_chats, monkeypatch, tmp_path):
+        """INERT-DENIAL path-8: superseded-once-real s1 cannot be task assignee.
+
+        After s1→s2→s3, s1 is beyond the last-1 bound. Assigning s1 as a task
+        assignee must be DENIED (fail-closed). NOT the trivially-never-bound case —
+        s1 was a real accepted member and is in the slot registry history.
+        """
+        from khimaira.monitor import sessions as sessions_mod
+        c = isolated_chats
+
+        chat_id = self._setup_chat(c, sessions_mod)
+        sessions_mod.set_session_slot(self.S2, self._SLOT)  # s1 → prior
+        sessions_mod.set_session_slot(self.S3, self._SLOT)  # s2 → prior, s1 revoked
+
+        # s1 is INERT (superseded-beyond-last-1) — must be denied as assignee
+        with pytest.raises(ValueError, match="only accepted members can be assignees"):
+            c.create_task(chat_id, self.MASTER, "Implement Y", assignee_session_id=self.S1)
+
+    def test_inert_denial_path6_role_superseded_sid(self, isolated_chats, monkeypatch, tmp_path):
+        """INERT-DENIAL path-6 (explicit): superseded-once-real s1 resolves to NO role.
+
+        After s1→s2→s3, _slot_heal_member_key(s1) must return (None, None).
+        member_roles must NOT resolve to the stale role — s1 is INERT.
+        This is the explicit path-6 inert case (not just transitively covered by path-3/4).
+        """
+        from khimaira.monitor import sessions as sessions_mod
+        c = isolated_chats
+
+        chat_id = self._setup_chat(c, sessions_mod)
+        c.chat_grant_role(chat_id, self.MASTER, self.S1, "agent")  # bind a role
+
+        sessions_mod.set_session_slot(self.S2, self._SLOT)
+        sessions_mod.set_session_slot(self.S3, self._SLOT)  # s1 revoked
+
+        # s1 is INERT: _slot_heal_member_key must return (None, None)
+        room = c.load_room(chat_id)
+        canonical, _ = c._slot_heal_member_key(room, self.S1)
+        assert canonical is None, (
+            "superseded-once-real s1 must return canonical=None (inert, fail-closed); "
+            "must NOT return the old member key and allow stale role to resolve"
+        )
+        # Double-check: member_roles must NOT resolve to "agent" via an inert s1
+        stale_role = room["meta"].get("member_roles", {}).get(canonical) if canonical else None
+        assert stale_role is None, "inert s1 must not resolve a stale role"
