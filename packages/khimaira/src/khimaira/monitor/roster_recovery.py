@@ -1132,6 +1132,29 @@ def _detect_rate_limit(text: str) -> bool:
     return bool(_RATE_LIMIT_RE.search(text))
 
 
+# Server-side 429 specifically — distinct from the 5h personal usage cap.
+# DIFFERENT CLASSES: 429 (server temporary) → stagger + retry soon;
+# 5h cap → wait for reset (staggering can't help a 5h cap, wrong mitigation).
+# Keys on the stable "Server is temporarily limiting requests" core substring.
+# The "(not your usage limit)" tail self-discriminates from the cap but is
+# treated as optional chrome — a line-wrapped render may split it.
+_SERVER_429_RE = re.compile(
+    r"Server\s+is\s+temporarily\s+limiting\s+requests",
+    re.IGNORECASE,
+)
+
+
+def _detect_server_429(text: str) -> bool:
+    """True if the window shows a server-side 429 (not the 5h personal usage cap).
+
+    Use for the stagger mitigation path — keyed on the CONFIRMED render string
+    from Joseph 2026-06-03: "API Error: Server is temporarily limiting requests
+    (not your usage limit) · Rate limited". MUST NOT match the 5h cap render
+    ("Claude usage limit reached") which needs a DIFFERENT mitigation.
+    """
+    return bool(_SERVER_429_RE.search(text))
+
+
 def _get_screen_scrollback(window_id: int, tail_lines: int = 220) -> str | None:
     """Read a generous slice of the window's SCROLLBACK (not just the visible
     screen). A rate-limit error scrolls off-screen the moment chat messages

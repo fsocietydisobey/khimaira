@@ -2412,7 +2412,8 @@ def test_assign_batch_fires_begin_when_all_acked(isolated_chats):
         for r in c._read(chat_id)
         if (r.get("body") or "").startswith("🟢 ALL AGENTS CONFIRMED")
     ]
-    assert len(begin_msgs) == 1
+    # Stagger sends one individual BEGIN per confirmed agent (not one broadcast).
+    assert len(begin_msgs) == 2
 
 
 def test_assign_batch_partial_timeout_no_begin(isolated_chats):
@@ -2478,6 +2479,67 @@ def test_assign_batch_unknown_agent_raises(isolated_chats):
     ]
     with pytest.raises(ValueError):
         asyncio.run(c.assign_batch(chat_id, "master", specs, wait_for_acks=False))
+
+
+def test_assign_batch_stagger_begin_fires_between_agents(isolated_chats, monkeypatch):
+    """STAGGER: with N=2 agents, asyncio.sleep is called between the 2 BEGIN fires.
+
+    The stagger prevents burst-429 (N simultaneous first-API-calls in one second)
+    by staggering when each agent receives its individual BEGIN signal.
+    """
+    import unittest.mock
+
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    monkeypatch.setattr(c, "_DISPATCH_STAGGER_S", 1.0)
+
+    chat_id = _setup_batch_chat(c, sessions_mod)
+    specs = [
+        {
+            "agent_session_id": "agent-a",
+            "task_body": "task A",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+        {
+            "agent_session_id": "agent-b",
+            "task_body": "task B",
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+    ]
+    acks_injected = [False]
+    sleep_calls: list[float] = []
+
+    async def tracked_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        if not acks_injected[0]:
+            acks_injected[0] = True
+            for r in c._read(chat_id):
+                if r.get("kind") == c.TASK and r.get("assignee_id"):
+                    _agent_ack(c, chat_id, r["assignee_id"], r["id"])
+
+    async def run():
+        with unittest.mock.patch("asyncio.sleep", tracked_sleep):
+            return await c.assign_batch(chat_id, "master", specs, timeout_s=30)
+
+    result = asyncio.run(run())
+    assert result["begin_fired"] is True
+
+    # At least one sleep of the stagger delay should have fired between BEGIN signals.
+    stagger_sleeps = [s for s in sleep_calls if s >= 1.0]
+    assert len(stagger_sleeps) >= 1, (
+        f"Expected at least one stagger sleep (≥1.0s) between BEGIN signals; "
+        f"sleep_calls={sleep_calls}"
+    )
+
+    # Each agent gets an individual BEGIN (not one broadcast).
+    begin_msgs = [
+        r for r in c._read(chat_id)
+        if (r.get("body") or "").startswith("🟢 ALL AGENTS CONFIRMED")
+    ]
+    assert len(begin_msgs) == 2
 
 
 # ---------------------------------------------------------------------------

@@ -2686,6 +2686,12 @@ def _scan_acks(chat_id: str, task_ids: dict[str, str]) -> dict[str, dict]:
     return found
 
 
+# Stagger between BEGIN signals when multiple agents are dispatched simultaneously.
+# Prevents burst API calls all hitting Anthropic in the same second (server-side 429).
+# KHIMAIRA_DISPATCH_STAGGER_S env var overrides; 0 disables. Staggers FIRST call only.
+_DISPATCH_STAGGER_S: float = float(os.environ.get("KHIMAIRA_DISPATCH_STAGGER_S", "2.5"))
+
+
 async def assign_batch(
     chat_id: str,
     from_session_id: str,
@@ -2777,12 +2783,21 @@ async def assign_batch(
     begin_fired = False
     if polled and (confirmed == all_agent_ids or (fire_begin_on_partial and confirmed)):
         begin_body = (assignments[0].get("task_body") or "") if assignments else ""
-        send_message(
-            chat_id,
-            from_session_id,
-            _format_begin_block(begin_body),
-            to=sorted(confirmed),
-        )
+        # Stagger BEGIN signals across confirmed agents to prevent simultaneous
+        # first-API-calls all hitting Anthropic in the same second (server-side 429).
+        # Each agent receives an individual BEGIN targeted to it; _DISPATCH_STAGGER_S
+        # (default 2.5s) between each. Staggers FIRST call only — subsequent calls
+        # in each agent's turn are naturally unsynchronised.
+        agents_in_order = sorted(confirmed)
+        for i, agent_id in enumerate(agents_in_order):
+            if i > 0 and _DISPATCH_STAGGER_S > 0:
+                await asyncio.sleep(_DISPATCH_STAGGER_S)
+            send_message(
+                chat_id,
+                from_session_id,
+                _format_begin_block(begin_body),
+                to=[agent_id],
+            )
         begin_fired = True
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)

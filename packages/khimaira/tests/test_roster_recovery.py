@@ -1327,6 +1327,46 @@ class TestRateLimitDetect:
         assert rr._detect_rate_limit(text) is False
 
 
+class TestServer429Detect:
+    """_detect_server_429 — discriminates 429 from the 5h personal usage cap.
+
+    These are DIFFERENT failure classes needing OPPOSITE mitigations:
+    429 (server temporary) → stagger + retry soon.
+    5h cap → wait for personal reset (staggering cannot help a 5h cap).
+    """
+
+    CONFIRMED_429 = (
+        "API Error: Server is temporarily limiting requests "
+        "(not your usage limit) · Rate limited"
+    )
+    WRAPPED_429 = (
+        "  ⎿  API Error: Server is temporarily limiting\n"
+        "     requests (not your usage limit) · Rate\n"
+        "     limited"
+    )
+    USAGE_CAP = "● Claude usage limit\n  reached. Your limit will reset at 3pm."
+
+    def test_confirmed_429_string_matches(self):
+        """Joseph's exact confirmed render string (2026-06-03) must match."""
+        assert rr._detect_server_429(self.CONFIRMED_429) is True
+
+    def test_wrapped_429_matches(self):
+        """Line-wrapped variant (window wraps mid-phrase) must match."""
+        assert rr._detect_server_429(self.WRAPPED_429) is True
+
+    def test_usage_cap_does_not_match(self):
+        """THE DISCRIMINATOR: 5h personal usage cap must NOT match _detect_server_429.
+
+        Failure here means the 429 and cap detectors are conflated, which would
+        apply the wrong mitigation (stagger/retry for a 5h cap → wastes retries).
+        """
+        assert rr._detect_server_429(self.USAGE_CAP) is False
+
+    def test_generic_rate_limit_text_does_not_match(self):
+        """Discussion text mentioning rate limits must NOT match."""
+        assert rr._detect_server_429("discussing the rate limit issue") is False
+
+
 # ---------------------------------------------------------------------------
 # Disk-WIP probe — _session_has_recent_wip + wake-path integration
 # ---------------------------------------------------------------------------
