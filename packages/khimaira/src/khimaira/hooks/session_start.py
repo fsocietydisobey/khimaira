@@ -899,8 +899,18 @@ def main() -> int:
                 f"/api/sessions/{session_id}/slot",
                 {"slot": _roster_slot, "window_id": int(_kitty_wid)},
             )
-        except Exception:
-            pass  # fail-open; daemon logs TRAP-2 mismatches; boot continues
+        except Exception as _slot_err:
+            # Log — don't silently swallow. A systematic POST failure recreates the
+            # exact silent-non-binding this task exists to fix. Non-fatal (boot
+            # continues) but VISIBLE so a persistent failure surfaces immediately.
+            # The daemon independently logs TRAP-2 mismatches; this catches network/
+            # endpoint-drift/schema failures BEFORE the daemon even sees the request.
+            import sys
+            print(
+                f"[khimaira-hook] WARN: slot-bind POST failed for {session_id[:8]} "
+                f"slot={_roster_slot!r}: {_slot_err!r} — session un-slotted (drift-heal will not fire)",
+                file=sys.stderr,
+            )
 
     # Real-time chat registration — emitted immediately after identity block so
     # it appears at the very top before inbox, handoffs, and role file content.
