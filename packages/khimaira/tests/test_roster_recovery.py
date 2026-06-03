@@ -1390,6 +1390,21 @@ class TestSessionHasRecentWip:
         body = "Edit `packages/nonexistent/ghost.py`"
         assert rr._session_has_recent_wip("test-session", body, tmp_path, 900.0) is False
 
+    def test_fresh_non_target_file_ignored(self, tmp_path):
+        """Shared-cwd regression guard: a fresh file NOT in this session's task
+        targets must NOT trigger WIP. This test FAILS if the probe ever performs
+        a workspace-scan (it would pick up peer_edit.py). Passes only with the
+        correct owed-task-scoped attribution."""
+        import os
+        target = tmp_path / "my_target.py"
+        target.write_text("x")
+        stale_ts = time.time() - 1800
+        os.utime(target, (stale_ts, stale_ts))       # this session's target: stale
+        (tmp_path / "peer_edit.py").write_text("fresh")  # a peer's fresh edit — NOT in task
+        body = f"Implement fix in `{target}`"
+        # My target is stale → no WIP, even though peer_edit.py is fresh in the same dir
+        assert rr._session_has_recent_wip("test-session", body, tmp_path, 900.0) is False
+
     def test_stale_last_active_but_fresh_target_returns_true(self, tmp_path):
         """Hook-independent: last_active stale but target file fresh → WIP detected.
         This is the key false-dark case: SSE-deaf session whose hook can't bump
