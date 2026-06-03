@@ -885,6 +885,23 @@ def main() -> int:
         "after you call `session_set_name(...)`."
     )
 
+    # roster-identity slot-binding (Phase-B Part E wiring — Resolution A).
+    # POST /sessions/{id}/slot BEFORE the SSE-open (chat_my_chats below) so the
+    # subscriber key resolves to the slot at subscribe-time → structurally
+    # avoids the open-before-bind race; makes (i) slot-key-at-subscribe durable.
+    # Fail-open: never block session boot; a missing env / TRAP-2 mismatch is
+    # logged by the daemon but doesn't prevent the session from starting.
+    _roster_slot = os.environ.get("KHIMAIRA_ROSTER_SLOT", "").strip()
+    _kitty_wid = os.environ.get("KITTY_WINDOW_ID", "").strip()
+    if _roster_slot and _kitty_wid:
+        try:
+            _http_post_json(
+                f"/api/sessions/{session_id}/slot",
+                {"slot": _roster_slot, "window_id": int(_kitty_wid)},
+            )
+        except Exception:
+            pass  # fail-open; daemon logs TRAP-2 mismatches; boot continues
+
     # Real-time chat registration — emitted immediately after identity block so
     # it appears at the very top before inbox, handoffs, and role file content.
     # Without this call the SSE subscriber never starts and chat_send messages
