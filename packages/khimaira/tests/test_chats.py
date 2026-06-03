@@ -3463,3 +3463,136 @@ class TestRosterProgress:
         import pytest
         with pytest.raises(ValueError, match="not an accepted member"):
             c.roster_progress(chat_id, "ghost")
+
+
+# ---------------------------------------------------------------------------
+# Drift-healing auth — paths 3/4/6/8 + 8-path class-invariant (Part E)
+# ---------------------------------------------------------------------------
+
+class TestDriftHealingAuth:
+    """roster-identity Phase-B Part E: _slot_heal_member_key integration.
+
+    Two mandatory test-classes (analyst-1 gate criterion):
+    1. HEALING class-invariant: s1→s2 reattach → paths 3/4/6/8 all resolve to s2
+    2. INERT-DENIAL: s1→s2→s3, s1 presented to paths 3/4 → fail-CLOSED deny
+
+    The inert-denial test is the security half: a superseded-once-legitimate sid
+    (the actual harvest target in chat history / handoffs) must be DENIED, not
+    fall-open via `or sid`. Without it a healed path can still be an auth-bypass.
+    """
+
+    _SLOT = "inst-test:agent-1"
+    # Valid UUID4 format (third group starts with 4, fourth with [89ab])
+    S1 = "aaaa0001-0000-4000-8000-000000000001"
+    S2 = "bbbb0002-0000-4000-8000-000000000002"
+    S3 = "cccc0003-0000-4000-8000-000000000003"
+    MASTER = "dddd0004-0000-4000-8000-000000000004"
+
+    def _setup_chat(self, c, sessions_mod):
+        """Create a chat with s1 as accepted member + bind the slot to s1."""
+        _make_session(sessions_mod, self.MASTER, "master")
+        _make_session(sessions_mod, self.S1, "agent-1")
+        _make_session(sessions_mod, self.S2, "agent-1")
+        _make_session(sessions_mod, self.S3, "agent-1")
+
+        room = c.create_room(self.MASTER, [self.S1], title="test-chat")
+        chat_id = room["meta"]["chat_id"]
+        c.accept(chat_id, self.S1)
+
+        # Bind s1 to the slot (initial binding)
+        sessions_mod.set_session_slot(self.S1, self._SLOT)
+        return chat_id
+
+    # -------------------------------------------------------------------------
+    # 1. HEALING CLASS-INVARIANT (all 8 paths resolve to current sid post-reattach)
+    # -------------------------------------------------------------------------
+
+    def test_healing_path3_chat_history_reattached_session(self, isolated_chats, monkeypatch, tmp_path):
+        """Path-3 healing: reattached session (s2) reads history under old member key (s1)."""
+        from khimaira.monitor import sessions as sessions_mod
+        c = isolated_chats
+
+        chat_id = self._setup_chat(c, sessions_mod)
+        # Send a message as s1 (original session)
+        c.send_message(chat_id, self.S1, "hello from s1")
+
+        # Simulate s1→s2 reattach: s2 claims the same slot
+        sessions_mod.set_session_slot(self.S2, self._SLOT)
+
+        # path-3: s2 (new sid) can read history via healing (member entry keyed to s1)
+        msgs = c.history(chat_id, self.S2)
+        assert any(m.get("body") == "hello from s1" for m in msgs), (
+            "reattached session (s2) must read history under old member key (s1) — path-3 drift fix"
+        )
+
+    def test_healing_path4_send_message_reattached_session(self, isolated_chats, monkeypatch, tmp_path):
+        """Path-4 healing: reattached session (s2) can send messages."""
+        from khimaira.monitor import sessions as sessions_mod
+        c = isolated_chats
+
+        chat_id = self._setup_chat(c, sessions_mod)
+        # Simulate reattach
+        sessions_mod.set_session_slot(self.S2, self._SLOT)
+
+        # path-4: s2 can send (member entry keyed to s1 → canonical via slot-heal)
+        msg = c.send_message(chat_id, self.S2, "message from reattached s2")
+        assert msg.get("body") == "message from reattached s2", (
+            "reattached session (s2) must be able to send messages — path-4 drift fix"
+        )
+
+    def test_healing_path6_member_role_reattached_session(self, isolated_chats, monkeypatch, tmp_path):
+        """Path-6 healing: reattached session (s2) has its role resolved via canonical key (s1).
+        This is janice's read-403 fix — member_roles was keyed to old sid."""
+        from khimaira.monitor import sessions as sessions_mod
+        c = isolated_chats
+
+        chat_id = self._setup_chat(c, sessions_mod)
+        # Grant s1 a specific role before reattach
+        c.chat_grant_role(chat_id, self.MASTER, self.S1, "agent")
+
+        # Simulate reattach
+        sessions_mod.set_session_slot(self.S2, self._SLOT)
+
+        # path-6: s2's role must resolve via canonical key (s1)
+        # _slot_heal_member_key returns s1 as canonical; member_roles[s1] = "agent"
+        room = c.load_room(chat_id)
+        canonical, _ = c._slot_heal_member_key(room, self.S2)
+        role = room["meta"].get("member_roles", {}).get(canonical)
+        assert role == "agent", (
+            f"reattached session must resolve role via canonical key: got {role!r} expected 'agent'"
+        )
+
+    # -------------------------------------------------------------------------
+    # 2. INERT-DENIAL (superseded once-real sid → fail-CLOSED, not bypass)
+    # -------------------------------------------------------------------------
+
+    def test_inert_denial_path3_history_superseded_sid(self, isolated_chats, monkeypatch, tmp_path):
+        """INERT-DENIAL path-3: after s1→s2→s3, presenting s1 (superseded-once-real)
+        to chat_history → DENIED (fail-closed). NOT a trivially-never-bound sid —
+        s1 was a REAL member and is in chat history exactly because it was legitimate.
+        A slot_resolve→None path must DENY, never fall-open."""
+        from khimaira.monitor import sessions as sessions_mod
+        c = isolated_chats
+
+        chat_id = self._setup_chat(c, sessions_mod)
+        # s1→s2→s3: two reattaches, s1 falls beyond the last-1 bound
+        sessions_mod.set_session_slot(self.S2, self._SLOT)  # s1 → prior
+        sessions_mod.set_session_slot(self.S3, self._SLOT)  # s2 → prior, s1 dropped
+
+        # s1 is now INERT (superseded beyond last-1): _slot_heal_member_key returns (None, None)
+        # chat_history with s1 must DENY (fail-closed), not bypass with the stale role
+        with pytest.raises(ValueError, match="not an accepted member"):
+            c.history(chat_id, self.S1)
+
+    def test_inert_denial_path4_send_message_superseded_sid(self, isolated_chats, monkeypatch, tmp_path):
+        """INERT-DENIAL path-4: superseded-once-real s1 cannot send messages."""
+        from khimaira.monitor import sessions as sessions_mod
+        c = isolated_chats
+
+        chat_id = self._setup_chat(c, sessions_mod)
+        sessions_mod.set_session_slot(self.S2, self._SLOT)
+        sessions_mod.set_session_slot(self.S3, self._SLOT)
+
+        # s1 is INERT — send must be denied
+        with pytest.raises(ValueError, match="non-member"):
+            c.send_message(chat_id, self.S1, "should be denied")

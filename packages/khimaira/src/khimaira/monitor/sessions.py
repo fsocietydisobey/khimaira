@@ -891,18 +891,26 @@ def _update_slot_registry(slot: str, new_sid: str) -> None:
     """Update the slot registry when a new sid claims a slot.
 
     Moves current_sid to prior_sids (bounded to _SLOT_REGISTRY_MAX_PRIOR).
+    Rotates the displaced prior into revoked_sids (superseded-beyond-bound →
+    explicit DENY set for _slot_heal_member_key inert-denial).
+
     If new_sid == current_sid (idempotent re-register), no-ops the prior list.
     """
     registry = _read_slot_registry()
-    entry = registry.get(slot, {"current_sid": None, "prior_sids": []})
+    entry = registry.get(slot, {"current_sid": None, "prior_sids": [], "revoked_sids": []})
     old_current = entry.get("current_sid")
 
     if old_current and old_current != new_sid:
-        # Rotate: current → head of prior_sids, capped at max
-        prior = [old_current] + [s for s in entry.get("prior_sids", []) if s != new_sid]
-        entry["prior_sids"] = prior[:_SLOT_REGISTRY_MAX_PRIOR]
+        old_prior = [s for s in entry.get("prior_sids", []) if s != new_sid]
+        new_prior = ([old_current] + old_prior)[:_SLOT_REGISTRY_MAX_PRIOR]
+        # Sids displaced from prior_sids (beyond the bound) move to revoked_sids.
+        displaced = old_prior[_SLOT_REGISTRY_MAX_PRIOR - 1:]
+        revoked = list({*entry.get("revoked_sids", []), *displaced} - {new_sid})
+        entry["prior_sids"] = new_prior
+        entry["revoked_sids"] = revoked
     elif not old_current:
         entry["prior_sids"] = []
+        entry["revoked_sids"] = []
 
     entry["current_sid"] = new_sid
     entry["updated_at"] = _now_iso()

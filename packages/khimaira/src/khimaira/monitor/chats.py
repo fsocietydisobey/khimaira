@@ -542,6 +542,64 @@ def _assert_session_registered(session_id: str) -> None:
         )
 
 
+def _slot_heal_member_key(
+    room: dict,
+    sid: str,
+) -> "tuple[str | None, dict | None]":
+    """Drift-healing member lookup for paths 3/4/6/8 (roster-identity Phase-B Part E).
+
+    Returns (canonical_key, member_dict) where canonical_key is the member_roles
+    key that this session maps to — either the presented sid (already registered)
+    OR the prior member key (reattached session healing through the slot registry).
+
+    FAIL-CLOSED: returns (None, None) for:
+    - Superseded sids beyond the last-1 bound (the harvest target; `slot_resolve→None`)
+    - Sids never in any slot (unregistered callers remain at current behavior)
+
+    NEVER use `or sid` as a fallback — that defeats the security bound.
+    A None return MUST be treated as DENY at every call-site.
+    """
+    try:
+        from khimaira.monitor.sessions import _read_slot_registry
+
+        registry = _read_slot_registry()
+
+        # INERT-DENIAL must run BEFORE the direct member lookup (lines below).
+        # A revoked sid still has a member entry (the old binding is never removed),
+        # so the direct lookup would succeed and bypass the security bound.
+        # Revoked = superseded beyond the last-1 window → fail-closed immediately.
+        # if sid is in any slot's revoked_sids, it was superseded beyond the last-1
+        # bound. Deny immediately — the member list still has the old entry so the
+        # direct lookup would succeed, bypassing the security bound. Revoked check
+        # gates it here first. This is the "or sid" anti-pattern prevention.
+        for _slot, entry in registry.items():
+            if sid in entry.get("revoked_sids", []):
+                return None, None  # fail-closed
+
+        # SLOT-HEAL: presented sid is current for a slot whose prior sid(s)
+        # are the member keys (reattached session after reconnect).
+        for _slot, entry in registry.items():
+            if entry.get("current_sid") != sid:
+                continue
+            # (a) Current sid is also a direct member (freshly-added, no healing needed)
+            direct_member = room["members"].get(sid)
+            if direct_member is not None:
+                return sid, direct_member
+            # (b) Heal via prior sids: current reconnected; member entry keyed to old sid
+            for prior_sid in entry.get("prior_sids", []):
+                old_member = room["members"].get(prior_sid)
+                if old_member is not None and old_member.get("state") == ACCEPTED:
+                    return prior_sid, old_member
+    except Exception:
+        pass  # probe failure → fall through to direct lookup (fail-open for probe errors)
+
+    # Not in slot registry → direct member lookup (existing behavior for un-slotted sessions).
+    member = room["members"].get(sid)
+    if member is not None:
+        return sid, member
+    return None, None
+
+
 def _resolve_or_uuid(session_id_or_name: str, *, chat_id: str | None = None) -> str:
     """Resolve a session name → UUID, OR accept a UUID verbatim.
 
@@ -950,7 +1008,14 @@ def send_message(
             "a private message with no recipients is meaningless."
         )
     room = load_room(chat_id)
-    member = room["members"].get(sender_session_id)
+    # path-4 drift-healing: resolve a reattached session's sid to its member key.
+    # Fail-closed: if (None, None) is returned, the session is DENIED (not a valid
+    # current identity — superseded beyond bound or unregistered).
+    canonical_sender, member = _slot_heal_member_key(room, sender_session_id)
+    if canonical_sender is None:
+        member = None  # explicit fail-closed
+    else:
+        sender_session_id = canonical_sender  # use the canonical key going forward
     if not member or member["state"] != ACCEPTED:
         state = (member or {}).get("state", "non-member")
         raise ValueError(
@@ -1099,7 +1164,12 @@ def create_task(
     assignee_name = None
     if assignee_session_id is not None:
         assignee_resolved = _resolve_or_uuid(assignee_session_id)
-        amember = room["members"].get(assignee_resolved)
+        # path-8 drift-healing: resolve a reattached session's sid to its member key.
+        canonical_assignee, amember = _slot_heal_member_key(room, assignee_resolved)
+        if canonical_assignee is None:
+            amember = None
+        else:
+            assignee_resolved = canonical_assignee
         if not amember or amember["state"] != ACCEPTED:
             astate = (amember or {}).get("state", "non-member")
             raise ValueError(
@@ -1847,7 +1917,13 @@ def history(
     """Return messages visible to requester. Must be an accepted member."""
     requester_session_id = _resolve_or_uuid(requester_session_id, chat_id=chat_id)
     room = load_room(chat_id)
-    member = room["members"].get(requester_session_id)
+    # path-3 drift-healing: resolve a reattached session's sid to its member key.
+    # Fail-closed on None — superseded/unregistered sids are DENIED.
+    canonical_req, member = _slot_heal_member_key(room, requester_session_id)
+    if canonical_req is None:
+        member = None
+    else:
+        requester_session_id = canonical_req
     if not member or member["state"] != ACCEPTED:
         raise ValueError(
             f"Session {requester_session_id!r} is not an accepted member of {chat_id!r}; "
