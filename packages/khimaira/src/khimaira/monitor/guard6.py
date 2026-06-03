@@ -38,6 +38,11 @@ log = logging.getLogger(__name__)
 _T_DARK_S = float(os.environ.get("KHIMAIRA_DARK_THRESHOLD_S", str(45 * 60)))  # 45 min
 _WATCH_INTERVAL_S = float(os.environ.get("KHIMAIRA_GUARD6_WATCH_S", "300"))  # 5 min sweep
 _BOOTSTRAP_GRACE_S = float(os.environ.get("KHIMAIRA_GUARD6_BOOTSTRAP_S", str(5 * 60)))  # 5 min
+# Disk-WIP threshold for TRAP-3 alive-but-deaf guard: how recently a task-target
+# file must have been modified to count as "actively working but SSE-deaf."
+# Same recoverable-default as #7: errs long (false-no-escalation is recoverable;
+# false-escalation of a working session is disruptive).
+_GUARD6_WIP_THRESHOLD_S = float(os.environ.get("KHIMAIRA_GUARD6_WIP_S", "900"))  # 15 min
 
 # Scoping gate: only include members of chats that have had activity within this window.
 # Prevents cross-project leakage: 16-day-old test sessions, jeevy_portal jp-* sessions,
@@ -304,6 +309,35 @@ async def _guard6_check_once() -> None:
                 log.info("guard6: session %s now reachable — debounce re-armed", sid[:8])
                 _GUARD6_DARK.pop(sid, None)
             continue
+
+        # Disk-WIP guard (TRAP-3 — roster-identity Phase-B Part D).
+        # An alive-but-SSE-deaf session has stale last_active but IS editing:
+        # the #7 disk-WIP probe reads owed-task target-file mtimes directly
+        # (hook-independent, per-session-precise via owed-task-target-files —
+        # never a shared-cwd workspace scan). SHARED fn: reap + wake use ONE
+        # attribution fn (_session_has_recent_wip, 740bc1d).
+        # Recoverable-default: err toward NOT escalating (false-no-escalation
+        # self-heals next cycle; false-escalation of a working session is disruptive).
+        try:
+            from pathlib import Path
+            from khimaira.monitor.roster_recovery import (
+                _get_session_active_task_body,
+                _session_has_recent_wip,
+            )
+
+            task_body = _get_session_active_task_body(sid)
+            has_wip = _session_has_recent_wip(
+                sid, task_body, Path.cwd(), _GUARD6_WIP_THRESHOLD_S
+            )
+            if has_wip:
+                log.debug(
+                    "guard6: session %s has recent disk-WIP — alive-but-deaf, skip dark escalation",
+                    sid[:8],
+                )
+                _GUARD6_DARK.pop(sid, None)  # re-arm if previously flagged
+                continue
+        except Exception:
+            pass  # fail-open: probe failure → proceed with escalation (conservative)
 
         # Dark session detected — debounce: one alert per session
         if sid in _GUARD6_DARK:
