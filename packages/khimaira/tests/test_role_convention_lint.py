@@ -833,3 +833,68 @@ def test_khimaira_gaps_command_exists():
     assert "khimaira gap" in content, (
         "khimaira-gaps.md must reference the '🐞 KHIMAIRA GAP' tag filter."
     )
+
+
+# ---------------------------------------------------------------------------
+# Accountability model P1 (task-a7aeeed16aeb)
+# ---------------------------------------------------------------------------
+
+
+def test_master_md_contains_lead_domain_gate_section():
+    """Regression guard: master.md must have the lead-domain gate + Track-A/B convention."""
+    content = (ROLE_DIR / "master.md").read_text().lower()
+    assert "lead-domain gate" in content or "lead domain gate" in content, (
+        "master.md missing 'Lead-domain gate' accountability section."
+    )
+    assert "track-a" in content, "master.md missing Track-A routing."
+    assert "track-b" in content, "master.md missing Track-B advisory roles."
+
+
+def test_master_md_lead_gate_frames_convention_not_enforcement():
+    """P1 prose MUST NOT claim P2 enforcement that doesn't exist yet.
+
+    A role-doc that reads as enforced over-claims an unbuilt gate → master trusts
+    protection that isn't there (diffusion hidden behind 'the doc says it's handled').
+    The convention-marker 'until then it is convention' (or equivalent) must be present.
+    """
+    content = (ROLE_DIR / "master.md").read_text()
+    lowered = content.lower()
+    assert "until then it is convention" in lowered or "p2 enforcement pending" in lowered, (
+        "master.md lead-gate section missing the convention-marker "
+        "'until then it is convention' / 'P2 enforcement pending'. "
+        "P1 ships convention only; the prose must not claim enforced behavior."
+    )
+    # S1 audited override must be present
+    assert "audited" in lowered and ("override" in lowered or "waive" in lowered), (
+        "master.md missing S1 audited-override / audited-waive clause."
+    )
+    # Default-on language must be present
+    assert "default" in lowered and "on" in lowered, (
+        "master.md missing 'default-on' lead-gate language."
+    )
+
+
+def test_agent_md_contains_domain_routing_section():
+    """Regression guard: agent.md must have the lead-gate domain routing convention."""
+    content = (ROLE_DIR / "agent.md").read_text().lower()
+    assert "domain-done" in content or "domain done" in content, (
+        "agent.md missing domain-done routing section (lead before master)."
+    )
+    assert "lead" in content and ("correctness" in content or "domain" in content), (
+        "agent.md missing lead-domain-correctness routing guidance."
+    )
+
+
+def test_lead_role_docs_contain_accountability_section():
+    """Regression guard: lead role-docs must have domain accountability + author≠implementer."""
+    for lead_doc in ("backend-lead.md", "data-lead.md"):
+        content = (ROLE_DIR / lead_doc).read_text().lower()
+        assert "domain accountability" in content or "p1 convention" in content, (
+            f"{lead_doc} missing 'Domain accountability' section."
+        )
+        assert "author" in content and ("implementer" in content or "implement" in content), (
+            f"{lead_doc} missing S3 author≠implementer clause."
+        )
+        assert "until then it is convention" in content or "p2 enforcement pending" in content, (
+            f"{lead_doc} missing P1 convention-marker (not enforced until P2)."
+        )

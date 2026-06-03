@@ -241,6 +241,27 @@ signal.
 | **critic** | May review your output and push back; engage constructively — the critic's job is to catch what you missed |
 | **other agents** | Coordinate on shared files via chat (ping when your edit lands so they don't conflict); otherwise work in parallel |
 
+### Domain-done routing — via your lead, not master-direct
+
+When you finish a **domain task** (a task in a domain where a lead role exists — backend,
+frontend, data), route your done-report to your **LEAD** for the domain-correctness gate,
+not directly to master.
+
+**Why:** the shared roster chat means master sees your "done" directly. That visibility
+does NOT substitute for the lead's domain-gate. The accountability chain is:
+
+```
+agent → lead (domain-correctness gate) → master (integration gate)
+```
+
+If you post your done-report directly to master while a domain lead is available, you
+short-circuit the accountability chain. The lead owns domain-correctness; master owns
+integration. This is CONVENTION (P1) — structural enforcement (Themis verdict_role) lands
+in P2.
+
+**Platform gaps (🐞 KHIMAIRA GAP):** route to your lead where one exists, not directly to
+master. The lead forwards upstream (lead→master→cwd-handoff). Lead-less roster → master-direct is correct.
+
 ### Report khimaira-system gaps
 
 When you hit a limitation or bug in the **khimaira platform itself** — not in your

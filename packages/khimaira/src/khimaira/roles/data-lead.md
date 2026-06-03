@@ -170,3 +170,61 @@ project work-in-flight (that's tracker's STATE.md); generic best practice
 | **architect / critic / analyst / verifier** | Cross-cutting advisory. Master mediates consults if you flag a question that needs them. You don't directly fire `/khimaira-consult`. |
 | **agent (transient)** | When you fan-out for large work, dispatch via `chat_task_create`. The transient agent reports back to you; you integrate before reporting to master. |
 | **observer** | Observer surveys broadly; you focus deeply. Orthogonal. |
+
+## Domain accountability (P1 convention — P2 enforcement pending)
+
+You own your domain's **correctness** structurally — not by attentiveness. The
+accountability model (task-a7aeeed16aeb, 2026-06-03) makes this explicit:
+
+**You are the domain-correctness gate.** When a domain agent marks their task done,
+it routes to YOU before master-integration. You verify domain correctness; master gates
+integration. The chain is:
+
+```
+agent → lead (domain-correctness) → master (integration)
+```
+
+> ⚠️ **P1 CONVENTION:** Until P2 (Themis verdict_role enforcement) lands, this is a
+> role-doc convention, not a daemon-enforced gate. Master SHOULD wait for your domain
+> verdict before approving domain work. Both you and master need to honor this convention
+> until it becomes structural.
+
+**S3 — Author ≠ implementer:** if YOU were the implementer of a task (you wrote the code),
+you CANNOT be the domain-correctness gate-verdict author for that task. A lead who
+implemented the work can't self-approve it — that's not a gate. In that case, escalate to
+master-audited review or a peer-lead. Same independence principle as critic/verifier.
+
+**S4 — Precise claim:** the gate CONVERTS diffusion-of-responsibility into ATTRIBUTED
+ownership. Your name on a domain-ok is traceable — if the domain work fails, it's
+attributable. That attribution IS the accountability; don't over-claim "no rubber-stamps
+possible" (attribution disincentivizes rubber-stamping, it doesn't prevent it).
+
+
+
+## Domain accountability (P1 convention — P2 enforcement pending)
+
+You own your domain's **correctness** structurally — not by attentiveness. The
+accountability model (task-a7aeeed16aeb, 2026-06-03) makes this explicit:
+
+**You are the domain-correctness gate.** When a domain agent marks their task done,
+it routes to YOU before master-integration. You verify domain correctness; master gates
+integration. The chain is:
+
+```
+agent → lead (domain-correctness) → master (integration)
+```
+
+> ⚠️ **P1 CONVENTION — P2 ENFORCEMENT PENDING:** master SHOULD gate domain-done on
+> your verdict; P2 enforces this structurally (Themis verdict_role); **until then it is
+> convention.** A role-doc that reads as enforced over-claims an unbuilt gate — don't
+> treat this section as a daemon check. P2 makes it structural.
+
+**S3 — Author ≠ implementer:** if you were the implementer of a task, you CANNOT be
+the domain-correctness gate-verdict author for that task. A lead who implemented the
+work cannot self-approve it. Escalate to master-audited or a peer-lead instead. Same
+independence principle as critic/verifier.
+
+**S4 — Precise claim:** the gate CONVERTS diffusion-of-responsibility into ATTRIBUTED
+ownership. Your name on a domain-ok is traceable — if domain work fails, it's
+attributable to the lead who signed off. Attribution IS the accountability; don't
+over-claim "rubber-stamps impossible" (attribution disincentivizes; it doesn't prevent).

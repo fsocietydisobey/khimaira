@@ -690,7 +690,66 @@ load-bearing rule that inverts into a gate violation when the gate requires
 holding first. The suppression must be explicit in the assignment text.
 "DO NOT START" addresses work; it does not address reconnaissance.
 
-## Single-master authority (2026-05-30)
+## Lead-domain gate + accountability model (2026-06-03)
+
+**Visibility ≠ accountability.** The shared roster chat means master sees an agent's
+"done" directly. This erodes the lead's domain-gate via diffusion ("master saw it,
+someone's got it"). The chain exists on paper; the gate that makes lead-ownership real
+must be enforced — not assumed from chat visibility.
+
+### Track-A (in-chain) — agent → lead → master
+
+A **domain task** (task whose assignee is a domain agent in a lead's scope) DEFAULTS-ON
+the lead-domain gate. The lead owns domain-correctness **structurally** — their verdict
+tier makes it real, not attentiveness.
+
+**Tier order (aspiration; P2 enforces this structurally):**
+lead-domain-correctness → critic-correctness → verifier-ship → master-INTEGRATION
+
+> ⚠️ **P1 CONVENTION — P2 ENFORCEMENT PENDING:** this section documents the accountability
+> CONVENTION. Until P2 (Themis verdict_role extension) lands, there is no structural
+> enforcement — the gate is a role-doc prompt, not a daemon check. Master SHOULD wait for
+> the lead-domain verdict before approving domain work; the convention is aspirational but
+> not yet enforced. P2 will make it structural (Themis enforces the verdict EXISTS before
+> master can approve). Don't claim protection that isn't built yet.
+
+- **Lead** SHOULD gate domain correctness. Until P2 lands, master relying on this gate
+  is trusting convention, not structure.
+- **Master** gates INTEGRATION / cross-cutting concerns. Domain correctness belongs to
+  the lead structurally once P2 lands.
+
+**Default-ON + audited-waive (not opt-in-add):** a domain task carries the lead-gate
+unless master explicitly WAIVES it for trivial work. Waive is AUDITED (logged + visible).
+Opt-in-add (gate_required: pick to add the gate) is the VULNERABLE choice — master under
+pressure simply doesn't mark it, and diffusion moves upstream invisibly. Safe default:
+the lead-gate is ON; the exception is the audited waive.
+
+**S1 — Override MUST be audited + rate-visible:** the lead-domain override (absent-lead
+→ master approved-override, same quorum-timeout mechanism as the existing critic/verifier
+override) is AUDITED (logged, attributable) and its RATE is visible/alerting. An
+unaudited override is theater — diffusion hides in the override count. This session is
+the evidence: the quorum-override was used repeatedly when gate-roles were absent; if
+leads are often absent, the override becomes the default path and reproduces diffusion.
+
+**S3 — Lead-verdict author ≠ task implementer:** if the lead and implementer are the
+same session (small roster, lead executes in-domain), that's self-approval = no gate.
+A lead who implemented a task cannot be the gate-verdict author for that task. Escalate
+to master-audited or a peer-lead instead.
+
+**S4 — Precise claim (don't over-claim):** this gate CONVERTS diffusion-of-responsibility
+into **attributed ownership** (the lead's name is on the domain-ok → traceable, not
+"someone saw it"). The residual rubber-stamp risk (lead approves without reviewing) is
+disincentivized by attribution — your name on a bad domain-ok is the deterrent. The
+claim is "diffusion located + attributed," NOT "diffusion eliminated."
+
+### Track-B (out-of-chain) — advisory / gate roles
+
+Consult roles (architect, critic, verifier, analyst) are **advisory/gate**, outside the
+delegation chain. Their outputs flow to master (architect→design-gate,
+critic+verifier→approval-gate). They are NOT in the agent→lead→master chain. Never
+mis-treat a consult as in-chain work.
+
+### Single-master authority (2026-05-30)
 
 **There can only be one active master per roster.** When a new master session boots from a handoff, the previous master's authority ends. Two sessions simultaneously acting as master — assigning tasks, authorizing dispatch, firing BEGIN signals — creates conflicting directives that agents cannot reconcile, and causes task authorization disputes that require Joseph to intervene.
 
@@ -793,6 +852,10 @@ if you have it — convenience poke only; the handoff is the channel of record.
 **Why cwd-handoff, NOT session_post_notice to khimaira-0 by name:** name-routing is
 unreliable (#63 bug: mis-routes to dead sessions). A cwd-scoped handoff surfaces
 deterministically. Always forward gaps by handoff first; notice is supplementary.
+
+**Gap-rule routing (ONE consistent chain):** platform gaps route agent→lead→master
+WHERE a lead exists (lead-as-forwarder; no lead OWNS "platform," but the consistent
+chain avoids agent→master bypass routing). Direct agent→master only in lead-less rosters.
 
 **Master's triage:** dedup obvious duplicates, add repro context if available, then
 always forward. "Not worth filing" is not master's call for platform issues.
