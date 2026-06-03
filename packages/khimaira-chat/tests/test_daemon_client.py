@@ -253,3 +253,66 @@ async def test_httpx_read_timeout_fires_on_silent_server():
     finally:
         server.close()
         await server.wait_closed()
+
+
+# ---------------------------------------------------------------------------
+# invite(role=) and grant_role() (task-b7ddcbf080da)
+# ---------------------------------------------------------------------------
+
+
+def test_invite_without_role_omits_role_field(monkeypatch):
+    """invite() without role= sends only by_session_id + invitee_session_id."""
+    sent = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"kind": "member", "state": "pending"})
+
+    _patch_request(monkeypatch, handler)
+    daemon_client.invite("chat-abc", "alice", "bob")
+    assert "role" not in sent["body"]
+    assert sent["body"]["by_session_id"] == "alice"
+    assert sent["body"]["invitee_session_id"] == "bob"
+
+
+def test_invite_with_role_includes_role_field(monkeypatch):
+    """invite(role='agent') sends role in the request body."""
+    sent = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"kind": "member", "state": "pending"})
+
+    _patch_request(monkeypatch, handler)
+    daemon_client.invite("chat-abc", "alice", "bob", role="agent")
+    assert sent["body"]["role"] == "agent"
+
+
+def test_grant_role_sends_correct_payload(monkeypatch):
+    """grant_role() POSTs to /grant-role with the expected payload."""
+    sent = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["path"] = request.url.path
+        sent["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"member_roles": {"bob": "agent"}})
+
+    _patch_request(monkeypatch, handler)
+    result = daemon_client.grant_role("chat-abc", "alice", "bob", "agent")
+    assert sent["path"] == "/api/chats/chat-abc/grant-role"
+    assert sent["body"]["by_session_id"] == "alice"
+    assert sent["body"]["target_session_id"] == "bob"
+    assert sent["body"]["role"] == "agent"
+    assert sent["body"]["demote_to"] == "agent"
+    assert result == {"member_roles": {"bob": "agent"}}
+
+
+def test_grant_role_daemon_error_propagates(monkeypatch):
+    """403 from daemon (non-master caller) raises DaemonError."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"detail": "only the master can grant roles"})
+
+    _patch_request(monkeypatch, handler)
+    with pytest.raises(daemon_client.DaemonError, match="403"):
+        daemon_client.grant_role("chat-abc", "bob", "carol", "agent")

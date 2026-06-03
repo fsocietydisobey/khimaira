@@ -782,6 +782,15 @@ def invite(
     # (Checked after caller-membership so that error is surfaced first.)
     _assert_session_registered(invitee_session_id)
 
+    # Privileged role-assignment authority: master or *-lead roles may only be
+    # assigned by the current master — accepted-member-can-invite ≠ can-assign-any-role.
+    if role is not None and (role == ROLE_MASTER or role.endswith("-lead")):
+        if not _is_master(room, by_session_id):
+            raise ValueError(
+                f"Assigning privileged role {role!r} via invite requires master authority; "
+                f"session {by_session_id!r} is not the master of {chat_id!r}."
+            )
+
     # #3 ATOMIC ROLE-BINDING: if a role is provided, write it to member_roles now
     # so the invitee is never role-unbound. member_roles is authoritative for Themis.
     if role is not None:

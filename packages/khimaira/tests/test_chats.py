@@ -3246,3 +3246,77 @@ def test_invite_with_role_binds_atomically(isolated_chats):
     room2 = c.load_room(chat_id)
     member_roles = room2["meta"].get("member_roles") or {}
     assert member_roles.get("bob-uuid") == c.ROLE_ANALYST
+
+
+# ---------------------------------------------------------------------------
+# Privileged role-assignment authority on invite (task-b7ddcbf080da)
+# ---------------------------------------------------------------------------
+
+
+def test_invite_with_privileged_role_requires_master(isolated_chats):
+    """Non-master accepted member cannot invite with master or *-lead role."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("alice", "bob", "dave"):
+        _make_session(sessions_mod, sid, sid)
+    room = c.create_room("alice", ["bob"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob")
+
+    # bob is not master; inviting dave (fresh session) with master role must fail
+    with pytest.raises(ValueError, match="privileged role"):
+        c.invite(chat_id, "bob", "dave", role=c.ROLE_MASTER)
+
+
+def test_invite_with_lead_role_requires_master(isolated_chats):
+    """Non-master cannot invite with a *-lead role (e.g. backend-lead)."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("alice", "bob", "dave", "eve"):
+        _make_session(sessions_mod, sid, sid)
+    room = c.create_room("alice", ["bob"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob")
+
+    with pytest.raises(ValueError, match="privileged role"):
+        c.invite(chat_id, "bob", "dave", role="backend-lead")
+
+    with pytest.raises(ValueError, match="privileged role"):
+        c.invite(chat_id, "bob", "eve", role="jp-frontend-lead")
+
+
+def test_invite_with_nonprivileged_role_by_nonmaster_ok(isolated_chats):
+    """Any accepted member may invite with a non-privileged role (agent, observer, etc.)."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("alice", "bob", "carol"):
+        _make_session(sessions_mod, sid, sid)
+    room = c.create_room("alice", ["bob"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob")
+
+    # bob (non-master) invites carol with agent role — must succeed
+    c.invite(chat_id, "bob", "carol", role=c.ROLE_AGENT)
+    room2 = c.load_room(chat_id)
+    member_roles = room2["meta"].get("member_roles") or {}
+    assert member_roles.get("carol") == c.ROLE_AGENT
+
+
+def test_master_can_invite_with_privileged_role(isolated_chats):
+    """Master may invite with master or *-lead role."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("alice", "bob"):
+        _make_session(sessions_mod, sid, sid)
+    room = c.create_room("alice", [])
+    chat_id = room["meta"]["chat_id"]
+
+    # alice is master; inviting bob with backend-lead must succeed
+    c.invite(chat_id, "alice", "bob", role="backend-lead")
+    room2 = c.load_room(chat_id)
+    member_roles = room2["meta"].get("member_roles") or {}
+    assert member_roles.get("bob") == "backend-lead"

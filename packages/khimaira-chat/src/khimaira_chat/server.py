@@ -419,15 +419,57 @@ def _build_server() -> Server:
             ),
             types.Tool(
                 name="chat_invite",
-                description="Invite another session into an existing chat. Caller must be an accepted member.",
+                description=(
+                    "Invite another session into an existing chat. Caller must be an accepted member. "
+                    "Pass `role` to atomically bind the invitee's role at invite-time (no separate "
+                    "chat_grant_role needed). Assigning master or *-lead roles requires the caller "
+                    "to be the chat master; non-privileged roles (agent, observer, etc.) may be "
+                    "assigned by any accepted member."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "session_id": {"type": "string"},
                         "chat_id": {"type": "string"},
                         "invitee": {"type": "string", "description": "Session id or name"},
+                        "role": {
+                            "type": "string",
+                            "description": (
+                                "Optional role to bind atomically at invite-time. "
+                                "Privileged roles (master, *-lead) require caller to be master."
+                            ),
+                        },
                     },
                     "required": ["session_id", "chat_id", "invitee"],
+                },
+            ),
+            types.Tool(
+                name="chat_grant_role",
+                description=(
+                    "Master-only: bind a role onto an existing accepted chat member. "
+                    "Use to fix role-less members added before atomic invite-role support, "
+                    "or to promote/demote mid-session. The caller must be the chat master — "
+                    "the daemon enforces this against the authenticated session identity."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "chat_id": {"type": "string"},
+                        "target_session_id": {
+                            "type": "string",
+                            "description": "Session id or name of the member to assign the role to",
+                        },
+                        "role": {"type": "string", "description": "Role to assign"},
+                        "demote_to": {
+                            "type": "string",
+                            "description": (
+                                "Role to assign the current master when promoting a new master "
+                                "(default: agent). Ignored for non-master role assignments."
+                            ),
+                        },
+                    },
+                    "required": ["session_id", "chat_id", "target_session_id", "role"],
                 },
             ),
             types.Tool(
@@ -902,7 +944,17 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
             member_roles=args.get("member_roles"),
         )
     if name == "chat_invite":
-        return daemon_client.invite(args["chat_id"], sid, args["invitee"])
+        return daemon_client.invite(
+            args["chat_id"], sid, args["invitee"], role=args.get("role")
+        )
+    if name == "chat_grant_role":
+        return daemon_client.grant_role(
+            args["chat_id"],
+            sid,  # authenticated caller — never a user-supplied by_session_id
+            args["target_session_id"],
+            args["role"],
+            demote_to=args.get("demote_to", "agent"),
+        )
     if name == "chat_accept":
         chat_id = args.get("chat_id")
         if not chat_id:

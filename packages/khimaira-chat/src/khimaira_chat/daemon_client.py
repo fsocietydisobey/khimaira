@@ -104,14 +104,49 @@ def invite(
     by_session_id: str,
     invitee_session_id: str,
     *,
+    role: str | None = None,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "by_session_id": by_session_id,
+        "invitee_session_id": invitee_session_id,
+    }
+    if role is not None:
+        payload["role"] = role
     resp = _request_with_retry(
         "POST",
         f"{base}/api/chats/{chat_id}/invite",
+        json=payload,
+        timeout=10.0,
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
+def grant_role(
+    chat_id: str,
+    by_session_id: str,
+    target_session_id: str,
+    role: str,
+    *,
+    demote_to: str = "agent",
+    base: str = DEFAULT_BASE,
+) -> dict[str, Any]:
+    """Master-only: bind a role onto an existing chat member.
+
+    `by_session_id` must be the authenticated caller's session id (the
+    daemon enforces _is_master against this). Do not expose as a
+    user-fillable param in MCP tools — always pass `sid` from the
+    server's authenticated context.
+    """
+    resp = _request_with_retry(
+        "POST",
+        f"{base}/api/chats/{chat_id}/grant-role",
         json={
             "by_session_id": by_session_id,
-            "invitee_session_id": invitee_session_id,
+            "target_session_id": target_session_id,
+            "role": role,
+            "demote_to": demote_to,
         },
         timeout=10.0,
     )
