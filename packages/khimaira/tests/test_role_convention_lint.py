@@ -855,10 +855,16 @@ def test_master_md_lead_gate_frames_convention_not_enforcement():
 
     A role-doc that reads as enforced over-claims an unbuilt gate → master trusts
     protection that isn't there (diffusion hidden behind 'the doc says it's handled').
-    The convention-marker 'until then it is convention' (or equivalent) must be present.
+
+    The positive half: the convention-marker must be present.
+    The negative half (analyst-required, section-SCOPED): no enforced-phrasing in
+    the lead-domain-gate section. Section-scoped to avoid false-positives on the
+    legitimately-enforced lead WRITE-gate elsewhere in master.md (e.g. 'never weaken').
     """
     content = (ROLE_DIR / "master.md").read_text()
     lowered = content.lower()
+
+    # ── Positive: convention-marker must be present ──
     assert "until then it is convention" in lowered or "p2 enforcement pending" in lowered, (
         "master.md lead-gate section missing the convention-marker "
         "'until then it is convention' / 'P2 enforcement pending'. "
@@ -872,6 +878,32 @@ def test_master_md_lead_gate_frames_convention_not_enforcement():
     assert "default" in lowered and "on" in lowered, (
         "master.md missing 'default-on' lead-gate language."
     )
+
+    # ── Negative: no present-tense-enforced phrasing in the lead-domain-gate SECTION ──
+    # Extract the section between '## Lead-domain gate' and the next '## '.
+    # Section-scoped to avoid false-positives on the legitimately-enforced
+    # lead write-gate elsewhere in master.md ('locked lead-gate — never weaken').
+    import re as _re
+
+    gate_section_match = _re.search(
+        r"## Lead-domain gate.*?(?=\n## |\Z)", content, _re.DOTALL | _re.IGNORECASE
+    )
+    if gate_section_match:
+        gate_section = gate_section_match.group(0).lower()
+        FORBIDDEN_ENFORCED_PHRASES = [
+            "master cannot approve",
+            "master can't approve",
+            "the gate blocks",
+            "enforced by lint",
+            "master must not approve",
+            "cannot be approved without",
+        ]
+        for phrase in FORBIDDEN_ENFORCED_PHRASES:
+            assert phrase not in gate_section, (
+                f"master.md lead-gate section contains enforced-phrasing '{phrase}'. "
+                "P1 ships CONVENTION only — no present-tense-enforced claims. "
+                "P2 (Themis verdict_role) will enforce this; until then it is convention."
+            )
 
 
 def test_agent_md_contains_domain_routing_section():
