@@ -1274,8 +1274,40 @@ class AssignBatchReq(BaseModel):
 def build_router():
     fastapi = require("fastapi")
     sse_starlette = require("sse_starlette.sse")
+    import logging
+
+    _log = logging.getLogger(__name__)
 
     router = fastapi.APIRouter()
+
+    # ---------------------------------------------------------------------------
+    # TM1 daemon-auth (Phase B.1 — warn+fallback; see SECURITY.md).
+    # B.1: reads X-Session-ID header (env-sourced from CLAUDE_CODE_SESSION_ID in
+    # honest MCP clients → correct-by-construction). Returns None when absent —
+    # callers use body authority-id as fallback + log a WARN. B.2 flip: change the
+    # None-return path to raise HTTPException(401).
+    # ---------------------------------------------------------------------------
+
+    async def require_actor(request: Request) -> "str | None":
+        """TM1 actor identity. B.1: header → use it; absent → None (fallback)."""
+        caller = (request.headers.get("x-session-id") or "").strip()
+        return caller if caller else None
+
+    def _actor_or_body(actor_header: "str | None", body_id: str, path: str) -> str:
+        """B.1: prefer header; fall back to body authority-id with WARN.
+        Warns → 0 is the B.2 flip-trigger (see SECURITY.md).
+        """
+        if actor_header is not None:
+            return actor_header
+        _log.warning(
+            "daemon-auth B.1: X-Session-ID absent on %s; "
+            "falling back to body authority-id=%s. "
+            "Restart session to send header (CLAUDE_CODE_SESSION_ID). "
+            "Warns→0 = safe to flip to B.2 hard-reject.",
+            path,
+            (body_id[:8] + "...") if len(body_id) > 8 else body_id,
+        )
+        return body_id
 
     # Lazy import: themis role cache invalidation. Fail-open — if themis router
     # is not loaded (test environments), chat writes proceed unaffected.
@@ -1475,11 +1507,16 @@ def build_router():
         return room
 
     @router.post("/chats/{chat_id}/invite")
-    async def invite_member(chat_id: str, req: InviteReq) -> dict:
+    async def invite_member(
+        chat_id: str,
+        req: InviteReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
+        actor = _actor_or_body(_actor, req.by_session_id, f"/chats/{chat_id}/invite")
         try:
             result = chats.invite(
                 chat_id,
-                req.by_session_id,
+                actor,
                 req.invitee_session_id,
                 role=req.role,
             )
@@ -1499,11 +1536,17 @@ def build_router():
 
     @router.delete("/chats/{chat_id}/members/{target_session_id}")
     async def remove_member(
-        chat_id: str, target_session_id: str, req: RemoveMemberReq
+        chat_id: str,
+        target_session_id: str,
+        req: RemoveMemberReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
     ) -> dict:
         """#2 remove-member: master evicts a member, discards their SSE subscriber."""
+        actor = _actor_or_body(
+            _actor, req.by_session_id, f"/chats/{chat_id}/members/{target_session_id}"
+        )
         try:
-            result = chats.remove_member(chat_id, req.by_session_id, target_session_id)
+            result = chats.remove_member(chat_id, actor, target_session_id)
             # Invalidate the removed session's Themis role cache.
             _inval(target_session_id)
             return result
@@ -1534,11 +1577,16 @@ def build_router():
             raise fastapi.HTTPException(404, str(exc)) from exc
 
     @router.post("/chats/{chat_id}/messages")
-    async def send_message(chat_id: str, req: SendReq) -> dict:
+    async def send_message(
+        chat_id: str,
+        req: SendReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
+        actor = _actor_or_body(_actor, req.sender_session_id, f"/chats/{chat_id}/messages")
         # Resolve: this send counts as a reply to any peer awaiting a response.
         if req.to:
             # Targeted send: resolve only named recipients.
-            await _resolve_expected_reply(req.sender_session_id, req.to)
+            await _resolve_expected_reply(actor, req.to)
         else:
             # Broadcast: resolve for ALL accepted chat members (critic/verifier
             # conventionally reply via broadcast, not DM).
@@ -1547,10 +1595,10 @@ def build_router():
                 member_ids = [
                     sid
                     for sid, m in room["members"].items()
-                    if m.get("state") == chats.ACCEPTED and sid != req.sender_session_id
+                    if m.get("state") == chats.ACCEPTED and sid != actor
                 ]
                 if member_ids:
-                    await _resolve_expected_reply(req.sender_session_id, member_ids)
+                    await _resolve_expected_reply(actor, member_ids)
             except Exception:
                 pass  # fail-open: don't block the send if room lookup fails
         deadline = time.monotonic() + _PENDING_WAIT_DEADLINE
@@ -1558,16 +1606,14 @@ def build_router():
             try:
                 result = chats.send_message(
                     chat_id,
-                    req.sender_session_id,
+                    actor,
                     req.body,
                     to=req.to,
                     private=req.private,
                 )
                 # Register only for targeted sends — broadcasts don't expect a reply.
                 if req.to:
-                    await _register_expected_reply(
-                        req.sender_session_id, req.to, chat_id
-                    )
+                    await _register_expected_reply(actor, req.to, chat_id)
                 return result
             except ValueError as exc:
                 msg = str(exc)
@@ -1584,11 +1630,16 @@ def build_router():
     # ---- Phase B: tasks ----
 
     @router.post("/chats/{chat_id}/tasks")
-    async def create_task(chat_id: str, req: CreateTaskReq) -> dict:
+    async def create_task(
+        chat_id: str,
+        req: CreateTaskReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
+        actor = _actor_or_body(_actor, req.sender_session_id, f"/chats/{chat_id}/tasks")
         try:
             return chats.create_task(
                 chat_id,
-                req.sender_session_id,
+                actor,
                 req.body,
                 assignee_session_id=req.assignee_session_id,
                 assignee_role=req.assignee_role,
@@ -1602,13 +1653,19 @@ def build_router():
 
     @router.post("/chats/{chat_id}/tasks/{task_id}/status")
     async def update_task_status(
-        chat_id: str, task_id: str, req: UpdateTaskStatusReq
+        chat_id: str,
+        task_id: str,
+        req: UpdateTaskStatusReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
     ) -> dict:
+        actor = _actor_or_body(
+            _actor, req.by_session_id, f"/chats/{chat_id}/tasks/{task_id}/status"
+        )
         try:
             result = chats.update_task_status(
                 chat_id,
                 task_id,
-                req.by_session_id,
+                actor,
                 req.new_status,
                 note=req.note,
                 private=req.private,
@@ -1626,14 +1683,17 @@ def build_router():
         # Guard-5 Part A: AUTO-create review-tasks when gate_required task → done.
         if req.new_status == chats.TASK_DONE:
             try:
-                _auto_create_review_tasks(chat_id, task_id, req.by_session_id)
+                _auto_create_review_tasks(chat_id, task_id, actor)
             except Exception:
                 pass  # fail-open: AUTO-create is best-effort
         return result
 
     @router.post("/chats/{chat_id}/tasks/{task_id}/override-verdict")
     async def master_override_verdict(
-        chat_id: str, task_id: str, req: MasterOverrideVerdictReq
+        chat_id: str,
+        task_id: str,
+        req: MasterOverrideVerdictReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
     ) -> dict:
         """Audited gate-close for master — quorum-timeout escape valve (Guard-5 Part A).
 
@@ -1641,10 +1701,15 @@ def build_router():
         permits this when the audited fields are present. Only master may call this.
         trigger ∈ {quorum_timeout, manual_deadlock}. reason must be non-empty.
         """
+        actor = _actor_or_body(
+            _actor,
+            req.by_session_id,
+            f"/chats/{chat_id}/tasks/{task_id}/override-verdict",
+        )
         try:
             return chats.master_override_verdict(
                 chat_id,
-                req.by_session_id,
+                actor,
                 task_id,
                 req.verdict,
                 req.reason,
@@ -1663,12 +1728,16 @@ def build_router():
 
     @router.post("/chats/{chat_id}/tasks/{task_id}/signal-start")
     async def signal_task_start(
-        chat_id: str, task_id: str, req: SignalTaskStartReq
+        chat_id: str,
+        task_id: str,
+        req: SignalTaskStartReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
     ) -> dict:
+        actor = _actor_or_body(
+            _actor, req.by_session_id, f"/chats/{chat_id}/tasks/{task_id}/signal-start"
+        )
         try:
-            return chats.signal_task_start(
-                chat_id, task_id, req.by_session_id, note=req.note
-            )
+            return chats.signal_task_start(chat_id, task_id, actor, note=req.note)
         except ValueError as exc:
             msg = str(exc)
             if "No task" in msg:
@@ -1682,13 +1751,17 @@ def build_router():
 
     @router.post("/chats/{chat_id}/tasks/{task_id}/verdict")
     async def record_gate_verdict(
-        chat_id: str, task_id: str, req: RecordGateVerdictReq
+        chat_id: str,
+        task_id: str,
+        req: RecordGateVerdictReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
     ) -> dict:
         """Write a structured gate-verdict (B3). critic: approve/changes; verifier: ship/hold."""
+        actor = _actor_or_body(
+            _actor, req.by_session_id, f"/chats/{chat_id}/tasks/{task_id}/verdict"
+        )
         try:
-            return chats.record_gate_verdict(
-                chat_id, req.by_session_id, task_id, req.verdict
-            )
+            return chats.record_gate_verdict(chat_id, actor, task_id, req.verdict)
         except ValueError as exc:
             msg = str(exc)
             code = 404 if "No task" in msg else 400 if "Invalid verdict" in msg else 403
@@ -1704,16 +1777,21 @@ def build_router():
     # ---- v1.9: assign-batch coordinator ----
 
     @router.post("/chats/{chat_id}/assign-batch")
-    async def assign_batch(chat_id: str, req: AssignBatchReq) -> dict:
+    async def assign_batch(
+        chat_id: str,
+        req: AssignBatchReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
         """v1.9 coordinator: fan-out assignments + collect acks + fire begin.
 
         Collapses the master's 3N+K+2 call loop into one daemon HTTP call.
         Long-running when wait_for_acks=True (up to timeout_s seconds).
         """
+        actor = _actor_or_body(_actor, req.from_session_id, f"/chats/{chat_id}/assign-batch")
         try:
             return await chats.assign_batch(
                 chat_id,
-                req.from_session_id,
+                actor,
                 [a.model_dump() for a in req.assignments],
                 timeout_s=req.timeout_s,
                 wait_for_acks=req.wait_for_acks,
@@ -1795,11 +1873,18 @@ def build_router():
             raise fastapi.HTTPException(404, str(exc)) from exc
 
     @router.post("/chats/{chat_id}/transfer-membership")
-    async def transfer_membership(chat_id: str, req: TransferMembershipReq) -> dict:
+    async def transfer_membership(
+        chat_id: str,
+        req: TransferMembershipReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
+        actor = _actor_or_body(
+            _actor, req.from_session_id, f"/chats/{chat_id}/transfer-membership"
+        )
         try:
             result = chats.transfer_membership(
                 chat_id,
-                req.from_session_id,
+                actor,
                 req.to_session_id,
                 as_deputize=req.as_deputize,
             )
@@ -1817,15 +1902,22 @@ def build_router():
             raise fastapi.HTTPException(code, msg) from exc
 
     @router.post("/chats/{chat_id}/resume-master")
-    async def resume_master(chat_id: str, req: ResumeMasterReq) -> dict:
+    async def resume_master(
+        chat_id: str,
+        req: ResumeMasterReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
         """Phase B v1.6: caller (original master per meta marker) reclaims
         master role from the vice that's currently holding it. Pairs with
         /khimaira-resume on the skill side. See chats.chat_resume_master for
         semantics + invariants."""
+        actor = _actor_or_body(
+            _actor, req.by_session_id, f"/chats/{chat_id}/resume-master"
+        )
         try:
             result = chats.chat_resume_master(
                 chat_id,
-                req.by_session_id,
+                actor,
                 demote_to=req.demote_to,
             )
             # by_session_id reclaims master; the former vice's session_id is
@@ -1852,14 +1944,19 @@ def build_router():
             raise fastapi.HTTPException(code, msg) from exc
 
     @router.post("/chats/{chat_id}/grant-role")
-    async def grant_role(chat_id: str, req: GrantRoleReq) -> dict:
+    async def grant_role(
+        chat_id: str,
+        req: GrantRoleReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
         """Phase B v2: master-only role grant. Calls chats.chat_grant_role and
         immediately invalidates the Themis role cache for the affected sessions
         so the new role is enforced on the next tool call (no TTL wait)."""
+        actor = _actor_or_body(_actor, req.by_session_id, f"/chats/{chat_id}/grant-role")
         try:
             result = chats.chat_grant_role(
                 chat_id,
-                req.by_session_id,
+                actor,
                 req.target_session_id,
                 req.role,
                 demote_to=req.demote_to,
@@ -1891,9 +1988,21 @@ def build_router():
             raise fastapi.HTTPException(code, msg) from exc
 
     @router.delete("/chats/{chat_id}")
-    async def delete_chat(chat_id: str, by_session_id: str) -> dict:
+    async def delete_chat(
+        chat_id: str,
+        # B.1: by_session_id kept as query-param fallback; removed at B.2.
+        by_session_id: "str | None" = None,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
+        actor = _actor_or_body(
+            _actor, by_session_id or "", f"/chats/{chat_id} (DELETE)"
+        )
+        if not actor:
+            raise fastapi.HTTPException(
+                401, "X-Session-ID header required (or by_session_id query param in B.1)"
+            )
         try:
-            return chats.delete(chat_id, by_session_id)
+            return chats.delete(chat_id, actor)
         except ValueError as exc:
             msg = str(exc)
             code = 403 if "creator" in msg else 404

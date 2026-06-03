@@ -19,6 +19,18 @@ import httpx
 
 DEFAULT_BASE = os.environ.get("KHIMAIRA_MONITOR_URL", "http://127.0.0.1:8740")
 
+# TM1 daemon-auth: send CLAUDE_CODE_SESSION_ID as X-Session-ID header so the
+# daemon can derive actor identity from an env-sourced value rather than a
+# caller-supplied body field. Matches themis/server.py's _caller_headers().
+_CALLER_SESSION_ID: str = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+
+
+def _caller_headers() -> dict[str, str]:
+    """Return X-Session-ID header when caller ID is known (set by Claude Code)."""
+    if _CALLER_SESSION_ID:
+        return {"X-Session-ID": _CALLER_SESSION_ID}
+    return {}
+
 # Brief retry on connection-refused absorbs a daemon restart (~1-3s
 # downtime). 4xx/5xx responses are NOT retried — they're real server
 # answers, not transport hiccups.
@@ -50,8 +62,19 @@ def _request_with_retry(method: str, url: str, **kwargs) -> httpx.Response:
     Absorbs a daemon restart without surfacing the failure to the agent.
     Last attempt's exception bubbles up unchanged so the caller still
     sees a real DaemonError if the daemon stays down.
+
+    TM1: all POST requests automatically include X-Session-ID from the
+    env-sourced CLAUDE_CODE_SESSION_ID so the daemon can derive actor
+    identity without trusting a caller-supplied body field.
     """
     import time
+
+    if method.upper() == "POST":
+        caller_headers = _caller_headers()
+        if caller_headers:
+            merged = dict(caller_headers)
+            merged.update(kwargs.get("headers") or {})
+            kwargs["headers"] = merged
 
     last_exc: Exception | None = None
     for attempt in range(_RETRY_ATTEMPTS):
