@@ -1325,3 +1325,185 @@ class TestRateLimitDetect:
         # The chat is full of "rate limit(ed)" discussion — the detector keys on
         # CC's literal API-error phrases, not the generic term.
         assert rr._detect_rate_limit(text) is False
+
+
+# ---------------------------------------------------------------------------
+# Disk-WIP probe — _session_has_recent_wip + wake-path integration
+# ---------------------------------------------------------------------------
+
+class TestResolveTaskTargetPaths:
+    """_resolve_task_target_paths extracts file paths from task bodies."""
+
+    def test_backtick_paths(self, tmp_path):
+        f = tmp_path / "roster_recovery.py"
+        f.write_text("x")
+        body = f"Fix the bug in `{f}`"
+        result = rr._resolve_task_target_paths(body, tmp_path)
+        assert f in result
+
+    def test_package_prefix_path(self, tmp_path):
+        pkg = tmp_path / "packages" / "foo"
+        pkg.mkdir(parents=True)
+        f = pkg / "bar.py"
+        f.write_text("x")
+        body = f"Edit packages/foo/bar.py to fix this"
+        result = rr._resolve_task_target_paths(body, tmp_path)
+        assert any(p.name == "bar.py" for p in result)
+
+    def test_nonexistent_paths_excluded(self, tmp_path):
+        body = "Edit `packages/nonexistent/file.py`"
+        result = rr._resolve_task_target_paths(body, tmp_path)
+        assert result == []
+
+    def test_empty_task_body(self, tmp_path):
+        assert rr._resolve_task_target_paths("", tmp_path) == []
+
+
+class TestSessionHasRecentWip:
+    """_session_has_recent_wip: per-session-precise disk-WIP detection."""
+
+    def test_recent_mtime_returns_true(self, tmp_path):
+        """Task target file modified recently → WIP detected."""
+        f = tmp_path / "target.py"
+        f.write_text("x")
+        # mtime is NOW (just created) → within 900s threshold
+        body = f"Implement fix in `{f}`"
+        assert rr._session_has_recent_wip("test-session", body, tmp_path, 900.0) is True
+
+    def test_stale_mtime_returns_false(self, tmp_path):
+        """Task target file NOT modified recently → no WIP."""
+        f = tmp_path / "old_target.py"
+        f.write_text("x")
+        import os
+        # Set mtime to 30 minutes ago
+        old_ts = time.time() - 1800
+        os.utime(f, (old_ts, old_ts))
+        body = f"Implement fix in `{f}`"
+        assert rr._session_has_recent_wip("test-session", body, tmp_path, 900.0) is False
+
+    def test_no_task_body_returns_false(self, tmp_path):
+        """No task body → can't attribute in shared-cwd → returns False."""
+        assert rr._session_has_recent_wip("test-session", None, tmp_path, 900.0) is False
+
+    def test_unresolvable_paths_returns_false(self, tmp_path):
+        """Task body mentions files that don't exist → returns False."""
+        body = "Edit `packages/nonexistent/ghost.py`"
+        assert rr._session_has_recent_wip("test-session", body, tmp_path, 900.0) is False
+
+    def test_stale_last_active_but_fresh_target_returns_true(self, tmp_path):
+        """Hook-independent: last_active stale but target file fresh → WIP detected.
+        This is the key false-dark case: SSE-deaf session whose hook can't bump
+        last_active, but whose task-target file was just edited."""
+        f = tmp_path / "task_target.py"
+        f.write_text("recent_edit")
+        # File is fresh (mtime=now) even though last_active would be stale
+        body = f"Implement the fix in `{f}`"
+        result = rr._session_has_recent_wip("deaf-session", body, tmp_path, 900.0)
+        assert result is True, "stale-last_active + fresh target file must be detected as WIP"
+
+
+class TestProcessWindowWakeDiskWIP:
+    """Wake path: disk-WIP probe gates wake correctly in _process_window."""
+
+    TASK_BODY = "Implement fix in `packages/khimaira/src/khimaira/monitor/chats.py`"
+
+    def _win(self):
+        return {"window_id": 300, "role": "agent", "raw_name": "agent-test"}
+
+    @pytest.fixture(autouse=True)
+    def clear_state(self):
+        rr._DEBOUNCE.pop((300, "wake"), None)
+        rr._DEBOUNCE.pop((300, "ratelimit"), None)
+        yield
+        rr._DEBOUNCE.pop((300, "wake"), None)
+        rr._DEBOUNCE.pop((300, "ratelimit"), None)
+
+    def _wake_ctx(self, has_wip=False, rate_limited=False, has_obligations=True):
+        """Context manager stack for wake-path tests."""
+        return (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_env_auto_hitl_enabled", return_value=False),
+            patch.object(rr, "_resolve_session_by_name", return_value="session-uuid"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_session_hitl_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value="agent idle\n"),
+            patch.object(rr, "_compute_context_pct", return_value=None),
+            patch("khimaira.monitor.api.chats._get_session_obligations",
+                  return_value=[{"type": "task"}] if has_obligations else []),
+            patch.object(rr, "_session_has_pending_task", return_value=False),
+            patch.object(rr, "_session_has_pending_invite", return_value=False),
+            patch.object(rr, "_session_has_recent_wip", return_value=has_wip),
+            patch.object(rr, "_get_session_active_task_body",
+                         return_value=self.TASK_BODY if has_wip else None),
+        )
+
+    def _session_row(self, idle_s=600):
+        return {"session_id": "session-uuid", "last_active_age_s": idle_s}
+
+    @pytest.mark.asyncio
+    async def test_alive_but_working_not_woken(self):
+        """Session with recent disk-WIP is NOT woken — false-dark eliminated."""
+        import sys
+        from khimaira.monitor import sessions as sessions_mod
+        row = self._session_row(idle_s=600)
+
+        patches = self._wake_ctx(has_wip=True)
+        with (patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+              patches[6], patches[7], patches[8], patches[9], patches[10], patches[11],
+              patch.object(sessions_mod, "list_sessions", return_value=[row]),
+              patch.object(rr, "_inject_text_and_submit") as mock_inject):
+            await rr._process_window(self._win())
+
+        mock_inject.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_genuinely_idle_is_woken(self):
+        """Session with no disk-WIP AND no rate-limit → IS woken."""
+        from khimaira.monitor import sessions as sessions_mod
+        row = self._session_row(idle_s=600)
+
+        patches = self._wake_ctx(has_wip=False)
+        with (patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+              patches[6], patches[7], patches[8], patches[9], patches[10], patches[11],
+              patch.object(sessions_mod, "list_sessions", return_value=[row]),
+              patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject):
+            await rr._process_window(self._win())
+
+        mock_inject.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_not_woken(self):
+        """Rate-limited window is NOT woken (futile injection)."""
+        from khimaira.monitor import sessions as sessions_mod
+        row = self._session_row(idle_s=600)
+        # Set rate-limit debounce to recent
+        rr._DEBOUNCE[(300, "ratelimit")] = time.time()
+
+        patches = self._wake_ctx(has_wip=False)
+        with (patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+              patches[6], patches[7], patches[8], patches[9], patches[10], patches[11],
+              patch.object(sessions_mod, "list_sessions", return_value=[row]),
+              patch.object(rr, "_inject_text_and_submit") as mock_inject):
+            await rr._process_window(self._win())
+
+        mock_inject.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_shared_cwd_no_cross_attribution(self):
+        """Session A editing a file NOT in session B's owed-task → B is still woken.
+        Proves attribution is per-owed-task, not shared-cwd. This is the key test
+        for the shared-cwd false-attribution bug (analyst premise flag)."""
+        from khimaira.monitor import sessions as sessions_mod
+        row = self._session_row(idle_s=600)
+        # B has NO disk-WIP on its own task targets (has_wip=False for B's session)
+        # even though A may be editing in the same repo
+
+        patches = self._wake_ctx(has_wip=False)  # B's WIP check returns False
+        with (patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+              patches[6], patches[7], patches[8], patches[9], patches[10], patches[11],
+              patch.object(sessions_mod, "list_sessions", return_value=[row]),
+              patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject):
+            await rr._process_window(self._win())
+
+        # B must be woken — A's edits in the shared repo do NOT suppress B's wake
+        mock_inject.assert_called_once()

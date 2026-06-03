@@ -55,6 +55,10 @@ _IDLE_MIN_S = float(os.environ.get("KHIMAIRA_ROSTER_IDLE_MIN_S", "300"))  # 5 mi
 _WATCH_INTERVAL_S = float(os.environ.get("KHIMAIRA_ROSTER_WATCH_S", "60"))
 _COMPACT_COOLDOWN_S = 300.0  # 5 min between compact/wake attempts per window
 _RATE_LIMIT_COOLDOWN_S = 600.0  # 10 min between rate-limit escalations per window
+# Disk-WIP threshold: how recently a task-target file must have been modified to
+# count as ALIVE-BUT-WORKING. Errs long (recoverable-default): a false-no-wake
+# delay self-heals next cycle; a false-wake interrupting active work is the harm.
+_WIP_THRESHOLD_S = float(os.environ.get("KHIMAIRA_WIP_THRESHOLD_S", "900"))  # 15 min
 
 # Patterns that indicate the terminal is actively working (NOT idle).
 _BUSY_MARKERS = ("esc to interrupt", "compacting…", "compacting...", "compacting ")
@@ -976,6 +980,113 @@ def _handle_hitl_prompt(
 
 
 # ---------------------------------------------------------------------------
+# Disk-WIP probe — hook-independent ALIVE-BUT-WORKING detection
+# ---------------------------------------------------------------------------
+#
+# DESIGN CONSTRAINT (analyst + architect, 2026-06-03):
+# All khimaira agents share ~/dev/khimaira as cwd. A bare git-status or
+# workspace-scan cross-attributes — agent-A's edit shows in agent-B's WIP check.
+# The ONLY per-session-precise signal is the OWED-TASK target-file mtime:
+# files declared in THIS session's active chat-task → stat those mtimes.
+# No owed-task or no resolvable files → no per-session signal; caller falls
+# back to reachability + active-since-restart (never infer WIP from shared repo).
+
+# Extracts file paths from a task body. Three forms:
+#   1. Backtick-wrapped: `packages/foo/bar.py`
+#   2. Bare package path: packages/foo/bar.py (after whitespace)
+#   3. "file:" / "path:" prefix: file: packages/foo/bar.py
+_TASK_FILE_PATH_RE = re.compile(
+    r"`([^`\n]+\.[a-zA-Z]{1,6})`"
+    r"|(?:^|\s)((?:packages?|src|apps?|tests?)/\S+\.[a-zA-Z]{1,6})"
+    r"|(?:file|path)\s*[:=]\s*(\S+\.[a-zA-Z]{1,6})",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _resolve_task_target_paths(task_body: str, project_root: Path) -> list[Path]:
+    """Extract candidate file paths from a task body and resolve to existing files.
+
+    Tries each extracted path as (a) absolute and (b) relative to project_root.
+    Returns only paths that exist on disk — these are the OWED-TASK target files.
+    """
+    found: list[Path] = []
+    seen: set[str] = set()
+    for m in _TASK_FILE_PATH_RE.finditer(task_body):
+        raw = next(g for g in m.groups() if g)
+        raw = raw.strip()  # whitespace only — preserve leading / for absolute paths
+        if not raw or raw in seen or len(raw) < 4:
+            continue
+        seen.add(raw)
+        for candidate in (Path(raw), project_root / raw):
+            try:
+                if candidate.is_file():
+                    found.append(candidate)
+                    break
+            except OSError:
+                continue
+    return found
+
+
+def _session_has_recent_wip(
+    session_id: str,
+    task_body: str | None,
+    project_root: Path,
+    threshold_s: float,
+) -> bool:
+    """Return True if disk evidence shows the session is actively editing.
+
+    Checks two signals — both scoped to THIS session's owed-task target files
+    (never the full shared repo):
+    (a) stat mtime — catches any recent write to the target file(s).
+    (b) git diff HEAD -- <target files> — catches staged/unstaged WIP on those files.
+
+    No owed-task → returns False (no per-session signal in a shared-cwd roster).
+    """
+    if not task_body:
+        return False
+
+    target_files = _resolve_task_target_paths(task_body, project_root)
+    if not target_files:
+        _log.debug(
+            "roster-recovery: disk-WIP session=%s — no resolvable target files in task body",
+            session_id[:8],
+        )
+        return False
+
+    cutoff = time.time() - threshold_s
+
+    # (a) stat mtime — hook-independent, catches any write
+    for p in target_files:
+        try:
+            if p.stat().st_mtime > cutoff:
+                _log.debug(
+                    "roster-recovery: disk-WIP session=%s file=%s modified %.0fs ago",
+                    session_id[:8], p.name, time.time() - p.stat().st_mtime,
+                )
+                return True
+        except OSError:
+            continue
+
+    # (b) git diff INTERSECTED with target files — catches staged/unstaged WIP on
+    # these specific files without touching the full repo diff (no cross-attribution).
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--"] + [str(p) for p in target_files],
+            capture_output=True, text=True, timeout=5.0, cwd=str(project_root),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            _log.debug(
+                "roster-recovery: disk-WIP session=%s git-diff shows WIP on target files",
+                session_id[:8],
+            )
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Per-window decision logic
 # ---------------------------------------------------------------------------
 
@@ -1268,6 +1379,39 @@ async def _process_window(win: dict[str, Any]) -> None:
         idle_s = float(row.get("last_active_age_s") or 0)
         if idle_s < _IDLE_MIN_S:
             return  # not idle long enough
+
+        # Disk-WIP probe — ALIVE-BUT-WORKING guard (hook-independent).
+        # Checks owed-task target-file mtimes + git-diff intersection; does NOT
+        # use bare git-status / workspace-scan (cross-attributes in shared-cwd roster).
+        task_body_for_wip = await asyncio.get_running_loop().run_in_executor(
+            None, _get_session_active_task_body, session_id
+        )
+        has_wip = await asyncio.get_running_loop().run_in_executor(
+            None,
+            _session_has_recent_wip,
+            session_id,
+            task_body_for_wip,
+            Path.cwd(),
+            _WIP_THRESHOLD_S,
+        )
+        if has_wip:
+            # Session is editing-but-SSE-deaf: last_active is stale but task-target
+            # files are fresh. Do NOT inject a wake — it would interrupt live work.
+            _log.info(
+                "roster-recovery: skip wake window=%d role=%s session=%s "
+                "(idle=%.0fs but disk-WIP on task targets — ALIVE-BUT-WORKING)",
+                window_id, role, session_id[:8], idle_s,
+            )
+            return
+
+        # Rate-limited: if rate-limit escalation fired recently for this window,
+        # the session can't act on a wake injection — skip to avoid a futile attempt.
+        if time.time() - _DEBOUNCE.get((window_id, "ratelimit"), 0.0) < _RATE_LIMIT_COOLDOWN_S:
+            _log.debug(
+                "roster-recovery: skip wake window=%d role=%s — rate-limited recently",
+                window_id, role,
+            )
+            return
 
         action_key = (window_id, "wake")
         last_attempt = _DEBOUNCE.get(action_key, 0.0)
