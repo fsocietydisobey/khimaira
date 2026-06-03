@@ -1383,6 +1383,13 @@ async def _process_window(win: dict[str, Any]) -> None:
         # Disk-WIP probe — ALIVE-BUT-WORKING guard (hook-independent).
         # Checks owed-task target-file mtimes + git-diff intersection; does NOT
         # use bare git-status / workspace-scan (cross-attributes in shared-cwd roster).
+        #
+        # Path.cwd() is correct for THIS khimaira roster (all seats share ~/dev/khimaira).
+        # CROSS-PROJECT follow-up: project_root is a per-session attribute; for a jp seat
+        # in a different repo it should be resolved from the session's recorded cwd
+        # (sessions.get_workspace), not the daemon's cwd — else relative task-target paths
+        # resolve against the wrong repo → probe returns False → false-wake.
+        # (architect msg-fa3ba046b93a, analyst criterion-4 — 2026-06-03)
         task_body_for_wip = await asyncio.get_running_loop().run_in_executor(
             None, _get_session_active_task_body, session_id
         )
