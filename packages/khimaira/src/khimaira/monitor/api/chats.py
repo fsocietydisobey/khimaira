@@ -144,6 +144,8 @@ async def _send_diagnostic_probe(
     Returns True on success; False on error (fail-open — caller proceeds
     to presumed-dead path on next tick regardless).
     """
+    if os.environ.get("KHIMAIRA_QUIET") == "1":
+        return False  # quiet mode — suppress diagnostic liveness pings
     body = (
         f"🩺 ping from diagnostic — `{from_id}` has been waiting since "
         f"T+{elapsed_s:.0f}s. Please broadcast any message to confirm you're alive."

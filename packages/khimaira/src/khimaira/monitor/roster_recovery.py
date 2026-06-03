@@ -1036,6 +1036,8 @@ def _get_screen_scrollback(window_id: int, tail_lines: int = 220) -> str | None:
 
 def _escalate_rate_limit(window_id: int, session_id: str, role: str) -> None:
     """Notify master that a roster session is rate-limited + stalled mid-turn."""
+    if os.environ.get("KHIMAIRA_QUIET") == "1":
+        return  # quiet mode — suppress rate-limit notices (detection still runs)
     try:
         from khimaira.monitor import sessions as sess_mod
         master_id = _find_master_session_for_hitl()
