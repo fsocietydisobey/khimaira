@@ -3330,6 +3330,28 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
     arrive. Yielding stops only when the caller cancels.
     """
     session_id = _resolve_or_uuid(session_id)
+
+    # SSE inert-denial: if this sid is revoked (superseded beyond last-1 bound),
+    # no-op the subscribe — the session must not hold a queue and receive deliveries.
+    # Mirrors polled paths 10/11 inert-denial (revoked_sids check in sessions.py).
+    # Uses revoked_sids explicitly to distinguish "revoked" from "un-slotted":
+    # un-slotted sessions (not in registry) must still subscribe normally.
+    try:
+        from khimaira.monitor.sessions import _read_slot_registry as _rsr
+        _rr = _rsr()
+        _is_revoked_sse = any(
+            session_id in entry.get("revoked_sids", []) for entry in _rr.values()
+        )
+    except Exception:
+        _is_revoked_sse = False
+    if _is_revoked_sse:
+        log.info(
+            "chats: SSE subscribe no-op for revoked session %s — "
+            "beyond last-1 bound, must not hold a subscriber queue (inert-denial)",
+            session_id[:8],
+        )
+        return  # ends the async generator immediately; no queue added
+
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     # Phase-B Part F: key by slot when stamped so delivery follows the identity.
     _sub_key = _slot_subscriber_key(session_id)

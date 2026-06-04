@@ -3766,3 +3766,48 @@ class TestFamilyBDelivery:
         assert result.get("suppressed") == "target-inert", (
             f"post_notice to revoked S1 must be suppressed; got: {result}"
         )
+
+    def test_path9_sse_inert_denial_revoked_no_queue(self, isolated_chats, monkeypatch, tmp_path):
+        """PATH-9 SSE INERT-DENIAL: revoked-once-legitimate s1 must NOT get a subscriber queue.
+
+        After s1→s2→s3, s1 is revoked (beyond last-1 bound). A subscribe() call for s1
+        must be a NO-OP — no queue added to _subscribers under any key. Without this,
+        a revoked-but-not-yet-reaped subprocess would share the slot's SSE queue and
+        receive deliveries = leak-to-superseded-identity.
+
+        Uses the REAL superseded-once-legitimate s1 pattern (not trivially-never-bound).
+        This is the SSE-mirror of Part E's inert-denial for auth paths.
+        """
+        import asyncio
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+
+        for sid, name in [(self.S1, "s1"), (self.S2, "s2"), (self.S3, "s3")]:
+            _make_session(sessions_mod, sid, name)
+        sessions_mod.set_session_slot(self.S1, self.SLOT)   # S1 current
+        sessions_mod.set_session_slot(self.S2, self.SLOT)   # S2 current, S1 prior
+        sessions_mod.set_session_slot(self.S3, self.SLOT)   # S3 current, S2 prior, S1 REVOKED
+
+        # Run subscribe() for revoked S1 — must return immediately with no queue
+        async def _try_subscribe():
+            events = []
+            async for _ in c.subscribe(self.S1):
+                events.append(_)
+                break  # should not reach here
+            return events
+
+        asyncio.run(_try_subscribe())
+
+        # Revoked S1 must NOT appear in _subscribers under ANY key
+        assert self.S1 not in c._subscribers, (
+            "Revoked S1 must NOT be in _subscribers[S1] (inert-denial)"
+        )
+        slot_key = c._slot_subscriber_key(self.S1)
+        # The slot key for the revoked S1 might point to the slot string;
+        # there should be no queue for S1 under it either
+        s1_queues_in_slot = [
+            q for q in c._subscribers.get(slot_key, set())
+        ]
+        assert len(s1_queues_in_slot) == 0, (
+            f"Revoked S1 must NOT hold any queue in _subscribers['{slot_key}']"
+        )
