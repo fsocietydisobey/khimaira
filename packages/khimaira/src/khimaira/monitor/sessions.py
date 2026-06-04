@@ -3079,6 +3079,38 @@ def delete_session(session_id: str, force: bool = False) -> dict:
     if not session_dir.exists():
         return {"error": f"session not found: {resolved!r}", "session_id": resolved}
 
+    # ALIVE-GUARD (root fix for chat-orphaning): refuse to delete a session that is
+    # currently ACTIVE. delete_session marks the session LEFT in every chat, and
+    # 'left' cannot self-rejoin — so deleting a still-running session silently orphans
+    # it from the roster chat. This bites a roster cleanup that resolves a name to the
+    # LIVE same-named session via name-collision (resolve_session_id picks most-recent).
+    # An active session is never a valid deletion target. NOT overridable by `force`
+    # (which is decisions-only): active roster sessions carry decisions, so a force=True
+    # delete would otherwise bypass this. To delete a live session, stop it first.
+    import time as _time
+
+    # Env-tunable; read at call-time so test isolation / module reloads don't bake in a
+    # stale value (KHIMAIRA_ALIVE_DELETE_GUARD_S=0 disables it).
+    _alive_guard_s = float(os.environ.get("KHIMAIRA_ALIVE_DELETE_GUARD_S", "900"))
+    try:
+        _mtimes = [p.stat().st_mtime for p in session_dir.iterdir() if p.is_file()]
+        _last_age = (_time.time() - max(_mtimes)) if _mtimes else float("inf")
+    except OSError:
+        _last_age = float("inf")
+    if _last_age < _alive_guard_s:
+        return {
+            "error": (
+                f"refusing to delete ACTIVE session {resolved!r} (last active "
+                f"{_last_age:.0f}s ago). delete_session leaves all its chats "
+                f"(state='left', which cannot self-rejoin) — deleting a running session "
+                f"orphans it from the roster. If you meant an OLD same-named session, "
+                f"target its EXACT session-id; to delete this live one, stop it first."
+            ),
+            "session_id": resolved,
+            "active": True,
+            "last_active_age_s": round(_last_age),
+        }
+
     # Read decision count and name before touching anything
     decisions = _read_jsonl(session_dir / "decisions.jsonl")
     decision_count = len(decisions)

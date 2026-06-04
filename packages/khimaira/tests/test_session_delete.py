@@ -18,6 +18,34 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _disable_alive_delete_guard(monkeypatch):
+    """delete_session's alive-guard (root fix for chat-orphaning) refuses to delete a
+    recently-active session. These unit tests create-then-delete fresh sessions, which
+    the guard correctly treats as 'alive' — disable it here so they exercise the rest of
+    delete_session. test_delete_session_refuses_active re-enables it + verifies it works."""
+    monkeypatch.setenv("KHIMAIRA_ALIVE_DELETE_GUARD_S", "0")
+
+
+def test_delete_session_refuses_active(isolated_state, monkeypatch):
+    """Alive-guard: a currently-active session is refused (not deleted, not chat-left).
+
+    Root fix for the orphaning bug — deleting a live session (e.g. a roster cleanup
+    resolving a name to the LIVE same-named session) left it from its chats → state=left,
+    which cannot self-rejoin. force=True must NOT override (active roster sessions carry
+    decisions, so a force=True delete would otherwise bypass the guard)."""
+    monkeypatch.setenv("KHIMAIRA_ALIVE_DELETE_GUARD_S", "900")
+    sid = "active-session-guard"
+    isolated_state.set_status(sid, "orchestrating", "")
+    session_dir = isolated_state._session_dir(sid)
+
+    result = isolated_state.delete_session(sid, force=True)
+
+    assert "error" in result and result.get("active") is True
+    assert "ACTIVE" in result["error"]
+    assert session_dir.exists()  # untouched — not deleted, chats not left
+
+
 def test_delete_session_without_decisions(isolated_state):
     """Happy path: session with no decisions is deleted; files removed."""
     sid = "delete-test-1"
