@@ -13,6 +13,7 @@ instead of name matching.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -21,6 +22,34 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 _POSTGRES_SCHEMES = ("postgres", "postgresql", "postgresql+psycopg", "postgresql+asyncpg")
+
+_log = logging.getLogger(__name__)
+
+# The monitor daemon runs as a BARE host process. A checkpointer URL using
+# `host.docker.internal` (a Docker-internal alias, resolvable only inside a
+# container) is unreachable here — from the host that name means 127.0.0.1, the
+# same DB the in-container app writes to. Rewrite it so the monitor can read the
+# checkpointer. Without this, every thread/run query raises `failed to resolve
+# host` and the retry storm degrades the whole daemon (observed: 25k+ failures
+# loading the daemon into request timeouts).
+_DOCKER_HOST_ALIAS = "host.docker.internal"
+_MONITOR_HOST = "127.0.0.1"
+_rewritten_urls_logged: set[str] = set()
+
+
+def _normalize_monitor_host(url: str) -> str:
+    """Rewrite the Docker-internal host alias to localhost for the host-side monitor."""
+    if _DOCKER_HOST_ALIAS not in url:
+        return url
+    if url not in _rewritten_urls_logged:
+        _rewritten_urls_logged.add(url)
+        _log.info(
+            "connections: rewrote checkpointer host %s -> %s (monitor runs on the host, "
+            "not in Docker; the Docker-internal alias is unresolvable here)",
+            _DOCKER_HOST_ALIAS,
+            _MONITOR_HOST,
+        )
+    return url.replace(_DOCKER_HOST_ALIAS, _MONITOR_HOST)
 
 
 @dataclass(frozen=True)
@@ -145,6 +174,7 @@ def discover_postgres(project_path: Path) -> list[PostgresConnection]:
             if not env_path.is_file():
                 continue
             for var, url in _parse_env(env_path):
+                url = _normalize_monitor_host(url)
                 if not _looks_like_postgres(url):
                     continue
                 if url in seen:

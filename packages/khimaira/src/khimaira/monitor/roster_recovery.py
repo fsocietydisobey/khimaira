@@ -53,6 +53,10 @@ _log = logging.getLogger(__name__)
 _COMPACT_THRESHOLD = int(os.environ.get("KHIMAIRA_ROSTER_COMPACT_PCT", "85"))
 _IDLE_MIN_S = float(os.environ.get("KHIMAIRA_ROSTER_IDLE_MIN_S", "300"))  # 5 min
 _WATCH_INTERVAL_S = float(os.environ.get("KHIMAIRA_ROSTER_WATCH_S", "60"))
+# Space consecutive wake injections so many SSE-deaf seats waking at once don't
+# burst the Anthropic API into a "Server is temporarily limiting requests" 429.
+# Mirrors the assign->BEGIN dispatch stagger (chats._DISPATCH_STAGGER_S). 0 disables.
+_WAKE_STAGGER_S = float(os.environ.get("KHIMAIRA_WAKE_STAGGER_S", "2.5"))
 _COMPACT_COOLDOWN_S = 300.0  # 5 min between compact/wake attempts per window
 _RATE_LIMIT_COOLDOWN_S = 600.0  # 10 min between rate-limit escalations per window
 # Disk-WIP threshold: how recently a task-target file must have been modified to
@@ -1460,6 +1464,12 @@ async def _process_window(win: dict[str, Any]) -> None:
                 role,
                 session_id[:8],
             )
+            # Stagger: pause before the sweep moves to the next window so multiple
+            # SSE-deaf seats don't all hit the API simultaneously on wake (429 burst).
+            # Only fires after an ACTUAL wake — skipped windows (WIP / rate-limited /
+            # debounced / not-idle) return early above and never pay the delay.
+            if _WAKE_STAGGER_S > 0:
+                await asyncio.sleep(_WAKE_STAGGER_S)
     except Exception as exc:
         _log.debug("roster-recovery: wake-path error for %s: %s", role, exc)
 
