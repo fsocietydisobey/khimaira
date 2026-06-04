@@ -589,6 +589,10 @@ def _slot_heal_member_key(
             for prior_sid in entry.get("prior_sids", []):
                 old_member = room["members"].get(prior_sid)
                 if old_member is not None and old_member.get("state") == ACCEPTED:
+                    log.debug(
+                        "chats: slot-heal resolved %s → prior_sid=%s via slot %s",
+                        sid[:8], prior_sid[:8], _slot,
+                    )
                     return prior_sid, old_member
     except Exception:
         pass  # probe failure → fall through to direct lookup (fail-open for probe errors)
@@ -2254,6 +2258,21 @@ def transfer_membership(
     # directive fires in that branch.
     if creator_meta_update is not None:
         _emit_role_directive(chat_id, to_session_id, ROLE_MASTER, ts=ts)
+    # Part F MIGRATION BRIDGE: re-key any sid-keyed SSE subscribers from the old
+    # session to the slot key so they survive the transfer. Needed when the
+    # transferring session subscribed BEFORE slot-keying was deployed (pre-migration
+    # old-style subscriber in _subscribers[from_session_id]).
+    # Post-migration, fresh sessions subscribe with the slot key already, so this
+    # is a no-op; it only fires for pre-migration sid-keyed queues.
+    old_queues = _subscribers.pop(from_session_id, set())
+    if old_queues:
+        to_slot_key = _slot_subscriber_key(to_session_id)
+        _subscribers.setdefault(to_slot_key, set()).update(old_queues)
+        log.info(
+            "chats: Part F migration bridge — re-keyed %d SSE queue(s) from %s → %s",
+            len(old_queues), from_session_id[:8], to_slot_key,
+        )
+
     log.info(
         "chats: transfer chat=%s from=%s to=%s transfer_id=%s%s",
         chat_id,
@@ -3082,25 +3101,45 @@ async def assign_batch(
 _subscribers: dict[str, set[asyncio.Queue]] = {}
 
 
+def _slot_subscriber_key(sid: str) -> str:
+    """Return the _subscribers key for a given session sid.
+
+    Phase-B Part F: key by SLOT string when the session is slot-bound, so SSE
+    delivery follows the roster identity across transfer/reattach. If sid is not
+    slot-bound (pre-migration or non-roster session), falls through to sid itself.
+
+    Why slot-key beats sid-key for SSE delivery:
+    - After transfer_membership(A→B), SID_A is the accepted member in chat, but
+      SID_B is the LIVE session (process). SID_B opens SSE → keyed by slot.
+      `_broadcast` looks up slot(SID_A) == slot(SID_B) → finds B's queue.
+    - Without slot-key, delivery goes to _subscribers[SID_A] = empty → dropped.
+
+    Inert-denial: revoked sids (beyond-last-1-bound) should NOT hold SSE queues.
+    If slot_resolve(sid) returns None, the session is revoked — a subscribe call
+    for a revoked sid should be a no-op (subscriber never delivers).
+    """
+    try:
+        from khimaira.monitor.sessions import get_session_slot
+        slot = get_session_slot(sid)
+        return slot if slot else sid
+    except Exception:
+        return sid
+
+
 def is_reachable(session_id: str) -> bool:
     """Return True if session_id has a live SSE subscription (open /events connection).
 
-    Uses the daemon-side _subscribers registry — ground truth (open stream = reachable).
-    A session with at least one active queue is subscribed and can receive events.
+    Phase-B Part F: checks both the slot-key (primary, for stamped sessions) and
+    the sid-key (fallback, for un-slotted/legacy sessions).
 
-    _resolve_or_uuid is load-bearing: subscribe() keys _subscribers by the resolved UUID
-    (chats.py:2573); is_reachable must resolve identically or name-vs-UUID mismatches
-    produce false negatives (session looks unreachable when it's connected).
-
-    Caveat: lags a silent TCP-drop by ≤15s — the drop is detected on the next failed
-    ping (ping=15 in EventSourceResponse), which cancels the generator and runs the
-    finally that discards the queue. Negligible vs T_stall (minutes).
+    Caveat: lags a silent TCP-drop by ≤15s.
     """
     try:
         sid = _resolve_or_uuid(session_id)
     except Exception:
         return False
-    return bool(_subscribers.get(sid))
+    slot_key = _slot_subscriber_key(sid)
+    return bool(_subscribers.get(slot_key) or (slot_key != sid and _subscribers.get(sid)))
 
 
 # ---------------------------------------------------------------------------
@@ -3237,7 +3276,9 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
     # Invite-targeted broadcast: deliver to invitee only.
     if record.get("kind") == MEMBER and record.get("state") == PENDING:
         invitee = record.get("session_id")
-        for q in _subscribers.get(invitee, ()):
+        # Part F: resolve invitee → slot key for delivery.
+        inv_key = _slot_subscriber_key(invitee) if invitee else invitee
+        for q in _subscribers.get(inv_key, ()):
             try:
                 q.put_nowait(record)
             except asyncio.QueueFull:
@@ -3255,7 +3296,11 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
             continue
         if targeted is not None and sid not in targeted:
             continue
-        queues = _subscribers.get(sid)
+        # Part F: resolve member sid → slot key so delivery follows the live
+        # session across transfer/reattach. Slot-keyed subscriber receives the
+        # event even when its membership entry is keyed to the prior sid.
+        deliver_key = _slot_subscriber_key(sid)
+        queues = _subscribers.get(deliver_key) or _subscribers.get(sid)
         if not queues:
             log.warning(
                 "chats: dropped event for disconnected subscriber sid=%s chat=%s "
@@ -3286,7 +3331,9 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
     """
     session_id = _resolve_or_uuid(session_id)
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
-    _subscribers.setdefault(session_id, set()).add(queue)
+    # Phase-B Part F: key by slot when stamped so delivery follows the identity.
+    _sub_key = _slot_subscriber_key(session_id)
+    _subscribers.setdefault(_sub_key, set()).add(queue)
     try:
         # Pending-invite catch-up. The invite broadcast at create_room
         # time goes to active subscribers only — if the invitee's
@@ -3386,6 +3433,6 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
             record = await queue.get()
             yield record
     finally:
-        _subscribers[session_id].discard(queue)
-        if not _subscribers[session_id]:
-            _subscribers.pop(session_id, None)
+        _subscribers[_sub_key].discard(queue)
+        if not _subscribers[_sub_key]:
+            _subscribers.pop(_sub_key, None)

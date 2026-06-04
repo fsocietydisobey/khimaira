@@ -1348,6 +1348,21 @@ def post_answer(
     `target_session_id` accepts either a UUID or a friendly name.
     """
     target_session_id = resolve_session_id(target_session_id)
+    # Part F path-11 write-time: resolve target → current slot sid.
+    _slot_reg2 = _read_slot_registry()
+    _is_revoked2 = any(
+        target_session_id in entry.get("revoked_sids", [])
+        for entry in _slot_reg2.values()
+    )
+    if _is_revoked2:
+        log.info(
+            "sessions: post_answer to %s suppressed — target in revoked_sids (inert)",
+            target_session_id[:8],
+        )
+        return {"ok": False, "suppressed": "target-inert"}
+    target_resolved2 = slot_resolve(target_session_id)
+    if target_resolved2 is not None:
+        target_session_id = target_resolved2
     answer = sanitize_agent_text(answer)
     qpath = _session_dir(target_session_id) / "questions.jsonl"
     questions = _read_jsonl(qpath)
@@ -2456,9 +2471,14 @@ def consume_handoffs(
             continue
         # Targeted-invite filter: if a handoff names a specific invitee,
         # only that session may consume it; cwd-peers skip silently.
+        # Part F path-12 read-time: also allow a reattached session to consume
+        # handoffs targeted at its prior sid (slot_resolve(target) == session_id).
         target = h.get("target_session_id")
         if target and target != session_id:
-            continue
+            # Check slot-heal: target may be a prior sid of the poller's slot.
+            resolved_target = slot_resolve(target)
+            if resolved_target != session_id:
+                continue
         read_by = h.get("read_by") or []
         if session_id in read_by:
             continue
@@ -2534,6 +2554,27 @@ def post_notice(
     purpose-built notification.
     """
     target_session_id = resolve_session_id(target_session_id)
+    # Part F path-10 write-time: resolve target → current slot sid so notices
+    # land in the live session's inbox, not the stale prior's.
+    # INERT-DENIAL: if target is in revoked_sids (superseded-beyond-last-1-bound),
+    # suppress delivery. If NOT in the registry (un-slotted session), deliver as-is.
+    # Distinguish "not in registry" (deliver) from "revoked beyond bound" (deny).
+    _slot_reg = _read_slot_registry()
+    _is_revoked = any(
+        target_session_id in entry.get("revoked_sids", [])
+        for entry in _slot_reg.values()
+    )
+    if _is_revoked:
+        log.info(
+            "sessions: post_notice to %s suppressed — target in revoked_sids (inert)",
+            target_session_id[:8],
+        )
+        return {"ok": False, "suppressed": "target-inert"}
+    target_resolved = slot_resolve(target_session_id)
+    # If in registry (current or prior) → deliver to the current authoritative sid.
+    # If NOT in registry (un-slotted) → deliver to original target (existing behavior).
+    if target_resolved is not None:
+        target_session_id = target_resolved
     text = sanitize_agent_text(text)
     note: dict = {
         "id": uuid.uuid4().hex[:12],

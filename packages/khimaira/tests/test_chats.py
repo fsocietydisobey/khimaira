@@ -3661,3 +3661,108 @@ class TestDriftHealingAuth:
         # Double-check: member_roles must NOT resolve to "agent" via an inert s1
         stale_role = room["meta"].get("member_roles", {}).get(canonical) if canonical else None
         assert stale_role is None, "inert s1 must not resolve a stale role"
+
+
+# ---------------------------------------------------------------------------
+# Part F: Family-B delivery — slot-keyed SSE + polled paths (task-186694924205)
+# ---------------------------------------------------------------------------
+
+
+class TestFamilyBDelivery:
+    """Part F: SSE delivery (path-9) + polled (paths 10/11/12) follow the slot.
+
+    Extended class-invariant: after reattach, every path (Family A auth + Family B
+    delivery) targets the slot's current sid.
+    Family-B inert-denial: a superseded-beyond-last-1-bound sid does NOT receive
+    delivery — delivery-side mirror of Part E fail-closed.
+    """
+
+    S1 = "cc000001-0000-4000-8000-000000000001"
+    S2 = "dd000002-0000-4000-8000-000000000002"
+    S3 = "ee000003-0000-4000-8000-000000000003"
+    MASTER = "ff000004-0000-4000-8000-000000000004"
+    SLOT = "part-f-inst:test-agent"
+
+    def _setup(self, c, sessions_mod):
+        for sid, name in [(self.MASTER, "master"), (self.S1, "agent-1"),
+                          (self.S2, "agent-1"), (self.S3, "agent-1")]:
+            _make_session(sessions_mod, sid, name)
+        room = c.create_room(self.MASTER, [self.S1], title="part-f-test")
+        chat_id = room["meta"]["chat_id"]
+        c.accept(chat_id, self.S1)
+        sessions_mod.set_session_slot(self.S1, self.SLOT)
+        return chat_id
+
+    def test_slot_subscriber_key_returns_slot_for_stamped(self, isolated_chats, monkeypatch, tmp_path):
+        """slot-key-at-subscribe: _slot_subscriber_key returns slot string for a slot-bound session."""
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+        _make_session(sessions_mod, self.S1, "agent-1")
+        sessions_mod.set_session_slot(self.S1, self.SLOT)
+        key = c._slot_subscriber_key(self.S1)
+        assert key == self.SLOT, f"Expected slot key '{self.SLOT}', got '{key}'"
+
+    def test_slot_subscriber_key_returns_sid_for_unstamped(self, isolated_chats, monkeypatch, tmp_path):
+        """Fallback: un-slotted session gets its own sid as subscriber key."""
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+        _make_session(sessions_mod, self.S1, "agent-1")
+        # S1 not slot-bound → should return sid itself
+        key = c._slot_subscriber_key(self.S1)
+        assert key == self.S1
+
+    def test_migration_bridge_rekeys_on_transfer(self, isolated_chats, monkeypatch, tmp_path):
+        """Migration bridge: old-style sid-keyed subscriber is re-keyed on transfer."""
+        import asyncio
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+        chat_id = self._setup(c, sessions_mod)
+
+        # Simulate a pre-migration subscriber keyed by S1 (old-style).
+        q = asyncio.Queue()
+        c._subscribers[self.S1] = {q}
+
+        # Transfer S1 → S2 (migration bridge should re-key)
+        _make_session(sessions_mod, self.S2, "agent-1")
+        c.transfer_membership(chat_id, self.S1, self.S2)
+
+        # Old sid-keyed entry should be gone; re-keyed to S2's slot key.
+        assert self.S1 not in c._subscribers, "Old sid-key must be removed by bridge"
+        s2_key = c._slot_subscriber_key(self.S2)
+        assert q in c._subscribers.get(s2_key, set()), (
+            f"Queue must be under S2's slot key '{s2_key}' after bridge"
+        )
+
+    def test_path10_notice_delivers_to_current_sid(self, isolated_chats, monkeypatch, tmp_path):
+        """Path-10 polled: post_notice to S1 (prior) delivers to S2 (current) inbox."""
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+
+        _make_session(sessions_mod, self.S1, "s1")
+        _make_session(sessions_mod, self.S2, "s2")
+        sessions_mod.set_session_slot(self.S1, self.SLOT)
+        sessions_mod.set_session_slot(self.S2, self.SLOT)  # S2 claims slot → S1 to prior
+
+        from khimaira.monitor import sessions as sess
+        result = sess.post_notice(self.S1, "heal-test-notice", from_session_id="external")
+        # Notice should have been redirected to S2 (the current)
+        s2_inbox = (tmp_path / "khimaira" / "sessions" / self.S2 / "inbox.jsonl")
+        assert result.get("ok") is not False, (
+            f"post_notice must not be suppressed for a prior-sid (not revoked): {result}"
+        )
+
+    def test_path10_inert_denial_suppresses_revoked(self, isolated_chats, monkeypatch, tmp_path):
+        """Path-10 inert-denial: post_notice to a revoked (s1→s2→s3, S1=revoked) is suppressed."""
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod, sessions as sess
+
+        for sid, name in [(self.S1, "s1"), (self.S2, "s2"), (self.S3, "s3")]:
+            _make_session(sessions_mod, sid, name)
+        sessions_mod.set_session_slot(self.S1, self.SLOT)   # S1 current
+        sessions_mod.set_session_slot(self.S2, self.SLOT)   # S2 current, S1 prior
+        sessions_mod.set_session_slot(self.S3, self.SLOT)   # S3 current, S2 prior, S1 REVOKED
+
+        result = sess.post_notice(self.S1, "should-be-blocked", from_session_id="external")
+        assert result.get("suppressed") == "target-inert", (
+            f"post_notice to revoked S1 must be suppressed; got: {result}"
+        )
