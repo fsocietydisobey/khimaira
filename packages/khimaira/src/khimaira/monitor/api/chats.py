@@ -1313,11 +1313,52 @@ def build_router():
             return caller
 
     def _actor_or_body(actor_header: "str | None", body_id: str, path: str) -> str:
-        """B.1: prefer header; fall back to body authority-id with WARN.
+        """B.1: prefer the X-Session-ID header, but only when it identifies an
+        accepted member of the chat being accessed; else fall back to the body
+        authority-id (the durable khimaira session id the client passes).
+
+        Why the membership gate: CLAUDE_CODE_SESSION_ID (the header source) is a
+        *boot* id that changes on every Claude Code restart, so after a restart
+        the header is present-but-not-a-member while the body still carries the
+        session's real khimaira member id. Without this gate, a restart 403s every
+        session whose boot id != member id (the identity-split bug — observed
+        roster-wide post-suspend). The downstream membership check still gates the
+        operation; this only picks the id likeliest to be the real member.
+
+        Security: falling back to the client-supplied body id under a non-member
+        header is the SAME-UID trust boundary already documented for B.1 (a local
+        same-uid process is trusted; cross-uid spoof defense is out of scope). No
+        new boundary is crossed — the absent-header path already trusted the body.
         Warns → 0 is the B.2 flip-trigger (see SECURITY.md).
         """
         if actor_header is not None:
-            return actor_header
+            chat_id = None
+            _parts = path.strip("/").split("/")
+            if len(_parts) >= 2 and _parts[0] == "chats":
+                chat_id = _parts[1]
+            header_is_member = False
+            if chat_id is not None:
+                try:
+                    _room = load_room(chat_id)
+                    header_is_member = (
+                        _room.get("members", {}).get(actor_header, {}).get("state")
+                        == ACCEPTED
+                    )
+                except Exception:
+                    header_is_member = False
+            # Non-chat path (no chat_id to check) → trust the header as before.
+            if chat_id is None or header_is_member:
+                return actor_header
+            _log.warning(
+                "daemon-auth B.1: X-Session-ID=%s present but NOT an accepted member "
+                "of %s on %s; using body authority-id=%s (stale boot id after restart "
+                "— CLAUDE_CODE_SESSION_ID != khimaira member id).",
+                actor_header[:8] + "...",
+                chat_id,
+                path,
+                (body_id[:8] + "...") if len(body_id) > 8 else body_id,
+            )
+            return body_id
         _log.warning(
             "daemon-auth B.1: X-Session-ID absent on %s; "
             "falling back to body authority-id=%s. "
