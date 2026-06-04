@@ -110,6 +110,9 @@ class _SubprocessState:
     def register(self, session_id: str) -> None:
         if self.session_id is None:
             self.session_id = session_id
+            # Ensure the daemon-auth header uses the khimaira session ID, not
+            # CLAUDE_CODE_SESSION_ID (which may differ after a session restart).
+            daemon_client.set_caller_session_id(session_id)
             log.info("khimaira-chat: registered session_id=%s", session_id)
             # Bridge Claude Code's `-n <name>` flag → khimaira friendly name.
             _maybe_register_display_name(session_id)

@@ -19,14 +19,28 @@ import httpx
 
 DEFAULT_BASE = os.environ.get("KHIMAIRA_MONITOR_URL", "http://127.0.0.1:8740")
 
-# TM1 daemon-auth: send CLAUDE_CODE_SESSION_ID as X-Session-ID header so the
-# daemon can derive actor identity from an env-sourced value rather than a
-# caller-supplied body field. Matches themis/server.py's _caller_headers().
+# TM1 daemon-auth: send X-Session-ID header so the daemon can derive actor
+# identity from a validated value rather than a caller-supplied body field.
+# The env var is the fallback; call set_caller_session_id() to override with
+# the subprocess-bound khimaira session ID once it's known (avoids the
+# CLAUDE_CODE_SESSION_ID ≠ khimaira-session-id mismatch that causes B.1 to
+# use a non-member session as the actor — see gap report 2026-06-04).
 _CALLER_SESSION_ID: str = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
 
 
+def set_caller_session_id(session_id: str) -> None:
+    """Override the X-Session-ID value sent to the daemon.
+
+    Call this once the subprocess-bound khimaira session ID is known so that
+    B.1 daemon-auth receives the correct member identity, not the raw
+    CLAUDE_CODE_SESSION_ID env var (which may differ after a session restart).
+    """
+    global _CALLER_SESSION_ID
+    _CALLER_SESSION_ID = session_id
+
+
 def _caller_headers() -> dict[str, str]:
-    """Return X-Session-ID header when caller ID is known (set by Claude Code)."""
+    """Return X-Session-ID header when caller ID is known."""
     if _CALLER_SESSION_ID:
         return {"X-Session-ID": _CALLER_SESSION_ID}
     return {}
