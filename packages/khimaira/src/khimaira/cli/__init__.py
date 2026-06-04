@@ -35,6 +35,7 @@ from . import (
     models as models_cmd,
     monitor,
     observer,
+    proxy as proxy_cmd,
     route,
     task,
     themis as themis_cmd,
@@ -61,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     dev.add_subparser(subparsers)
     doctor.add_subparser(subparsers)
     monitor.add_subparser(subparsers)
+    proxy_cmd.add_subparser(subparsers)
     mcp_serve.add_subparser(subparsers)
     install_hooks.add_subparser(subparsers)
     attach_cmd.add_subparser(subparsers)
