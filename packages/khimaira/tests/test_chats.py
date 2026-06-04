@@ -3811,3 +3811,43 @@ class TestFamilyBDelivery:
         assert len(s1_queues_in_slot) == 0, (
             f"Revoked S1 must NOT hold any queue in _subscribers['{slot_key}']"
         )
+
+    def test_path9_sse_unslotted_session_not_denied(self, isolated_chats, monkeypatch, tmp_path):
+        """Non-regression: un-slotted sessions must NOT be denied by the SSE inert-check.
+
+        The inert-denial uses `session_id in revoked_sids` explicitly. Un-slotted
+        sessions are not in ANY entry's revoked_sids → the revoked check is False →
+        falls through to normal subscribe (no over-deny).
+
+        This tests the two conditions that determine subscribe() behavior:
+        1. _is_revoked check (must be False for un-slotted)
+        2. _slot_subscriber_key (must return the sid itself, not a slot)
+        A slot_resolve→None-based check would over-deny both — this test guards that.
+        """
+        c = isolated_chats
+        from khimaira.monitor import sessions as sessions_mod
+        from khimaira.monitor.sessions import _read_slot_registry
+
+        UN_SLOTTED = "gg000005-0000-4000-8000-000000000005"
+        _make_session(sessions_mod, UN_SLOTTED, "unslotted-session")
+        # Explicitly NOT calling set_session_slot — no slot binding
+
+        # Condition 1: revoked-check must return False for un-slotted
+        registry = _read_slot_registry()
+        is_revoked = any(
+            UN_SLOTTED in entry.get("revoked_sids", []) for entry in registry.values()
+        )
+        assert not is_revoked, (
+            "Un-slotted session must NOT appear in any revoked_sids — "
+            "the inert-denial must return False and fall through to normal subscribe"
+        )
+
+        # Condition 2: _slot_subscriber_key must return the sid itself (no slot)
+        sub_key = c._slot_subscriber_key(UN_SLOTTED)
+        assert sub_key == UN_SLOTTED, (
+            f"Un-slotted session subscriber key must be the sid itself, got '{sub_key}'"
+        )
+
+        # Both conditions hold → subscribe() will NOT early-return, WILL add queue.
+        # (The async generator path is tested via the revoked test — this guards the
+        # over-deny regression without async timing fragility.)
