@@ -343,7 +343,7 @@ _ROLE_BUDGET: dict[str, dict[str, str]] = {
     "architect": {"model": "opus", "effort": "max"},
     "intake": {"model": "sonnet", "effort": "medium"},
     "analyst": {"model": "opus", "effort": "max"},
-    "verifier": {"model": "opus", "effort": "max"},
+    "verifier": {"model": "sonnet", "effort": "medium"},
     "tracker": {"model": "haiku", "effort": "medium"},
     # critic intentionally absent — no default
     # Domain leads: sonnet/medium (mirrors ROLE_BUDGET in chats.py — kept duplicated

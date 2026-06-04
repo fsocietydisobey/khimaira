@@ -121,9 +121,9 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
         "effort": "max",
     },  # spec disambiguation, idle-by-default
     ROLE_VERIFIER: {
-        "model": "opus",
-        "effort": "max",
-    },  # test coverage gate, idle-by-default
+        "model": "sonnet",
+        "effort": "medium",
+    },  # test coverage gate, idle-by-default (sonnet matches the bin/roster spawn tier)
     ROLE_TRACKER: {
         "model": "haiku",
         "effort": "medium",
