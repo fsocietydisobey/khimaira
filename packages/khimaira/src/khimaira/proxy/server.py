@@ -261,8 +261,10 @@ async def _upstream_with_retry(
     body: bytes,
     session_id: str | None,
 ) -> httpx.Response:
-    """Forward with retry on 429/5xx, honoring Retry-After + jitter."""
-    assert _controller is not None
+    """Forward with retry on 429/5xx, honoring Retry-After + jitter.
+
+    Caller is responsible for holding the concurrency slot across this call.
+    """
     last_exc: Exception | None = None
 
     for attempt in range(_MAX_RETRIES + 1):
@@ -388,8 +390,13 @@ async def _throttled_non_stream(
     body: bytes,
     session_id: str | None,
 ) -> Response:
-    """Throttled + retried non-streaming request."""
-    assert _controller is not None
+    """Throttled + retried non-streaming request.
+
+    The acquire() and finally-release are in the same scope — no slot can
+    leak regardless of any error inside _upstream_with_retry.
+    """
+    if _controller is None:
+        raise RuntimeError("proxy: controller not initialized")
 
     await _controller.acquire()
     try:
@@ -409,18 +416,22 @@ async def _throttled_stream(
     body: bytes,
     session_id: str | None,
 ) -> StreamingResponse:
-    """Throttled streaming request — semaphore slot held for full stream duration."""
-    assert _controller is not None
-    assert _client is not None
+    """Throttled streaming request — slot acquired INSIDE _gen() for leak-proof-by-construction.
 
-    await _controller.acquire()
-    # Track whether we've already released so the finally-guard is idempotent.
-    slot_released = False
+    Acquire and finally-release share one scope inside the async generator.
+    If _gen() is never iterated, no slot is acquired.  Any post-acquire error
+    is covered by the same finally, so N can NEVER permanently decrement from
+    a stray exception — closing the latent stall/dark-out mode.
+    """
+    if _controller is None or _client is None:
+        raise RuntimeError("proxy: not initialized")
 
     async def _gen() -> AsyncIterator[bytes]:
-        nonlocal slot_released
+        slot_released = False
         try:
-            # Retry loop wraps the entire stream attempt; on 429 we re-acquire.
+            # Acquire inside _gen — same scope as finally-release below.
+            await _controller.acquire()
+
             for attempt in range(_MAX_RETRIES + 1):
                 try:
                     async with _client.stream(
@@ -444,8 +455,8 @@ async def _throttled_stream(
                                 _MAX_RETRIES,
                                 delay,
                             )
-                            await _controller.release()
                             slot_released = True
+                            await _controller.release()
                             await asyncio.sleep(delay)
                             await _controller.acquire()
                             slot_released = False
@@ -463,15 +474,14 @@ async def _throttled_stream(
                         "proxy: stream error attempt %d/%d (%s); retrying in %.1fs",
                         attempt + 1, _MAX_RETRIES, exc, delay,
                     )
-                    await _controller.release()
                     slot_released = True
+                    await _controller.release()
                     await asyncio.sleep(delay)
                     await _controller.acquire()
                     slot_released = False
         finally:
             if not slot_released:
                 await _controller.release()
-                slot_released = True
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 

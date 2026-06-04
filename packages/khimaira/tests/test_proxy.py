@@ -546,6 +546,52 @@ async def test_streaming_slot_held_during_stream():
 
 
 @pytest.mark.asyncio
+async def test_flag1_streaming_degrade_to_passthrough():
+    """If throttled_stream raises, proxy falls through to _passthrough_stream (FLAG-1)."""
+    import khimaira.proxy.server as srv
+
+    async def _boom_stream(path, headers, body, session_id):
+        raise RuntimeError("injected stream throttle fault")
+
+    passthrough_called = False
+
+    async def _fake_passthrough_stream(request, path, body):
+        nonlocal passthrough_called
+        passthrough_called = True
+        from fastapi.responses import StreamingResponse as SR
+        return SR(iter([]), media_type="text/event-stream")
+
+    req = MagicMock()
+    req.headers = {"content-type": "application/json", "authorization": "Bearer sk-test"}
+    req.body = AsyncMock(return_value=b'{"model":"claude","max_tokens":1,"messages":[],"stream":true}')
+
+    with patch.object(srv, "_throttled_stream", side_effect=_boom_stream), \
+         patch.object(srv, "_passthrough_stream", side_effect=_fake_passthrough_stream):
+        response = await srv._handle_proxy(req, "POST", "/v1/messages")
+
+    assert passthrough_called, "Expected streaming FLAG-1 degrade to _passthrough_stream"
+
+
+@pytest.mark.asyncio
+async def test_streaming_acquire_inside_gen_no_slot_if_never_iterated():
+    """If _gen() is never consumed, no slot is acquired (acquire-inside-gen by construction)."""
+    import khimaira.proxy.server as srv
+
+    controller = srv._ConcurrencyController(2)
+    headers = {"content-type": "application/json", "authorization": "Bearer sk-test"}
+    body = b'{"model":"claude","max_tokens":1,"messages":[],"stream":true}'
+
+    mock_client = MagicMock()
+
+    with patch.object(srv, "_controller", controller), \
+         patch.object(srv, "_client", mock_client):
+        # Build the StreamingResponse but never consume the body_iterator
+        stream_resp = await srv._throttled_stream("/v1/messages", headers, body, "sess-1")
+        # Generator was created but never iterated
+        assert controller.in_flight == 0, "Slot should NOT be acquired if _gen is never iterated"
+
+
+@pytest.mark.asyncio
 async def test_load_32_concurrent_cap_holds():
     """Under 32 concurrent requests to a mock upstream, cap holds and all succeed."""
     import khimaira.proxy.server as srv
