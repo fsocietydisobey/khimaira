@@ -79,6 +79,29 @@ driver behind the nudge breakage, the session clutter, AND the name-resolution c
    fails for the whole roster after every restart — the recovery system defeating
    itself.
 
+### Live evidence — 2026-06-05 (janice, jp roster, mid-session)
+
+Confirms the gap is actively fraying (not collapsing — membership held):
+- `session_list` showed FRESH 0m registrations with no id / status `?` for several jp +
+  un-prefixed roles, sitting ALONGSIDE the established member session-ids (real
+  jp-agent-1 = `f264f79d`). Proliferation signature again.
+- Kitty window-ids renumbered a **3rd time** this session (240s → 371-379 → 428-438).
+- jp-agent-4/5/6 windows CLOSED yet `session_list` still showed them `active 0m` —
+  stale session records outliving dead windows.
+- jp-architect (`9242c08c`) FAILED OUT on the upstream **529 storm** (churned ~14m, retry
+  7/15, exhausted, idle without posting). Joseph manually created a replacement architect
+  window → new session-id NOT a chat member → master had to re-invite + re-bootstrap by
+  hand. The full restart-to-recover → new-identity → manual-rebind cycle.
+- **Note:** the 529 retry-exhaustion is what the concurrency-proxy is meant to absorb —
+  VERIFY whether the (personal) jp roster is actually routed through the proxy
+  (`KHIMAIRA_PROXY_URL` auto-detect in `bin/roster`); retry 7/15 looks like the CLI's own
+  retry firing, suggesting it may NOT be going through the proxy.
+
+**Next (janice offered):** trace the khimaira session-REGISTRATION code (same as she did
+for the SSE subscriber → commit 475c002) to pin the implementation-level root of "restart
+mints a new session-id that doesn't inherit chat membership / window binding" → an
+implementation-level fix target, not inference. Pair with the SSE fix already in-tree.
+
 ### The deeper fix (root)
 
 4. **Resume should re-attach the existing session-id**, not spawn fresh — identity
