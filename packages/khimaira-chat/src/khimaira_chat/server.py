@@ -17,10 +17,13 @@ need to be delivered.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import collections
 import json
 import logging
+import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import mcp.types as types
@@ -59,6 +62,136 @@ INSTRUCTIONS = (
     "DON'T leak `<thinking>`, `<scratchpad>`, etc. tags into chat message bodies — "
     "the daemon strips them defensively but it's noise. Send only the message body."
 )
+
+
+# ---------------------------------------------------------------------------
+# Session entanglement fence — globally-unique SSE subscriber per session_id
+# ---------------------------------------------------------------------------
+#
+# The bug: two subprocesses can register the SAME khimaira session_id (e.g.
+# via `claude --resume` or a duplicate window launch). Each subprocess calls
+# daemon_client.subscribe_events(session_id) independently — the daemon pushes
+# every chat event to that id → BOTH subprocesses emit it → both windows see
+# the roster's notifications. The `_SubprocessState` guard is per-subprocess;
+# it does NOT prevent two separate subprocesses from claiming the same id.
+#
+# The fix: a PID claim file at _SSE_CLAIM_DIR/<session_id>.pid. When this
+# subprocess registers a session_id it checks for a prior claim:
+#   - No file → this subprocess is the first; write our PID, subscribe.
+#   - File exists, PID alive → a live peer already owns this id; fence
+#     (set _state.sse_fenced=True, skip SSE subscription, log a warning).
+#   - File exists, PID dead → prior subprocess is gone; reclaim the file,
+#     write our PID, subscribe normally.
+#
+# Ambiguity policy: err toward FENCE (not ALLOW). If we cannot verify the
+# prior PID is dead, we block. A false-fence is visible (this window gets no
+# SSE) and retryable; a false-allow re-opens the silent dual-subscribe, which
+# is the undiagnosable bug we're fixing. (Same recoverable-default discipline
+# as other safety decisions this session: the direction of the default IS the
+# safety property.)
+#
+# Non-Linux: /proc is unavailable; we cannot check PID liveness. Fail-open
+# (allow subscription) with a warning — don't block a legitimate session on
+# a platform where we can't verify.
+
+_SSE_CLAIM_DIR = Path.home() / ".local" / "state" / "khimaira" / "sse-claim"
+_MY_PID = os.getpid()
+# The claim path for this subprocess's session (set in _acquire_session_claim).
+_my_claim_path: Path | None = None
+
+
+def _pid_alive(pid: int) -> bool | None:
+    """Return True if the process is alive, False if dead, None if unknown.
+
+    Uses /proc on Linux. Returns None on non-Linux platforms where /proc is
+    unavailable — caller should treat None as ambiguous and err toward FENCE.
+    """
+    proc_path = Path(f"/proc/{pid}")
+    if not Path("/proc").exists():
+        return None  # non-Linux; can't determine
+    try:
+        return proc_path.exists()
+    except OSError:
+        return None  # permission or other error → ambiguous
+
+
+def _acquire_session_claim(session_id: str) -> bool:
+    """Attempt to acquire the SSE-subscriber claim for session_id.
+
+    Returns True if this subprocess should proceed to subscribe (either no
+    prior claim, or the prior claimant's process is dead).
+    Returns False if a live prior claimant already owns this session_id —
+    this subprocess must NOT subscribe (entanglement fence).
+    """
+    global _my_claim_path
+    try:
+        _SSE_CLAIM_DIR.mkdir(parents=True, exist_ok=True)
+        claim_path = _SSE_CLAIM_DIR / f"{session_id}.pid"
+
+        if claim_path.exists():
+            try:
+                prior_pid = int(claim_path.read_text().strip())
+            except (ValueError, OSError):
+                prior_pid = None
+
+            if prior_pid is not None and prior_pid != _MY_PID:
+                alive = _pid_alive(prior_pid)
+                if alive is True:
+                    # Live prior claimant — fence this subprocess.
+                    log.warning(
+                        "khimaira-chat: session-entanglement fence: session_id=%s already "
+                        "claimed by live PID %d; this subprocess will NOT subscribe to SSE. "
+                        "Two subprocesses are sharing the same khimaira session_id. "
+                        "Close the duplicate window to clear the entanglement.",
+                        session_id,
+                        prior_pid,
+                    )
+                    return False
+                elif alive is None:
+                    # Unknown liveness (non-Linux or permission error) → err toward FENCE.
+                    log.warning(
+                        "khimaira-chat: session-entanglement fence: session_id=%s has a "
+                        "prior claim (PID %d) but process liveness cannot be verified "
+                        "(non-Linux or /proc unavailable). Fencing this subprocess as a "
+                        "precaution — clear the claim file if this is a false positive: %s",
+                        session_id,
+                        prior_pid,
+                        claim_path,
+                    )
+                    return False
+                else:
+                    # Prior PID is dead → reclaim.
+                    log.info(
+                        "khimaira-chat: session-entanglement: reclaiming session_id=%s "
+                        "from dead PID %d",
+                        session_id,
+                        prior_pid,
+                    )
+
+        # Write our claim.
+        claim_path.write_text(str(_MY_PID))
+        _my_claim_path = claim_path
+
+        def _release_claim() -> None:
+            try:
+                if claim_path.exists() and claim_path.read_text().strip() == str(_MY_PID):
+                    claim_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        atexit.register(_release_claim)
+        return True
+
+    except OSError as exc:
+        # Filesystem error creating the claim dir or writing the file.
+        # Fail-open: allow subscription (don't block on infra failure).
+        log.warning(
+            "khimaira-chat: session-entanglement: could not write claim file for "
+            "session_id=%s (%s); proceeding without fence (fail-open)",
+            session_id,
+            exc,
+        )
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +239,11 @@ class _SubprocessState:
         # subscriber can emit notifications/claude/channel directly,
         # without needing the session object from request_context.
         self.write_stream: Any = None
+        # True if the entanglement fence blocked this subprocess from
+        # subscribing to SSE (a live prior claimant already owns this
+        # session_id). When fenced, _ensure_subscriber and _serve skip
+        # spawning _proactive_sse_loop.
+        self.sse_fenced: bool = False
 
     def register(self, session_id: str) -> None:
         if self.session_id is None:
@@ -113,7 +251,17 @@ class _SubprocessState:
             # Ensure the daemon-auth header uses the khimaira session ID, not
             # CLAUDE_CODE_SESSION_ID (which may differ after a session restart).
             daemon_client.set_caller_session_id(session_id)
-            log.info("khimaira-chat: registered session_id=%s", session_id)
+            # Entanglement fence: only one live subprocess may subscribe SSE
+            # for a given session_id. Checks process-liveness of any prior
+            # claimant; errs toward FENCE on ambiguity (silent dual-subscribe
+            # is the worse, undiagnosable failure vs a visible/retryable block).
+            if not _acquire_session_claim(session_id):
+                self.sse_fenced = True
+            log.info(
+                "khimaira-chat: registered session_id=%s (sse_fenced=%s)",
+                session_id,
+                self.sse_fenced,
+            )
             # Bridge Claude Code's `-n <name>` flag → khimaira friendly name.
             _maybe_register_display_name(session_id)
         elif self.session_id != session_id:
@@ -328,6 +476,10 @@ def _ensure_subscriber() -> None:
     hook timing), this path wins the boot race, so the stale session-bound
     loop ran for the whole session. Repointing it here closes the gap.
     """
+    if _state.sse_fenced:
+        # Entanglement fence: a live peer already owns this session_id.
+        # This subprocess must not subscribe to SSE.
+        return
     if _state.write_stream is None:
         # stdio transport not up yet (write_stream is captured in _serve);
         # the watchdog will start the subscriber on its first tick.
@@ -1113,7 +1265,7 @@ async def _serve() -> None:
             except Exception:
                 log.exception("khimaira-chat: async ppid-bridge raised; falling back to lazy-reg")
 
-        if _state.session_id and _state.subscriber_task is None:
+        if _state.session_id and _state.subscriber_task is None and not _state.sse_fenced:
             _state.subscriber_task = asyncio.create_task(_proactive_sse_loop())
         # Phase B v1.3: watchdog supervises subscriber_task for its
         # subprocess lifetime. Spawned BEFORE the subscriber (or instead
@@ -1285,6 +1437,11 @@ async def _subscriber_watchdog() -> None:
             await asyncio.sleep(_WATCHDOG_INTERVAL_S)
             if _state.session_id is None:
                 continue  # still lazy-reg phase, nothing to supervise
+            if _state.sse_fenced:
+                # Entanglement fence: this subprocess must not subscribe SSE.
+                # Watchdog stays running (suppresses the "no subscriber" warn)
+                # but never restarts the subscriber.
+                continue
             task = _state.subscriber_task
             if task is None:
                 # Session is registered but subscriber never started —

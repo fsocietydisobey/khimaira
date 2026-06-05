@@ -706,3 +706,94 @@ async def test_ensure_subscriber_uses_proactive_loop_not_session(monkeypatch):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         (server._state.subscriber_task, server._state.write_stream) = orig
+
+
+# ---------------------------------------------------------------------------
+# Session entanglement fence
+# ---------------------------------------------------------------------------
+
+
+class TestSessionEntanglementFence:
+    """The PID-based fence prevents two live subprocesses from dual-subscribing
+    to the same khimaira session_id's SSE stream.
+
+    Tests are unit-level (no real subprocess spawning): they call
+    _acquire_session_claim directly and verify the fence decisions.
+    """
+
+    def test_no_prior_claim_allowed(self, tmp_path, monkeypatch):
+        """No prior claim file → subprocess may subscribe."""
+        from khimaira_chat import server as srv
+        monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
+        monkeypatch.setattr(srv, "_MY_PID", 99999)
+        result = srv._acquire_session_claim("test-session-1")
+        assert result is True, "No prior claim should allow subscription"
+        claim = tmp_path / "test-session-1.pid"
+        assert claim.exists(), "Claim file should be written"
+        assert claim.read_text().strip() == "99999"
+
+    def test_live_prior_fenced(self, tmp_path, monkeypatch):
+        """Claim file holds a live PID → this subprocess is fenced (not allowed).
+
+        Uses os.getpid() as the 'live' PID — this process is definitely alive.
+        The fence must return False (block subscription), not True (allow).
+        This is the reproduce-the-bug test: without the fence, _acquire_session_claim
+        would overwrite the claim and return True regardless of prior liveness.
+        After the fix, the second claimant is blocked by the live-PID check.
+        """
+        import os
+        from khimaira_chat import server as srv
+
+        live_pid = os.getpid()
+        monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
+        monkeypatch.setattr(srv, "_MY_PID", live_pid + 1)  # different PID = different subprocess
+        # Write a claim as if the live_pid subprocess already claimed it.
+        (tmp_path / "test-session-live.pid").write_text(str(live_pid))
+        result = srv._acquire_session_claim("test-session-live")
+        assert result is False, (
+            "A live prior claimant should FENCE this subprocess (entanglement prevented)"
+        )
+
+    def test_dead_prior_reclaim_allowed(self, tmp_path, monkeypatch):
+        """Claim file holds a dead PID → this subprocess may reclaim and subscribe.
+
+        Uses a PID beyond the kernel's PID_MAX — guaranteed not to exist.
+        The fence should see it as dead and allow the reclaim on Linux.
+        """
+        import pathlib
+        from khimaira_chat import server as srv
+
+        monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
+        monkeypatch.setattr(srv, "_MY_PID", 88888)
+        dead_pid = 99999999  # beyond kernel PID_MAX (typically 4194304 on Linux)
+        (tmp_path / "test-session-dead.pid").write_text(str(dead_pid))
+        result = srv._acquire_session_claim("test-session-dead")
+        # If /proc is available (Linux), the dead PID should not exist → reclaim.
+        # On non-Linux, _pid_alive returns None → fence (ambiguity policy).
+        if pathlib.Path("/proc").exists():
+            assert result is True, "Dead prior PID should allow reclaim on Linux"
+            claim = tmp_path / "test-session-dead.pid"
+            assert claim.read_text().strip() == "88888", "Claim file should hold our PID"
+        else:
+            # Non-Linux: /proc unavailable → ambiguous → fence (recoverable-default)
+            assert result is False, "Non-Linux: ambiguous liveness → fence"
+
+    def test_sse_fenced_skips_subscriber(self):
+        """When sse_fenced=True, _ensure_subscriber must not spawn a task."""
+        from khimaira_chat import server as srv
+
+        orig_fenced = srv._state.sse_fenced
+        orig_task = srv._state.subscriber_task
+        orig_stream = srv._state.write_stream
+        try:
+            srv._state.sse_fenced = True
+            srv._state.subscriber_task = None
+            srv._state.write_stream = object()  # non-None (transport up)
+            srv._ensure_subscriber()
+            assert srv._state.subscriber_task is None, (
+                "_ensure_subscriber must not start SSE when sse_fenced=True"
+            )
+        finally:
+            srv._state.sse_fenced = orig_fenced
+            srv._state.subscriber_task = orig_task
+            srv._state.write_stream = orig_stream
