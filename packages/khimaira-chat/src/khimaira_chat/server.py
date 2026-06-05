@@ -1400,12 +1400,17 @@ async def _async_try_auto_register_from_ppid() -> None:
                 sid = None
             if sid:
                 _state.session_id = sid
+                # Apply entanglement fence — the ppid-bridge path also needs
+                # to claim before any subscriber starts (same as register()).
+                if not _acquire_session_claim(sid):
+                    _state.sse_fenced = True
                 log.info(
                     "khimaira-chat: async ppid-bridge succeeded on attempt %d "
-                    "via ancestor ppid=%s → session_id=%s",
+                    "via ancestor ppid=%s → session_id=%s (sse_fenced=%s)",
                     attempt,
                     ppid,
                     sid,
+                    _state.sse_fenced,
                 )
                 _maybe_register_display_name(sid)
                 return
@@ -1663,10 +1668,16 @@ def _try_auto_register_from_ppid() -> None:
         )
         return
     _state.session_id = session_id
+    # Apply entanglement fence — the sync ppid-bridge path also needs to
+    # claim before any subscriber starts (same as register() and async bridge).
+    if not _acquire_session_claim(session_id):
+        _state.sse_fenced = True
     log.info(
-        "khimaira-chat: auto-registered session_id=%s via ancestor ppid=%s (no agent tool call needed)",
+        "khimaira-chat: auto-registered session_id=%s via ancestor ppid=%s "
+        "(sse_fenced=%s, no agent tool call needed)",
         session_id,
         matched_ppid,
+        _state.sse_fenced,
     )
     _maybe_register_display_name(session_id)
 

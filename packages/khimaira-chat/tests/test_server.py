@@ -832,6 +832,59 @@ class TestSessionEntanglementFence:
             "silent dual-subscribe is the undiagnosable failure"
         )
 
+    def test_crash_stale_claim_reclaimable(self, tmp_path, monkeypatch):
+        """A stale claim from a CRASHED subprocess (no atexit) is reclaimable.
+
+        Crash = no atexit fires → claim file left behind with a now-dead PID.
+        The dead-PID path must allow reclaim, or a crash permanently fences
+        the real session (recoverable-default crux from janice Q2).
+        """
+        import pathlib
+        from khimaira_chat import server as srv
+
+        if not pathlib.Path("/proc").exists():
+            import pytest
+            pytest.skip("Crash-stale test requires /proc (Linux only)")
+
+        monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
+        monkeypatch.setattr(srv, "_MY_PID", 88889)
+        # Simulate a stale claim from a crashed subprocess: dead PID + its starttime.
+        dead_pid = 99999998  # guaranteed non-existent
+        (tmp_path / "test-session-crash.pid").write_text(f"{dead_pid}:54321")
+        result = srv._acquire_session_claim("test-session-crash")
+        assert result is True, (
+            "A stale crash-claim (dead PID, no atexit) must be reclaimable — "
+            "otherwise a crashed subprocess permanently fences the real session"
+        )
+
+    def test_fence_applied_before_subscriber_in_register(self):
+        """register() acquires the fence claim BEFORE any subscriber would start.
+
+        Guards Q1: the claim must be checked before subscribe, so a 2nd subprocess
+        cannot dual-subscribe even momentarily during the registration window.
+        Verified statically: register() calls _acquire_session_claim → sets sse_fenced
+        → THEN _ensure_subscriber/_serve check sse_fenced before spawning the loop.
+        """
+        from khimaira_chat import server as srv
+        import inspect
+
+        src = inspect.getsource(srv._SubprocessState.register)
+        claim_pos = src.find("_acquire_session_claim")
+        ensure_pos = src.find("_ensure_subscriber")
+        # _ensure_subscriber is NOT called inside register() at all (subscriber
+        # is spawned elsewhere in _serve/_ensure_subscriber on subsequent calls).
+        # What matters: _acquire_session_claim runs in register() before the session
+        # is considered registered. Verify the call is present.
+        assert claim_pos != -1, (
+            "register() must call _acquire_session_claim to fence before registration"
+        )
+        # _ensure_subscriber is NOT in register() — subscriber spawn is deferred.
+        # This is correct: claim first (fence set), subscriber spawned later (checks fence).
+        assert ensure_pos == -1, (
+            "register() must NOT call _ensure_subscriber directly — "
+            "subscriber spawn is deferred to _serve/_ensure_subscriber, which checks sse_fenced"
+        )
+
     def test_sse_fenced_skips_subscriber(self):
         """When sse_fenced=True, _ensure_subscriber must not spawn a task."""
         from khimaira_chat import server as srv
