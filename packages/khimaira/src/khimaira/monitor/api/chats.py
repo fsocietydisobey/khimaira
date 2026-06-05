@@ -1273,6 +1273,20 @@ class AssignBatchReq(BaseModel):
     fire_begin_on_partial: bool = False
 
 
+# Per-chat asyncio.Lock for task-claim CAS: serializes concurrent pending→in_progress
+# transitions within the same event loop so only one claim can read+check+write at a
+# time per chat.  Without this, a multi-worker deploy (or future refactor to async
+# update_task_status) would allow TOCTOU races at the check/write boundary.
+_claim_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_claim_lock(chat_id: str) -> asyncio.Lock:
+    """Lazy per-chat claim lock."""
+    if chat_id not in _claim_locks:
+        _claim_locks[chat_id] = asyncio.Lock()
+    return _claim_locks[chat_id]
+
+
 def build_router():
     fastapi = require("fastapi")
     sse_starlette = require("sse_starlette.sse")
@@ -1722,19 +1736,22 @@ def build_router():
             _actor, req.by_session_id, f"/chats/{chat_id}/tasks/{task_id}/status"
         )
         try:
-            result = chats.update_task_status(
-                chat_id,
-                task_id,
-                actor,
-                req.new_status,
-                note=req.note,
-                private=req.private,
-            )
+            async with _get_claim_lock(chat_id):
+                result = chats.update_task_status(
+                    chat_id,
+                    task_id,
+                    actor,
+                    req.new_status,
+                    note=req.note,
+                    private=req.private,
+                )
         except ValueError as exc:
-            # 403 for permission errors (master-only transitions); 404 for unknown task
+            # 409 for duplicate claims; 403 for permission/transition errors; 404 for unknown task
             msg = str(exc)
             code = (
-                403
+                409
+                if "already claimed" in msg
+                else 403
                 if any(w in msg for w in ("creator", "assignee", "transition"))
                 else 404
             )

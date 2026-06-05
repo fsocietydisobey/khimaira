@@ -3851,3 +3851,116 @@ class TestFamilyBDelivery:
         # Both conditions hold → subscribe() will NOT early-return, WILL add queue.
         # (The async generator path is tested via the revoked test — this guards the
         # over-deny regression without async timing fragility.)
+
+
+# ---------------------------------------------------------------------------
+# CAS — task-claim atomicity (task-f5b53dae5b15)
+# ---------------------------------------------------------------------------
+
+
+def test_task_already_claimed_structured_rejection(isolated_chats):
+    """Second pending→in_progress attempt raises 'already claimed' (not 'Invalid transition').
+
+    This test FAILS against pre-fix code where the second claim raised
+    'Invalid transition in_progress → in_progress' — the wrong message and class.
+    """
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    _make_session(sessions_mod, "carol-uuid", "carol")
+    c.create_room("alice-uuid", ["bob-uuid", "carol-uuid"], title="cas-test")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+    c.accept(chat_id, "carol-uuid")
+
+    # Unassigned task — any accepted member can claim
+    task = c.create_task(chat_id, "alice-uuid", "do thing")
+    tid = task["id"]
+
+    # First claim succeeds
+    result = c.update_task_status(chat_id, tid, "bob-uuid", c.TASK_IN_PROGRESS)
+    assert result["status"] == c.TASK_IN_PROGRESS
+
+    # Second claim gets structured "already claimed" rejection (not "Invalid transition")
+    with pytest.raises(ValueError, match="already claimed"):
+        c.update_task_status(chat_id, tid, "carol-uuid", c.TASK_IN_PROGRESS)
+
+
+def test_task_already_claimed_contains_who(isolated_chats):
+    """'Already claimed' error names the first claimant for clean stand-down."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    _make_session(sessions_mod, "carol-uuid", "carol")
+    c.create_room("alice-uuid", ["bob-uuid", "carol-uuid"], title="cas-who")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+    c.accept(chat_id, "carol-uuid")
+
+    task = c.create_task(chat_id, "alice-uuid", "do thing")
+    tid = task["id"]
+    c.update_task_status(chat_id, tid, "bob-uuid", c.TASK_IN_PROGRESS)
+
+    with pytest.raises(ValueError) as exc_info:
+        c.update_task_status(chat_id, tid, "carol-uuid", c.TASK_IN_PROGRESS)
+    msg = str(exc_info.value)
+    assert "already claimed" in msg
+    assert "bob" in msg.lower()  # the error names the first claimant
+
+
+@pytest.mark.asyncio
+async def test_task_claim_concurrent_exactly_one_wins(isolated_chats):
+    """Two concurrent pending→in_progress claims: exactly ONE wins, one gets 'already claimed'.
+
+    Uses asyncio.gather to dispatch both claims concurrently.  Since
+    update_task_status is synchronous, the asyncio scheduler runs them
+    sequentially (no TOCTOU in single-threaded asyncio without yields).
+    But the test verifies the SEMANTIC: one wins with 200, one is rejected
+    with a structured 'already claimed' error — not a confusing 403.
+
+    This test FAILS against pre-fix code: without the CAS guard, both calls
+    either both succeed (if yields were present) or the second raises
+    'Invalid transition' (wrong error class, no claimant info).
+
+    The asyncio.Lock in the API handler ensures this contract holds even if
+    the function is ever made async or the daemon is refactored to multi-worker.
+    """
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    _make_session(sessions_mod, "carol-uuid", "carol")
+    c.create_room("alice-uuid", ["bob-uuid", "carol-uuid"], title="cas-concurrent")
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+    c.accept(chat_id, "carol-uuid")
+
+    task = c.create_task(chat_id, "alice-uuid", "do thing")
+    tid = task["id"]
+
+    successes = []
+    rejections = []
+
+    async def claim(claimant: str) -> None:
+        try:
+            result = c.update_task_status(chat_id, tid, claimant, c.TASK_IN_PROGRESS)
+            successes.append(result)
+        except ValueError as exc:
+            rejections.append(str(exc))
+
+    await asyncio.gather(claim("bob-uuid"), claim("carol-uuid"))
+
+    # Class invariant: exactly one wins, one is rejected
+    assert len(successes) == 1, f"Expected 1 success, got {len(successes)}: {successes}"
+    assert len(rejections) == 1, f"Expected 1 rejection, got {len(rejections)}: {rejections}"
+    assert successes[0]["status"] == c.TASK_IN_PROGRESS
+
+    # The rejection must be structured ("already claimed"), not generic
+    assert "already claimed" in rejections[0], (
+        f"Expected 'already claimed' in rejection, got: {rejections[0]!r}"
+    )

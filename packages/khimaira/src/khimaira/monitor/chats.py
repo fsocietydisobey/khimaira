@@ -1249,6 +1249,7 @@ def update_task_status(
 
     task_record = None
     current_status = None
+    first_claim: dict[str, Any] | None = None  # first TASK_UPDATE that set status=in_progress
     for line in _read(chat_id):
         k = line.get("kind")
         if k == TASK and line.get("id") == task_id:
@@ -1256,9 +1257,25 @@ def update_task_status(
             current_status = line.get("status")
         elif k == TASK_UPDATE and line.get("task_id") == task_id:
             current_status = line.get("status")
+            if current_status == TASK_IN_PROGRESS and first_claim is None:
+                first_claim = line
 
     if task_record is None:
         raise ValueError(f"No task with id={task_id!r} in {chat_id!r}.")
+
+    # CAS guard: detect a duplicate claim before the generic transition check so
+    # the claimant gets a structured "already claimed by X" rejection (409) rather
+    # than a confusing "Invalid transition in_progress → in_progress" (403).
+    if current_status == TASK_IN_PROGRESS and new_status == TASK_IN_PROGRESS:
+        who = (
+            first_claim.get("by_name")
+            or (first_claim.get("by_session_id") or "unknown")[:8]
+        ) if first_claim else "unknown"
+        when = first_claim.get("ts", "") if first_claim else ""
+        raise ValueError(
+            f"Task {task_id!r} already claimed by {who!r} at {when}. "
+            f"Stand down — first claim wins atomically."
+        )
 
     transition = (current_status, new_status)
     allowed_roles = _TASK_TRANSITIONS.get(transition)
