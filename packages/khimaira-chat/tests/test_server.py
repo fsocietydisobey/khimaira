@@ -637,3 +637,72 @@ def test_subscriber_dedup_lru_eviction():
         assert f"evt-{cap:04d}" in state.seen_event_ids
     finally:
         server._state.seen_event_ids = orig_seen
+
+
+@pytest.mark.asyncio
+async def test_ensure_subscriber_uses_proactive_loop_not_session(monkeypatch):
+    """Regression (SSE-deaf-on-compaction): the lazy-start `_ensure_subscriber`
+    must spawn the write_stream-based `_proactive_sse_loop`, NOT a
+    request-context-session-bound loop.
+
+    The old `_sse_loop(ctx.session)` captured the MCP request-context session
+    from the first tool call and kept emitting through it; after a context
+    compaction that handle went stale, so the subscriber stayed alive (never
+    crashed → the watchdog never replaced it) while every channel notification
+    silently went nowhere — the agent appeared online but received nothing.
+    The fix repoints the lazy-start onto `_proactive_sse_loop` (the same loop
+    the watchdog + force-resubscribe already used) and removes the session
+    capture entirely. This test locks both invariants in."""
+    import contextlib
+    import inspect
+
+    from khimaira_chat import server
+
+    # Invariant 1: no session capture — `_ensure_subscriber` takes no args.
+    assert inspect.signature(server._ensure_subscriber).parameters == {}, (
+        "_ensure_subscriber must not capture a request-context session"
+    )
+
+    started = {"proactive": False}
+
+    async def stub_proactive():
+        started["proactive"] = True
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(server, "_proactive_sse_loop", stub_proactive)
+
+    orig = (server._state.subscriber_task, server._state.write_stream)
+    task = None
+    try:
+        # Invariant 2: with the transport up (write_stream set), it starts
+        # the proactive loop.
+        server._state.subscriber_task = None
+        server._state.write_stream = object()  # non-None → stdio transport up
+
+        server._ensure_subscriber()
+        task = server._state.subscriber_task
+        assert task is not None, "_ensure_subscriber did not start a subscriber"
+        await asyncio.sleep(0.01)
+        assert started["proactive"], (
+            "_ensure_subscriber started the wrong loop (not _proactive_sse_loop)"
+        )
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        # Invariant 3: transport not up yet (write_stream None) → no-op, so
+        # the proactive loop's `assert write_stream is not None` can't trip.
+        server._state.subscriber_task = None
+        server._state.write_stream = None
+        server._ensure_subscriber()
+        assert server._state.subscriber_task is None, (
+            "_ensure_subscriber must no-op when write_stream is None (transport not up)"
+        )
+    finally:
+        task = server._state.subscriber_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        (server._state.subscriber_task, server._state.write_stream) = orig

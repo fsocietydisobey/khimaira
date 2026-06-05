@@ -185,28 +185,6 @@ def _maybe_register_display_name(session_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Channel notification — bypass typed API to send the custom method
-# ---------------------------------------------------------------------------
-
-
-async def _emit_channel_notification(session: Any, content: str, meta: dict[str, str]) -> None:
-    """Send a notifications/claude/channel event over the MCP transport.
-
-    The Python MCP SDK's typed send_notification() rejects unknown methods,
-    so we go around it via send_message() with a raw JSONRPCNotification.
-    Channels is a research-preview Claude Code extension; this is the
-    standard escape hatch documented in the SDK.
-    """
-    notif = types.JSONRPCNotification(
-        jsonrpc="2.0",
-        method="notifications/claude/channel",
-        params={"content": content, "meta": meta},
-    )
-    msg = SessionMessage(message=types.JSONRPCMessage(root=notif))
-    await session.send_message(msg)
-
-
-# ---------------------------------------------------------------------------
 # Routing — pure function deciding whether/how to emit a channel block
 # ---------------------------------------------------------------------------
 
@@ -326,38 +304,37 @@ def _route_record(record: dict[str, Any], my_session_id: str) -> tuple[str, dict
 
 
 # ---------------------------------------------------------------------------
-# SSE subscriber — runs in background, emits channel notifications
+# SSE subscriber lazy-start
 # ---------------------------------------------------------------------------
 
 
-async def _sse_loop(session: Any) -> None:
-    """Pump events from the daemon's SSE stream into channel notifications.
+def _ensure_subscriber() -> None:
+    """Start the proactive SSE subscriber if it isn't running yet.
 
-    Routing lives in `_route_record`; this loop just pumps and emits.
+    Uses `_proactive_sse_loop` (emits via the stable `write_stream` captured
+    at stdio boot), NOT the request-context session — so inbound delivery
+    survives context compaction and turn boundaries.
+
+    History (the bug this fixes): the lazy-start path used to spawn a
+    session-bound `_sse_loop(ctx.session)`. That captured the MCP
+    request-context session from the FIRST tool call and kept emitting
+    through it; after a context compaction the session handle went stale,
+    so the subscriber stayed 'alive' (never crashed → the watchdog never
+    replaced it) but every channel notification went nowhere — the agent
+    was silently SSE-deaf. Phase B v1.3 introduced the write_stream-based
+    `_proactive_sse_loop` and migrated the watchdog (Lane A) and
+    force-resubscribe (Lane B) onto it, but this lazy-start path was
+    missed. When the boot-time ppid-bridge misses (common — SessionStart
+    hook timing), this path wins the boot race, so the stale session-bound
+    loop ran for the whole session. Repointing it here closes the gap.
     """
-    assert _state.session_id is not None
-    async for record in daemon_client.subscribe_events(
-        _state.session_id, last_event_id=_state.last_event_id
-    ):
-        evt_id = record.get("event_id")
-        if evt_id:
-            _state.last_event_id = evt_id
-
-        decision = _route_record(record, _state.session_id)
-        if decision is None:
-            continue
-        content, meta = decision
-        try:
-            await _emit_channel_notification(session, content, meta)
-        except Exception as exc:
-            log.warning("khimaira-chat: failed to emit channel notification — %s", exc)
-
-
-def _ensure_subscriber(session: Any) -> None:
-    """Start the SSE subscriber if it isn't running yet."""
+    if _state.write_stream is None:
+        # stdio transport not up yet (write_stream is captured in _serve);
+        # the watchdog will start the subscriber on its first tick.
+        return
     if _state.subscriber_task is not None and not _state.subscriber_task.done():
         return
-    _state.subscriber_task = asyncio.create_task(_sse_loop(session))
+    _state.subscriber_task = asyncio.create_task(_proactive_sse_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +741,13 @@ def _build_server() -> Server:
                         "task_id": {"type": "string"},
                         "new_status": {
                             "type": "string",
-                            "enum": ["in_progress", "done", "approved", "changes_requested", "cancelled"],
+                            "enum": [
+                                "in_progress",
+                                "done",
+                                "approved",
+                                "changes_requested",
+                                "cancelled",
+                            ],
                             "description": "Target state",
                         },
                         "note": {
@@ -885,10 +868,12 @@ def _build_server() -> Server:
         except ValueError as exc:
             return [types.TextContent(type="text", text=f"Error: {exc}")]
 
-        # Lazy-start the SSE subscriber. Needs the live MCP session,
-        # which is on the request_context.
-        ctx = server.request_context
-        _ensure_subscriber(ctx.session)
+        # Lazy-start the proactive SSE subscriber. It emits via the stable
+        # write_stream (captured at stdio boot), NOT the request-context
+        # session — so inbound delivery survives context compaction. (This
+        # path historically captured ctx.session, which went stale on
+        # compaction and silently broke inbound delivery.)
+        _ensure_subscriber()
 
         try:
             result = await _dispatch_tool(name, args)
@@ -947,9 +932,7 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
             member_roles=args.get("member_roles"),
         )
     if name == "chat_invite":
-        return daemon_client.invite(
-            args["chat_id"], sid, args["invitee"], role=args.get("role")
-        )
+        return daemon_client.invite(args["chat_id"], sid, args["invitee"], role=args.get("role"))
     if name == "chat_grant_role":
         return daemon_client.grant_role(
             args["chat_id"],
