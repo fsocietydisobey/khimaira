@@ -301,9 +301,10 @@ For every approval:
 
    **Trigger condition:** the approved task's assignee session name contains
    a domain-lead pattern (`detect_domain(assignee_name) != "general"`).
-   Skip for agent, observer, tracker, critic, verifier, architect, intake —
+   Skip for agent, critic, verifier, architect, analyst, intake —
    only domain leads (backend-lead, frontend-lead, data-lead, devops-lead
    and project-prefixed variants like jp-frontend-lead-1) distill.
+   If tracker or observer are in the roster, they also skip (non-domain roles).
 
    **What to distill:** the lead's done-report text (task note + any key
    decisions from `session_state(assignee)`) — NOT the raw transcript.
@@ -370,9 +371,10 @@ with an explicit ask) expecting an ack or visible progress:
 - **Don't blindly resend.** Before retry, check chat history + agent's
   `session_state` to confirm the dispatch genuinely failed, not just slow.
   Retrying a still-processing message is noise.
-- **Observer is your eyes.** When observer is in the roster, ask them to
+- **Observer is your eyes (if present).** If observer is in the roster, ask them to
   actively check a suspected-stuck agent: `session_post_notice(target=observer-1,
-  text="is <agent> alive? no response on task-<id> for 5 min")`.
+  text="is <agent> alive? no response on task-<id> for 5 min")`. Observer is
+  off by default; use `--observer` when spawning a roster to include them.
 
 **Visible-failure trigger — DO NOT wait for the silence timer when the user
 reports a terminal-visible failure or you can observe ambient distress
@@ -818,7 +820,7 @@ mis-treat a consult as in-chain work.
 |---|---|
 | **intake** | Receives `🎯 INTAKE HANDOFF`; acks with `🛬 INTAKE RECEIVED`; signals `🏁 INTAKE COMPLETE` when done |
 | **agent** | You assign tasks (brief body + ctx-id), collect acks, review done work, approve or request changes |
-| **observer** | Passive — they watch your decisions and surface spec-drift anomalies; you don't need to direct them |
+| **observer** (optional) | Passive — they watch your decisions and surface spec-drift anomalies; you don't need to direct them. Off by default; add with `--observer`. |
 | **critic** | You invite critic review before approving multi-file or architectural tasks; critic pushes back; you decide |
 | **architect** | Consult on Complexity: HIGH tasks or architectural trade-offs; one structured reply per consult |
 | **analyst** | Consult when a task spec is ambiguous or agents are producing wrong output due to missing context. Send `📐 ANALYST CONSULT` privately; analyst returns a crisp spec you fold into the CONTEXT UPDATE before delegating. |
