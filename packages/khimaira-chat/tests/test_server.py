@@ -904,3 +904,76 @@ class TestSessionEntanglementFence:
             srv._state.sse_fenced = orig_fenced
             srv._state.subscriber_task = orig_task
             srv._state.write_stream = orig_stream
+
+
+# ---------------------------------------------------------------------------
+# Compaction re-slot
+# ---------------------------------------------------------------------------
+
+
+class TestCompactionReslot:
+    """register() re-posts the slot-bind when KHIMAIRA_ROSTER_SLOT is set,
+    so a compaction-recycled subprocess (new session_id, same window) re-slotifies
+    its new uuid and slot_resolve can bridge it.
+    """
+
+    def test_reslot_fires_when_env_set(self, monkeypatch):
+        """_maybe_reslot POSTs bind_slot when env vars are present and not fenced."""
+        from unittest.mock import MagicMock
+        from khimaira_chat import server as srv, daemon_client
+
+        monkeypatch.setenv("KHIMAIRA_ROSTER_SLOT", "inst123:agent-4")
+        monkeypatch.setenv("KITTY_WINDOW_ID", "42")
+        monkeypatch.setattr(srv._state, "sse_fenced", False)
+        mock_bind = MagicMock(return_value={"ok": True})
+        monkeypatch.setattr(daemon_client, "bind_slot", mock_bind)
+
+        srv._maybe_reslot("new-session-abc")
+
+        mock_bind.assert_called_once_with("new-session-abc", "inst123:agent-4", 42)
+
+    def test_reslot_skipped_when_fenced(self, monkeypatch):
+        """A fenced subprocess (K3 — duplicate of live session) must NOT re-slot.
+
+        If it did, _update_slot_registry would make the duplicate's sid the
+        slot's current_sid, hijacking the live owner's identity. The fence
+        stops dual-subscribe; this gate stops slot-hijack.
+        """
+        from unittest.mock import MagicMock
+        from khimaira_chat import server as srv, daemon_client
+
+        monkeypatch.setenv("KHIMAIRA_ROSTER_SLOT", "inst123:agent-4")
+        monkeypatch.setenv("KITTY_WINDOW_ID", "42")
+        monkeypatch.setattr(srv._state, "sse_fenced", True)
+        mock_bind = MagicMock()
+        monkeypatch.setattr(daemon_client, "bind_slot", mock_bind)
+
+        srv._maybe_reslot("fenced-session-xyz")
+
+        mock_bind.assert_not_called()
+
+    def test_reslot_skipped_when_no_env(self, monkeypatch):
+        """_maybe_reslot is a no-op when KHIMAIRA_ROSTER_SLOT is absent."""
+        from unittest.mock import MagicMock
+        from khimaira_chat import server as srv, daemon_client
+
+        monkeypatch.delenv("KHIMAIRA_ROSTER_SLOT", raising=False)
+        monkeypatch.setattr(srv._state, "sse_fenced", False)
+        mock_bind = MagicMock()
+        monkeypatch.setattr(daemon_client, "bind_slot", mock_bind)
+
+        srv._maybe_reslot("no-slot-session")
+
+        mock_bind.assert_not_called()
+
+    def test_reslot_fail_open(self, monkeypatch):
+        """bind_slot failure must NOT raise — fail-open (don't block registration)."""
+        from khimaira_chat import server as srv, daemon_client
+
+        monkeypatch.setenv("KHIMAIRA_ROSTER_SLOT", "inst123:agent-4")
+        monkeypatch.setenv("KITTY_WINDOW_ID", "42")
+        monkeypatch.setattr(srv._state, "sse_fenced", False)
+        monkeypatch.setattr(daemon_client, "bind_slot", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("daemon down")))
+
+        # Must not raise
+        srv._maybe_reslot("fail-session")

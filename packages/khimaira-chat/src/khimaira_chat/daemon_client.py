@@ -564,6 +564,26 @@ def set_session_name(session_id: str, name: str, *, base: str = DEFAULT_BASE) ->
     return resp.json()
 
 
+def bind_slot(
+    session_id: str, slot: str, window_id: int, *, base: str = DEFAULT_BASE
+) -> dict[str, Any]:
+    """POST /sessions/{session_id}/slot — bind (or re-bind) a session to a slot.
+
+    Called at register() time in the chat MCP subprocess so that a
+    compaction-recycled subprocess (new session_id, same window/slot) re-slotifies
+    its new uuid. Idempotent: re-binding the same slot with the same or a new sid
+    just updates the registry. Callers must handle all exceptions (fail-open).
+    """
+    resp = _request_with_retry(
+        "POST",
+        f"{base}/api/sessions/{session_id}/slot",
+        json={"slot": slot, "window_id": window_id},
+        timeout=10.0,
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
 def get_room(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[str, Any]:
     resp = _request_with_retry(
         "GET", f"{base}/api/chats/{chat_id}", params={"session_id": session_id}, timeout=10.0

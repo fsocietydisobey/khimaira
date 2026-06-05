@@ -344,6 +344,11 @@ class _SubprocessState:
                 session_id,
                 self.sse_fenced,
             )
+            # Re-slot: if compaction recycled this subprocess and assigned a new
+            # session_id, re-bind the window's stable KHIMAIRA_ROSTER_SLOT to the
+            # new sid so slot_resolve can bridge it. Gated: skip if fenced (a
+            # duplicate must not hijack the live owner's slot).
+            _maybe_reslot(session_id)
             # Bridge Claude Code's `-n <name>` flag → khimaira friendly name.
             _maybe_register_display_name(session_id)
         elif self.session_id != session_id:
@@ -355,6 +360,72 @@ class _SubprocessState:
 
 
 _state = _SubprocessState()
+
+
+def _maybe_reslot(session_id: str) -> None:
+    """Re-bind the slot when the subprocess (re)registers a session_id.
+
+    On context compaction, Claude Code recycles the MCP subprocess and assigns
+    a new session uuid, but does NOT re-fire SessionStart (the sole slot
+    registrar). As a result, the new uuid is never slot-registered and
+    slot_resolve cannot bridge it → the roster link breaks.
+
+    This function re-posts the slot-bind on every register() so compaction
+    composes correctly: KHIMAIRA_ROSTER_SLOT is preserved in the window env
+    across compaction (set once at kitty window launch), so the bind stays
+    stable even as the uuid rotates.
+
+    GATE — only re-slot if NOT fenced:
+        A fenced subprocess (K3 entanglement — duplicate of a LIVE session)
+        must NOT re-slot. If it did, `_update_slot_registry` would make the
+        duplicate's sid the slot's current_sid, displacing the REAL owner and
+        hijacking its identity. The fence stops dual-subscribe; this gate
+        stops slot-hijack. The two fixes must compose, not fight.
+
+    Idempotency: the daemon's /slot endpoint treats a re-POST with the same
+    slot + unchanged current_sid as a no-op — no prior_sids rotation, no churn.
+    Only a new sid triggers the rotate. Fail-open: never block registration on
+    slot-bind failure.
+    """
+    if _state.sse_fenced:
+        # Fenced = duplicate of a live session. Do NOT re-slot — that would
+        # hijack the live owner's slot binding.
+        log.info(
+            "khimaira-chat: re-slot skipped for session_id=%s (sse_fenced — "
+            "duplicate subprocess must not own the slot)",
+            session_id,
+        )
+        return
+    roster_slot = os.environ.get("KHIMAIRA_ROSTER_SLOT", "").strip()
+    kitty_wid_str = os.environ.get("KITTY_WINDOW_ID", "").strip()
+    if not roster_slot or not kitty_wid_str:
+        return
+    try:
+        kitty_wid = int(kitty_wid_str)
+    except ValueError:
+        log.warning(
+            "khimaira-chat: re-slot skipped — KITTY_WINDOW_ID=%r is not an int",
+            kitty_wid_str,
+        )
+        return
+    try:
+        daemon_client.bind_slot(session_id, roster_slot, kitty_wid)
+        log.info(
+            "khimaira-chat: re-slotted session_id=%s → slot=%s wid=%d",
+            session_id,
+            roster_slot,
+            kitty_wid,
+        )
+    except Exception as exc:
+        # Fail-open: a missing slot-bind is bad but must not block registration.
+        log.warning(
+            "khimaira-chat: re-slot POST failed for session_id=%s slot=%r wid=%d: %r "
+            "— session un-slotted, slot_resolve will not bridge this sid",
+            session_id,
+            roster_slot,
+            kitty_wid,
+            exc,
+        )
 
 
 def _detect_claude_display_name() -> str | None:
@@ -1412,6 +1483,7 @@ async def _async_try_auto_register_from_ppid() -> None:
                     sid,
                     _state.sse_fenced,
                 )
+                _maybe_reslot(sid)
                 _maybe_register_display_name(sid)
                 return
         # Backoff: 0.5s, 1s, 1.5s, 2s. Total ~5s matches the deadline.
@@ -1672,6 +1744,8 @@ def _try_auto_register_from_ppid() -> None:
     # claim before any subscriber starts (same as register() and async bridge).
     if not _acquire_session_claim(session_id):
         _state.sse_fenced = True
+    # Re-slot: same as register() — if compaction recycled this path, re-bind.
+    _maybe_reslot(session_id)
     log.info(
         "khimaira-chat: auto-registered session_id=%s via ancestor ppid=%s "
         "(sse_fenced=%s, no agent tool call needed)",
