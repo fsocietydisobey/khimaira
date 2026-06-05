@@ -110,6 +110,32 @@ def _http_post_json(path: str, body: dict) -> dict | None:
         return None
 
 
+def _http_post_json_retry(
+    path: str, body: dict, attempts: int = 3, base_delay: float = 0.4
+) -> dict | None:
+    """POST with bounded retry — for CRITICAL registration calls that must
+    survive a transient daemon hiccup or a roster boot-storm.
+
+    A roster launches N sessions at once; their concurrent registration POSTs
+    can push a busy daemon past the tight _HTTP_TIMEOUT_S, and the single-attempt
+    best-effort POST then silently drops the registration (the session boots fine
+    but never appears in session_list — observed live: a 14-session launch
+    registered only 2). The slot + register-pending endpoints return a dict on
+    success, so None means genuine failure → retry with backoff. Happy path is
+    one fast POST (no added latency); only failure pays the retry cost. Never
+    raises — boot must not block.
+    """
+    import time
+
+    for _attempt in range(attempts):
+        resp = _http_post_json(path, body)
+        if resp is not None:
+            return resp
+        if _attempt < attempts - 1:
+            time.sleep(base_delay * (_attempt + 1))  # 0.4s, 0.8s
+    return None
+
+
 def _http_get_json(path: str) -> dict | None:
     """GET <endpoint>/<path> → parsed JSON, or None on any failure.
 
@@ -844,7 +870,7 @@ def main() -> int:
     # parallel and retries the lookup for ~3s; we need the POST to
     # land within that window or the bridge falls back to lazy.
     try:
-        _http_post_json(
+        _http_post_json_retry(
             "/api/chats/register-pending-session",
             {"ppid": os.getppid(), "session_id": session_id},
         )
@@ -894,21 +920,25 @@ def main() -> int:
     _roster_slot = os.environ.get("KHIMAIRA_ROSTER_SLOT", "").strip()
     _kitty_wid = os.environ.get("KITTY_WINDOW_ID", "").strip()
     if _roster_slot and _kitty_wid:
+        # Retry — a transient daemon hiccup or boot-storm timeout must NOT silently
+        # un-slot the session (that recreates the exact silent-non-binding this code
+        # exists to prevent). _http_post_json returns None on failure (never raises),
+        # so the old bare `except` here was DEAD CODE: check the return value and WARN
+        # only on a genuine post-retry failure.
+        _slot_resp = None
         try:
-            _http_post_json(
+            _slot_resp = _http_post_json_retry(
                 f"/api/sessions/{session_id}/slot",
                 {"slot": _roster_slot, "window_id": int(_kitty_wid)},
             )
-        except Exception as _slot_err:
-            # Log — don't silently swallow. A systematic POST failure recreates the
-            # exact silent-non-binding this task exists to fix. Non-fatal (boot
-            # continues) but VISIBLE so a persistent failure surfaces immediately.
-            # The daemon independently logs TRAP-2 mismatches; this catches network/
-            # endpoint-drift/schema failures BEFORE the daemon even sees the request.
+        except Exception:
+            _slot_resp = None
+        if _slot_resp is None:
             import sys
             print(
-                f"[khimaira-hook] WARN: slot-bind POST failed for {session_id[:8]} "
-                f"slot={_roster_slot!r}: {_slot_err!r} — session un-slotted (drift-heal will not fire)",
+                f"[khimaira-hook] WARN: slot-bind POST failed (after retries) for "
+                f"{session_id[:8]} slot={_roster_slot!r} — session un-slotted "
+                "(drift-heal will not fire)",
                 file=sys.stderr,
             )
 
