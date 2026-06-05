@@ -205,6 +205,10 @@ def _acquire_session_claim(session_id: str) -> bool:
                 raw = claim_path.read_text().strip()
                 parts = raw.split(":", 1)
                 prior_pid = int(parts[0])
+                # prior_starttime is None for claims written by older code (PID-only
+                # format). Reuse-safety (starttime discrimination) applies only to
+                # new-format claims; old-format falls back to PID-only liveness.
+                # Old claims are transitional — they age out as new ones overwrite.
                 prior_starttime = parts[1] if len(parts) > 1 and parts[1] else None
             except (ValueError, OSError, IndexError):
                 prior_pid = None
