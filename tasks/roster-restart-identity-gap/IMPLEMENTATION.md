@@ -102,6 +102,28 @@ for the SSE subscriber → commit 475c002) to pin the implementation-level root 
 mints a new session-id that doesn't inherit chat membership / window binding" → an
 implementation-level fix target, not inference. Pair with the SSE fix already in-tree.
 
+### New facet — SESSION ENTANGLEMENT (same-id dual-subscribe) — 2026-06-05 (janice)
+
+A SECOND subprocess claiming a LIVE session_id is NOT fenced → both dual-subscribe to
+the chat SSE → both windows receive the roster's notifications. Repro: Joseph spun a 2nd
+`janice-0` window for a master-handoff context-transfer; it shared session_id `5ddb6421`
+(via `claude --resume` / duplicate launch) → the daemon pushes every chat event to that
+id → BOTH subprocesses' subscribers emit → both windows see the roster traffic.
+- Mechanism: chat-SSE delivers by session_id (`daemon_client.subscribe_events(session_id)`).
+  The `_SubprocessState` "one subprocess = one session" guard is enforced PER-SUBPROCESS
+  (refuses a *different* id mid-subprocess) but does NOT prevent TWO subprocesses
+  registering the SAME id globally. That hole = the entanglement.
+- **Why it matters:** the master-handoff flow is UNSAFE under this —
+  `chat_transfer_membership` needs a DISTINCT registered non-member target, which a
+  resume-into-same-id doesn't provide. A FULL close + fresh start sidesteps it (both
+  subprocesses die, fresh distinct ids mint).
+- **Ask (janice):** (a) chat-SSE delivery + the one-subprocess-per-session guard should be
+  GLOBALLY unique per session_id — a 2nd subprocess claiming a live id is rejected/fenced,
+  not silently dual-subscribed. (b) the transfer/handoff flow needs a distinct target id.
+- Common root with the rest of this gap: **identity at the session/subprocess layer is
+  not uniquely + stably bound**, so duplicates + resumes cross-wire. janice is tracing the
+  registration code → this fences into the same fix.
+
 ### The deeper fix (root)
 
 4. **Resume should re-attach the existing session-id**, not spawn fresh — identity
