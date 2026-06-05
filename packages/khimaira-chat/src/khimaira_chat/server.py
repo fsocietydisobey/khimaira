@@ -102,6 +102,35 @@ _MY_PID = os.getpid()
 _my_claim_path: Path | None = None
 
 
+def _get_proc_starttime(pid: int) -> str | None:
+    """Read the process start-time from /proc/<pid>/stat field 22 (Linux only).
+
+    Field 22 in /proc/<pid>/stat is the jiffies-since-boot at which the process
+    started. It is unique per PID within a boot — the OS cannot reuse the same
+    PID with the same start-time for a different process. This disambiguates PID
+    reuse: a stale claim for PID X with starttime T versus a LIVE unrelated
+    process at PID X with starttime T2 ≠ T — the claim is for the DEAD original.
+
+    Returns None if /proc is unavailable (non-Linux) or on any read error.
+    """
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+        # /proc/<pid>/stat format: pid (comm) state ppid ... starttime ...
+        # The command name can contain spaces and parentheses, so we parse from
+        # the right of the closing ')' to get reliably-indexed fields after it.
+        rp = stat_text.rfind(")")
+        if rp < 0:
+            return None
+        fields = stat_text[rp + 2 :].split()
+        # After ')': state(0), ppid(1), pgrp(2), session(3), tty(4), tpgid(5),
+        # flags(6), minflt(7), cminflt(8), majflt(9), cmajflt(10), utime(11),
+        # stime(12), cutime(13), cstime(14), priority(15), nice(16), nthreads(17),
+        # itrealvalue(18), starttime(19)
+        return fields[19] if len(fields) > 19 else None
+    except OSError:
+        return None
+
+
 def _pid_alive(pid: int) -> bool | None:
     """Return True if the process is alive, False if dead, None if unknown.
 
@@ -117,66 +146,113 @@ def _pid_alive(pid: int) -> bool | None:
         return None  # permission or other error → ambiguous
 
 
+def _is_original_claimant(prior_pid: int, prior_starttime: str | None) -> bool | None:
+    """Return True if the prior claim is from the ORIGINAL (not a reused) PID.
+
+    PID reuse: a crashed session leaves a stale claim. The OS can assign the same
+    PID to an unrelated process. `_pid_alive(stale_pid)` returns True for the
+    unrelated process → false-fence: the real session can never reclaim.
+
+    Fix: compare the current starttime of `prior_pid` against the starttime
+    recorded at claim-time. If they differ, the PID was reused → original is dead
+    → reclaim is safe. If they match, the original process is still alive → fence.
+
+    Returns:
+        True  — the original process is still alive (fence)
+        False — the process is dead or the PID was reused (reclaim)
+        None  — liveness cannot be determined (err toward fence)
+    """
+    if prior_starttime is None:
+        # No starttime was recorded at claim-time (e.g. written by an older version
+        # of this code). Fall back to PID-only alive check — reuse-ambiguous but the
+        # best we can do without the reference starttime.
+        return _pid_alive(prior_pid)
+    current_starttime = _get_proc_starttime(prior_pid)
+    if current_starttime is None:
+        # Can't read current starttime — process may not exist or /proc unavailable.
+        alive = _pid_alive(prior_pid)
+        if alive is False:
+            return False  # /proc/<pid>/ doesn't exist → dead → reclaim
+        return None  # ambiguous
+    if current_starttime != prior_starttime:
+        # PID was reused by a different process → original is dead → reclaim.
+        return False
+    # Same PID, same starttime → the original process is still alive → fence.
+    return True
+
+
 def _acquire_session_claim(session_id: str) -> bool:
     """Attempt to acquire the SSE-subscriber claim for session_id.
 
     Returns True if this subprocess should proceed to subscribe (either no
-    prior claim, or the prior claimant's process is dead).
+    prior claim, or the prior claimant's process is dead / PID-reused).
     Returns False if a live prior claimant already owns this session_id —
     this subprocess must NOT subscribe (entanglement fence).
+
+    The claim file stores PID:starttime so PID reuse is detectable: if the
+    OS assigns the same PID to a different process after a crash, the
+    start-times differ → original is dead → reclaim is allowed.
     """
     global _my_claim_path
     try:
         _SSE_CLAIM_DIR.mkdir(parents=True, exist_ok=True)
         claim_path = _SSE_CLAIM_DIR / f"{session_id}.pid"
+        my_starttime = _get_proc_starttime(_MY_PID)
+        my_claim_text = f"{_MY_PID}:{my_starttime or ''}"
 
         if claim_path.exists():
             try:
-                prior_pid = int(claim_path.read_text().strip())
-            except (ValueError, OSError):
+                raw = claim_path.read_text().strip()
+                parts = raw.split(":", 1)
+                prior_pid = int(parts[0])
+                prior_starttime = parts[1] if len(parts) > 1 and parts[1] else None
+            except (ValueError, OSError, IndexError):
                 prior_pid = None
+                prior_starttime = None
 
             if prior_pid is not None and prior_pid != _MY_PID:
-                alive = _pid_alive(prior_pid)
-                if alive is True:
-                    # Live prior claimant — fence this subprocess.
+                original_alive = _is_original_claimant(prior_pid, prior_starttime)
+                if original_alive is True:
+                    # Original process is live and owns this session_id — fence.
                     log.warning(
                         "khimaira-chat: session-entanglement fence: session_id=%s already "
-                        "claimed by live PID %d; this subprocess will NOT subscribe to SSE. "
-                        "Two subprocesses are sharing the same khimaira session_id. "
-                        "Close the duplicate window to clear the entanglement.",
+                        "claimed by live PID %d (starttime=%s); this subprocess will NOT "
+                        "subscribe to SSE. Two subprocesses share this session_id — close "
+                        "the duplicate window to clear the entanglement.",
                         session_id,
                         prior_pid,
+                        prior_starttime,
                     )
                     return False
-                elif alive is None:
-                    # Unknown liveness (non-Linux or permission error) → err toward FENCE.
+                elif original_alive is None:
+                    # Liveness ambiguous (non-Linux, /proc-unreadable, etc.) → err FENCE.
                     log.warning(
                         "khimaira-chat: session-entanglement fence: session_id=%s has a "
                         "prior claim (PID %d) but process liveness cannot be verified "
-                        "(non-Linux or /proc unavailable). Fencing this subprocess as a "
-                        "precaution — clear the claim file if this is a false positive: %s",
+                        "(non-Linux or /proc unavailable). Fencing as a precaution. "
+                        "To force-reclaim: delete %s",
                         session_id,
                         prior_pid,
                         claim_path,
                     )
                     return False
                 else:
-                    # Prior PID is dead → reclaim.
+                    # Prior PID dead or reused — reclaim.
                     log.info(
                         "khimaira-chat: session-entanglement: reclaiming session_id=%s "
-                        "from dead PID %d",
+                        "from dead/reused PID %d (starttime=%s)",
                         session_id,
                         prior_pid,
+                        prior_starttime,
                     )
 
-        # Write our claim.
-        claim_path.write_text(str(_MY_PID))
+        # Write our claim (PID:starttime for reuse detection).
+        claim_path.write_text(my_claim_text)
         _my_claim_path = claim_path
 
         def _release_claim() -> None:
             try:
-                if claim_path.exists() and claim_path.read_text().strip() == str(_MY_PID):
+                if claim_path.exists() and claim_path.read_text().strip() == my_claim_text:
                     claim_path.unlink(missing_ok=True)
             except OSError:
                 pass
@@ -186,7 +262,7 @@ def _acquire_session_claim(session_id: str) -> bool:
 
     except OSError as exc:
         # Filesystem error creating the claim dir or writing the file.
-        # Fail-open: allow subscription (don't block on infra failure).
+        # Fail-open: allow subscription (don't block on claim-infra failure).
         log.warning(
             "khimaira-chat: session-entanglement: could not write claim file for "
             "session_id=%s (%s); proceeding without fence (fail-open)",

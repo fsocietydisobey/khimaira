@@ -730,25 +730,29 @@ class TestSessionEntanglementFence:
         assert result is True, "No prior claim should allow subscription"
         claim = tmp_path / "test-session-1.pid"
         assert claim.exists(), "Claim file should be written"
-        assert claim.read_text().strip() == "99999"
+        # Claim file is now PID:starttime (starttime may be absent on non-Linux)
+        assert claim.read_text().strip().startswith("99999")
 
     def test_live_prior_fenced(self, tmp_path, monkeypatch):
-        """Claim file holds a live PID → this subprocess is fenced (not allowed).
+        """Claim file holds a live PID with its real starttime → fenced.
 
-        Uses os.getpid() as the 'live' PID — this process is definitely alive.
-        The fence must return False (block subscription), not True (allow).
+        Uses os.getpid() as the 'live' PID — this process is definitely alive,
+        and _get_proc_starttime will return its REAL starttime (same starttime
+        as recorded = original process still alive = FENCE).
+
         This is the reproduce-the-bug test: without the fence, _acquire_session_claim
         would overwrite the claim and return True regardless of prior liveness.
-        After the fix, the second claimant is blocked by the live-PID check.
+        After the fix, the second claimant is blocked.
         """
         import os
         from khimaira_chat import server as srv
 
         live_pid = os.getpid()
+        live_starttime = srv._get_proc_starttime(live_pid) or ""
         monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
         monkeypatch.setattr(srv, "_MY_PID", live_pid + 1)  # different PID = different subprocess
-        # Write a claim as if the live_pid subprocess already claimed it.
-        (tmp_path / "test-session-live.pid").write_text(str(live_pid))
+        # Write claim as if live_pid already claimed it (with its real starttime).
+        (tmp_path / "test-session-live.pid").write_text(f"{live_pid}:{live_starttime}")
         result = srv._acquire_session_claim("test-session-live")
         assert result is False, (
             "A live prior claimant should FENCE this subprocess (entanglement prevented)"
@@ -766,37 +770,65 @@ class TestSessionEntanglementFence:
         monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
         monkeypatch.setattr(srv, "_MY_PID", 88888)
         dead_pid = 99999999  # beyond kernel PID_MAX (typically 4194304 on Linux)
-        (tmp_path / "test-session-dead.pid").write_text(str(dead_pid))
+        (tmp_path / "test-session-dead.pid").write_text(f"{dead_pid}:12345")
         result = srv._acquire_session_claim("test-session-dead")
         # If /proc is available (Linux), the dead PID should not exist → reclaim.
         # On non-Linux, _pid_alive returns None → fence (ambiguity policy).
         if pathlib.Path("/proc").exists():
             assert result is True, "Dead prior PID should allow reclaim on Linux"
             claim = tmp_path / "test-session-dead.pid"
-            assert claim.read_text().strip() == "88888", "Claim file should hold our PID"
+            assert claim.read_text().strip().startswith("88888"), "Claim file should hold our PID"
         else:
             # Non-Linux: /proc unavailable → ambiguous → fence (recoverable-default)
             assert result is False, "Non-Linux: ambiguous liveness → fence"
 
-    def test_ambiguous_liveness_fenced(self, tmp_path, monkeypatch):
-        """_pid_alive returning None (non-Linux or /proc-unreadable) must FENCE.
+    def test_pid_reused_reclaim_allowed(self, tmp_path, monkeypatch):
+        """Claim holds a live PID but DIFFERENT starttime → reuse detected → reclaim.
 
-        This is the load-bearing safety path: the code says alive=None → fence,
-        but the original commit message said 'Non-Linux: fail-open'. This test
-        pins the CODE (err-fence-on-ambiguity) so a future edit can't silently
-        flip it to the wrong direction.
+        A crashed session leaves a stale claim. The OS reuses the same PID number
+        for an unrelated process. Without starttime disambiguation, _pid_alive
+        returns True → permanent false-fence. With PID+starttime, the different
+        starttime reveals PID-reuse → original is dead → reclaim allowed.
+        """
+        import os
+        import pathlib
+        from khimaira_chat import server as srv
+
+        if not pathlib.Path("/proc").exists():
+            import pytest
+            pytest.skip("PID-reuse test requires /proc (Linux only)")
+
+        live_pid = os.getpid()
+        monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
+        monkeypatch.setattr(srv, "_MY_PID", live_pid + 1)
+        # Write claim with a DIFFERENT starttime — simulates PID reuse.
+        # The current process (live_pid) exists but has starttime S; claim says S+1.
+        real_starttime = srv._get_proc_starttime(live_pid) or "1"
+        fake_starttime = str(int(real_starttime) + 999)  # different starttime
+        (tmp_path / "test-session-reused.pid").write_text(f"{live_pid}:{fake_starttime}")
+        result = srv._acquire_session_claim("test-session-reused")
+        assert result is True, (
+            "PID reuse (same PID, different starttime) must allow reclaim — "
+            "the original process is dead even though the PID number is live"
+        )
+
+    def test_ambiguous_liveness_fenced(self, tmp_path, monkeypatch):
+        """_is_original_claimant returning None (ambiguous) must FENCE.
+
+        This pins the err-fence-on-ambiguity safety path so a future edit
+        can't flip it to fail-open (silent dual-subscribe = undiagnosable failure).
         """
         from khimaira_chat import server as srv
 
         monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
         monkeypatch.setattr(srv, "_MY_PID", 77777)
-        # A claim exists from some other PID.
-        (tmp_path / "test-session-ambiguous.pid").write_text("55555")
-        # Force _pid_alive to return None (simulates /proc-unavailable).
-        monkeypatch.setattr(srv, "_pid_alive", lambda pid: None)
+        # A claim exists from some other PID with a starttime.
+        (tmp_path / "test-session-ambiguous.pid").write_text("55555:999")
+        # Force _is_original_claimant to return None (simulates ambiguous liveness).
+        monkeypatch.setattr(srv, "_is_original_claimant", lambda pid, st: None)
         result = srv._acquire_session_claim("test-session-ambiguous")
         assert result is False, (
-            "Ambiguous liveness (alive=None) must FENCE, not fail-open — "
+            "Ambiguous liveness must FENCE, not fail-open — "
             "silent dual-subscribe is the undiagnosable failure"
         )
 
