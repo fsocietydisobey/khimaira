@@ -1570,7 +1570,7 @@ def build_router():
     @router.get("/chats/{chat_id}")
     async def get_room(chat_id: str, session_id: str) -> dict:
         try:
-            room = chats.load_room(chat_id)
+            room = await asyncio.to_thread(chats.load_room, chat_id)
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
         member = room["members"].get(chats._resolve_or_uuid(session_id))
@@ -1923,7 +1923,9 @@ def build_router():
         since: str | None = None,
     ) -> dict:
         try:
-            msgs = chats.history(chat_id, session_id, limit=limit, since_event_id=since)
+            msgs = await asyncio.to_thread(
+                chats.history, chat_id, session_id, limit=limit, since_event_id=since
+            )
         except ValueError as exc:
             raise fastapi.HTTPException(403, str(exc)) from exc
         # Option A: resolve each sender's CURRENT name at read-time.

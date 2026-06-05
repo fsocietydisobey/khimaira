@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2682,9 +2683,23 @@ def delete(chat_id: str, by_session_id: str) -> dict[str, Any]:
     return {"chat_id": chat_id, "archived_to": str(dst), "deleted_at": _now_iso()}
 
 
+# Short-TTL cache for my_chats — avoids re-reading 24+ JSONL files on every
+# agent turn. my_chats() measured at 78ms+ on a 24-file state; under 20
+# concurrent agents this blocks the event loop for ~1.5s per wave.
+# Agents call chat_my_chats() on every turn (SSE re-registration); membership
+# changes are rare, so 2s staleness is acceptable.
+_MY_CHATS_CACHE: dict[str, tuple[float, list]] = {}
+_MY_CHATS_TTL_S: float = 2.0
+
+
 def my_chats(session_id: str) -> list[dict[str, Any]]:
     """List chats where session is an accepted member, with brief metadata."""
     session_id = _resolve_or_uuid(session_id)
+    now = time.monotonic()
+    if session_id in _MY_CHATS_CACHE:
+        cached_at, cached_result = _MY_CHATS_CACHE[session_id]
+        if now - cached_at < _MY_CHATS_TTL_S:
+            return cached_result
     out: list[dict[str, Any]] = []
     if not _chat_dir().exists():
         return out
@@ -2712,6 +2727,7 @@ def my_chats(session_id: str) -> list[dict[str, Any]]:
             }
         )
     out.sort(key=lambda c: c["last_message_ts"] or "", reverse=True)
+    _MY_CHATS_CACHE[session_id] = (time.monotonic(), out)
     return out
 
 
