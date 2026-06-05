@@ -356,6 +356,58 @@ class TestInjectTextAndSubmit:
             result = rr._inject_text_and_submit(window_id=10, text="/compact")
         assert result is False
 
+    def test_uses_title_match_when_title_provided(self):
+        """When window_title is given, send-text and send-key use --match=title:<title>."""
+        screen_after_inject = self._make_screen("/compact")
+        with patch.object(rr, "_kitty") as mock_kitty:
+            mock_kitty.side_effect = ["", screen_after_inject, ""]
+            result = rr._inject_text_and_submit(
+                window_id=10, text="/compact", window_title="agent-3"
+            )
+        assert result is True
+        # send-text call (index 0) and send-key call (index 2) must use title-match.
+        # The TOCTOU get-text (index 1) intentionally still uses id-match for precision.
+        send_text_call = str(mock_kitty.call_args_list[0])
+        send_key_call = str(mock_kitty.call_args_list[2])
+        assert "title:agent-3" in send_text_call, "send-text must use title-match"
+        assert "title:agent-3" in send_key_call, "send-key must use title-match"
+        assert "id:10" not in send_text_call, "send-text must NOT use id-match when title given"
+        assert "id:10" not in send_key_call, "send-key must NOT use id-match when title given"
+
+    def test_uses_id_match_when_title_empty(self):
+        """Without window_title, falls back to id-match (backward compat)."""
+        screen_after_inject = self._make_screen("/compact")
+        with patch.object(rr, "_kitty") as mock_kitty:
+            mock_kitty.side_effect = ["", screen_after_inject, ""]
+            result = rr._inject_text_and_submit(window_id=10, text="/compact")
+        assert result is True
+        calls = [str(c) for c in mock_kitty.call_args_list]
+        assert any("id:10" in c for c in calls), "id-match must be used when no title given"
+
+    def test_title_match_absent_title_fails_loudly(self):
+        """Title-match returning None (rc!=0 = window not found) → False, not silent."""
+        # kitty @ send-text --match=title:<absent> → rc != 0 → _kitty returns None
+        with patch.object(rr, "_kitty", return_value=None):
+            result = rr._inject_text_and_submit(
+                window_id=99, text="wake", window_title="dead-agent"
+            )
+        assert result is False
+
+
+class TestAutoWakeFreshEnumerate:
+    """Auto-wake re-enumerates kitty @ ls fresh every cycle (no id-map caching)."""
+
+    @pytest.mark.asyncio
+    async def test_check_once_calls_discover_each_run(self):
+        """check_once() calls _discover_roster_windows each time (not cached)."""
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_discover_roster_windows", return_value=[]) as mock_discover,
+        ):
+            await rr.check_once()
+            await rr.check_once()
+        assert mock_discover.call_count == 2, "Must re-enumerate windows on every sweep"
+
 
 # ---------------------------------------------------------------------------
 # _process_window — decision logic
@@ -368,8 +420,8 @@ class TestProcessWindow:
         yield
         rr._DEBOUNCE.clear()
 
-    def _win(self, role="agent-1", window_id=10):
-        return {"window_id": window_id, "role": role, "cmdline": f"claude-chat -r {role}"}
+    def _win(self, role="agent-1", window_id=10, raw_name=""):
+        return {"window_id": window_id, "role": role, "raw_name": raw_name, "cmdline": f"claude-chat -r {role}"}
 
     @pytest.mark.asyncio
     async def test_compact_when_at_threshold(self):
@@ -384,7 +436,7 @@ class TestProcessWindow:
             patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
         ):
             await rr._process_window(self._win())
-        mock_inject.assert_called_once_with(10, "/compact")
+        mock_inject.assert_called_once_with(10, "/compact", "")
 
     @pytest.mark.asyncio
     async def test_distill_called_before_compact(self):
@@ -395,7 +447,7 @@ class TestProcessWindow:
         async def mock_distill(sid, role):
             call_order.append("distill")
 
-        def mock_inject(wid, text):
+        def mock_inject(wid, text, title=""):
             call_order.append("inject")
             return True
 

@@ -470,21 +470,34 @@ def _distill_sync(session_id: str, role: str) -> None:
 # Guard (b): TOCTOU-safe injection
 # ---------------------------------------------------------------------------
 
-def _inject_text_and_submit(window_id: int, text: str) -> bool:
+def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -> bool:
     """Inject ``text`` into a kitty window and submit with Enter.
+
+    Prefers title-match (``--match=title:<window_title>``) over id-match when
+    ``window_title`` is provided.  Title-match is stable across restarts (window
+    IDs renumber; titles don't) and fails loudly on no-match (rc != 0) instead
+    of silently no-oping like ``--match=id:<dead>`` (rc=0, undetected until the
+    TOCTOU check fires).  Id-match is kept as the fallback for callers that only
+    know the window id.
 
     Steps:
     1. Send the text (does NOT submit yet).
     2. Wait briefly for the terminal to echo it.
-    3. Re-read the buffer — verify it ends with ONLY our text (TOCTOU guard).
-       Abort + clear (Ctrl-C) if changed.
+    3. Re-read the buffer via id (precise) — verify it ends with ONLY our text
+       (TOCTOU guard). Abort + clear (Ctrl-C) if changed.
     4. Submit with Enter.
 
     Returns True if submitted, False if aborted.
     """
+    match_arg = (
+        f"--match=title:{window_title}" if window_title else f"--match=id:{window_id}"
+    )
+
     # Step 1: send text
-    if _kitty("send-text", f"--match=id:{window_id}", "--", text) is None:
-        _log.warning("roster-recovery: send-text failed for window %d", window_id)
+    if _kitty("send-text", match_arg, "--", text) is None:
+        _log.warning(
+            "roster-recovery: send-text failed for window %d (%s)", window_id, match_arg
+        )
         return False
 
     # Step 2: brief pause for echo
@@ -519,8 +532,10 @@ def _inject_text_and_submit(window_id: int, text: str) -> bool:
         return False
 
     # Step 4: submit
-    if _kitty("send-key", f"--match=id:{window_id}", "enter") is None:
-        _log.warning("roster-recovery: send-key enter failed for window %d", window_id)
+    if _kitty("send-key", match_arg, "enter") is None:
+        _log.warning(
+            "roster-recovery: send-key enter failed for window %d (%s)", window_id, match_arg
+        )
         return False
 
     return True
@@ -932,6 +947,7 @@ def _handle_hitl_prompt(
     session_id: str,
     role: str,
     prompt: dict[str, str],
+    window_title: str = "",
 ) -> str:
     """Run Guards A/B/C/D. Inject answer or escalate. Return action taken."""
     raw = prompt["raw_block"]
@@ -969,7 +985,7 @@ def _handle_hitl_prompt(
         return "escalated"
 
     # All guards passed — inject the answer
-    submitted = _inject_text_and_submit(window_id, answer_key)
+    submitted = _inject_text_and_submit(window_id, answer_key, window_title)
     if submitted:
         _log.info(
             "roster-hitl: ANSWERED window=%d role=%s session=%s key=%r kind=%s",
@@ -1295,7 +1311,7 @@ async def _process_window(win: dict[str, Any]) -> None:
                     )
                 else:
                     result = await asyncio.get_running_loop().run_in_executor(
-                        None, _handle_hitl_prompt, window_id, session_id, role, hitl_prompt
+                        None, _handle_hitl_prompt, window_id, session_id, role, hitl_prompt, raw_name
                     )
                     _DEBOUNCE[action_key] = time.time()
                     if result == "escalated":
@@ -1365,7 +1381,7 @@ async def _process_window(win: dict[str, Any]) -> None:
 
         # Guard (b) + TOCTOU: inject /compact with buffer-verify before submit
         submitted = await asyncio.get_running_loop().run_in_executor(
-            None, _inject_text_and_submit, window_id, "/compact"
+            None, _inject_text_and_submit, window_id, "/compact", raw_name
         )
         if submitted:
             _DEBOUNCE[action_key] = time.time()
@@ -1454,7 +1470,7 @@ async def _process_window(win: dict[str, Any]) -> None:
 
         wake_msg = "⏰ resume: call chat_my_chats + act on your pending task"
         submitted = await asyncio.get_running_loop().run_in_executor(
-            None, _inject_text_and_submit, window_id, wake_msg
+            None, _inject_text_and_submit, window_id, wake_msg, raw_name
         )
         if submitted:
             _DEBOUNCE[action_key] = time.time()
