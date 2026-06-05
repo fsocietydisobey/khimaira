@@ -2,20 +2,6 @@
 # Conditions are AND-combined only. No OR/NOT support in Phase 1.
 role: intake
 invariants:
-  - id: IN-INTAKE-1
-    name: NO_FILE_EDIT
-    severity: block
-    matchers:
-      - tool: Edit
-      - tool: Write
-      - tool: MultiEdit
-      - tool: NotebookEdit
-    message: |
-      🛑 Themis IN-INTAKE-1 (NO_FILE_EDIT): intake cannot call {tool_name}.
-      Relay to master (notice/chat); master dispatches.
-      The boundary exists so intake's status answers stay current — the
-      moment intake implements, its "what's the status?" answer drifts.
-
   - id: IN-INTAKE-2
     name: NO_API_DISPATCH
     severity: block
@@ -37,33 +23,6 @@ invariants:
       background Claude Code agents. Check session_list() — if agents are idle,
       relay to master (notice/chat); master dispatches. Standalone agents bypass the enforcement gate,
       context broadcast, observer, and task lifecycle.
-
-  - id: IN-INTAKE-4
-    name: NO_BASH_MUTATING
-    severity: block
-    matchers:
-      - tool: Bash
-        tool_input_field:
-          field: command
-          pattern: '\bgit\s+(commit|push|merge|rebase|reset|checkout\s+-|stash\s+pop|tag\s+-)'
-      - tool: Bash
-        tool_input_field:
-          field: command
-          pattern: '\b(rm|mv|cp|mkdir|touch|chmod|chown)\s+'
-      - tool: Bash
-        tool_input_field:
-          field: command
-          pattern: '>\s*[^/&]'
-      - tool: Bash
-        tool_input_field:
-          field: command
-          pattern: '>>\s*[^/&]'
-    message: |
-      🛑 Themis IN-INTAKE-4 (NO_BASH_MUTATING): this Bash command mutates state
-      (git commit/push, rm/mv/cp/mkdir, or shell output redirect outside /tmp).
-      Intake is a non-executor role — read-only Bash (wc, find, grep, ls) is
-      allowed; mutating operations are not. Hand off by relaying to master
-      (notice/chat); master dispatches.
 
   - id: IN-INTAKE-5
     name: NO_MASTER_DISPATCH

@@ -145,13 +145,14 @@ class TestListRules:
         assert isinstance(result[0]["invariants"], list)
         assert len(result[0]["invariants"]) > 0
 
-    def test_intake_has_no_file_edit_rule(self):
-        """intake.yaml must contain the IN-INTAKE-1 NO_FILE_EDIT invariant."""
+    def test_intake_write_access_granted(self):
+        """intake.yaml must NOT contain IN-INTAKE-1 — intake has write access (2026-06-05)."""
         from themis.server import list_rules
 
         result = list_rules(role="intake")
         ids = [inv["id"] for inv in result[0]["invariants"]]
-        assert "IN-INTAKE-1" in ids
+        assert "IN-INTAKE-1" not in ids
+        assert "IN-INTAKE-4" not in ids
 
     def test_verifier_phase_1_omits_no_file_edit(self):
         """verifier.yaml has no NO_FILE_EDIT in Phase 1 per spec."""
@@ -268,37 +269,24 @@ class TestCheck:
         assert result["ok"] is True
         assert "error" in result
 
-    def test_end_to_end_fixture_intake_no_file_edit(self):
-        """End-to-end: simulate daemon calling engine for intake + Edit.
+    def test_end_to_end_fixture_intake_edit_allowed(self):
+        """End-to-end: intake Edit is now ALLOWED (IN-INTAKE-1 removed, 2026-06-05).
 
-        Validates that the engine returns block on IN-INTAKE-1, then that
-        the MCP wrapper correctly passes through the daemon verdict.
+        Validates that the engine returns ok=True for intake + Edit, and that
+        the MCP wrapper correctly passes through an ok verdict.
         """
         from themis.engine import evaluate
         from themis.server import check
 
         eval_result = evaluate("intake", "Edit", {})
-        assert not eval_result.ok
-        assert eval_result.violation is not None
-        assert eval_result.violation.rule_id == "IN-INTAKE-1"
-        assert eval_result.violation.severity.value == "block"
+        assert eval_result.ok is True
+        assert eval_result.violation is None
 
-        # Simulate the daemon wrapping the engine result in the response shape
-        daemon_payload = {
-            "ok": eval_result.ok,
-            "role": "intake",
-            "violation": {
-                "rule_id": eval_result.violation.rule_id,
-                "name": eval_result.violation.name,
-                "severity": eval_result.violation.severity.value,
-                "message": eval_result.violation.message,
-            },
-        }
+        daemon_payload = {"ok": True, "role": "intake"}
         with patch("urllib.request.urlopen", return_value=_urlopen_response(daemon_payload)):
             result = check("session-intake", "Edit", {})
 
-        assert result["ok"] is False
-        assert result["violation"]["rule_id"] == "IN-INTAKE-1"
+        assert result["ok"] is True
 
 
 # ---------------------------------------------------------------------------

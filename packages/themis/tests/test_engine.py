@@ -307,11 +307,9 @@ class TestToolInputFieldMatcher:
 # ---------------------------------------------------------------------------
 
 class TestBundledRulesEngine:
-    def test_intake_edit_blocked(self):
+    def test_intake_edit_allowed(self):
         result = evaluate("intake", "Edit", {})
-        assert result.ok is False
-        assert result.violation.rule_id == "IN-INTAKE-1"
-        assert result.violation.severity == Severity.BLOCK
+        assert result.ok is True
 
     def test_intake_read_allowed(self):
         result = evaluate("intake", "Read", {})

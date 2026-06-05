@@ -134,14 +134,9 @@ class TestLoadRules:
         assert "IN-VERIFIER-1" in ids
         assert "IN-VERIFIER-2" in ids
 
-    def test_intake_has_five_invariants(self):
+    def test_intake_has_three_invariants(self):
         rs = load_rules("intake")
-        assert len(rs.invariants) == 5
-
-    def test_intake_in_intake_1_severity_is_block(self):
-        rs = load_rules("intake")
-        inv = next(i for i in rs.invariants if i.id == "IN-INTAKE-1")
-        assert inv.severity == Severity.BLOCK
+        assert len(rs.invariants) == 3
 
     def test_master_in_master_1_has_conditions(self):
         rs = load_rules("master")

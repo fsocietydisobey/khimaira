@@ -19,7 +19,7 @@ import pytest
 from themis.data import Severity, load_rules
 
 _NON_EXECUTOR_ROLES = [
-    "intake",
+    # intake is executor-level (master-equivalent write access, 2026-06-05)
     "tracker",
     "observer",
     "architect",
