@@ -887,6 +887,34 @@ def _write_slot_registry(registry: "dict[str, dict]") -> None:
     path.write_text(json.dumps(registry, indent=2))
 
 
+def _get_registry_sids_by_status() -> (
+    "tuple[frozenset[str], frozenset[str], frozenset[str]]"
+):
+    """Return (current_sids, prior_sids, revoked_sids) derived from the slot registry.
+
+    Single source of truth for supersede-state — derived at read-time from the
+    slot registry, never from a flag written to session records.  This prevents
+    flag-vs-registry drift (the two-sources class).
+
+    Visibility contract (mirrors _SLOT_REGISTRY_MAX_PRIOR=1 last-1 bound):
+      - current_sids : fully visible in list_sessions + preferred in name resolution
+      - prior_sids   : visible in list_sessions (healing window) but deprioritised
+                       in name resolution (current preferred over prior)
+      - revoked_sids : hidden from list_sessions + skipped in name resolution
+    """
+    registry = _read_slot_registry()
+    current: set[str] = set()
+    prior: set[str] = set()
+    revoked: set[str] = set()
+    for entry in registry.values():
+        c = entry.get("current_sid")
+        if c:
+            current.add(c)
+        prior.update(entry.get("prior_sids", []))
+        revoked.update(entry.get("revoked_sids", []))
+    return frozenset(current), frozenset(prior), frozenset(revoked)
+
+
 def _update_slot_registry(slot: str, new_sid: str) -> None:
     """Update the slot registry when a new sid claims a slot.
 
@@ -1036,28 +1064,54 @@ def _find_by_name_in_candidates(
       un-migrated session can still be active; no basis to disambiguate).
     - caller_instance=None + all-unstamped + ≥2: original abort (today's behavior).
 
+    Auto-retire (2026-06-05): revoked sids (beyond-last-1 bound in the slot
+    registry) are skipped entirely.  Prior sids (within-last-1 bound) are kept as
+    a fallback: when both a current and a prior sid match by name, the current is
+    preferred — prior is only returned if no current sid has the name set.
+
     Also handles legacy test fixtures where the session_id IS the name
     (non-UUID dir, no status.json name field set).
     """
+    _current_sids, _prior_sids, _revoked_sids = _get_registry_sids_by_status()
+
     matches: list[str] = []
+    prior_fallback: list[str] = []  # prior-sid matches, deprioritised
     for sid in candidate_ids:
+        if sid in _revoked_sids:
+            continue  # skip retired sids entirely
+
+        # Determine if this is a prior (healing window) or current/unslotted.
+        is_prior = sid in _prior_sids
+
         # Primary check: status.json has name == query
         status_path = _BASE_DIR / sid / "status.json"
+        name_matches = False
         if status_path.is_file():
             try:
                 s = json.loads(status_path.read_text())
             except (OSError, json.JSONDecodeError):
                 s = {}
-            if s.get("name") == name:
-                matches.append(sid)
-                continue
+            name_matches = s.get("name") == name
 
-        # Dirname fallback: for legacy non-UUID session IDs where the
-        # dirname is the session identity (no status.json name field set).
-        # Production sessions always have names in status.json; this only
-        # fires in test fixtures that use bare strings as session IDs.
-        if not _is_uuid(sid) and sid == name and (_BASE_DIR / sid).is_dir():
-            matches.append(sid)
+        if not name_matches:
+            # Dirname fallback: for legacy non-UUID session IDs where the
+            # dirname is the session identity (no status.json name field set).
+            # Production sessions always have names in status.json; this only
+            # fires in test fixtures that use bare strings as session IDs.
+            if not _is_uuid(sid) and sid == name and (_BASE_DIR / sid).is_dir():
+                name_matches = True
+
+        if name_matches:
+            if is_prior:
+                prior_fallback.append(sid)
+            else:
+                matches.append(sid)
+
+    # If no current/unslotted sids matched, fall back to prior sids.
+    # This covers the transition window where the new current sid hasn't
+    # set its name yet (e.g., early in the first turn after resume).
+    if not matches and prior_fallback:
+        matches = prior_fallback
 
     if len(matches) == 1:
         return matches[0]
@@ -1125,10 +1179,17 @@ def _resolve_name_global_legacy(name: str, *, caller_instance: str | None = None
     Called when: roster is empty (first-run/test-isolation) OR name not found in
     the active roster OR roster computation errored.
     """
+    # Skip revoked sids (beyond last-1 bound) and deprioritise prior sids
+    # (within last-1 bound) in the same way as _find_by_name_in_candidates.
+    _current_sids, _prior_sids, _revoked_sids = _get_registry_sids_by_status()
+
     matches: list[str] = []
+    prior_fallback: list[str] = []
     for d in _BASE_DIR.iterdir():
         if not d.is_dir():
             continue
+        if d.name in _revoked_sids:
+            continue  # skip retired sids
         status_path = d / "status.json"
         if not status_path.is_file():
             continue
@@ -1145,7 +1206,14 @@ def _resolve_name_global_legacy(name: str, *, caller_instance: str | None = None
                     name,
                     d.name,
                 )
-            matches.append(d.name)
+            if d.name in _prior_sids:
+                prior_fallback.append(d.name)
+            else:
+                matches.append(d.name)
+
+    # Prefer current/unslotted matches; fall back to prior only if none.
+    if not matches and prior_fallback:
+        matches = prior_fallback
 
     if not matches:
         fallback_dir = _BASE_DIR / name
@@ -2948,9 +3016,19 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
             _list_sessions_cache = (time.time(), [])
             return []
 
+        # Derive superseded state from the slot registry once per scan.
+        # revoked_sids = beyond last-1 bound → hidden from the live roster.
+        # prior_sids   = within last-1 bound → visible but labelled "prior".
+        _, _prior_sids, _revoked_sids = _get_registry_sids_by_status()
+
         out: list[dict] = []
         for sd in _BASE_DIR.iterdir():
             if not sd.is_dir():
+                continue
+            # Skip revoked (superseded-beyond-last-1) sessions: they are
+            # retired-intentionally, not dark/stuck.  Records remain on disk
+            # for transcript/decision/alive-guard reads; only the live list is pruned.
+            if sd.name in _revoked_sids:
                 continue
             last_mtime = max(
                 (p.stat().st_mtime for p in sd.iterdir() if p.is_file()),
@@ -2993,6 +3071,14 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
                 if isinstance(raw, str) and raw:
                     ws_value = raw
 
+            # roster_status: derived from slot registry, never from a stored flag.
+            if sd.name in _prior_sids:
+                roster_status: str | None = "prior"
+            elif sd.name in _revoked_sids:
+                roster_status = "superseded"  # unreachable here — revoked filtered above
+            else:
+                roster_status = None  # current or unslotted
+
             out.append(
                 {
                     "session_id": sd.name,
@@ -3008,6 +3094,7 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
                     "decision_count": decisions,
                     "file_touch_count": files,
                     "open_question_count": open_q,
+                    "roster_status": roster_status,
                 }
             )
         out.sort(key=lambda r: r.get("last_active", 0), reverse=True)

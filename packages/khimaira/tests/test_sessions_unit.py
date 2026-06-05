@@ -1414,3 +1414,178 @@ def test_slot_resolve_idempotent_rebind_no_prior_churn(isolated_state):
     registry = s._read_slot_registry()
     entry = registry.get("inst-abc:agent-1", {})
     assert sid not in entry.get("prior_sids", [])
+
+
+# ---------------------------------------------------------------------------
+# Auto-retire-prior tests (2026-06-05) — task-58d26e15221e
+# Verifies: revoked sids are hidden from list_sessions; prior sids are visible;
+# name resolution returns current, not stale; alive-guard skips retired records.
+# ---------------------------------------------------------------------------
+
+
+def _make_session(s, sid: str, name: str | None = None) -> None:
+    """Create a minimal session dir + optional status.json with a name."""
+    d = s._session_dir(sid)
+    if name:
+        status_path = d / "status.json"
+        import json as _json
+        status_path.write_text(_json.dumps({"name": name, "status": "idle"}))
+
+
+class TestAutoRetirePrior:
+    """Auto-retire: revoked sids hidden from live roster, prior visible."""
+
+    def test_revoked_sid_hidden_from_list_sessions(self, isolated_state):
+        """After N>2 slot binds, revoked sids (beyond last-1) absent from list_sessions."""
+        s = isolated_state
+        slot = "inst-retire:agent-1"
+        s1 = "aaaa0001-0000-4000-8000-000000000001"
+        s2 = "bbbb0002-0000-4000-8000-000000000002"
+        s3 = "cccc0003-0000-4000-8000-000000000003"
+
+        for sid in (s1, s2, s3):
+            _make_session(s, sid, name="agent-1")
+            s.set_session_slot(sid, slot)
+
+        rows = s.list_sessions(use_cache=False)
+        session_ids = {r["session_id"] for r in rows}
+
+        assert s1 not in session_ids, "revoked (beyond last-1) must be hidden"
+        assert s2 in session_ids, "prior (last-1 bound) must be visible"
+        assert s3 in session_ids, "current must be visible"
+
+    def test_prior_sid_roster_status_is_prior(self, isolated_state):
+        """Prior sid (last-1 bound) has roster_status='prior' in list_sessions output."""
+        s = isolated_state
+        slot = "inst-retire:agent-2"
+        s1 = "aaaa0001-0000-4000-8000-000000000001"  # will become prior
+        s2 = "bbbb0002-0000-4000-8000-000000000002"  # will become current
+
+        for sid in (s1, s2):
+            _make_session(s, sid, name="agent-2")
+            s.set_session_slot(sid, slot)
+
+        # After loop: s2 = current, s1 = prior (last-1 bound, still visible)
+        rows = s.list_sessions(use_cache=False)
+        row_map = {r["session_id"]: r for r in rows}
+
+        assert s1 in row_map, "prior (last-1 bound) must be visible in list_sessions"
+        assert row_map[s1]["roster_status"] == "prior"
+        assert s2 in row_map, "current must be visible in list_sessions"
+        assert row_map[s2]["roster_status"] is None, "current has no special roster_status"
+
+    def test_current_sid_roster_status_none(self, isolated_state):
+        """Current sids are unslotted (roster_status=None) in list_sessions."""
+        s = isolated_state
+        slot = "inst-retire:agent-3"
+        s1 = "aaaa0001-0000-4000-8000-000000000001"
+        _make_session(s, s1, name="agent-3")
+        s.set_session_slot(s1, slot)
+
+        rows = s.list_sessions(use_cache=False)
+        row_map = {r["session_id"]: r for r in rows}
+        assert row_map[s1]["roster_status"] is None
+
+    def test_n_resumes_class_invariant(self, isolated_state):
+        """After N resumes of a slot, list_sessions shows current + last-1 only.
+
+        Class invariant: with MAX_PRIOR=1, for N binds of the same slot,
+        exactly 2 records appear (current + last-1 prior).  All older
+        (revoked) records are hidden.
+        """
+        s = isolated_state
+        slot = "inst-class:agent-x"
+        sids = [
+            f"aaaa000{i}-0000-4000-8000-000000000001" for i in range(1, 6)
+        ]
+        # Replace the 'd' in last group to avoid UUID collision on hex digit
+        sids = [
+            "aaaa0001-0000-4000-8000-000000000001",
+            "bbbb0002-0000-4000-8000-000000000002",
+            "cccc0003-0000-4000-8000-000000000003",
+            "dddd0004-0000-4000-8000-000000000004",
+            "eeee0005-0000-4000-8000-000000000005",
+        ]
+
+        for sid in sids:
+            _make_session(s, sid, name="agent-x")
+            s.set_session_slot(sid, slot)
+
+        rows = s.list_sessions(use_cache=False)
+        slotted_rows = [r for r in rows if r.get("session_id") in set(sids)]
+
+        visible_ids = {r["session_id"] for r in slotted_rows}
+        current = sids[-1]
+        prior = sids[-2]
+        revoked = set(sids[:-2])
+
+        assert current in visible_ids, "current must appear in list_sessions"
+        assert prior in visible_ids, "last-1 prior must appear in list_sessions"
+        assert revoked.isdisjoint(visible_ids), (
+            f"revoked sids must not appear in list_sessions; found {revoked & visible_ids}"
+        )
+        assert len(slotted_rows) == 2, (
+            f"exactly 2 live records per slot (current + last-1 prior), got {len(slotted_rows)}"
+        )
+
+    def test_name_resolution_prefers_current_over_prior(self, isolated_state):
+        """resolve_session_id by name returns the current sid, not the prior.
+
+        Even when both current and prior sid have the same name set, the
+        current is preferred and the prior is deprioritised.
+        """
+        s = isolated_state
+        slot = "inst-resolve:agent-y"
+        s_prior = "aaaa0001-0000-4000-8000-000000000001"
+        s_current = "bbbb0002-0000-4000-8000-000000000002"
+
+        for sid in (s_prior, s_current):
+            _make_session(s, sid, name="agent-y")
+            s.set_session_slot(sid, slot)
+
+        resolved = s.resolve_session_id("agent-y")
+        assert resolved == s_current, (
+            f"name should resolve to current sid {s_current!r}, got {resolved!r}"
+        )
+
+    def test_name_resolution_skips_revoked(self, isolated_state):
+        """Revoked sids are never returned by resolve_session_id."""
+        s = isolated_state
+        slot = "inst-revoke:agent-z"
+        s1 = "aaaa0001-0000-4000-8000-000000000001"
+        s2 = "bbbb0002-0000-4000-8000-000000000002"
+        s3 = "cccc0003-0000-4000-8000-000000000003"
+
+        for sid in (s1, s2, s3):
+            _make_session(s, sid, name="agent-z")
+            s.set_session_slot(sid, slot)
+
+        # s1 is revoked (beyond last-1). Resolution must not return s1.
+        resolved = s.resolve_session_id("agent-z")
+        assert resolved == s3, f"should resolve to current s3, got {resolved!r}"
+        assert resolved != s1, "revoked sid must not be returned"
+
+    def test_alive_guard_skips_revoked_via_list_sessions(self, isolated_state):
+        """Alive-guard row lookup returns None for revoked sids (guard exits early).
+
+        The alive-guard at roster_recovery.py:1419 looks up the session by id in
+        list_sessions. Revoked sids are absent → row=None → guard returns without
+        acting.  This verifies retired records are NOT treated as dark/stuck.
+        """
+        s = isolated_state
+        slot = "inst-guard:agent-g"
+        s1 = "aaaa0001-0000-4000-8000-000000000001"
+        s2 = "bbbb0002-0000-4000-8000-000000000002"
+        s3 = "cccc0003-0000-4000-8000-000000000003"
+
+        for sid in (s1, s2, s3):
+            _make_session(s, sid, name="agent-g")
+            s.set_session_slot(sid, slot)
+
+        rows = s.list_sessions(use_cache=False)
+        # Simulate the guard's lookup pattern:
+        revoked_row = next((r for r in rows if r.get("session_id") == s1), None)
+        assert revoked_row is None, (
+            "revoked sid must not appear in list_sessions — alive-guard would "
+            "skip it (retired-intentionally ≠ dark-stall)"
+        )
