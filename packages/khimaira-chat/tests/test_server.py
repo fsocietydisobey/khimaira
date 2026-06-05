@@ -778,6 +778,28 @@ class TestSessionEntanglementFence:
             # Non-Linux: /proc unavailable → ambiguous → fence (recoverable-default)
             assert result is False, "Non-Linux: ambiguous liveness → fence"
 
+    def test_ambiguous_liveness_fenced(self, tmp_path, monkeypatch):
+        """_pid_alive returning None (non-Linux or /proc-unreadable) must FENCE.
+
+        This is the load-bearing safety path: the code says alive=None → fence,
+        but the original commit message said 'Non-Linux: fail-open'. This test
+        pins the CODE (err-fence-on-ambiguity) so a future edit can't silently
+        flip it to the wrong direction.
+        """
+        from khimaira_chat import server as srv
+
+        monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
+        monkeypatch.setattr(srv, "_MY_PID", 77777)
+        # A claim exists from some other PID.
+        (tmp_path / "test-session-ambiguous.pid").write_text("55555")
+        # Force _pid_alive to return None (simulates /proc-unavailable).
+        monkeypatch.setattr(srv, "_pid_alive", lambda pid: None)
+        result = srv._acquire_session_claim("test-session-ambiguous")
+        assert result is False, (
+            "Ambiguous liveness (alive=None) must FENCE, not fail-open — "
+            "silent dual-subscribe is the undiagnosable failure"
+        )
+
     def test_sse_fenced_skips_subscriber(self):
         """When sse_fenced=True, _ensure_subscriber must not spawn a task."""
         from khimaira_chat import server as srv

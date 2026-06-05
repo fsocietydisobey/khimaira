@@ -90,9 +90,11 @@ INSTRUCTIONS = (
 # as other safety decisions this session: the direction of the default IS the
 # safety property.)
 #
-# Non-Linux: /proc is unavailable; we cannot check PID liveness. Fail-open
-# (allow subscription) with a warning — don't block a legitimate session on
-# a platform where we can't verify.
+# Non-Linux / /proc-unreadable: _pid_alive returns None (ambiguous). The fence
+# treats this as FENCE (not allow) — same err-toward-fence policy. The only
+# fail-open path is a filesystem error creating the claim dir or writing the
+# file (an infra blip that would block every new session; failing-open there
+# is the recoverable default since the process still works without the fence).
 
 _SSE_CLAIM_DIR = Path.home() / ".local" / "state" / "khimaira" / "sse-claim"
 _MY_PID = os.getpid()
