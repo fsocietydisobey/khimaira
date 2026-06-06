@@ -2561,3 +2561,54 @@ def test_create_room_api_allow_overlap_creates_second_chat(chats_api_client):
     )
     assert resp_b.status_code == 200
     assert resp_b.json()["meta"]["title"] == "Roster B"
+
+
+# ---------------------------------------------------------------------------
+# #14 — auto-BEGIN HTTP-layer wire-up
+# ---------------------------------------------------------------------------
+
+
+def test_auto_begin_fires_through_http(chats_api_client):
+    """POST /api/chats/{id}/tasks with required_agents → compliant ack via POST /messages
+    → TASK_SIGNAL start written.  Verifies the HTTP-layer field threading from
+    CreateTaskReq through to _try_auto_begin (verifier gap, 2026-06-06).
+    """
+    client, chats_mod = chats_api_client
+
+    # Room: alice (master / creator) + bob (agent).
+    created = client.post(
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
+    ).json()
+    chat_id = created["meta"]["chat_id"]
+    client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
+
+    # Create task with auto-BEGIN fields.
+    task_resp = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "implement #14 http test",
+            "assignee_session_id": "bob",
+            "required_agents": ["bob"],
+            "auto_begin": True,
+            "required_model": "sonnet",
+            "required_effort": "medium",
+        },
+    )
+    assert task_resp.status_code == 200
+    task_id = task_resp.json()["id"]
+    assert not chats_mod._is_task_begun(chat_id, task_id)
+
+    # Bob sends a compliant ready-ack via the HTTP messages endpoint.
+    ack_resp = client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={
+            "sender_session_id": "bob",
+            "body": f"✅ ready [task-id: {task_id}] | model=sonnet effort=medium",
+        },
+    )
+    assert ack_resp.status_code == 200
+
+    # BEGIN must have fired synchronously inside send_message.
+    assert chats_mod._is_task_begun(chat_id, task_id)
