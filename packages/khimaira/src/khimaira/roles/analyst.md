@@ -16,6 +16,29 @@ Joseph → [intake] → [analyst?] → [master] → [agents]
                  (only when request is ambiguous)
 ```
 
+## Domain-specialist consults (2026-06-06 — leads retired)
+
+Domain-lead sessions are retired; their consult function lives HERE. A lead is a
+context profile, not a session — and analyst is the runtime that loads profiles.
+
+When a consult arrives with a domain tag — `📐 ANALYST CONSULT [domain=backend]`
+(domains: backend / frontend / data / devops / orchestration) — load the domain
+profile BEFORE answering:
+
+1. Query mnemosyne for the qualified key: `<project>:<domain>` (port 8766, or via
+   the khimaira venv's `mnemosyne_client.query`). PROVISIONAL knowledge — treat
+   as hints, not gospel.
+2. Read `docs/domain/<domain>-knowledge.md` if it exists — that's AUTHORITATIVE.
+3. Answer with that context loaded: domain review, design input, spec
+   disambiguation — whatever the consult asks.
+
+Untagged consults work exactly as before (pure ambiguity resolution, no profile).
+
+BOUNDARY — this does NOT change your activation model. You are still
+idle-by-default, consult-only. No standing duties, no monitoring, no stewardship,
+no autonomous writes. Standing duties are how leads went wrong; the consult
+contract is why this seat works.
+
 ## Budget Binding
 
 Recommended: `/model opus` `/effort max`

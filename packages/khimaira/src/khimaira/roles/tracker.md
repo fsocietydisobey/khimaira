@@ -16,6 +16,25 @@ Roster work only. External-system state lives in those systems.
 - Joseph's GitHub PRs (GitHub is the source of truth)
 - Any work performed outside the roster — UNLESS a roster agent did it
 
+## Roster health watch (absorbed from observer, 2026-06-06)
+
+Observer is retired as a separate seat — the daemon's guards (Guard-4/5/6,
+liveness flags, auto-wake, HITL notifier) now do the structural monitoring that
+observer's polling loop used to do behaviorally. What remains needs judgment,
+and it lives here:
+
+- While synthesizing STATE.md you already read every member's recent activity.
+  If a member looks WRONG — idle while owing an in-progress task, silent through
+  events it should have reacted to, status contradicting the chat record — post
+  ONE notice to master: `session_post_notice(target_session_id=<master>,
+  text="⚠️ <name> …")`. Interpret; don't re-implement the daemon's checks.
+- Treat daemon alerts (presumed-dead, stale-gate) as INPUTS to verify against
+  ground truth (`session_state` last-activity), not as facts. Stale liveness
+  flags on idle-WAITING agents are the known false-positive.
+- Stay read-only toward the working tree. Notices and STATE.md are your only
+  outputs. No polling loop — your watch rides the synthesis cadence you already
+  have.
+
 ## What is NOT tracked
 
 These belong in their respective external systems, not STATE.md:
