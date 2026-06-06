@@ -941,6 +941,47 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    # Roster auto-accept (closes the last-launched-session pending tail, 2026-06-06).
+    # A worker pre-registers its MASTER in its auto-accept allowlist at boot — BEFORE the
+    # master bootstraps the roster chat. Then chats.create_room's existing auto-accept
+    # (should_auto_accept) admits the worker SERVER-SIDE at room creation, with no
+    # dependency on the SSE invite block reaching the worker or the worker being awake to
+    # accept it. Without this, the last-launched sessions (observer/tracker) whose SSE
+    # subscriber wasn't live when create_room ran stay `pending` forever.
+    #
+    # We WRITE the durable by-name allowlist file directly rather than POSTing the daemon
+    # endpoint: at SessionStart the worker has no transcript yet, so it isn't resolvable —
+    # the endpoint's _resolve_or_uuid would 404. The file is keyed by the worker's roster
+    # name and read at create_room time, when the worker IS named/registered. This mirrors
+    # exactly what chats.set_auto_accept writes (auto-accept-by-name-<name>.json). Workers
+    # only — the master's own name == KHIMAIRA_ROSTER_MASTER, so it skips itself.
+    _roster_master = os.environ.get("KHIMAIRA_ROSTER_MASTER", "").strip()
+    _slot_name = _roster_slot.split(":")[-1] if ":" in _roster_slot else ""
+    if _roster_master and _slot_name and _slot_name != _roster_master:
+        try:
+            import datetime as _dt
+
+            _state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+                "~/.local/state"
+            )
+            _aa_dir = os.path.join(_state, "khimaira", "chats")
+            os.makedirs(_aa_dir, exist_ok=True)
+            _aa_path = os.path.join(
+                _aa_dir, f"auto-accept-by-name-{_slot_name}.json"
+            )
+            with open(_aa_path, "w", encoding="utf-8") as _f:
+                json.dump(
+                    {
+                        "allow": [_roster_master],
+                        "updated_at": _dt.datetime.now(
+                            _dt.timezone.utc
+                        ).isoformat(),
+                    },
+                    _f,
+                )
+        except Exception:
+            pass  # fail-open — a miss just falls back to the prior SSE-invite accept path
+
     # Real-time chat registration — emitted immediately after identity block so
     # it appears at the very top before inbox, handoffs, and role file content.
     # Without this call the SSE subscriber never starts and chat_send messages
