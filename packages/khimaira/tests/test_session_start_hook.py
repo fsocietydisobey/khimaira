@@ -366,3 +366,34 @@ def test_roleless_session_consumes_handoffs(hook_module, monkeypatch, capsys):
     ctx, calls = _run_main(hook_module, monkeypatch, capsys, chat_roles=None)
     assert calls == ["sess-x"]
     assert "khimaira handoffs" in ctx
+
+
+def test_format_inbox_caps_count_and_answer_length(hook_module):
+    notes = [
+        {
+            "from_session_id": f"s{i}",
+            "question_text": f"q{i}",
+            "answer": "x" * 5000 if i == 0 else f"a{i}",
+            "ts": f"2026-06-06T10:{i % 60:02d}:00",
+        }
+        for i in range(25)
+    ]
+    out = hook_module._format_inbox(notes)
+    assert "25 unread" in out          # true total in header
+    assert out.count("- (from ") == 10  # newest 10 rendered
+    assert "+15 more note(s)" in out
+    assert "session_search_archive" in out
+    # the 5000-char answer belongs to the OLDEST note (i=0) → cut by the cap;
+    # length-cap is verified separately below
+    long_note = [{"from_session_id": "s", "question_text": "q", "answer": "y" * 5000, "ts": "t"}]
+    out2 = hook_module._format_inbox(long_note)
+    assert "truncated; full text via session_search_archive" in out2
+    assert len(out2) < 3000
+
+
+def test_format_tasks_caps_at_15(hook_module):
+    tasks = [{"id": f"t{i:03}", "title": f"task {i}", "state": "todo"} for i in range(40)]
+    out = hook_module._format_tasks(tasks)
+    assert "40 open assignment(s)" in out
+    assert out.count("  • ") == 15
+    assert "+25 more" in out

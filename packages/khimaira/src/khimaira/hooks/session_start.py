@@ -243,18 +243,36 @@ def _consume_inbox(session_id: str, cwd: str | None = None) -> list[dict]:
 
 
 def _format_inbox(notes: list[dict]) -> str:
+    # Bounded surface (same class as the handoff caps, 2026-06-06): a session
+    # that was away while peers posted N long answers must not boot with all
+    # of them injected in full. Newest 10 shown, each answer length-capped.
+    # Overflow notes are already drained to archive.jsonl by _consume_inbox,
+    # so the browse primitive for the rest is session_search_archive.
+    _INBOX_CAP = 10
+    _ANSWER_CHAR_CAP = 2000
+
+    total = len(notes)
+    shown = sorted(notes, key=lambda n: n.get("ts") or "", reverse=True)[:_INBOX_CAP]
+
     lines = [
-        f"📬 khimaira inbox — {len(notes)} unread answer(s) from other sessions:",
+        f"📬 khimaira inbox — {total} unread answer(s) from other sessions:",
         "",
     ]
-    for n in notes:
+    for n in shown:
         from_id = n.get("from_session_id") or "unknown"
         q = n.get("question_text") or "?"
         a = n.get("answer") or "?"
+        if len(a) > _ANSWER_CHAR_CAP:
+            a = a[:_ANSWER_CHAR_CAP] + " … (truncated; full text via session_search_archive)"
         lines.append(f"- (from {from_id})")
         lines.append(f"  Q: {q}")
         lines.append(f"  A: {a}")
         lines.append("")
+    if total > _INBOX_CAP:
+        lines.append(
+            f"… +{total - _INBOX_CAP} more note(s) not shown (newest {_INBOX_CAP} above). "
+            f"All notes are archived — browse via `session_search_archive`."
+        )
     return "\n".join(lines).rstrip()
 
 
@@ -642,8 +660,14 @@ def _format_tasks(tasks: list[dict]) -> str:
         return (t.get("source", ""), state_order.get(state, 9), t.get("id", ""))
 
     sorted_tasks = sorted(tasks, key=_sort_key)
-    lines = [f"📋 khimaira tasks — {len(sorted_tasks)} open assignment(s):", ""]
-    for t in sorted_tasks:
+    # Bounded surface (same class as the handoff/inbox caps, 2026-06-06):
+    # in-progress/in-review sort first, so the cap drops the stalest todos.
+    _TASKS_CAP = 15
+    total = len(sorted_tasks)
+    shown = sorted_tasks[:_TASKS_CAP]
+
+    lines = [f"📋 khimaira tasks — {total} open assignment(s):", ""]
+    for t in shown:
         state = (t.get("state") or "").strip()
         state_label = f" ({state})" if state else ""
         source_label = f" [{t['source']}]" if t.get("source") else ""
@@ -651,6 +675,11 @@ def _format_tasks(tasks: list[dict]) -> str:
         if len(line) > 110:
             line = line[:107] + "..."
         lines.append(line)
+    if total > _TASKS_CAP:
+        lines.append(
+            f"  … +{total - _TASKS_CAP} more (browse via `chat_task_status` "
+            f"or the daemon API)."
+        )
     return "\n".join(lines)
 
 
