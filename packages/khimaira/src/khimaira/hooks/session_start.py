@@ -365,12 +365,12 @@ def _discover_other_active_sessions(
 _ROLE_BUDGET: dict[str, dict[str, str]] = {
     "master": {"model": "opus", "effort": "max"},
     "agent": {"model": "sonnet", "effort": "medium"},
-    "observer": {"model": "haiku", "effort": "default"},
+    "observer": {"model": "sonnet", "effort": "low"},
     "architect": {"model": "opus", "effort": "max"},
     "intake": {"model": "sonnet", "effort": "medium"},
     "analyst": {"model": "opus", "effort": "max"},
     "verifier": {"model": "sonnet", "effort": "medium"},
-    "tracker": {"model": "haiku", "effort": "medium"},
+    "tracker": {"model": "sonnet", "effort": "medium"},
     # critic intentionally absent — no default
     # Domain leads: sonnet/medium (mirrors ROLE_BUDGET in chats.py — kept duplicated
     # here because session_start must run in a stdlib-only subprocess). Entries must

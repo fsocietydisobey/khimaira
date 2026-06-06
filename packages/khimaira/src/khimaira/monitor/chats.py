@@ -114,7 +114,7 @@ except ImportError:
 ROLE_BUDGET: dict[str, dict[str, str]] = {
     ROLE_MASTER: {"model": "opus", "effort": "max"},
     ROLE_AGENT: {"model": "sonnet", "effort": "medium"},
-    ROLE_OBSERVER: {"model": "haiku", "effort": "low"},
+    ROLE_OBSERVER: {"model": "sonnet", "effort": "low"},  # haiku→sonnet 2026-06-06
     ROLE_ARCHITECT: {"model": "opus", "effort": "max"},  # synthesis/design sidecar
     ROLE_INTAKE: {"model": "sonnet", "effort": "medium"},  # user-facing front-end
     ROLE_ANALYST: {
@@ -126,7 +126,7 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
         "effort": "medium",
     },  # test coverage gate, idle-by-default (sonnet matches the bin/roster spawn tier)
     ROLE_TRACKER: {
-        "model": "haiku",
+        "model": "sonnet",  # haiku→sonnet 2026-06-06 (synthesis role; haiku mis-dispatched boot registration)
         "effort": "medium",
     },  # checklist curator + Linear filer
     # Domain leads: sonnet/medium default; escalate to opus only for rare decomposition-heavy
@@ -173,6 +173,34 @@ _TASK_TRANSITIONS: dict[tuple[str, str], set[str]] = {
     (TASK_PENDING, TASK_CANCELLED): {"master"},
     (TASK_IN_PROGRESS, TASK_CANCELLED): {"master"},
 }
+
+# K3b: freshness horizon for roster-overlap detection (seconds). Reuses the
+# same env var as sessions.py alive-guard so both subsystems agree on "stale".
+_ROSTER_OVERLAP_FRESHNESS_S: float = float(
+    os.environ.get("KHIMAIRA_ALIVE_DELETE_GUARD_S", "900")
+)
+_ROSTER_OVERLAP_THRESHOLD: float = 0.5
+
+# States that count as "active" (not departed) for overlap liveness check.
+_ACTIVE_MEMBER_STATES: frozenset[str] = frozenset({PENDING, ACCEPTED})
+
+
+class RosterOverlapError(Exception):
+    """Raised by create_room when a new chat would fork an existing live roster.
+
+    The guard fires when the new chat's member-set overlaps an existing live
+    chat by ≥50%. Surface as HTTP 409 via the API layer.
+    """
+
+    def __init__(self, existing_chat_id: str, overlap_members: list[str]) -> None:
+        self.existing_chat_id = existing_chat_id
+        self.overlap_members = overlap_members
+        super().__init__(
+            f"Roster overlap with existing live chat {existing_chat_id!r} "
+            f"({len(overlap_members)} shared member(s)). "
+            f"Use allow_overlap=True to override, or chat_invite to add missing members "
+            f"to the existing chat instead."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +620,9 @@ def _slot_heal_member_key(
                 if old_member is not None and old_member.get("state") == ACCEPTED:
                     log.debug(
                         "chats: slot-heal resolved %s → prior_sid=%s via slot %s",
-                        sid[:8], prior_sid[:8], _slot,
+                        sid[:8],
+                        prior_sid[:8],
+                        _slot,
                     )
                     return prior_sid, old_member
     except Exception:
@@ -702,6 +732,54 @@ def _resolve_session_name(session_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _check_roster_overlap(new_members: set[str]) -> None:
+    """K3b guard: raise RosterOverlapError if new_members overlaps a live roster ≥50%.
+
+    Scans all existing chat files. A chat is "live" when it has ≥1 active (pending
+    or accepted) member AND its last activity is within _ROSTER_OVERLAP_FRESHNESS_S.
+    Overlap ratio = |existing_active ∩ new_members| / |new_members|.
+    """
+    if not _chat_dir().exists() or not new_members:
+        return
+
+    threshold = _ROSTER_OVERLAP_THRESHOLD * len(new_members)
+    now_dt = datetime.now(UTC)
+
+    for path in _chat_dir().glob("chat-*.jsonl"):
+        chat_id = path.stem
+        try:
+            room = load_room(chat_id)
+        except (ValueError, OSError):
+            continue
+
+        members = room["members"]
+        # Only count non-departed members toward overlap.
+        active_sids = {
+            sid for sid, m in members.items() if m.get("state") in _ACTIVE_MEMBER_STATES
+        }
+        if not active_sids:
+            continue
+
+        # Check freshness via last activity timestamp.
+        messages = room.get("messages", [])
+        last_ts_str: str | None = (
+            messages[-1]["ts"] if messages else room["meta"].get("created_at")
+        )
+        if last_ts_str is None:
+            continue
+        try:
+            last_dt = datetime.fromisoformat(last_ts_str)
+        except ValueError:
+            continue
+        age_s = (now_dt - last_dt).total_seconds()
+        if age_s > _ROSTER_OVERLAP_FRESHNESS_S:
+            continue
+
+        overlap = active_sids & new_members
+        if len(overlap) >= threshold:
+            raise RosterOverlapError(chat_id, sorted(overlap))
+
+
 _VALID_TOPOLOGIES: frozenset[str] = frozenset({"flat", "hierarchical", "custom"})
 
 
@@ -713,6 +791,7 @@ def create_room(
     fresh: bool = False,
     topology: str = "flat",
     member_roles: dict[str, str] | None = None,
+    allow_overlap: bool = False,
 ) -> dict[str, Any]:
     """Create a new chat room. Creator is auto-`accepted`; other members
     start `pending` and must call `accept()` to receive notifications.
@@ -722,6 +801,9 @@ def create_room(
       - "hierarchical": send_to auto-defaults private=True when not explicitly passed.
       - "custom": no automatic privacy defaults; caller drives privacy explicitly.
     Existing chats without a topology field are backward-compatible with "flat".
+
+    `allow_overlap=True` bypasses the K3b roster-overlap guard for the rare
+    deliberate parallel-chat case. Default off.
     """
     if topology not in _VALID_TOPOLOGIES:
         raise ValueError(
@@ -736,6 +818,11 @@ def create_room(
         _assert_session_registered(sid)
     if creator_session_id not in resolved_members:
         resolved_members.append(creator_session_id)
+
+    # K3b: roster-overlap guard — refuse to fork a live roster whose member-set
+    # overlaps ours by ≥50%. Runs before any write so no partial file is created.
+    if not allow_overlap:
+        _check_roster_overlap(set(resolved_members))
 
     fresh_suffix = _now_iso() if fresh else None
     chat_id = derive_chat_id(resolved_members, fresh_suffix)
@@ -1065,6 +1152,11 @@ def send_message(
     }
     _append(chat_id, record)
 
+    # #14 auto-BEGIN: if this message is a compliant ready-ack, check the auto-BEGIN gate.
+    _m_ack = _ACK_RE.search(record.get("body") or "")
+    if _m_ack:
+        _try_auto_begin(chat_id, _m_ack.group(1))
+
     # Loud-fail: surface target reachability for `to`-targeted sends.
     if resolved_to:
         target_states = []
@@ -1119,6 +1211,11 @@ def create_task(
     verdict_role: str | None = None,
     *,
     private: bool = False,
+    required_agents: list[str] | None = None,
+    auto_begin: bool = True,
+    required_model: str | None = None,
+    required_effort: str | None = None,
+    begin_gate_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Append a TASK record (status=pending). Sender must be an accepted member;
     if assignee_session_id is set, that session must also be accepted.
@@ -1204,16 +1301,24 @@ def create_task(
         "gate_required": gate_required,
         "gate_for": gate_for,
         "verdict_role": verdict_role,
+        # #14 auto-BEGIN fields
+        "required_agents": [_resolve_or_uuid(sid) for sid in (required_agents or [])],
+        "auto_begin": auto_begin,
+        "required_model": required_model,
+        "required_effort": required_effort,
+        "begin_gate_task_id": begin_gate_task_id,
     }
     _append(chat_id, record)
     log.info(
-        "chats: task %s created in %s by %s (assignee=%s assignee_role=%s gate_required=%s)",
+        "chats: task %s created in %s by %s (assignee=%s assignee_role=%s gate_required=%s auto_begin=%s required_agents=%s)",
         record["id"],
         chat_id,
         sender_session_id,
         assignee_resolved or "(none)",
         assignee_role or "(none)",
         gate_required,
+        auto_begin,
+        record["required_agents"] or "(none)",
     )
     return record
 
@@ -1250,7 +1355,9 @@ def update_task_status(
 
     task_record = None
     current_status = None
-    first_claim: dict[str, Any] | None = None  # first TASK_UPDATE that set status=in_progress
+    first_claim: dict[str, Any] | None = (
+        None  # first TASK_UPDATE that set status=in_progress
+    )
     for line in _read(chat_id):
         k = line.get("kind")
         if k == TASK and line.get("id") == task_id:
@@ -1269,9 +1376,13 @@ def update_task_status(
     # than a confusing "Invalid transition in_progress → in_progress" (403).
     if current_status == TASK_IN_PROGRESS and new_status == TASK_IN_PROGRESS:
         who = (
-            first_claim.get("by_name")
-            or (first_claim.get("by_session_id") or "unknown")[:8]
-        ) if first_claim else "unknown"
+            (
+                first_claim.get("by_name")
+                or (first_claim.get("by_session_id") or "unknown")[:8]
+            )
+            if first_claim
+            else "unknown"
+        )
         when = first_claim.get("ts", "") if first_claim else ""
         raise ValueError(
             f"Task {task_id!r} already claimed by {who!r} at {when}. "
@@ -2288,7 +2399,9 @@ def transfer_membership(
         _subscribers.setdefault(to_slot_key, set()).update(old_queues)
         log.info(
             "chats: Part F migration bridge — re-keyed %d SSE queue(s) from %s → %s",
-            len(old_queues), from_session_id[:8], to_slot_key,
+            len(old_queues),
+            from_session_id[:8],
+            to_slot_key,
         )
 
     log.info(
@@ -2814,6 +2927,154 @@ def _scan_acks(chat_id: str, task_ids: dict[str, str]) -> dict[str, dict]:
     return found
 
 
+def _is_task_begun(chat_id: str, task_id: str) -> bool:
+    """Return True if a TASK_SIGNAL 'start' event exists for this task.
+
+    Guards against double-fire in _try_auto_begin and provides the
+    Guard-4 2D pending-gate truth value: pending+no_begin = waiting,
+    pending+begun = wedged.
+    Fail-open: returns False on any read error so callers stay safe.
+    """
+    try:
+        for line in _read(chat_id):
+            if (
+                line.get("kind") == TASK_SIGNAL
+                and line.get("task_id") == task_id
+                and line.get("signal") == "start"
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _try_auto_begin(chat_id: str, task_id: str) -> bool:
+    """Auto-fire BEGIN if all gate conditions are satisfied. (#14)
+
+    Called from send_message on every compliant ready-ack. Makes a
+    single-pass JSONL scan to gather:
+      - the task record (auto_begin flag, required_agents, required tier, begin_gate_task_id)
+      - whether BEGIN was already fired (idempotency guard)
+      - the set of acks received so far
+
+    Returns True if BEGIN was fired this call; False otherwise.
+    Fail-open: any unexpected exception returns False.
+    """
+    try:
+        task_record: dict | None = None
+        begun = False
+        acks: dict[str, dict] = {}  # sender_id → {model, effort, ts}
+
+        for line in _read(chat_id):
+            k = line.get("kind")
+            if k == TASK and line.get("id") == task_id:
+                task_record = line
+            elif (
+                k == TASK_SIGNAL
+                and line.get("task_id") == task_id
+                and line.get("signal") == "start"
+            ):
+                begun = True
+            elif k == MSG:
+                m = _ACK_RE.search(line.get("body") or "")
+                if m and m.group(1) == task_id:
+                    sender_id = line.get("sender_id")
+                    if sender_id:
+                        # Keep the latest ack per sender (handles re-ack).
+                        acks[sender_id] = {
+                            "model": m.group(2).lower(),
+                            "effort": m.group(3).lower(),
+                            "ts": line.get("ts") or "",
+                        }
+
+        if begun or task_record is None:
+            return False
+        if not task_record.get("auto_begin", True):
+            return False
+        required_agents: list[str] = task_record.get("required_agents") or []
+        if not required_agents:
+            return False
+
+        req_model: str | None = task_record.get("required_model")
+        req_effort: str | None = task_record.get("required_effort")
+
+        # Verdict/budget gate: block if a prior task's B3 verdicts aren't in.
+        begin_gate_task_id: str | None = task_record.get("begin_gate_task_id")
+        if begin_gate_task_id:
+            verdicts = get_gate_verdicts_by_task(
+                task_record.get("sender_id") or required_agents[0],
+                begin_gate_task_id,
+            )
+            if not (
+                isinstance(verdicts, dict)
+                and verdicts.get("critic_approved")
+                and verdicts.get("verifier_shipped")
+            ):
+                log.debug(
+                    "chats: auto-BEGIN blocked by verdict gate task=%s gate=%s verdicts=%r",
+                    task_id,
+                    begin_gate_task_id,
+                    verdicts,
+                )
+                return False
+
+        # All required agents must have compliant acks.
+        for agent_id in required_agents:
+            ack = acks.get(agent_id)
+            if ack is None:
+                return False
+            if req_model and ack["model"] != req_model.lower():
+                return False
+            if req_effort and ack["effort"] != req_effort.lower():
+                return False
+
+        # Gate satisfied — find master and fire BEGIN.
+        room = load_room(chat_id)
+        master_id: str | None = None
+        for sid, role in (room["meta"].get("member_roles") or {}).items():
+            if role == ROLE_MASTER:
+                master_id = sid
+                break
+        if master_id is None:
+            master_id = room["meta"].get("created_by")
+        if master_id is None:
+            log.warning(
+                "chats: auto-BEGIN could not resolve master for chat=%s", chat_id
+            )
+            return False
+
+        try:
+            signal_task_start(
+                chat_id,
+                task_id,
+                master_id,
+                note="auto-BEGIN: all required agents confirmed",
+            )
+        except ValueError:
+            # Task moved out of PENDING via race; treat as already begun.
+            return False
+
+        begin_body = _format_begin_block(task_record.get("body") or "")
+        for agent_id in required_agents:
+            try:
+                send_message(chat_id, master_id, begin_body, to=[agent_id])
+            except Exception:
+                pass  # fail-open; agents can detect BEGIN via TASK_SIGNAL too
+
+        log.info(
+            "chats: auto-BEGIN fired task=%s agents=%s chat=%s",
+            task_id,
+            required_agents,
+            chat_id,
+        )
+        return True
+    except Exception:
+        log.exception(
+            "chats: _try_auto_begin failed for task=%s chat=%s", task_id, chat_id
+        )
+        return False
+
+
 def roster_progress(chat_id: str, requester_session_id: str) -> list[dict[str, Any]]:
     """Observable-truth aggregator for roster member work state.
 
@@ -2851,9 +3112,9 @@ def roster_progress(chat_id: str, requester_session_id: str) -> list[dict[str, A
     member_roles_map = (room.get("meta") or {}).get("member_roles") or {}
 
     # Single-pass scan: build owed-task map, task statuses, and done-reports.
-    owed: dict[str, dict] = {}        # assignee_sid → {task_id, body, status}
+    owed: dict[str, dict] = {}  # assignee_sid → {task_id, body, status}
     task_statuses: dict[str, str] = {}  # task_id → latest status
-    done_reports: dict[str, str] = {}   # sender_sid → latest ✅ done-report ts
+    done_reports: dict[str, str] = {}  # sender_sid → latest ✅ done-report ts
     for line in _read(chat_id):
         k = line.get("kind")
         if k == TASK:
@@ -2978,7 +3239,8 @@ def roster_progress(chat_id: str, requester_session_id: str) -> list[dict[str, A
             ):
                 stale = True
             elif derived == "idle" and any(
-                w in ml for w in ("implementing", "working", "in_progress", "researching")
+                w in ml
+                for w in ("implementing", "working", "in_progress", "researching")
             ):
                 stale = True
 
@@ -2989,8 +3251,12 @@ def roster_progress(chat_id: str, requester_session_id: str) -> list[dict[str, A
             "owed_task": task_info,
             "has_recent_wip": has_wip,
             "last_done_report_ts": last_done_ts,
-            "last_active_s": round(last_active_s, 1) if last_active_s is not None else None,
-            "last_touch_s": round(last_touch_s, 1) if last_touch_s is not None else None,
+            "last_active_s": (
+                round(last_active_s, 1) if last_active_s is not None else None
+            ),
+            "last_touch_s": (
+                round(last_touch_s, 1) if last_touch_s is not None else None
+            ),
             "manual_status": manual_status,
             "derived_label": derived,
             "stale_status": stale,
@@ -3153,6 +3419,7 @@ def _slot_subscriber_key(sid: str) -> str:
     """
     try:
         from khimaira.monitor.sessions import get_session_slot
+
         slot = get_session_slot(sid)
         return slot if slot else sid
     except Exception:
@@ -3172,7 +3439,9 @@ def is_reachable(session_id: str) -> bool:
     except Exception:
         return False
     slot_key = _slot_subscriber_key(sid)
-    return bool(_subscribers.get(slot_key) or (slot_key != sid and _subscribers.get(sid)))
+    return bool(
+        _subscribers.get(slot_key) or (slot_key != sid and _subscribers.get(sid))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3371,6 +3640,7 @@ async def subscribe(session_id: str, since_event_id: str | None = None) -> Any:
     # un-slotted sessions (not in registry) must still subscribe normally.
     try:
         from khimaira.monitor.sessions import _read_slot_registry as _rsr
+
         _rr = _rsr()
         _is_revoked_sse = any(
             session_id in entry.get("revoked_sids", []) for entry in _rr.values()
