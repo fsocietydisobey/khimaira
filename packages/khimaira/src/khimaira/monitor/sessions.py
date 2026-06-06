@@ -3130,12 +3130,18 @@ def _invalidate_list_sessions_cache() -> None:
 _ARCHIVE_DIR = _BASE_DIR.parent / "sessions_archive"
 
 
-def delete_session(session_id: str, force: bool = False) -> dict:
+def delete_session(
+    session_id: str, force: bool = False, reap: bool = False
+) -> dict:
     """Remove a session from the registry.
 
     Guards:
     - If session has decisions and force=False: refuse with structured error.
     - If session has decisions and force=True: archive before deletion.
+    - ALIVE-GUARD: refuse a recently-active session UNLESS reap=True. reap = the
+      caller has confirmed the session is DEAD (e.g. its kitty window is closed) —
+      the daemon can't tell that from mtime alone. Used by the roster START preflight
+      to clear a REPLACED roster's stale records (the buildup/entanglement fix).
     - If session_id matches the env var CLAUDE_CODE_SESSION_ID: refuse (no self-delete).
     - If session_id is already gone: return structured error (idempotent-safe).
 
@@ -3171,9 +3177,11 @@ def delete_session(session_id: str, force: bool = False) -> dict:
     # 'left' cannot self-rejoin — so deleting a still-running session silently orphans
     # it from the roster chat. This bites a roster cleanup that resolves a name to the
     # LIVE same-named session via name-collision (resolve_session_id picks most-recent).
-    # An active session is never a valid deletion target. NOT overridable by `force`
-    # (which is decisions-only): active roster sessions carry decisions, so a force=True
-    # delete would otherwise bypass this. To delete a live session, stop it first.
+    # An active session is never a valid deletion target via a NORMAL delete. NOT
+    # overridable by `force` (decisions-only). Overridable by `reap=True`: the caller
+    # asserts the session is DEAD (e.g. its kitty window is closed) — the daemon can't
+    # tell that from mtime (a just-closed session looks "active"). Roster START uses reap
+    # to clear a replaced roster's stale records. To delete a live session, stop it first.
     import time as _time
 
     # Env-tunable; read at call-time so test isolation / module reloads don't bake in a
@@ -3184,7 +3192,7 @@ def delete_session(session_id: str, force: bool = False) -> dict:
         _last_age = (_time.time() - max(_mtimes)) if _mtimes else float("inf")
     except OSError:
         _last_age = float("inf")
-    if _last_age < _alive_guard_s:
+    if not reap and _last_age < _alive_guard_s:
         return {
             "error": (
                 f"refusing to delete ACTIVE session {resolved!r} (last active "

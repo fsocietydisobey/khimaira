@@ -488,14 +488,18 @@ def build_router():
             raise fastapi.HTTPException(404, str(e))
 
     @router.delete("/sessions/{session_id}")
-    async def delete_session(session_id: str, force: bool = False) -> dict:
+    async def delete_session(
+        session_id: str, force: bool = False, reap: bool = False
+    ) -> dict:
         """Delete a session from the registry.
 
-        If the session has logged decisions and force=False (default), the
-        deletion is refused with a 409. Pass force=True to archive decisions
-        and proceed. Returns 404 if the session is unknown.
+        force=True archives + deletes a session that has logged decisions
+        (else a 409). reap=True bypasses the ALIVE-GUARD for a session the
+        caller has confirmed DEAD (e.g. its kitty window is closed) — used by
+        the roster START preflight to clear a replaced roster. Returns 404 if
+        the session is unknown.
         """
-        result = sessions.delete_session(session_id, force=force)
+        result = sessions.delete_session(session_id, force=force, reap=reap)
         if "error" in result:
             if "not found" in result["error"]:
                 raise fastapi.HTTPException(404, result["error"])
