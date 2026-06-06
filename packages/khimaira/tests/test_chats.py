@@ -354,7 +354,7 @@ def test_my_chats_lists_pending_and_accepted(isolated_chats):
     _make_session(sessions_mod, "carol")
 
     c.create_room("alice", ["bob"])  # bob pending
-    room2 = c.create_room("alice", ["carol"])  # carol pending
+    room2 = c.create_room("alice", ["carol"], allow_overlap=True)  # carol pending
     c.accept(room2["meta"]["chat_id"], "carol")
 
     bob_chats = c.my_chats("bob")
@@ -1946,16 +1946,16 @@ def test_find_chats_deputized_by_returns_only_donors_chats(isolated_chats):
     c.accept(chat_a1, "bob")
     c.transfer_membership(chat_a1, "alice", "vice1", as_deputize=True)
 
-    r2 = c.create_room("alice", ["carol"], title="A2")
+    r2 = c.create_room("alice", ["carol"], title="A2", allow_overlap=True)
     chat_a2 = r2["meta"]["chat_id"]
     c.accept(chat_a2, "carol")
     c.transfer_membership(chat_a2, "alice", "vice2", as_deputize=True)
 
-    r3 = c.create_room("alice", ["bob"], title="A3", fresh=True)
+    r3 = c.create_room("alice", ["bob"], title="A3", fresh=True, allow_overlap=True)
     chat_a3 = r3["meta"]["chat_id"]
     c.accept(chat_a3, "bob")
 
-    r4 = c.create_room("bob", ["carol"], title="B1")
+    r4 = c.create_room("bob", ["carol"], title="B1", allow_overlap=True)
     chat_b1 = r4["meta"]["chat_id"]
     c.accept(chat_b1, "carol")
     c.transfer_membership(chat_b1, "bob", "vice1", as_deputize=True)
@@ -2163,7 +2163,7 @@ def test_deputize_resume_round_trip_multi_chat(isolated_chats):
     # so derive_chat_id doesn't collide).
     chat_ids = []
     for peer, title in (("bob", "ops"), ("carol", "design"), ("dave", "review")):
-        r = c.create_room("alice", [peer], title=title)
+        r = c.create_room("alice", [peer], title=title, allow_overlap=True)
         cid = r["meta"]["chat_id"]
         c.accept(cid, peer)
         chat_ids.append(cid)
@@ -2536,7 +2536,8 @@ def test_assign_batch_stagger_begin_fires_between_agents(isolated_chats, monkeyp
 
     # Each agent gets an individual BEGIN (not one broadcast).
     begin_msgs = [
-        r for r in c._read(chat_id)
+        r
+        for r in c._read(chat_id)
         if (r.get("body") or "").startswith("🟢 ALL AGENTS CONFIRMED")
     ]
     assert len(begin_msgs) == 2
@@ -3213,6 +3214,7 @@ def test_create_room_rejects_unregistered_name(isolated_chats):
     """#1: create_room rejects a non-UUID name that isn't in the session registry."""
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
+
     _make_session(sessions_mod, "alice-uuid", "alice")
 
     # "totally-unknown-name" is not in the registry → ValueError at resolution
@@ -3224,6 +3226,7 @@ def test_invite_rejects_unregistered_name(isolated_chats):
     """#1: invite rejects a non-UUID invitee name not in the session registry."""
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
+
     _make_session(sessions_mod, "alice-uuid", "alice")
     room = c.create_room("alice-uuid", [])
     chat_id = room["meta"]["chat_id"]
@@ -3238,6 +3241,7 @@ def test_invite_accepts_fresh_uuid_without_dir(isolated_chats):
     """#1 lazy-registration exception: UUID invitees without dirs are warned but accepted."""
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
+
     _make_session(sessions_mod, "alice-uuid", "alice")
     room = c.create_room("alice-uuid", [])
     chat_id = room["meta"]["chat_id"]
@@ -3253,6 +3257,7 @@ def test_remove_member_evicts_and_unsubscribes(isolated_chats):
     """#2: remove_member transitions to REMOVED and discards from _subscribers."""
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
+
     _make_session(sessions_mod, "alice-uuid", "alice")
     _make_session(sessions_mod, "bob-uuid", "bob")
     room = c.create_room("alice-uuid", ["bob-uuid"])
@@ -3261,6 +3266,7 @@ def test_remove_member_evicts_and_unsubscribes(isolated_chats):
 
     # Simulate bob having an SSE subscriber
     import asyncio
+
     q = asyncio.Queue()
     c._subscribers.setdefault("bob-uuid", set()).add(q)
     assert c.is_reachable("bob-uuid")
@@ -3280,6 +3286,7 @@ def test_remove_member_non_master_rejected(isolated_chats):
     """#2: only master can remove members."""
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
+
     _make_session(sessions_mod, "alice-uuid", "alice")
     _make_session(sessions_mod, "bob-uuid", "bob")
     _make_session(sessions_mod, "carol-uuid", "carol")
@@ -3296,6 +3303,7 @@ def test_invite_with_role_binds_atomically(isolated_chats):
     """#3: invite with role= writes member_roles atomically."""
     c = isolated_chats
     from khimaira.monitor import sessions as sessions_mod
+
     _make_session(sessions_mod, "alice-uuid", "alice")
     _make_session(sessions_mod, "bob-uuid", "bob")
     room = c.create_room("alice-uuid", [])
@@ -3425,7 +3433,9 @@ class TestRosterProgress:
         from khimaira.monitor import sessions as sessions_mod
 
         chat_id = self._setup(c, sessions_mod)
-        task = c.create_task(chat_id, "master", "Implement foo", assignee_session_id="agent-a")
+        task = c.create_task(
+            chat_id, "master", "Implement foo", assignee_session_id="agent-a"
+        )
         c.update_task_status(chat_id, task["id"], "agent-a", c.TASK_IN_PROGRESS)
         c.update_task_status(chat_id, task["id"], "agent-a", c.TASK_DONE)
         # agent-a's manual status is still the default (not updated)
@@ -3441,7 +3451,9 @@ class TestRosterProgress:
         from khimaira.monitor import sessions as sessions_mod
 
         chat_id = self._setup(c, sessions_mod)
-        task = c.create_task(chat_id, "master", "Implement bar", assignee_session_id="agent-b")
+        task = c.create_task(
+            chat_id, "master", "Implement bar", assignee_session_id="agent-b"
+        )
         c.update_task_status(chat_id, task["id"], "agent-b", c.TASK_IN_PROGRESS)
         # No WIP probe possible in isolated test (no real files); _session_has_recent_wip → False
 
@@ -3461,6 +3473,7 @@ class TestRosterProgress:
         chat_id = room["meta"]["chat_id"]
 
         import pytest
+
         with pytest.raises(ValueError, match="not an accepted member"):
             c.roster_progress(chat_id, "ghost")
 
@@ -3468,6 +3481,7 @@ class TestRosterProgress:
 # ---------------------------------------------------------------------------
 # Drift-healing auth — paths 3/4/6/8 + 8-path class-invariant (Part E)
 # ---------------------------------------------------------------------------
+
 
 class TestDriftHealingAuth:
     """roster-identity Phase-B Part E: _slot_heal_member_key integration.
@@ -3507,9 +3521,12 @@ class TestDriftHealingAuth:
     # 1. HEALING CLASS-INVARIANT (all 8 paths resolve to current sid post-reattach)
     # -------------------------------------------------------------------------
 
-    def test_healing_path3_chat_history_reattached_session(self, isolated_chats, monkeypatch, tmp_path):
+    def test_healing_path3_chat_history_reattached_session(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """Path-3 healing: reattached session (s2) reads history under old member key (s1)."""
         from khimaira.monitor import sessions as sessions_mod
+
         c = isolated_chats
 
         chat_id = self._setup_chat(c, sessions_mod)
@@ -3521,13 +3538,16 @@ class TestDriftHealingAuth:
 
         # path-3: s2 (new sid) can read history via healing (member entry keyed to s1)
         msgs = c.history(chat_id, self.S2)
-        assert any(m.get("body") == "hello from s1" for m in msgs), (
-            "reattached session (s2) must read history under old member key (s1) — path-3 drift fix"
-        )
+        assert any(
+            m.get("body") == "hello from s1" for m in msgs
+        ), "reattached session (s2) must read history under old member key (s1) — path-3 drift fix"
 
-    def test_healing_path4_send_message_reattached_session(self, isolated_chats, monkeypatch, tmp_path):
+    def test_healing_path4_send_message_reattached_session(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """Path-4 healing: reattached session (s2) can send messages."""
         from khimaira.monitor import sessions as sessions_mod
+
         c = isolated_chats
 
         chat_id = self._setup_chat(c, sessions_mod)
@@ -3536,14 +3556,17 @@ class TestDriftHealingAuth:
 
         # path-4: s2 can send (member entry keyed to s1 → canonical via slot-heal)
         msg = c.send_message(chat_id, self.S2, "message from reattached s2")
-        assert msg.get("body") == "message from reattached s2", (
-            "reattached session (s2) must be able to send messages — path-4 drift fix"
-        )
+        assert (
+            msg.get("body") == "message from reattached s2"
+        ), "reattached session (s2) must be able to send messages — path-4 drift fix"
 
-    def test_healing_path6_member_role_reattached_session(self, isolated_chats, monkeypatch, tmp_path):
+    def test_healing_path6_member_role_reattached_session(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """Path-6 healing: reattached session (s2) has its role resolved via canonical key (s1).
         This is janice's read-403 fix — member_roles was keyed to old sid."""
         from khimaira.monitor import sessions as sessions_mod
+
         c = isolated_chats
 
         chat_id = self._setup_chat(c, sessions_mod)
@@ -3558,20 +3581,23 @@ class TestDriftHealingAuth:
         room = c.load_room(chat_id)
         canonical, _ = c._slot_heal_member_key(room, self.S2)
         role = room["meta"].get("member_roles", {}).get(canonical)
-        assert role == "agent", (
-            f"reattached session must resolve role via canonical key: got {role!r} expected 'agent'"
-        )
+        assert (
+            role == "agent"
+        ), f"reattached session must resolve role via canonical key: got {role!r} expected 'agent'"
 
     # -------------------------------------------------------------------------
     # 2. INERT-DENIAL (superseded once-real sid → fail-CLOSED, not bypass)
     # -------------------------------------------------------------------------
 
-    def test_inert_denial_path3_history_superseded_sid(self, isolated_chats, monkeypatch, tmp_path):
+    def test_inert_denial_path3_history_superseded_sid(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """INERT-DENIAL path-3: after s1→s2→s3, presenting s1 (superseded-once-real)
         to chat_history → DENIED (fail-closed). NOT a trivially-never-bound sid —
         s1 was a REAL member and is in chat history exactly because it was legitimate.
         A slot_resolve→None path must DENY, never fall-open."""
         from khimaira.monitor import sessions as sessions_mod
+
         c = isolated_chats
 
         chat_id = self._setup_chat(c, sessions_mod)
@@ -3584,9 +3610,12 @@ class TestDriftHealingAuth:
         with pytest.raises(ValueError, match="not an accepted member"):
             c.history(chat_id, self.S1)
 
-    def test_inert_denial_path4_send_message_superseded_sid(self, isolated_chats, monkeypatch, tmp_path):
+    def test_inert_denial_path4_send_message_superseded_sid(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """INERT-DENIAL path-4: superseded-once-real s1 cannot send messages."""
         from khimaira.monitor import sessions as sessions_mod
+
         c = isolated_chats
 
         chat_id = self._setup_chat(c, sessions_mod)
@@ -3599,7 +3628,9 @@ class TestDriftHealingAuth:
 
     # master changes_requested: add path-8 healing + inert-denial + path-6 inert explicit
 
-    def test_healing_path8_assignee_reattached_session(self, isolated_chats, monkeypatch, tmp_path):
+    def test_healing_path8_assignee_reattached_session(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """PATH-8 HEALING: reattached session (s2) can be assigned tasks.
 
         create_task(assignee=s2) must succeed — s2's membership is resolved via
@@ -3607,17 +3638,22 @@ class TestDriftHealingAuth:
         "not an accepted member" and the task creation fails.
         """
         from khimaira.monitor import sessions as sessions_mod
+
         c = isolated_chats
 
         chat_id = self._setup_chat(c, sessions_mod)
         sessions_mod.set_session_slot(self.S2, self._SLOT)  # s1→s2 reattach
 
         # s2 should be assignable via slot-heal
-        task = c.create_task(chat_id, self.MASTER, "Implement X", assignee_session_id=self.S2)
+        task = c.create_task(
+            chat_id, self.MASTER, "Implement X", assignee_session_id=self.S2
+        )
         assert task.get("id"), "create_task must succeed for reattached s2"
         assert task.get("assignee_id") is not None, "assignee must be bound to the task"
 
-    def test_inert_denial_path8_assignee_superseded_sid(self, isolated_chats, monkeypatch, tmp_path):
+    def test_inert_denial_path8_assignee_superseded_sid(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """INERT-DENIAL path-8: superseded-once-real s1 cannot be task assignee.
 
         After s1→s2→s3, s1 is beyond the last-1 bound. Assigning s1 as a task
@@ -3625,6 +3661,7 @@ class TestDriftHealingAuth:
         s1 was a real accepted member and is in the slot registry history.
         """
         from khimaira.monitor import sessions as sessions_mod
+
         c = isolated_chats
 
         chat_id = self._setup_chat(c, sessions_mod)
@@ -3633,9 +3670,13 @@ class TestDriftHealingAuth:
 
         # s1 is INERT (superseded-beyond-last-1) — must be denied as assignee
         with pytest.raises(ValueError, match="only accepted members can be assignees"):
-            c.create_task(chat_id, self.MASTER, "Implement Y", assignee_session_id=self.S1)
+            c.create_task(
+                chat_id, self.MASTER, "Implement Y", assignee_session_id=self.S1
+            )
 
-    def test_inert_denial_path6_role_superseded_sid(self, isolated_chats, monkeypatch, tmp_path):
+    def test_inert_denial_path6_role_superseded_sid(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """INERT-DENIAL path-6 (explicit): superseded-once-real s1 resolves to NO role.
 
         After s1→s2→s3, _slot_heal_member_key(s1) must return (None, None).
@@ -3643,6 +3684,7 @@ class TestDriftHealingAuth:
         This is the explicit path-6 inert case (not just transitively covered by path-3/4).
         """
         from khimaira.monitor import sessions as sessions_mod
+
         c = isolated_chats
 
         chat_id = self._setup_chat(c, sessions_mod)
@@ -3659,7 +3701,9 @@ class TestDriftHealingAuth:
             "must NOT return the old member key and allow stale role to resolve"
         )
         # Double-check: member_roles must NOT resolve to "agent" via an inert s1
-        stale_role = room["meta"].get("member_roles", {}).get(canonical) if canonical else None
+        stale_role = (
+            room["meta"].get("member_roles", {}).get(canonical) if canonical else None
+        )
         assert stale_role is None, "inert s1 must not resolve a stale role"
 
 
@@ -3684,8 +3728,12 @@ class TestFamilyBDelivery:
     SLOT = "part-f-inst:test-agent"
 
     def _setup(self, c, sessions_mod):
-        for sid, name in [(self.MASTER, "master"), (self.S1, "agent-1"),
-                          (self.S2, "agent-1"), (self.S3, "agent-1")]:
+        for sid, name in [
+            (self.MASTER, "master"),
+            (self.S1, "agent-1"),
+            (self.S2, "agent-1"),
+            (self.S3, "agent-1"),
+        ]:
             _make_session(sessions_mod, sid, name)
         room = c.create_room(self.MASTER, [self.S1], title="part-f-test")
         chat_id = room["meta"]["chat_id"]
@@ -3693,29 +3741,39 @@ class TestFamilyBDelivery:
         sessions_mod.set_session_slot(self.S1, self.SLOT)
         return chat_id
 
-    def test_slot_subscriber_key_returns_slot_for_stamped(self, isolated_chats, monkeypatch, tmp_path):
+    def test_slot_subscriber_key_returns_slot_for_stamped(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """slot-key-at-subscribe: _slot_subscriber_key returns slot string for a slot-bound session."""
         c = isolated_chats
         from khimaira.monitor import sessions as sessions_mod
+
         _make_session(sessions_mod, self.S1, "agent-1")
         sessions_mod.set_session_slot(self.S1, self.SLOT)
         key = c._slot_subscriber_key(self.S1)
         assert key == self.SLOT, f"Expected slot key '{self.SLOT}', got '{key}'"
 
-    def test_slot_subscriber_key_returns_sid_for_unstamped(self, isolated_chats, monkeypatch, tmp_path):
+    def test_slot_subscriber_key_returns_sid_for_unstamped(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """Fallback: un-slotted session gets its own sid as subscriber key."""
         c = isolated_chats
         from khimaira.monitor import sessions as sessions_mod
+
         _make_session(sessions_mod, self.S1, "agent-1")
         # S1 not slot-bound → should return sid itself
         key = c._slot_subscriber_key(self.S1)
         assert key == self.S1
 
-    def test_migration_bridge_rekeys_on_transfer(self, isolated_chats, monkeypatch, tmp_path):
+    def test_migration_bridge_rekeys_on_transfer(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """Migration bridge: old-style sid-keyed subscriber is re-keyed on transfer."""
         import asyncio
+
         c = isolated_chats
         from khimaira.monitor import sessions as sessions_mod
+
         chat_id = self._setup(c, sessions_mod)
 
         # Simulate a pre-migration subscriber keyed by S1 (old-style).
@@ -3729,11 +3787,13 @@ class TestFamilyBDelivery:
         # Old sid-keyed entry should be gone; re-keyed to S2's slot key.
         assert self.S1 not in c._subscribers, "Old sid-key must be removed by bridge"
         s2_key = c._slot_subscriber_key(self.S2)
-        assert q in c._subscribers.get(s2_key, set()), (
-            f"Queue must be under S2's slot key '{s2_key}' after bridge"
-        )
+        assert q in c._subscribers.get(
+            s2_key, set()
+        ), f"Queue must be under S2's slot key '{s2_key}' after bridge"
 
-    def test_path10_notice_delivers_to_current_sid(self, isolated_chats, monkeypatch, tmp_path):
+    def test_path10_notice_delivers_to_current_sid(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """Path-10 polled: post_notice to S1 (prior) delivers to S2 (current) inbox."""
         c = isolated_chats
         from khimaira.monitor import sessions as sessions_mod
@@ -3741,33 +3801,46 @@ class TestFamilyBDelivery:
         _make_session(sessions_mod, self.S1, "s1")
         _make_session(sessions_mod, self.S2, "s2")
         sessions_mod.set_session_slot(self.S1, self.SLOT)
-        sessions_mod.set_session_slot(self.S2, self.SLOT)  # S2 claims slot → S1 to prior
+        sessions_mod.set_session_slot(
+            self.S2, self.SLOT
+        )  # S2 claims slot → S1 to prior
 
         from khimaira.monitor import sessions as sess
-        result = sess.post_notice(self.S1, "heal-test-notice", from_session_id="external")
-        # Notice should have been redirected to S2 (the current)
-        s2_inbox = (tmp_path / "khimaira" / "sessions" / self.S2 / "inbox.jsonl")
-        assert result.get("ok") is not False, (
-            f"post_notice must not be suppressed for a prior-sid (not revoked): {result}"
-        )
 
-    def test_path10_inert_denial_suppresses_revoked(self, isolated_chats, monkeypatch, tmp_path):
+        result = sess.post_notice(
+            self.S1, "heal-test-notice", from_session_id="external"
+        )
+        # Notice should have been redirected to S2 (the current)
+        s2_inbox = tmp_path / "khimaira" / "sessions" / self.S2 / "inbox.jsonl"
+        assert (
+            result.get("ok") is not False
+        ), f"post_notice must not be suppressed for a prior-sid (not revoked): {result}"
+
+    def test_path10_inert_denial_suppresses_revoked(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """Path-10 inert-denial: post_notice to a revoked (s1→s2→s3, S1=revoked) is suppressed."""
         c = isolated_chats
         from khimaira.monitor import sessions as sessions_mod, sessions as sess
 
         for sid, name in [(self.S1, "s1"), (self.S2, "s2"), (self.S3, "s3")]:
             _make_session(sessions_mod, sid, name)
-        sessions_mod.set_session_slot(self.S1, self.SLOT)   # S1 current
-        sessions_mod.set_session_slot(self.S2, self.SLOT)   # S2 current, S1 prior
-        sessions_mod.set_session_slot(self.S3, self.SLOT)   # S3 current, S2 prior, S1 REVOKED
+        sessions_mod.set_session_slot(self.S1, self.SLOT)  # S1 current
+        sessions_mod.set_session_slot(self.S2, self.SLOT)  # S2 current, S1 prior
+        sessions_mod.set_session_slot(
+            self.S3, self.SLOT
+        )  # S3 current, S2 prior, S1 REVOKED
 
-        result = sess.post_notice(self.S1, "should-be-blocked", from_session_id="external")
-        assert result.get("suppressed") == "target-inert", (
-            f"post_notice to revoked S1 must be suppressed; got: {result}"
+        result = sess.post_notice(
+            self.S1, "should-be-blocked", from_session_id="external"
         )
+        assert (
+            result.get("suppressed") == "target-inert"
+        ), f"post_notice to revoked S1 must be suppressed; got: {result}"
 
-    def test_path9_sse_inert_denial_revoked_no_queue(self, isolated_chats, monkeypatch, tmp_path):
+    def test_path9_sse_inert_denial_revoked_no_queue(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """PATH-9 SSE INERT-DENIAL: revoked-once-legitimate s1 must NOT get a subscriber queue.
 
         After s1→s2→s3, s1 is revoked (beyond last-1 bound). A subscribe() call for s1
@@ -3779,14 +3852,17 @@ class TestFamilyBDelivery:
         This is the SSE-mirror of Part E's inert-denial for auth paths.
         """
         import asyncio
+
         c = isolated_chats
         from khimaira.monitor import sessions as sessions_mod
 
         for sid, name in [(self.S1, "s1"), (self.S2, "s2"), (self.S3, "s3")]:
             _make_session(sessions_mod, sid, name)
-        sessions_mod.set_session_slot(self.S1, self.SLOT)   # S1 current
-        sessions_mod.set_session_slot(self.S2, self.SLOT)   # S2 current, S1 prior
-        sessions_mod.set_session_slot(self.S3, self.SLOT)   # S3 current, S2 prior, S1 REVOKED
+        sessions_mod.set_session_slot(self.S1, self.SLOT)  # S1 current
+        sessions_mod.set_session_slot(self.S2, self.SLOT)  # S2 current, S1 prior
+        sessions_mod.set_session_slot(
+            self.S3, self.SLOT
+        )  # S3 current, S2 prior, S1 REVOKED
 
         # Run subscribe() for revoked S1 — must return immediately with no queue
         async def _try_subscribe():
@@ -3799,20 +3875,20 @@ class TestFamilyBDelivery:
         asyncio.run(_try_subscribe())
 
         # Revoked S1 must NOT appear in _subscribers under ANY key
-        assert self.S1 not in c._subscribers, (
-            "Revoked S1 must NOT be in _subscribers[S1] (inert-denial)"
-        )
+        assert (
+            self.S1 not in c._subscribers
+        ), "Revoked S1 must NOT be in _subscribers[S1] (inert-denial)"
         slot_key = c._slot_subscriber_key(self.S1)
         # The slot key for the revoked S1 might point to the slot string;
         # there should be no queue for S1 under it either
-        s1_queues_in_slot = [
-            q for q in c._subscribers.get(slot_key, set())
-        ]
-        assert len(s1_queues_in_slot) == 0, (
-            f"Revoked S1 must NOT hold any queue in _subscribers['{slot_key}']"
-        )
+        s1_queues_in_slot = [q for q in c._subscribers.get(slot_key, set())]
+        assert (
+            len(s1_queues_in_slot) == 0
+        ), f"Revoked S1 must NOT hold any queue in _subscribers['{slot_key}']"
 
-    def test_path9_sse_unslotted_session_not_denied(self, isolated_chats, monkeypatch, tmp_path):
+    def test_path9_sse_unslotted_session_not_denied(
+        self, isolated_chats, monkeypatch, tmp_path
+    ):
         """Non-regression: un-slotted sessions must NOT be denied by the SSE inert-check.
 
         The inert-denial uses `session_id in revoked_sids` explicitly. Un-slotted
@@ -3844,9 +3920,9 @@ class TestFamilyBDelivery:
 
         # Condition 2: _slot_subscriber_key must return the sid itself (no slot)
         sub_key = c._slot_subscriber_key(UN_SLOTTED)
-        assert sub_key == UN_SLOTTED, (
-            f"Un-slotted session subscriber key must be the sid itself, got '{sub_key}'"
-        )
+        assert (
+            sub_key == UN_SLOTTED
+        ), f"Un-slotted session subscriber key must be the sid itself, got '{sub_key}'"
 
         # Both conditions hold → subscribe() will NOT early-return, WILL add queue.
         # (The async generator path is tested via the revoked test — this guards the
@@ -3957,10 +4033,165 @@ async def test_task_claim_concurrent_exactly_one_wins(isolated_chats):
 
     # Class invariant: exactly one wins, one is rejected
     assert len(successes) == 1, f"Expected 1 success, got {len(successes)}: {successes}"
-    assert len(rejections) == 1, f"Expected 1 rejection, got {len(rejections)}: {rejections}"
+    assert (
+        len(rejections) == 1
+    ), f"Expected 1 rejection, got {len(rejections)}: {rejections}"
     assert successes[0]["status"] == c.TASK_IN_PROGRESS
 
     # The rejection must be structured ("already claimed"), not generic
-    assert "already claimed" in rejections[0], (
-        f"Expected 'already claimed' in rejection, got: {rejections[0]!r}"
+    assert (
+        "already claimed" in rejections[0]
+    ), f"Expected 'already claimed' in rejection, got: {rejections[0]!r}"
+
+
+# ---------------------------------------------------------------------------
+# K3b — roster-overlap guard tests
+# ---------------------------------------------------------------------------
+
+
+def test_create_room_rejects_overlapping_live_roster(isolated_chats):
+    """≥50% member overlap with a live roster → RosterOverlapError; no second file."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("x-uuid", "y-uuid", "z-uuid"):
+        _make_session(sessions_mod, sid)
+
+    # Create roster A with {x, y, z}.
+    room_a = c.create_room("x-uuid", ["y-uuid", "z-uuid"], title="Roster A")
+    chat_a = room_a["meta"]["chat_id"]
+
+    # Attempt to create roster B with the same members → guard fires.
+    with pytest.raises(c.RosterOverlapError) as exc_info:
+        c.create_room("x-uuid", ["y-uuid", "z-uuid"], title="Roster B", fresh=True)
+
+    err = exc_info.value
+    assert err.existing_chat_id == chat_a
+    assert len(err.overlap_members) >= 2
+
+    # Assert only ONE chat file exists (no partial write for roster B).
+    chat_files = list(c._chat_dir().glob("chat-*.jsonl"))
+    assert len(chat_files) == 1, f"Expected 1 chat file, found {len(chat_files)}"
+
+
+def test_create_room_allow_overlap_override(isolated_chats):
+    """allow_overlap=True bypasses the guard and creates a second chat."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("a-uuid", "b-uuid", "c-uuid"):
+        _make_session(sessions_mod, sid)
+
+    c.create_room("a-uuid", ["b-uuid", "c-uuid"], title="Roster A")
+    # Same members with allow_overlap=True → should succeed.
+    room_b = c.create_room(
+        "a-uuid", ["b-uuid", "c-uuid"], title="Roster B", fresh=True, allow_overlap=True
     )
+    assert room_b["meta"]["title"] == "Roster B"
+    chat_files = list(c._chat_dir().glob("chat-*.jsonl"))
+    assert len(chat_files) == 2
+
+
+def test_create_room_no_overlap_proceeds(isolated_chats):
+    """Disjoint member sets → both chats created without error."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("p-uuid", "q-uuid", "r-uuid", "s-uuid"):
+        _make_session(sessions_mod, sid)
+
+    c.create_room("p-uuid", ["q-uuid"], title="Roster P")
+    # Completely disjoint roster.
+    room_r = c.create_room("r-uuid", ["s-uuid"], title="Roster R")
+    assert room_r["meta"]["title"] == "Roster R"
+    chat_files = list(c._chat_dir().glob("chat-*.jsonl"))
+    assert len(chat_files) == 2
+
+
+def test_create_room_stale_overlap_proceeds(isolated_chats, monkeypatch):
+    """Overlapping chat beyond freshness horizon is treated as stale → no block."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("u-uuid", "v-uuid", "w-uuid"):
+        _make_session(sessions_mod, sid)
+
+    c.create_room("u-uuid", ["v-uuid", "w-uuid"], title="Old Roster")
+
+    # Shrink freshness window to 0 so the existing chat is immediately stale.
+    monkeypatch.setattr(c, "_ROSTER_OVERLAP_FRESHNESS_S", 0.0)
+
+    # Should now succeed because the existing chat is past the freshness horizon.
+    room_new = c.create_room(
+        "u-uuid", ["v-uuid", "w-uuid"], title="Fresh Roster", fresh=True
+    )
+    assert room_new["meta"]["title"] == "Fresh Roster"
+
+
+def test_create_room_left_members_not_counted(isolated_chats):
+    """Non-master members who leave are not counted toward overlap.
+
+    If only the creator (master) remains active in the old chat and the new
+    roster has 3 members, 1/3 < 50% → guard should not fire.
+    """
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("aa-uuid", "bb-uuid", "cc-uuid"):
+        _make_session(sessions_mod, sid)
+
+    room_a = c.create_room("aa-uuid", ["bb-uuid", "cc-uuid"], title="Roster Gone")
+    chat_a_id = room_a["meta"]["chat_id"]
+
+    # Non-master members accept then leave; creator (master) stays.
+    c.accept(chat_a_id, "bb-uuid")
+    c.accept(chat_a_id, "cc-uuid")
+    c.leave(chat_a_id, "bb-uuid")
+    c.leave(chat_a_id, "cc-uuid")
+
+    # Only aa-uuid remains active — 1/3 members = 33% < 50% → guard does not fire.
+    room_b = c.create_room(
+        "aa-uuid", ["bb-uuid", "cc-uuid"], title="Roster New", fresh=True
+    )
+    assert room_b["meta"]["title"] == "Roster New"
+
+
+def test_no_two_live_chats_share_majority_members(isolated_chats):
+    """Class-invariant: after any create sequence without allow_overlap,
+    no two non-stale chats share ≥50% of their active members."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    # Create several sessions.
+    sids = [f"inv-{i}-uuid" for i in range(6)]
+    for sid in sids:
+        _make_session(sessions_mod, sid)
+
+    # Create two rosters with disjoint members.
+    c.create_room(sids[0], [sids[1], sids[2]], title="Roster 1")
+    c.create_room(sids[3], [sids[4], sids[5]], title="Roster 2")
+
+    # Verify the invariant: no pair of live chats shares ≥50% active members.
+    chat_files = list(c._chat_dir().glob("chat-*.jsonl"))
+    rooms = []
+    for path in chat_files:
+        try:
+            room = c.load_room(path.stem)
+        except ValueError:
+            continue
+        active = {
+            sid
+            for sid, m in room["members"].items()
+            if m.get("state") in (c.PENDING, c.ACCEPTED)
+        }
+        rooms.append((path.stem, active))
+
+    for i, (cid_a, members_a) in enumerate(rooms):
+        for cid_b, members_b in rooms[i + 1 :]:
+            overlap_ratio = len(members_a & members_b) / max(
+                len(members_a), len(members_b), 1
+            )
+            assert overlap_ratio < 0.5, (
+                f"Invariant violated: {cid_a} and {cid_b} share "
+                f"{overlap_ratio:.0%} active members"
+            )

@@ -1145,6 +1145,7 @@ class CreateRoomReq(BaseModel):
     member_roles: dict[str, str] | None = (
         None  # session_id → role; written to meta at creation
     )
+    allow_overlap: bool = False  # K3b: bypass roster-overlap guard when True
 
 
 class InviteReq(BaseModel):
@@ -1180,6 +1181,12 @@ class CreateTaskReq(BaseModel):
     gate_for: str | None = None  # Guard-5: review-task references this work-task
     verdict_role: str | None = None  # Guard-5: "critic"|"verifier"
     private: bool = False  # v1.9.2: hide from non-assignee in chat_history
+    # #14 auto-BEGIN fields
+    required_agents: list[str] | None = None
+    auto_begin: bool = True
+    required_model: str | None = None
+    required_effort: str | None = None
+    begin_gate_task_id: str | None = None
 
 
 class MasterOverrideVerdictReq(BaseModel):
@@ -1404,10 +1411,20 @@ def build_router():
                 fresh=req.fresh,
                 topology=req.topology,
                 member_roles=req.member_roles,
+                allow_overlap=req.allow_overlap,
             )
             # Invalidate creator + all initial members — they may now have roles
             _inval(req.creator_session_id, *req.member_session_ids)
             return result
+        except chats.RosterOverlapError as exc:
+            raise fastapi.HTTPException(
+                409,
+                {
+                    "existing_chat_id": exc.existing_chat_id,
+                    "overlap_count": len(exc.overlap_members),
+                    "overlap_members": exc.overlap_members,
+                },
+            ) from exc
         except ValueError as exc:
             raise fastapi.HTTPException(404, str(exc)) from exc
 
@@ -1721,6 +1738,11 @@ def build_router():
                 gate_for=req.gate_for,
                 verdict_role=req.verdict_role,
                 private=req.private,
+                required_agents=req.required_agents,
+                auto_begin=req.auto_begin,
+                required_model=req.required_model,
+                required_effort=req.required_effort,
+                begin_gate_task_id=req.begin_gate_task_id,
             )
         except ValueError as exc:
             raise fastapi.HTTPException(403, str(exc)) from exc

@@ -123,9 +123,9 @@ def test_get_my_chats_stamps_sse_heartbeat(chats_api_client):
 
     # Heartbeat should now be present
     status_after = json_mod.loads((sd / "status.json").read_text())
-    assert "last_sse_heartbeat" in status_after, (
-        "GET /chats must stamp last_sse_heartbeat for the requester (IN-MASTER-1 self-heal)"
-    )
+    assert (
+        "last_sse_heartbeat" in status_after
+    ), "GET /chats must stamp last_sse_heartbeat for the requester (IN-MASTER-1 self-heal)"
 
 
 # ---------------------------------------------------------------------------
@@ -215,12 +215,17 @@ def test_chat_history_shows_current_name_after_rename(chats_api_client):
     client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
 
     # alice posts a message while named "alice".
-    client.post(f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": "hi"})
+    client.post(
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "hi"},
+    )
 
     # Rename alice to "alice-renamed".
     sessions_mod.set_name("alice", "alice-renamed")
 
-    history = client.get(f"/api/chats/{chat_id}/messages?session_id=bob").json()["messages"]
+    history = client.get(f"/api/chats/{chat_id}/messages?session_id=bob").json()[
+        "messages"
+    ]
     user_msgs = [m for m in history if m.get("sender_id") == "alice"]
     assert len(user_msgs) == 1
     assert user_msgs[0]["sender_name"] == "alice-renamed"
@@ -240,7 +245,8 @@ def test_chat_history_falls_back_to_stored_name_for_deleted_session(chats_api_cl
 
     # alice posts a message (stored sender_name="alice").
     client.post(
-        f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": "from alice"}
+        f"/api/chats/{chat_id}/messages",
+        json={"sender_session_id": "alice", "body": "from alice"},
     )
 
     # Delete alice's session directory (simulate deleted session).
@@ -257,7 +263,9 @@ def test_chat_history_falls_back_to_stored_name_for_deleted_session(chats_api_cl
     assert alice_msgs[0]["sender_name"] == "alice"  # falls back to stored snapshot
 
 
-def test_chat_history_name_cache_per_request(chats_api_client, monkeypatch: pytest.MonkeyPatch):
+def test_chat_history_name_cache_per_request(
+    chats_api_client, monkeypatch: pytest.MonkeyPatch
+):
     """Per-request name cache: only 1 status.json read per unique sender per request."""
     import importlib
     from khimaira.monitor.api import chats as api_mod
@@ -274,7 +282,8 @@ def test_chat_history_name_cache_per_request(chats_api_client, monkeypatch: pyte
     # Post 5 messages from alice.
     for i in range(5):
         client.post(
-            f"/api/chats/{chat_id}/messages", json={"sender_session_id": "alice", "body": f"msg{i}"}
+            f"/api/chats/{chat_id}/messages",
+            json={"sender_session_id": "alice", "body": f"msg{i}"},
         )
 
     lookup_count = [0]
@@ -364,7 +373,9 @@ def test_send_to_pending_recipient_times_out_with_408(
 
     importlib.reload(api_mod)
     monkeypatch.setattr(api_mod, "_PENDING_POLL_INTERVAL", 0.01)
-    monkeypatch.setattr(api_mod, "_PENDING_WAIT_DEADLINE", 0.001)  # expires on first check
+    monkeypatch.setattr(
+        api_mod, "_PENDING_WAIT_DEADLINE", 0.001
+    )  # expires on first check
 
     client, _ = chats_api_client
     created = client.post(
@@ -696,7 +707,11 @@ def test_signal_task_start_returns_200(chats_api_client):
     client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
     task = client.post(
         f"/api/chats/{chat_id}/tasks",
-        json={"sender_session_id": "alice", "body": "do thing", "assignee_session_id": "bob"},
+        json={
+            "sender_session_id": "alice",
+            "body": "do thing",
+            "assignee_session_id": "bob",
+        },
     ).json()
 
     resp = client.post(
@@ -822,7 +837,9 @@ def test_overdue_watcher_fires_notice(registry_client, monkeypatch: pytest.Monke
     _, api_mod, _ = registry_client
     notices_fired: list[tuple[str, str]] = []
 
-    def _mock_post_notice(target_session_id, text, *, from_session_id="external", **_kw):
+    def _mock_post_notice(
+        target_session_id, text, *, from_session_id="external", **_kw
+    ):
         notices_fired.append((target_session_id, text))
         return {}
 
@@ -831,9 +848,11 @@ def test_overdue_watcher_fires_notice(registry_client, monkeypatch: pytest.Monke
     monkeypatch.setattr(api_mod, "_session_active_within", lambda sid, w: False)
     # Resolve master to alice.
     monkeypatch.setattr(api_mod, "_resolve_master_session_id", lambda chat_id: "alice")
+
     # Stub probe — no real SSE write needed.
     async def _fake_probe(chat_id, to_id, from_id, elapsed_s):
         return True
+
     monkeypatch.setattr(api_mod, "_send_diagnostic_probe", _fake_probe)
 
     # Plant a stale entry (91s old) in new format.
@@ -875,8 +894,10 @@ def test_overdue_watcher_one_shot(registry_client, monkeypatch: pytest.MonkeyPat
     )
     monkeypatch.setattr(api_mod, "_session_active_within", lambda sid, w: False)
     monkeypatch.setattr(api_mod, "_resolve_master_session_id", lambda chat_id: "alice")
+
     async def _fake_probe(chat_id, to_id, from_id, elapsed_s):
         return True
+
     monkeypatch.setattr(api_mod, "_send_diagnostic_probe", _fake_probe)
 
     api_mod._EXPECTED_REPLIES[("bob", "alice")] = {
@@ -1075,7 +1096,9 @@ def test_cursor_persists_across_daemon_restart(chats_api_client, tmp_path, monke
     assert chats_mod._cursor_for("bob", "chat-y") == "evt-200"
 
 
-def _drain_backfill(subscribe_coro, max_events: int = 100, timeout_s: float = 0.3) -> list[dict]:
+def _drain_backfill(
+    subscribe_coro, max_events: int = 100, timeout_s: float = 0.3
+) -> list[dict]:
     """Drain backfill events from an async generator using per-event timeouts.
 
     Stops collecting when an event takes longer than timeout_s (meaning we've
@@ -1116,13 +1139,19 @@ def test_multi_chat_backfill_uses_per_chat_cursors(chats_api_client):
 
     # Create chat A (alice+bob) and chat B (alice+carol).
     resp_a = client.post(
-        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["bob"]}
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
     ).json()
     chat_a = resp_a["meta"]["chat_id"]
     client.post(f"/api/chats/{chat_a}/accept", json={"session_id": "bob"})
 
     resp_b = client.post(
-        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["carol"]}
+        "/api/chats",
+        json={
+            "creator_session_id": "alice",
+            "member_session_ids": ["carol"],
+            "allow_overlap": True,
+        },
     ).json()
     chat_b = resp_b["meta"]["chat_id"]
     client.post(f"/api/chats/{chat_b}/accept", json={"session_id": "carol"})
@@ -1163,7 +1192,8 @@ def test_backfill_without_cursor_uses_last_50(chats_api_client):
 
     # Create two chats: A (where since_event_id will come from) and B (where backfill happens).
     resp_a = client.post(
-        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["bob"]}
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
     ).json()
     chat_a = resp_a["meta"]["chat_id"]
     client.post(f"/api/chats/{chat_a}/accept", json={"session_id": "bob"})
@@ -1178,10 +1208,17 @@ def test_backfill_without_cursor_uses_last_50(chats_api_client):
 
     sd = sessions_mod._session_dir("carol")
     sd.mkdir(parents=True, exist_ok=True)
-    (sd / "status.json").write_text(json.dumps({"status": "idle", "name": "carol"}), "utf-8")
+    (sd / "status.json").write_text(
+        json.dumps({"status": "idle", "name": "carol"}), "utf-8"
+    )
 
     resp_b = client.post(
-        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["carol"]}
+        "/api/chats",
+        json={
+            "creator_session_id": "alice",
+            "member_session_ids": ["carol"],
+            "allow_overlap": True,
+        },
     ).json()
     chat_b = resp_b["meta"]["chat_id"]
     client.post(f"/api/chats/{chat_b}/accept", json={"session_id": "carol"})
@@ -1193,7 +1230,9 @@ def test_backfill_without_cursor_uses_last_50(chats_api_client):
 
     # Subscribe with anchor from chat A as the since_event_id hint.
     # Chat B has no cursor → falls to last-50 backfill.
-    collected = _drain_backfill(chats_mod.subscribe("alice", since_event_id=anchor_event_id))
+    collected = _drain_backfill(
+        chats_mod.subscribe("alice", since_event_id=anchor_event_id)
+    )
     chat_b_events = [r for r in collected if r.get("chat_id") == chat_b]
     assert len(chat_b_events) > 0, "expected backfill events from chat B"
     assert len(chat_b_events) <= 50, "backfill capped at 50"
@@ -1207,7 +1246,8 @@ def test_broadcast_logs_warning_on_disconnected_subscriber(chats_api_client, cap
 
     # Create chat and accept.
     resp = client.post(
-        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["bob"]}
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
     ).json()
     chat_id = resp["meta"]["chat_id"]
     client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
@@ -1231,7 +1271,8 @@ def test_last_event_id_hint_used_when_no_cursor(chats_api_client):
 
     # Create chat and post 3 messages.
     resp = client.post(
-        "/api/chats", json={"creator_session_id": "alice", "member_session_ids": ["bob"]}
+        "/api/chats",
+        json={"creator_session_id": "alice", "member_session_ids": ["bob"]},
     ).json()
     chat_id = resp["meta"]["chat_id"]
     client.post(f"/api/chats/{chat_id}/accept", json={"session_id": "bob"})
@@ -1247,13 +1288,15 @@ def test_last_event_id_hint_used_when_no_cursor(chats_api_client):
     pivot_event_id = lines[1]["event_id"]  # last-event-id hint
 
     # No cursor set. Subscribe with since_event_id = pivot → only last msg delivered.
-    collected = _drain_backfill(chats_mod.subscribe("alice", since_event_id=pivot_event_id))
+    collected = _drain_backfill(
+        chats_mod.subscribe("alice", since_event_id=pivot_event_id)
+    )
     msg_bodies = [r["body"] for r in collected if r.get("kind") == "msg"]
     # msg 2 should appear (it comes after the pivot), msg 0 should NOT (it's before the pivot).
     assert "msg 2" in msg_bodies, f"expected 'msg 2' in backfill; got: {msg_bodies}"
-    assert "msg 0" not in msg_bodies, (
-        f"msg 0 predates the pivot and must not appear; got: {msg_bodies}"
-    )
+    assert (
+        "msg 0" not in msg_bodies
+    ), f"msg 0 predates the pivot and must not appear; got: {msg_bodies}"
 
 
 # ---------------------------------------------------------------------------
@@ -1368,9 +1411,9 @@ def test_guard4_escalates_when_process_dead(guard4_env, monkeypatch):
         str(n.get("kw", {}).get("text", "")) + " " + str(n.get("args", ""))
         for n in notices
     )
-    assert "crash" in all_text or assignee_sid[:8] in all_text, (
-        f"Escalation text should mention crash or session; got: {all_text!r}"
-    )
+    assert (
+        "crash" in all_text or assignee_sid[:8] in all_text
+    ), f"Escalation text should mention crash or session; got: {all_text!r}"
 
 
 def test_guard4_suppresses_when_alive_within_ceiling(guard4_env, monkeypatch):
@@ -1396,7 +1439,11 @@ def test_guard4_suppresses_when_alive_within_ceiling(guard4_env, monkeypatch):
     monkeypatch.setattr(api_mod, "_compute_throttle_ceiling_s", lambda: 600.0)
 
     def _mock_list(use_cache=True, **kw):
-        rows = sessions_mod.list_sessions.__wrapped__(use_cache=False) if hasattr(sessions_mod.list_sessions, '__wrapped__') else sessions_mod.list_sessions(use_cache=False)
+        rows = (
+            sessions_mod.list_sessions.__wrapped__(use_cache=False)
+            if hasattr(sessions_mod.list_sessions, "__wrapped__")
+            else sessions_mod.list_sessions(use_cache=False)
+        )
         for r in rows:
             if r.get("session_id") == assignee_sid:
                 r["last_active_age_s"] = small_silence
@@ -1432,9 +1479,7 @@ def test_guard4_no_escalation_without_obligation(guard4_env, monkeypatch):
     lone_sid = str(uuid.uuid4())
     sd = sessions_mod._BASE_DIR / lone_sid
     sd.mkdir(parents=True, exist_ok=True)
-    (sd / "status.json").write_text(
-        json.dumps({"status": "idle"}), encoding="utf-8"
-    )
+    (sd / "status.json").write_text(json.dumps({"status": "idle"}), encoding="utf-8")
 
     notices: list = []
     monkeypatch.setattr(
@@ -1453,16 +1498,18 @@ def test_guard4_no_escalation_without_obligation(guard4_env, monkeypatch):
         return rows
 
     real_fn = sessions_mod.list_sessions
-    monkeypatch.setattr(sessions_mod, "list_sessions", lambda **kw: real_fn(use_cache=False))
+    monkeypatch.setattr(
+        sessions_mod, "list_sessions", lambda **kw: real_fn(use_cache=False)
+    )
     api_mod._GUARD4_STALLED.clear()
 
     asyncio.run(api_mod._guard4_check_once())
 
     # No tasks → no escalation regardless of liveness
     task_related = [n for n in notices if lone_sid[:8] in str(n)]
-    assert len(task_related) == 0, (
-        "Guard-4 must be silent when session has no task obligations."
-    )
+    assert (
+        len(task_related) == 0
+    ), "Guard-4 must be silent when session has no task obligations."
 
 
 def test_guard4_debounce_fires_once(guard4_env, monkeypatch):
@@ -1555,6 +1602,7 @@ def test_throttle_escalation_cooldown_suppresses(throttle_env, monkeypatch):
 
     async def _fake_post(chat_id, body, kind=None):
         return {}
+
     monkeypatch.setattr("khimaira.monitor.chats._post_synthetic_message", _fake_post)
 
     api_mod._THROTTLE_STATE.clear()
@@ -1633,7 +1681,7 @@ def test_throttle_escalation_bare_idle(throttle_env, monkeypatch):
     monkeypatch.setattr("khimaira.monitor.chats._post_synthetic_message", _fake_post)
     monkeypatch.setattr(
         "khimaira.monitor.sessions.post_notice",
-        lambda *a, **kw: {} ,
+        lambda *a, **kw: {},
     )
     monkeypatch.setattr(api_mod, "_get_session_obligations", lambda sid: [])
     monkeypatch.setattr(api_mod, "_guard4_escalate", _fake_guard4)
@@ -1797,7 +1845,9 @@ def test_guard4_pending_no_begin_unknown_does_not_escalate(guard4_env, monkeypat
         lambda *a, **kw: notices.append(a) or {},
     )
 
-    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: None)  # unknown
+    monkeypatch.setattr(
+        api_mod, "_is_process_alive_for_session", lambda sid: None
+    )  # unknown
     monkeypatch.setattr(api_mod, "_compute_throttle_ceiling_s", lambda: 60.0)
 
     real_list = sessions_mod.list_sessions
@@ -1838,7 +1888,9 @@ def test_guard4_pending_no_begin_dead_escalates(guard4_env, monkeypatch):
         lambda *a, **kw: notices.append({"args": a, "kw": kw}) or {},
     )
 
-    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)  # dead
+    monkeypatch.setattr(
+        api_mod, "_is_process_alive_for_session", lambda sid: False
+    )  # dead
 
     real_list = sessions_mod.list_sessions
 
@@ -1874,6 +1926,7 @@ def test_guard4_pending_begin_fired_alive_escalates(guard4_env, monkeypatch):
 
     for sid in (master_sid, assignee_sid):
         import json
+
         sd = sessions_mod._BASE_DIR / sid
         sd.mkdir(parents=True, exist_ok=True)
         (sd / "status.json").write_text(
@@ -1902,7 +1955,9 @@ def test_guard4_pending_begin_fired_alive_escalates(guard4_env, monkeypatch):
         lambda *a, **kw: notices.append(a) or {},
     )
 
-    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: True)  # alive
+    monkeypatch.setattr(
+        api_mod, "_is_process_alive_for_session", lambda sid: True
+    )  # alive
     monkeypatch.setattr(api_mod, "_compute_throttle_ceiling_s", lambda: 60.0)
 
     real_list = sessions_mod.list_sessions
@@ -1944,7 +1999,9 @@ def test_guard4_debounce_not_reset_by_activity_blip(guard4_env, monkeypatch):
         lambda *a, **kw: notices.append(a) or {},
     )
 
-    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)  # dead
+    monkeypatch.setattr(
+        api_mod, "_is_process_alive_for_session", lambda sid: False
+    )  # dead
 
     silence = [300.0]  # mutable for sweep-by-sweep control
 
@@ -2038,7 +2095,7 @@ def test_post_grant_role_non_master_returns_403(chats_api_client):
     r = client.post(
         f"/api/chats/{chat_id}/grant-role",
         json={
-            "by_session_id": "bob",   # bob is agent, not master
+            "by_session_id": "bob",  # bob is agent, not master
             "target_session_id": "alice",
             "role": "agent",
         },
@@ -2051,7 +2108,9 @@ def test_post_grant_role_non_master_returns_403(chats_api_client):
 # ---------------------------------------------------------------------------
 
 
-def _setup_room_with_master(client, chats_mod, master="alice", members=("bob",), member_roles=None):
+def _setup_room_with_master(
+    client, chats_mod, master="alice", members=("bob",), member_roles=None
+):
     """Helper: create a room, accept all members, return chat_id."""
     roles = member_roles or {master: "master"}
     resp = client.post(
@@ -2098,7 +2157,8 @@ def test_auto_create_review_tasks_on_done(chats_api_client):
     """When a gate_required task → done, AUTO-creates critic + verifier review-tasks."""
     client, chats_mod = chats_api_client
     chat_id = _setup_room_with_master(
-        client, chats_mod,
+        client,
+        chats_mod,
         member_roles={"alice": "master", "bob": "agent"},
     )
     # Create a gate_required work-task
@@ -2129,7 +2189,8 @@ def test_auto_create_review_tasks_on_done(chats_api_client):
     # Check review-tasks were created
     room = chats_mod.load_room(chat_id)
     review_tasks = [
-        m for m in room["messages"]
+        m
+        for m in room["messages"]
         if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
     ]
     verdict_roles = {t["verdict_role"] for t in review_tasks}
@@ -2141,7 +2202,8 @@ def test_master_override_verdict_audited(chats_api_client):
     """master_override_verdict with reason+trigger → 200 and is_override=True on record."""
     client, chats_mod = chats_api_client
     chat_id = _setup_room_with_master(
-        client, chats_mod,
+        client,
+        chats_mod,
         member_roles={"alice": "master", "bob": "agent"},
     )
     r = client.post(
@@ -2170,7 +2232,8 @@ def test_master_override_verdict_non_master_blocked(chats_api_client):
     """Non-master cannot post override verdict → 403."""
     client, chats_mod = chats_api_client
     chat_id = _setup_room_with_master(
-        client, chats_mod,
+        client,
+        chats_mod,
         member_roles={"alice": "master", "bob": "agent"},
     )
     r = client.post(
@@ -2195,7 +2258,8 @@ def test_auto_create_review_tasks_no_duplicate_while_open(chats_api_client):
     """Second AUTO-create doesn't duplicate while prior review-tasks are still OPEN."""
     client, chats_mod = chats_api_client
     chat_id = _setup_room_with_master(
-        client, chats_mod,
+        client,
+        chats_mod,
         member_roles={"alice": "master", "bob": "agent"},
     )
     r = client.post(
@@ -2210,26 +2274,39 @@ def test_auto_create_review_tasks_no_duplicate_while_open(chats_api_client):
     work_task_id = r.json()["id"]
 
     # First done → creates 2 open review-tasks
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "in_progress"})
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "done"})
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
 
     # changes_requested → in_progress → done again (review-tasks still OPEN)
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "alice", "new_status": "changes_requested"})
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "in_progress"})
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "done"})
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "alice", "new_status": "changes_requested"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
 
     # Open review-tasks still exist → no duplicates; should still be exactly 2
     room = chats_mod.load_room(chat_id)
     review_tasks = [
-        m for m in room["messages"]
+        m
+        for m in room["messages"]
         if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
     ]
-    assert len(review_tasks) == 2, f"Expected 2 review-tasks (no dup), got {len(review_tasks)}"
+    assert (
+        len(review_tasks) == 2
+    ), f"Expected 2 review-tasks (no dup), got {len(review_tasks)}"
 
 
 def test_gate_bypass_prevented_on_satisfied_prior_round(chats_api_client):
@@ -2245,7 +2322,8 @@ def test_gate_bypass_prevented_on_satisfied_prior_round(chats_api_client):
     """
     client, chats_mod = chats_api_client
     chat_id = _setup_room_with_master(
-        client, chats_mod,
+        client,
+        chats_mod,
         members=("bob", "carol"),
         member_roles={"alice": "master", "bob": "agent", "carol": "critic"},
     )
@@ -2261,26 +2339,34 @@ def test_gate_bypass_prevented_on_satisfied_prior_round(chats_api_client):
     work_task_id = r.json()["id"]
 
     # Round 1: bob does task → done
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "in_progress"})
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "done"})
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
 
     # Round-1 verdicts: critic approves + verifier ships on the WORK-TASK
     chats_mod.record_gate_verdict(chat_id, "carol", work_task_id, "approve")
     # Simulate verifier shipping (override role check for test simplicity by
     # directly inserting a verdict record via _append)
     import uuid
-    chats_mod._append(chat_id, {
-        "kind": chats_mod.TASK_VERDICT,
-        "event_id": chats_mod._new_event_id(),
-        "ts": chats_mod._now_iso(),
-        "chat_id": chat_id,
-        "task_id": work_task_id,
-        "verdict": "ship",
-        "by_session_id": "alice",  # not a real verifier — test only
-        "by_name": "alice",
-    })
+
+    chats_mod._append(
+        chat_id,
+        {
+            "kind": chats_mod.TASK_VERDICT,
+            "event_id": chats_mod._new_event_id(),
+            "ts": chats_mod._now_iso(),
+            "chat_id": chat_id,
+            "task_id": work_task_id,
+            "verdict": "ship",
+            "by_session_id": "alice",  # not a real verifier — test only
+            "by_name": "alice",
+        },
+    )
 
     # Verify round-1 gate is satisfied
     verdicts_r1 = chats_mod.get_gate_verdicts_by_task("alice", work_task_id)
@@ -2289,25 +2375,32 @@ def test_gate_bypass_prevented_on_satisfied_prior_round(chats_api_client):
     assert verdicts_r1["verifier_shipped"] is True
 
     # Master requests changes despite satisfied verdicts → round-2 begins
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "alice", "new_status": "changes_requested"})
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "in_progress"})
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "done"})
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "alice", "new_status": "changes_requested"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
 
     # Round-2 gate must be ABSENT (stale round-1 verdicts invalidated)
     verdicts_r2 = chats_mod.get_gate_verdicts_by_task("alice", work_task_id)
-    assert verdicts_r2 == "absent", (
-        f"Expected gate ABSENT for round-2 (stale verdicts must be invalidated), got {verdicts_r2}"
-    )
+    assert (
+        verdicts_r2 == "absent"
+    ), f"Expected gate ABSENT for round-2 (stale verdicts must be invalidated), got {verdicts_r2}"
 
 
 def test_auto_create_review_tasks_fresh_on_re_done_after_closed(chats_api_client):
     """After prior review-tasks are closed, re-done creates fresh obligations."""
     client, chats_mod = chats_api_client
     chat_id = _setup_room_with_master(
-        client, chats_mod,
+        client,
+        chats_mod,
         member_roles={"alice": "master", "bob": "agent"},
     )
     r = client.post(
@@ -2322,38 +2415,54 @@ def test_auto_create_review_tasks_fresh_on_re_done_after_closed(chats_api_client
     work_task_id = r.json()["id"]
 
     # First done → creates 2 review-tasks
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "in_progress"})
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "done"})
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
 
     room = chats_mod.load_room(chat_id)
     review_task_ids = [
-        m["id"] for m in room["messages"]
+        m["id"]
+        for m in room["messages"]
         if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
     ]
     assert len(review_task_ids) == 2
 
     # Close review-tasks (mark them done — simulating reviewer completed them)
     for rtid in review_task_ids:
-        client.post(f"/api/chats/{chat_id}/tasks/{rtid}/status",
-                    json={"by_session_id": "alice", "new_status": "cancelled"})
+        client.post(
+            f"/api/chats/{chat_id}/tasks/{rtid}/status",
+            json={"by_session_id": "alice", "new_status": "cancelled"},
+        )
 
     # Work-task: changes_requested → in_progress → done again (review-tasks now CLOSED)
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "alice", "new_status": "changes_requested"})
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "in_progress"})
-    client.post(f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
-                json={"by_session_id": "bob", "new_status": "done"})
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "alice", "new_status": "changes_requested"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
 
     # Should now have 4 review-tasks total (2 closed + 2 fresh)
     room = chats_mod.load_room(chat_id)
     all_review_tasks = [
-        m for m in room["messages"]
+        m
+        for m in room["messages"]
         if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
     ]
-    assert len(all_review_tasks) == 4, f"Expected 4 review-tasks (2 fresh), got {len(all_review_tasks)}"
+    assert (
+        len(all_review_tasks) == 4
+    ), f"Expected 4 review-tasks (2 fresh), got {len(all_review_tasks)}"
 
 
 def test_is_reachable_false_when_not_subscribed(chats_api_client):
@@ -2386,3 +2495,69 @@ def test_guard4_suppressed_during_wind_down(chats_api_client, monkeypatch):
         assert escalated == [], "Guard-4 should not escalate during wind-down"
     finally:
         sessions_mod.set_roster_wind_down(False)
+
+
+# ---------------------------------------------------------------------------
+# K3b — API-layer roster-overlap guard (HTTP 409)
+# ---------------------------------------------------------------------------
+
+
+def test_create_room_api_rejects_overlapping_roster(chats_api_client):
+    """POST /api/chats with ≥50% member overlap returns 409 with existing_chat_id."""
+    client, _ = chats_api_client
+
+    # Create roster A.
+    resp_a = client.post(
+        "/api/chats",
+        json={
+            "creator_session_id": "alice",
+            "member_session_ids": ["bob", "carol"],
+            "title": "Roster A",
+        },
+    )
+    assert resp_a.status_code == 200
+    chat_a_id = resp_a.json()["meta"]["chat_id"]
+
+    # Attempt roster B with the same members — expect 409.
+    resp_b = client.post(
+        "/api/chats",
+        json={
+            "creator_session_id": "alice",
+            "member_session_ids": ["bob", "carol"],
+            "title": "Roster B",
+            "fresh": True,
+        },
+    )
+    assert resp_b.status_code == 409
+    body = resp_b.json()
+    # FastAPI wraps HTTPException detail in {"detail": ...}
+    detail = body.get("detail", body)
+    assert detail["existing_chat_id"] == chat_a_id
+    assert detail["overlap_count"] >= 2
+    assert isinstance(detail["overlap_members"], list)
+
+
+def test_create_room_api_allow_overlap_creates_second_chat(chats_api_client):
+    """POST /api/chats with allow_overlap=true bypasses the 409 guard."""
+    client, _ = chats_api_client
+
+    client.post(
+        "/api/chats",
+        json={
+            "creator_session_id": "alice",
+            "member_session_ids": ["bob", "carol"],
+            "title": "Roster A",
+        },
+    )
+    resp_b = client.post(
+        "/api/chats",
+        json={
+            "creator_session_id": "alice",
+            "member_session_ids": ["bob", "carol"],
+            "title": "Roster B",
+            "fresh": True,
+            "allow_overlap": True,
+        },
+    )
+    assert resp_b.status_code == 200
+    assert resp_b.json()["meta"]["title"] == "Roster B"

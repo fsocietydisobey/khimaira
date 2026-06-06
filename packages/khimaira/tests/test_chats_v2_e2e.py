@@ -89,18 +89,19 @@ def test_v2_role_lifecycle_end_to_end(isolated_chats):
 
     # --- pre-grant: alice is implicit master via created_by ---
     fresh = chats.load_room(chat_id)
-    assert fresh["meta"].get("member_roles") is None, (
-        "v1-era chats should have no explicit member_roles until first grant"
-    )
+    assert (
+        fresh["meta"].get("member_roles") is None
+    ), "v1-era chats should have no explicit member_roles until first grant"
     assert chats._is_master(fresh, "alice")
     assert not chats._is_master(fresh, "bob")
 
     # --- grant: alice grants bob critic (non-master grant materializes implicit master) ---
     chats.chat_grant_role(chat_id, "alice", "bob", "critic")
     fresh = chats.load_room(chat_id)
-    assert fresh["meta"]["member_roles"] == {"alice": "master", "bob": "critic"}, (
-        "first grant must materialize implicit master and add the requested role in one write"
-    )
+    assert fresh["meta"]["member_roles"] == {
+        "alice": "master",
+        "bob": "critic",
+    }, "first grant must materialize implicit master and add the requested role in one write"
 
     # --- grant: alice grants carol observer ---
     chats.chat_grant_role(chat_id, "alice", "carol", "observer")
@@ -138,14 +139,16 @@ def test_v2_role_lifecycle_end_to_end(isolated_chats):
     chats.chat_grant_role(chat_id, "alice", "dave", "master", demote_to="agent")
     fresh = chats.load_room(chat_id)
     assert fresh["meta"]["member_roles"]["dave"] == "master"
-    assert fresh["meta"]["member_roles"]["alice"] == "agent", (
-        "atomic promote-demote must demote the prior master in the same write"
-    )
+    assert (
+        fresh["meta"]["member_roles"]["alice"] == "agent"
+    ), "atomic promote-demote must demote the prior master in the same write"
     assert not chats._is_master(fresh, "alice")
     assert chats._is_master(fresh, "dave")
 
     # --- alice (now agent) CANNOT approve ---
-    task2 = chats.create_task(chat_id, "dave", "second task", assignee_session_id="alice")
+    task2 = chats.create_task(
+        chat_id, "dave", "second task", assignee_session_id="alice"
+    )
     chats.update_task_status(chat_id, task2["id"], "alice", c.TASK_IN_PROGRESS)
     chats.update_task_status(chat_id, task2["id"], "alice", c.TASK_DONE)
     with pytest.raises(ValueError, match="master"):
@@ -201,7 +204,9 @@ def test_set_creator_recovers_orphaned_chat(isolated_chats):
     # assert set_creator REFUSES when the current creator is still accepted.
 
     fresh = chats.load_room(chat_id)
-    assert fresh["meta"]["created_by"] == "carol", "Lane E v1.3 fix: master role moved on transfer"
+    assert (
+        fresh["meta"]["created_by"] == "carol"
+    ), "Lane E v1.3 fix: master role moved on transfer"
     assert fresh["members"]["alice"]["state"] == c.TRANSFERRED_OUT
 
     # --- set_creator should refuse: current creator (carol) is accepted, not transferred-out ---
@@ -224,3 +229,245 @@ def test_set_creator_refuses_non_member(isolated_chats):
     # Now carol is the v1.3-corrected master. Try set_creator on non-member dave.
     with pytest.raises(ValueError, match="non-member"):
         chats.set_creator(chat_id, "dave")
+
+
+# ---------------------------------------------------------------------------
+# #14 — Auto-BEGIN dispatch tests
+# ---------------------------------------------------------------------------
+
+
+def _setup_auto_begin_room(
+    chats, names: list[str], agents: list[str]
+) -> tuple[str, str]:
+    """Create room with master=names[0], agents=names[1:], accept all, create a
+    task with required_agents=agents, required_model='sonnet', required_effort='medium'.
+    Returns (chat_id, task_id)."""
+    for name in names:
+        _make(name)
+    master = names[0]
+    invited = names[1:]
+    room = chats.create_room(master, invited)
+    chat_id = room["meta"]["chat_id"]
+    for name in invited:
+        chats.accept(chat_id, name)
+    task = chats.create_task(
+        chat_id,
+        master,
+        "implement the feature",
+        assignee_session_id=agents[0],
+        required_agents=agents,
+        auto_begin=True,
+        required_model="sonnet",
+        required_effort="medium",
+    )
+    return chat_id, task["id"]
+
+
+def test_auto_begin_fires_on_last_ack(isolated_chats):
+    """Partial acks must not fire BEGIN; the final ack must trigger auto-BEGIN immediately."""
+    chats = isolated_chats
+    chat_id, task_id = _setup_auto_begin_room(
+        chats,
+        ["master", "agent-a", "agent-b"],
+        ["agent-a", "agent-b"],
+    )
+
+    # First ack — only agent-a present; BEGIN must NOT fire yet.
+    chats.send_message(
+        chat_id,
+        "agent-a",
+        f"✅ ready [task-id: {task_id}] | model=sonnet effort=medium",
+    )
+    assert not chats._is_task_begun(chat_id, task_id), "partial ack must not fire BEGIN"
+
+    # Second ack — gate satisfied; BEGIN MUST fire synchronously.
+    chats.send_message(
+        chat_id,
+        "agent-b",
+        f"✅ ready [task-id: {task_id}] | model=sonnet effort=medium",
+    )
+    assert chats._is_task_begun(chat_id, task_id), "all acks received; BEGIN must fire"
+
+    # Exactly one TASK_SIGNAL 'start' record in JSONL.
+    signals = [
+        line
+        for line in chats._read(chat_id)
+        if line.get("kind") == chats.TASK_SIGNAL
+        and line.get("task_id") == task_id
+        and line.get("signal") == "start"
+    ]
+    assert len(signals) == 1, f"expected exactly 1 BEGIN signal, got {len(signals)}"
+
+
+def test_auto_begin_ignores_noncompliant_ack(isolated_chats):
+    """An ack with the wrong model or effort must not satisfy the gate."""
+    chats = isolated_chats
+    chat_id, task_id = _setup_auto_begin_room(
+        chats,
+        ["master", "agent-a", "agent-b"],
+        ["agent-a", "agent-b"],
+    )
+
+    # agent-a sends a NON-compliant ack (wrong model).
+    chats.send_message(
+        chat_id,
+        "agent-a",
+        f"✅ ready [task-id: {task_id}] | model=haiku effort=medium",
+    )
+    # agent-b sends a compliant ack.
+    chats.send_message(
+        chat_id,
+        "agent-b",
+        f"✅ ready [task-id: {task_id}] | model=sonnet effort=medium",
+    )
+    # Gate should NOT be satisfied — agent-a's ack was non-compliant.
+    assert not chats._is_task_begun(
+        chat_id, task_id
+    ), "non-compliant ack must not satisfy the gate"
+
+    # Now agent-a re-acks with the correct tier — gate satisfies.
+    chats.send_message(
+        chat_id,
+        "agent-a",
+        f"✅ ready [task-id: {task_id}] | model=sonnet effort=medium",
+    )
+    assert chats._is_task_begun(chat_id, task_id), "compliant re-ack must fire BEGIN"
+
+
+def test_auto_begin_respects_hold(isolated_chats):
+    """auto_begin=False disables daemon auto-fire; master manual signal still works."""
+    chats = isolated_chats
+    for name in ("master", "agent-a"):
+        _make(name)
+    room = chats.create_room("master", ["agent-a"])
+    chat_id = room["meta"]["chat_id"]
+    chats.accept(chat_id, "agent-a")
+    task = chats.create_task(
+        chat_id,
+        "master",
+        "hold task",
+        assignee_session_id="agent-a",
+        required_agents=["agent-a"],
+        auto_begin=False,
+        required_model="sonnet",
+        required_effort="medium",
+    )
+    task_id = task["id"]
+
+    chats.send_message(
+        chat_id,
+        "agent-a",
+        f"✅ ready [task-id: {task_id}] | model=sonnet effort=medium",
+    )
+    assert not chats._is_task_begun(
+        chat_id, task_id
+    ), "auto_begin=False must suppress daemon BEGIN even when all acks received"
+
+    # Master can still manually fire.
+    chats.signal_task_start(chat_id, task_id, "master", note="manual")
+    assert chats._is_task_begun(
+        chat_id, task_id
+    ), "manual signal_task_start must still work"
+
+
+def test_auto_begin_idempotent(isolated_chats):
+    """Receiving acks after BEGIN has already fired must not produce duplicate signals."""
+    chats = isolated_chats
+    chat_id, task_id = _setup_auto_begin_room(
+        chats,
+        ["master", "agent-a"],
+        ["agent-a"],
+    )
+
+    # Single agent acks — auto-BEGIN fires.
+    chats.send_message(
+        chat_id,
+        "agent-a",
+        f"✅ ready [task-id: {task_id}] | model=sonnet effort=medium",
+    )
+    assert chats._is_task_begun(chat_id, task_id)
+
+    # Send another ack (e.g. from a restart) — must not double-fire.
+    chats.send_message(
+        chat_id,
+        "agent-a",
+        f"✅ ready [task-id: {task_id}] | model=sonnet effort=medium",
+    )
+
+    signals = [
+        line
+        for line in chats._read(chat_id)
+        if line.get("kind") == chats.TASK_SIGNAL
+        and line.get("task_id") == task_id
+        and line.get("signal") == "start"
+    ]
+    assert (
+        len(signals) == 1
+    ), f"double ack must not produce duplicate BEGIN; got {len(signals)}"
+
+
+def test_auto_begin_honors_verdict_gate(isolated_chats):
+    """begin_gate_task_id blocks auto-BEGIN until that task's B3 verdicts are in."""
+    chats = isolated_chats
+    for name in ("master", "agent-a"):
+        _make(name)
+    room = chats.create_room("master", ["agent-a"])
+    chat_id = room["meta"]["chat_id"]
+    chats.accept(chat_id, "agent-a")
+
+    # Gate task — the one whose B3 verdicts we're waiting on (none submitted yet).
+    gate_task = chats.create_task(
+        chat_id,
+        "master",
+        "gate work",
+        assignee_session_id="agent-a",
+    )
+    gate_task_id = gate_task["id"]
+
+    # Work task gated on the gate task's verdicts.
+    work_task = chats.create_task(
+        chat_id,
+        "master",
+        "gated work",
+        assignee_session_id="agent-a",
+        required_agents=["agent-a"],
+        auto_begin=True,
+        required_model="sonnet",
+        required_effort="medium",
+        begin_gate_task_id=gate_task_id,
+    )
+    work_task_id = work_task["id"]
+
+    # All required agents ack — but gate task has no verdicts yet.
+    chats.send_message(
+        chat_id,
+        "agent-a",
+        f"✅ ready [task-id: {work_task_id}] | model=sonnet effort=medium",
+    )
+    assert not chats._is_task_begun(
+        chat_id, work_task_id
+    ), "BEGIN must be blocked while begin_gate_task_id has no verdicts"
+
+
+def test_no_ready_task_idles_without_master(isolated_chats):
+    """Class invariant: when all required agents are compliant-ready, BEGIN fires
+    in the same ack-processing turn — a fully-ready task can never block on the master.
+    """
+    chats = isolated_chats
+    chat_id, task_id = _setup_auto_begin_room(
+        chats,
+        ["master", "agent-x"],
+        ["agent-x"],
+    )
+
+    # Single agent — compliant ack → BEGIN fires synchronously within send_message.
+    chats.send_message(
+        chat_id,
+        "agent-x",
+        f"✅ ready [task-id: {task_id}] | model=sonnet effort=medium",
+    )
+
+    # No polling, no master action — the task is begun immediately.
+    assert chats._is_task_begun(
+        chat_id, task_id
+    ), "a fully-ready task must be begun within the ack-processing turn, not wait for master"
