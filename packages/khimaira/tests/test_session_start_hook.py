@@ -397,3 +397,45 @@ def test_format_tasks_caps_at_15(hook_module):
     assert "40 open assignment(s)" in out
     assert out.count("  • ") == 15
     assert "+25 more" in out
+
+
+# ---------------------------------------------------------------------------
+# Domain-memory routing — leads retired (2026-06-06): master is the boot
+# reader of project:orchestration; output is length-capped.
+# ---------------------------------------------------------------------------
+
+
+def test_inject_domain_memory_master_gets_orchestration(hook_module, monkeypatch):
+    captured = {}
+
+    def _fake_query(domain):
+        captured["domain"] = domain
+        return {"answer": "orchestration wisdom", "training_pairs_available": 9}
+
+    monkeypatch.setattr(hook_module, "_mnemosyne_query", _fake_query)
+    monkeypatch.setattr(hook_module, "detect_project", lambda cwd: "khimaira")
+    out = hook_module._inject_domain_memory("sess-x", "/proj", chat_role="master")
+    assert captured["domain"] == "khimaira:orchestration"
+    assert "orchestration wisdom" in out
+    assert "PROVISIONAL domain memory" in out
+
+
+def test_inject_domain_memory_worker_role_gets_nothing(hook_module, monkeypatch):
+    # agent role, non-lead name → '' (no daemon/mnemosyne calls matter)
+    monkeypatch.setattr(
+        hook_module, "_http_get_json", lambda *a, **k: {"name": "agent-3"}
+    )
+    out = hook_module._inject_domain_memory("sess-x", "/proj", chat_role="agent")
+    assert out == ""
+
+
+def test_inject_domain_memory_answer_is_capped(hook_module, monkeypatch):
+    monkeypatch.setattr(
+        hook_module,
+        "_mnemosyne_query",
+        lambda d: {"answer": "z" * 20000, "training_pairs_available": 1},
+    )
+    monkeypatch.setattr(hook_module, "detect_project", lambda cwd: "khimaira")
+    out = hook_module._inject_domain_memory("sess-x", "/proj", chat_role="master")
+    assert len(out) < 5000
+    assert "truncated" in out

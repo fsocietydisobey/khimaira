@@ -856,26 +856,41 @@ def _format_active_sessions(sessions: list[dict]) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _inject_domain_memory(session_id: str, cwd: str) -> str:
-    """Return a PROVISIONAL domain-memory block for lead sessions, or '' on any failure.
+def _inject_domain_memory(session_id: str, cwd: str, chat_role: str = "") -> str:
+    """Return a PROVISIONAL domain-memory block, or '' on any failure.
 
-    Fetches the session name from the daemon; returns '' immediately if the session
-    is not a lead session or if mnemosyne is down.
+    Two consumers:
+      - MASTER sessions (chat_role == "master") → the `<project>:orchestration`
+        key. Leads were retired (2026-06-06, rate-limit pressure); master is
+        the coordinator and the natural reader of orchestration knowledge —
+        without this branch, distill writes to a store nothing boot-reads.
+      - Lead-named sessions (legacy, dormant while leads are retired) → their
+        code-domain key. Kept because the branch is harmless and leads may
+        return.
+
+    Output is length-capped — domain memory is boot context and must stay
+    bounded (same class as the handoff/inbox/tasks caps, 2026-06-06).
 
     Fail-open: any exception returns '' and never blocks session boot.
     """
+    _ANSWER_CHAR_CAP = 4000
     try:
-        session_info = _http_get_json(f"/api/sessions/{urllib.parse.quote(session_id)}")
-        session_name = ((session_info or {}).get("name") or "").strip()
-        if not session_name:
-            return ""
+        if chat_role == "master":
+            domain = "orchestration"
+        else:
+            session_info = _http_get_json(
+                f"/api/sessions/{urllib.parse.quote(session_id)}"
+            )
+            session_name = ((session_info or {}).get("name") or "").strip()
+            if not session_name:
+                return ""
 
-        lower = session_name.lower()
-        if "-lead" not in lower:
-            return ""
-        domain = detect_domain(session_name)
-        if domain == "general":
-            return ""
+            lower = session_name.lower()
+            if "-lead" not in lower:
+                return ""
+            domain = detect_domain(session_name)
+            if domain == "general":
+                return ""
 
         project = detect_project(cwd)
         qualified = (
@@ -888,6 +903,11 @@ def _inject_domain_memory(session_id: str, cwd: str) -> str:
         answer = result.get("answer") or ""
         if not answer:
             return ""
+        if len(answer) > _ANSWER_CHAR_CAP:
+            answer = (
+                answer[:_ANSWER_CHAR_CAP]
+                + " … (truncated; query mnemosyne directly for the rest)"
+            )
         count = result.get("training_pairs_available") or 0
 
         return (
@@ -1107,7 +1127,7 @@ def main() -> int:
                     except OSError:
                         pass
             blocks.append(_format_chat_roles(chat_roles))
-        domain_memory = _safe(_inject_domain_memory, session_id, cwd)
+        domain_memory = _safe(_inject_domain_memory, session_id, cwd, _primary_role)
         if domain_memory:
             blocks.append(domain_memory)
         if others:
