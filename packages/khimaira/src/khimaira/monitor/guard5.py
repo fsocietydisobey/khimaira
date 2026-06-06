@@ -435,6 +435,7 @@ async def _guard5_escalate(
                     f"Chat: {chat_id}. Status: {status}. Last change: {last_ts}."
                 ),
                 scope_cwd=None,
+                expires_in_hours=8,  # machine alert, not a human handoff — stale once the gate resolves
             )
         except Exception:
             pass

@@ -245,6 +245,7 @@ async def _guard6_escalate(
                 from_session_id="khimaira-daemon",
                 text=f"⚠️ Guard-6: {name_label} (role={role_label}) DARK {age_min:.0f} min, no obligation, zero reachable escalation targets.",
                 scope_cwd=None,
+                expires_in_hours=8,  # machine alert, not a human handoff
             )
         except Exception:
             pass

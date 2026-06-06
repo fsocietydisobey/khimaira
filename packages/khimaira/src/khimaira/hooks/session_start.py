@@ -664,12 +664,26 @@ def _format_handoffs(handoffs: list[dict], cwd: str) -> str:
     owned = [h for h in handoffs if h.get("_claim_role", "owner") == "owner"]
     observed = [h for h in handoffs if h.get("_claim_role") == "observer"]
 
+    # Hard caps — the surfaces must stay bounded no matter how the data layer
+    # misbehaves (observed 2026-06-06: 412 stale guard handoffs → 118KB block,
+    # ~30k tokens injected into every boot in the project). Newest first; the
+    # overflow is summarized in one line with the browse primitive named.
+    _OWNED_CAP = 10
+    _OBSERVED_CAP = 5
+
+    def _newest_first(items: list[dict]) -> list[dict]:
+        return sorted(items, key=lambda h: h.get("ts") or "", reverse=True)
+
+    owned_total, observed_total = len(owned), len(observed)
+    owned = _newest_first(owned)[:_OWNED_CAP]
+    observed = _newest_first(observed)[:_OBSERVED_CAP]
+
     lines: list[str] = []
 
     # --- OWNED handoffs — full directive framing ---
     if owned:
         lines.append(
-            f"📦 khimaira handoffs — {len(owned)} directive(s) you now OWN in this project ({cwd}):"
+            f"📦 khimaira handoffs — {owned_total} directive(s) you now OWN in this project ({cwd}):"
         )
         lines.append("")
         for h in owned:
@@ -709,6 +723,13 @@ def _format_handoffs(handoffs: list[dict], cwd: str) -> str:
             "`session_release_handoff(id)` so the next session in scope "
             "can pick it up."
         )
+        if owned_total > _OWNED_CAP:
+            lines.append("")
+            lines.append(
+                f"… +{owned_total - _OWNED_CAP} more owned handoff(s) not shown "
+                f"(newest {_OWNED_CAP} above). Browse the rest via "
+                f"`session_consume_handoffs` or the daemon API."
+            )
 
     # --- OBSERVED handoffs — owner already exists ---
     if observed:
@@ -717,7 +738,7 @@ def _format_handoffs(handoffs: list[dict], cwd: str) -> str:
             lines.append("---")
             lines.append("")
         lines.append(
-            f"👀 khimaira handoffs — {len(observed)} ALREADY-CLAIMED handoff(s) "
+            f"👀 khimaira handoffs — {observed_total} ALREADY-CLAIMED handoff(s) "
             f"visible in this project ({cwd}):"
         )
         lines.append("")
@@ -748,6 +769,12 @@ def _format_handoffs(handoffs: list[dict], cwd: str) -> str:
             "Don't duplicate the owner's work. Propose your role (subscribe / "
             "observe / stand down) in your first response."
         )
+        if observed_total > _OBSERVED_CAP:
+            lines.append("")
+            lines.append(
+                f"… +{observed_total - _OBSERVED_CAP} more already-claimed "
+                f"handoff(s) not shown (newest {_OBSERVED_CAP} above)."
+            )
 
     if not lines:
         return ""
@@ -1016,9 +1043,22 @@ def main() -> int:
 
     notes = _safe(_consume_inbox, session_id, cwd=cwd or None)
     others = _safe(_discover_other_active_sessions, session_id, within_minutes=30)
-    handoffs = _safe(_consume_handoffs, session_id, cwd)
-    tasks = _safe(_fetch_hook_safe_tasks)
     chat_roles = _safe(_discover_chat_roles, session_id)
+
+    # Role-gate the heavy coordination blocks. Handoffs are CONTEXT FOR THE
+    # COORDINATOR — the worker role docs explicitly say "do NOT act on any
+    # surfaced handoff" — so injecting them into worker boots is pure context
+    # bloat (observed 2026-06-06: 118KB of stale guard handoffs × 14 sessions
+    # per roster launch). Worse, _consume_handoffs AUTO-CLAIMS: a worker
+    # booting before master could steal ownership of a coordinator-bound
+    # handoff. Gating the CONSUME call (not just the formatting) closes both.
+    # Master + role-less (solo) sessions keep the full surface; every other
+    # roster role boots with identity + role file + budgets only.
+    _primary_role = (chat_roles[0].get("role") or "").strip() if chat_roles else ""
+    _is_roster_worker = bool(_primary_role) and _primary_role != "master"
+
+    handoffs = None if _is_roster_worker else _safe(_consume_handoffs, session_id, cwd)
+    tasks = None if _is_roster_worker else _safe(_fetch_hook_safe_tasks)
 
     try:
         if notes:

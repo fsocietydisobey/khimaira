@@ -252,3 +252,117 @@ def test_inject_domain_memory_fail_open_on_exception(hook_module, tmp_path):
         result = hook_module._inject_domain_memory("sess-abc", str(tmp_path))
 
     assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# _format_handoffs caps — the surfaces must stay bounded no matter how the
+# data layer misbehaves (2026-06-06: 412 stale guard handoffs → 118KB block,
+# ~30k tokens injected into every boot in the project).
+# ---------------------------------------------------------------------------
+
+
+def _mk_handoff(i: int, role: str) -> dict:
+    return {
+        "id": f"{i:012x}",
+        "ts": f"2026-06-06T10:{i % 60:02d}:00",
+        "from_session_id": "sender-uuid",
+        "text": f"handoff number {i}",
+        "_claim_role": role,
+    }
+
+
+def test_format_handoffs_caps_observed_at_5(hook_module):
+    observed = [_mk_handoff(i, "observer") for i in range(40)]
+    out = hook_module._format_handoffs(observed, "/proj")
+    # Header reports the TRUE total; body renders only the newest 5.
+    assert "40 ALREADY-CLAIMED" in out
+    assert out.count("- [handoff ") == 5
+    assert "+35 more already-claimed" in out
+
+
+def test_format_handoffs_caps_owned_at_10(hook_module):
+    owned = [_mk_handoff(i, "owner") for i in range(25)]
+    out = hook_module._format_handoffs(owned, "/proj")
+    assert "25 directive(s)" in out
+    assert out.count("- [handoff ") == 10
+    assert "+15 more owned" in out
+
+
+def test_format_handoffs_no_overflow_line_under_cap(hook_module):
+    owned = [_mk_handoff(i, "owner") for i in range(3)]
+    observed = [_mk_handoff(100 + i, "observer") for i in range(2)]
+    out = hook_module._format_handoffs(owned + observed, "/proj")
+    assert "more owned" not in out
+    assert "more already-claimed" not in out
+    assert out.count("- [handoff ") == 5  # 3 owned + 2 observed
+
+
+def test_format_handoffs_caps_keep_newest(hook_module):
+    """The newest entries (by ts) survive the cap, not the oldest."""
+    observed = [_mk_handoff(i, "observer") for i in range(10)]
+    out = hook_module._format_handoffs(observed, "/proj")
+    # ts minute = i % 60 → newest are 9..5; oldest 0..4 must be cut
+    assert "handoff number 9" in out
+    assert "handoff number 0" not in out
+
+
+# ---------------------------------------------------------------------------
+# Role-gated handoff consumption — workers must not consume (and therefore
+# cannot auto-claim) handoffs. Handoffs are context for the coordinator.
+# ---------------------------------------------------------------------------
+
+
+def _run_main(hook_module, monkeypatch, capsys, *, chat_roles):
+    """Drive main() with stubbed collaborators; return parsed additionalContext."""
+    import io
+    import json as _json
+
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-x", "cwd": "/proj"}))
+    )
+    consume_calls: list[str] = []
+
+    def _fake_consume(session_id, cwd):
+        consume_calls.append(session_id)
+        return [_mk_handoff(1, "owner")]
+
+    with (
+        patch.object(hook_module, "_post_ppid_bridge", lambda *a, **k: None, create=True),
+        patch.object(hook_module, "_ensure_chat_mcp_registered", lambda: None),
+        patch.object(hook_module, "_consume_inbox", lambda *a, **k: None),
+        patch.object(hook_module, "_discover_other_active_sessions", lambda *a, **k: None),
+        patch.object(hook_module, "_discover_chat_roles", lambda *a, **k: chat_roles),
+        patch.object(hook_module, "_consume_handoffs", _fake_consume),
+        patch.object(hook_module, "_fetch_hook_safe_tasks", lambda *a, **k: None),
+        patch.object(hook_module, "_inject_domain_memory", lambda *a, **k: None),
+        patch.object(hook_module, "_http_post_json", lambda *a, **k: None),
+    ):
+        rc = hook_module.main()
+    assert rc == 0
+    out = capsys.readouterr().out
+    ctx = _json.loads(out)["hookSpecificOutput"]["additionalContext"] if out.strip() else ""
+    return ctx, consume_calls
+
+
+def test_worker_role_skips_handoff_consume(hook_module, monkeypatch, capsys):
+    """agent-role session: _consume_handoffs is NEVER called (no claim, no bloat)."""
+    ctx, calls = _run_main(
+        hook_module, monkeypatch, capsys, chat_roles=[{"role": "agent", "chat_id": "c1"}]
+    )
+    assert calls == [], "worker boot must not consume handoffs"
+    assert "khimaira handoffs" not in ctx
+
+
+def test_master_role_consumes_handoffs(hook_module, monkeypatch, capsys):
+    ctx, calls = _run_main(
+        hook_module, monkeypatch, capsys, chat_roles=[{"role": "master", "chat_id": "c1"}]
+    )
+    assert calls == ["sess-x"]
+    assert "khimaira handoffs" in ctx
+
+
+def test_roleless_session_consumes_handoffs(hook_module, monkeypatch, capsys):
+    """Solo sessions (no chat role) keep the full handoff surface."""
+    ctx, calls = _run_main(hook_module, monkeypatch, capsys, chat_roles=None)
+    assert calls == ["sess-x"]
+    assert "khimaira handoffs" in ctx
