@@ -315,6 +315,7 @@ class TestInjectTextAndSubmit:
         screen_after_inject = self._make_screen("/compact")
         with patch.object(rr, "_kitty") as mock_kitty:
             mock_kitty.side_effect = [
+                "",                           # send-key ctrl+u (clear stale input)
                 "",                           # send-text → success
                 screen_after_inject,          # get-text (TOCTOU verify)
                 "",                           # send-key enter → success
@@ -326,7 +327,7 @@ class TestInjectTextAndSubmit:
         """User typed AFTER our text — buffer ends with /compact but has extra."""
         screen = self._make_screen("/compact extra")  # user typed after
         with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", screen, ""]
+            mock_kitty.side_effect = ["", "", screen, ""]
             result = rr._inject_text_and_submit(window_id=10, text="/compact")
         assert result is False
         assert "ctrl+c" in str(mock_kitty.call_args_list[-1])
@@ -335,7 +336,7 @@ class TestInjectTextAndSubmit:
         """User typed BEFORE our text — endswith() would pass but exact match catches it."""
         screen = self._make_screen("user_input/compact")  # user typed before
         with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", screen, ""]
+            mock_kitty.side_effect = ["", "", screen, ""]
             result = rr._inject_text_and_submit(window_id=10, text="/compact")
         assert result is False, "Exact-match guard must catch user-before-our-text"
         assert "ctrl+c" in str(mock_kitty.call_args_list[-1])
@@ -344,6 +345,7 @@ class TestInjectTextAndSubmit:
         """Can't verify buffer — abort conservatively."""
         with patch.object(rr, "_kitty") as mock_kitty:
             mock_kitty.side_effect = [
+                "",    # send-key ctrl+u (clear)
                 "",    # send-text
                 None,  # get-text fails
                 "",    # ctrl+c
@@ -352,23 +354,28 @@ class TestInjectTextAndSubmit:
         assert result is False
 
     def test_aborts_when_send_text_fails(self):
-        with patch.object(rr, "_kitty", return_value=None):
+        with patch.object(rr, "_kitty") as mock_kitty:
+            mock_kitty.side_effect = [
+                "",    # send-key ctrl+u (clear)
+                None,  # send-text fails
+            ]
             result = rr._inject_text_and_submit(window_id=10, text="/compact")
         assert result is False
 
     def test_uses_title_match_when_title_provided(self):
-        """When window_title is given, send-text and send-key use --match=title:<title>."""
+        """When window_title is given, send-text and send-key enter use title-match.
+        ctrl+u (step 1) and TOCTOU get-text (step 3) always use id-match for safety."""
         screen_after_inject = self._make_screen("/compact")
         with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", screen_after_inject, ""]
+            mock_kitty.side_effect = ["", "", screen_after_inject, ""]
             result = rr._inject_text_and_submit(
                 window_id=10, text="/compact", window_title="agent-3"
             )
         assert result is True
-        # send-text call (index 0) and send-key call (index 2) must use title-match.
-        # The TOCTOU get-text (index 1) intentionally still uses id-match for precision.
-        send_text_call = str(mock_kitty.call_args_list[0])
-        send_key_call = str(mock_kitty.call_args_list[2])
+        # Index 0: ctrl+u (id-match); index 1: send-text (title-match);
+        # index 2: get-text TOCTOU (id-match); index 3: send-key enter (title-match).
+        send_text_call = str(mock_kitty.call_args_list[1])
+        send_key_call = str(mock_kitty.call_args_list[3])
         assert "title:agent-3" in send_text_call, "send-text must use title-match"
         assert "title:agent-3" in send_key_call, "send-key must use title-match"
         assert "id:10" not in send_text_call, "send-text must NOT use id-match when title given"
@@ -378,7 +385,7 @@ class TestInjectTextAndSubmit:
         """Without window_title, falls back to id-match (backward compat)."""
         screen_after_inject = self._make_screen("/compact")
         with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", screen_after_inject, ""]
+            mock_kitty.side_effect = ["", "", screen_after_inject, ""]
             result = rr._inject_text_and_submit(window_id=10, text="/compact")
         assert result is True
         calls = [str(c) for c in mock_kitty.call_args_list]

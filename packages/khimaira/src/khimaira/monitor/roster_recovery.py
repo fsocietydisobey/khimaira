@@ -481,33 +481,43 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     know the window id.
 
     Steps:
-    1. Send the text (does NOT submit yet).
-    2. Wait briefly for the terminal to echo it.
-    3. Re-read the buffer via id (precise) — verify it ends with ONLY our text
+    1. Clear any pre-existing input with Ctrl-U (line-kill) so stale nudge text
+       from a prior aborted cycle doesn't pollute the TOCTOU check.
+    2. Send the text (does NOT submit yet).
+    3. Wait briefly for the terminal to echo it.
+    4. Re-read the buffer via id (precise) — verify it ends with ONLY our text
        (TOCTOU guard). Abort + clear (Ctrl-C) if changed.
-    4. Submit with Enter.
+    5. Submit with Enter.
 
     Returns True if submitted, False if aborted.
     """
     match_arg = (
         f"--match=title:{window_title}" if window_title else f"--match=id:{window_id}"
     )
+    id_match = f"--match=id:{window_id}"
 
-    # Step 1: send text
+    # Step 1: clear any stale input (Ctrl-U = Unix line-kill; clears current
+    # input line in Claude Code's TUI without affecting conversation history).
+    # This prevents accumulated nudge text from prior aborted cycles from causing
+    # TOCTOU false-positives (observed: 6× repeat accumulation in muther roster).
+    _kitty("send-key", id_match, "ctrl+u")
+    time.sleep(0.05)
+
+    # Step 2: send text
     if _kitty("send-text", match_arg, "--", text) is None:
         _log.warning(
             "roster-recovery: send-text failed for window %d (%s)", window_id, match_arg
         )
         return False
 
-    # Step 2: brief pause for echo
+    # Step 3: brief pause for echo
     time.sleep(0.15)
 
-    # Step 3: TOCTOU — re-read and verify
+    # Step 4: TOCTOU — re-read and verify
     buffer = _get_screen(window_id)
     if buffer is None:
         # Can't verify — abort safely
-        _kitty("send-key", f"--match=id:{window_id}", "ctrl+c")
+        _kitty("send-key", id_match, "ctrl+c")
         _log.warning(
             "roster-recovery: TOCTOU verify read failed for window %d — aborted",
             window_id,
@@ -522,7 +532,7 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     # (e.g. "user_input/compact" still endswith "/compact" but is a raced buffer).
     if last != expected:
         # Buffer has changed — user may have typed between our steps; abort
-        _kitty("send-key", f"--match=id:{window_id}", "ctrl+c")
+        _kitty("send-key", id_match, "ctrl+c")
         _log.warning(
             "roster-recovery: TOCTOU mismatch on window %d — expected %r, got %r, aborted",
             window_id,
@@ -531,7 +541,7 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
         )
         return False
 
-    # Step 4: submit
+    # Step 5: submit
     if _kitty("send-key", match_arg, "enter") is None:
         _log.warning(
             "roster-recovery: send-key enter failed for window %d (%s)", window_id, match_arg
