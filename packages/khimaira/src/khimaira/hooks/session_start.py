@@ -992,7 +992,8 @@ def main() -> int:
     # the agent, so emitting unconditionally is safe.
     blocks.append(
         "⚡ ACTION REQUIRED — real-time chat registration:\n"
-        f'Call `mcp__khimaira-chat__chat_my_chats(session_id="{session_id}")` '
+        f'Invoke the MCP TOOL `mcp__khimaira-chat__chat_my_chats(session_id="{session_id}")` '
+        "(a TOOL CALL — NOT a slash-command or skill; do NOT use the Skill tool) "
         "NOW, before anything else. This starts the SSE subscriber so "
         '`<channel source="khimaira-chat">` messages arrive in real time. '
         "Without it you will NOT receive chat messages as they arrive — only "
