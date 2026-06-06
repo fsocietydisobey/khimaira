@@ -934,7 +934,6 @@ def main() -> int:
         except Exception:
             _slot_resp = None
         if _slot_resp is None:
-            import sys
             print(
                 f"[khimaira-hook] WARN: slot-bind POST failed (after retries) for "
                 f"{session_id[:8]} slot={_roster_slot!r} — session un-slotted "
@@ -959,37 +958,51 @@ def main() -> int:
         "on your next prompted turn. One call per session; do it first."
     )
 
+    # Optional context blocks — each needs a daemon HTTP call. Under a boot-storm the
+    # daemon can be slow/erroring; an UNCAUGHT raise here previously took down the ENTIRE
+    # hook output (the entry point swallows the exception → 0 bytes written), losing the
+    # critical 🆔 + chat-registration blocks above. Agents then couldn't self-identify →
+    # they mis-registered as another session (corrupting it) or stalled. Make every
+    # optional block independently fail-safe so the identity blocks are ALWAYS emitted.
     cwd = data.get("cwd") or os.getcwd()
-    notes = _consume_inbox(session_id, cwd=cwd or None)
-    others = _discover_other_active_sessions(session_id, within_minutes=30)
-    handoffs = _consume_handoffs(session_id, cwd)
-    tasks = _fetch_hook_safe_tasks()
-    chat_roles = _discover_chat_roles(session_id)
 
-    if notes:
-        blocks.append(_format_inbox(notes))
-    if handoffs:
-        blocks.append(_format_handoffs(handoffs, cwd))
-    if tasks:
-        blocks.append(_format_tasks(tasks))
-    if chat_roles:
-        primary_role = chat_roles[0].get("role")
-        if primary_role:
-            role_path = _ROLES_DIR / f"{primary_role}.md"
-            if role_path.exists():
-                try:
-                    role_contents = role_path.read_text(encoding="utf-8")
-                    blocks.append(f"📖 ROLE FILE — {primary_role}\n{role_contents}")
-                except OSError:
-                    pass
-        blocks.append(_format_chat_roles(chat_roles))
+    def _safe(fn, *a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception:
+            return None
 
-    domain_memory = _inject_domain_memory(session_id, cwd)
-    if domain_memory:
-        blocks.append(domain_memory)
+    notes = _safe(_consume_inbox, session_id, cwd=cwd or None)
+    others = _safe(_discover_other_active_sessions, session_id, within_minutes=30)
+    handoffs = _safe(_consume_handoffs, session_id, cwd)
+    tasks = _safe(_fetch_hook_safe_tasks)
+    chat_roles = _safe(_discover_chat_roles, session_id)
 
-    if others:
-        blocks.append(_format_active_sessions(others))
+    try:
+        if notes:
+            blocks.append(_format_inbox(notes))
+        if handoffs:
+            blocks.append(_format_handoffs(handoffs, cwd))
+        if tasks:
+            blocks.append(_format_tasks(tasks))
+        if chat_roles:
+            primary_role = chat_roles[0].get("role")
+            if primary_role:
+                role_path = _ROLES_DIR / f"{primary_role}.md"
+                if role_path.exists():
+                    try:
+                        role_contents = role_path.read_text(encoding="utf-8")
+                        blocks.append(f"📖 ROLE FILE — {primary_role}\n{role_contents}")
+                    except OSError:
+                        pass
+            blocks.append(_format_chat_roles(chat_roles))
+        domain_memory = _safe(_inject_domain_memory, session_id, cwd)
+        if domain_memory:
+            blocks.append(domain_memory)
+        if others:
+            blocks.append(_format_active_sessions(others))
+    except Exception:
+        pass  # never lose the identity blocks already in `blocks`
 
     output = {
         "hookSpecificOutput": {
