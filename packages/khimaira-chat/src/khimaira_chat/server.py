@@ -307,6 +307,9 @@ class _SubprocessState:
         # Bounded dedup set — prevents reprocessing the same event_id after
         # a subscriber reconnect during the cursor-advance race window.
         self.seen_event_ids: collections.OrderedDict[str, None] = collections.OrderedDict()
+        # 2026-06-06: background boot task (ppid-bridge + subscriber start) —
+        # held here so it isn't garbage-collected mid-flight. See _serve().
+        self.boot_task: asyncio.Task | None = None
         # Phase B v1.3: watchdog supervises subscriber_task. Restarts it
         # if it crashes; logs the crash reason via task.exception(). One
         # watchdog per subprocess lifetime, spawned in _serve().
@@ -1407,19 +1410,32 @@ async def _serve() -> None:
         # the moment they arrive, agent sees them on next turn.
         _state.write_stream = write_stream
 
-        # Phase B v1.3 Lane D: eager subscription via async ppid-bridge.
-        # The sync version in main() already ran with a ~3s budget; if it
-        # missed (SessionStart hook slow / not-yet-posted), this async
-        # retry gives a longer window without blocking startup. No-op if
-        # main() already established session_id.
-        if _state.session_id is None:
-            try:
-                await _async_try_auto_register_from_ppid()
-            except Exception:
-                log.exception("khimaira-chat: async ppid-bridge raised; falling back to lazy-reg")
+        # Phase B v1.3 Lane D (rev 2026-06-06): eager registration via the async
+        # ppid-bridge — as a BACKGROUND task, never awaited before server.run().
+        # The bridge does daemon HTTP (ancestor walk + retries). Awaiting it here
+        # held the MCP initialize handshake hostage to daemon load: under a
+        # multi-roster boot storm (~30 sessions) per-call latency stretched the
+        # bridge far past Claude Code's connect timeout and EVERY session stuck
+        # at "still connecting" (ROSTER-LAUNCH-INCIDENT-2026-06-06.md). The
+        # handshake must start immediately; registration + subscriber start land
+        # in the background, and lazy-reg (first tool call) backstops a missed
+        # bridge exactly as before.
+        async def _background_boot() -> None:
+            if _state.session_id is None:
+                try:
+                    await _async_try_auto_register_from_ppid()
+                except Exception:
+                    log.exception(
+                        "khimaira-chat: async ppid-bridge raised; falling back to lazy-reg"
+                    )
+            if (
+                _state.session_id
+                and _state.subscriber_task is None
+                and not _state.sse_fenced
+            ):
+                _state.subscriber_task = asyncio.create_task(_proactive_sse_loop())
 
-        if _state.session_id and _state.subscriber_task is None and not _state.sse_fenced:
-            _state.subscriber_task = asyncio.create_task(_proactive_sse_loop())
+        _state.boot_task = asyncio.create_task(_background_boot())
         # Phase B v1.3: watchdog supervises subscriber_task for its
         # subprocess lifetime. Spawned BEFORE the subscriber (or instead
         # of it, in lazy-reg case) — that way even if _proactive_sse_loop
@@ -1436,7 +1452,9 @@ _ASYNC_PPID_BUDGET_S: float = 5.0
 
 
 async def _async_try_auto_register_from_ppid() -> None:
-    """Async sibling of `_try_auto_register_from_ppid`.
+    """The ppid-bridge: ancestor-walk daemon lookup to self-register at boot.
+    (The former sync sibling in main() was deleted 2026-06-06 — this async
+    version, run as a background task from _serve(), is now the only bridge.)
 
     main() runs the sync version (3s budget, time.sleep). If the
     SessionStart hook is slow to post the {ppid, session_id} mapping
@@ -1694,75 +1712,20 @@ def _ancestor_pids(max_depth: int = 5) -> list[int]:
     return out
 
 
-def _try_auto_register_from_ppid() -> None:
-    """At subprocess startup, query the daemon for our session_id by
-    parent (or grandparent / great-grandparent) PID. The SessionStart
-    hook posted {ppid: getppid(), session_id} at boot; this lookup
-    retrieves it. If found, we skip lazy registration.
-
-    **Walks the ancestor chain** because `bash -lc 'uv run khimaira-chat'`
-    means our direct parent is `uv`, not Claude Code. The hook's ppid
-    is Claude Code's PID (a few levels up). Try each ancestor.
-
-    **Race-tolerant**: the hook and this subprocess are spawned roughly
-    concurrently. If subprocess wins, lookup returns null at each
-    ancestor. Retry the whole walk with backoff over ~3s.
-
-    Best-effort: silent on persistent failure; lazy registration takes
-    over on the agent's first chat tool call.
-    """
-    import time
-
-    ancestors = _ancestor_pids(max_depth=6)
-    if not ancestors:
-        log.info("khimaira-chat: no ancestor PIDs found, skipping bridge")
-        return
-
-    session_id = None
-    matched_ppid = None
-    for attempt in range(6):  # ~3s total: 0.1+0.2+0.4+0.8+1.5 = 3s
-        for ppid in ancestors:
-            try:
-                session_id = daemon_client.lookup_session_by_ppid(ppid)
-            except Exception:
-                session_id = None
-            if session_id:
-                matched_ppid = ppid
-                break
-        if session_id:
-            break
-        time.sleep(0.1 * (2**attempt))
-
-    if not session_id:
-        log.info(
-            "khimaira-chat: no session_id found for ancestors %s, falling back to lazy",
-            ancestors,
-        )
-        return
-    _state.session_id = session_id
-    # Apply entanglement fence — the sync ppid-bridge path also needs to
-    # claim before any subscriber starts (same as register() and async bridge).
-    if not _acquire_session_claim(session_id):
-        _state.sse_fenced = True
-    # Re-slot: same as register() — if compaction recycled this path, re-bind.
-    _maybe_reslot(session_id)
-    log.info(
-        "khimaira-chat: auto-registered session_id=%s via ancestor ppid=%s "
-        "(sse_fenced=%s, no agent tool call needed)",
-        session_id,
-        matched_ppid,
-        _state.sse_fenced,
-    )
-    _maybe_register_display_name(session_id)
-
-
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stderr,
     )
-    _try_auto_register_from_ppid()
+    # 2026-06-06: the sync ppid-bridge that used to run here was DELETED. It blocked
+    # ~3s of daemon HTTP (far longer under load) before stdio even opened, stacking on
+    # top of the awaited async bridge in _serve() — together they held the MCP
+    # initialize handshake past Claude Code's connect timeout during multi-roster boot
+    # storms ("still connecting" roster-wide; ROSTER-LAUNCH-INCIDENT-2026-06-06.md).
+    # Registration now runs ONLY as the background task in _serve(); the async bridge
+    # (_async_try_auto_register_from_ppid) covers the same ancestor walk with a longer
+    # budget, and lazy-reg on first tool call remains the final backstop.
     asyncio.run(_serve())
 
 
