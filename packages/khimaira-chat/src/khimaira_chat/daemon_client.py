@@ -269,6 +269,7 @@ def create_task(
     *,
     assignee_session_id: str | None = None,
     private: bool = False,
+    domain: str | None = None,
     base: str = DEFAULT_BASE,
 ) -> dict[str, Any]:
     """Create a structured task in a chat. Sender must be an accepted
@@ -284,6 +285,8 @@ def create_task(
         payload["assignee_session_id"] = assignee_session_id
     if private:
         payload["private"] = True
+    if domain:
+        payload["domain"] = domain
     resp = _request_with_retry(
         "POST",
         f"{base}/api/chats/{chat_id}/tasks",

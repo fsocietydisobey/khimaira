@@ -1200,6 +1200,57 @@ def send_message(
 # ---------------------------------------------------------------------------
 
 
+# Assign-time domain injection (tasks/domain-specialist/IMPLEMENTATION.md):
+# leads are retired; implementer agents get specialist context attached to the
+# task brief itself instead of from a standing domain-lead session.
+VALID_TASK_DOMAINS = frozenset(
+    {"backend", "frontend", "data", "devops", "orchestration"}
+)
+_DOMAIN_CONTEXT_CHAR_CAP = 3000
+
+
+def _inject_domain_context(body: str, domain: str, sender_session_id: str) -> str:
+    """Append PROVISIONAL mnemosyne knowledge for ``domain`` to a task body.
+
+    Qualified key is ``<project>:<domain>`` where project comes from the
+    sender session's recorded workspace (same source as the FLAG-B path);
+    falls back to the bare domain when no project is detectable.
+
+    Fail-open EVERYWHERE: mnemosyne down, no workspace, empty answer, any
+    exception → body returned unchanged. Task creation must never block on
+    the knowledge store.
+    """
+    try:
+        from khimaira.hooks.mnemosyne_client import query as _mnemosyne_query
+        from khimaira.hooks.session_end_utils import detect_project
+
+        project = ""
+        try:
+            from khimaira.monitor import sessions as sessions_mod
+
+            ws = sessions_mod.state(sender_session_id, recent=0).get("workspace") or ""
+            if ws:
+                project = detect_project(ws) or ""
+        except Exception:
+            project = ""
+        qualified = (
+            f"{project}:{domain}" if project and project != "unknown" else domain
+        )
+
+        result = _mnemosyne_query(qualified)
+        answer = (result or {}).get("answer") or ""
+        if not answer:
+            return body
+        if len(answer) > _DOMAIN_CONTEXT_CHAR_CAP:
+            answer = answer[:_DOMAIN_CONTEXT_CHAR_CAP] + " … (truncated)"
+        return (
+            f"{body}\n\n🧠 domain context ({qualified}, auto-injected, "
+            f"PROVISIONAL — verify against authoritative docs):\n{answer}"
+        )
+    except Exception:
+        return body
+
+
 def create_task(
     chat_id: str,
     sender_session_id: str,
@@ -1216,6 +1267,7 @@ def create_task(
     required_model: str | None = None,
     required_effort: str | None = None,
     begin_gate_task_id: str | None = None,
+    domain: str | None = None,
 ) -> dict[str, Any]:
     """Append a TASK record (status=pending). Sender must be an accepted member;
     if assignee_session_id is set, that session must also be accepted.
@@ -1237,6 +1289,10 @@ def create_task(
     Phase B v2: observers cannot create tasks.
     """
     sender_session_id = _resolve_or_uuid(sender_session_id, chat_id=chat_id)
+    if domain is not None and domain not in VALID_TASK_DOMAINS:
+        raise ValueError(
+            f"Unknown task domain {domain!r}; valid: {sorted(VALID_TASK_DOMAINS)}."
+        )
     if private and assignee_session_id is None:
         raise ValueError(
             "private=True requires assignee_session_id — "
@@ -1280,6 +1336,9 @@ def create_task(
             )
         assignee_name = amember.get("session_name") or assignee_resolved[:8]
 
+    if domain:
+        body = _inject_domain_context(body, domain, sender_session_id)
+
     record = {
         "kind": TASK,
         "event_id": _new_event_id(),
@@ -1307,6 +1366,8 @@ def create_task(
         "required_model": required_model,
         "required_effort": required_effort,
         "begin_gate_task_id": begin_gate_task_id,
+        # domain-specialist: which knowledge profile was injected (None = none)
+        "domain": domain,
     }
     _append(chat_id, record)
     log.info(

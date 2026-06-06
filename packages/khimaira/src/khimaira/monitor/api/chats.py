@@ -1187,6 +1187,8 @@ class CreateTaskReq(BaseModel):
     required_model: str | None = None
     required_effort: str | None = None
     begin_gate_task_id: str | None = None
+    # domain-specialist: inject <project>:<domain> mnemosyne context into the body
+    domain: str | None = None
 
 
 class MasterOverrideVerdictReq(BaseModel):
@@ -1743,6 +1745,7 @@ def build_router():
                 required_model=req.required_model,
                 required_effort=req.required_effort,
                 begin_gate_task_id=req.begin_gate_task_id,
+                domain=req.domain,
             )
         except ValueError as exc:
             raise fastapi.HTTPException(403, str(exc)) from exc

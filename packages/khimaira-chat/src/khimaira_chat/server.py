@@ -1026,6 +1026,23 @@ def _build_server() -> Server:
                                 "in chat_history. Requires assignee to be set."
                             ),
                         },
+                        "domain": {
+                            "type": "string",
+                            "enum": [
+                                "backend",
+                                "frontend",
+                                "data",
+                                "devops",
+                                "orchestration",
+                            ],
+                            "description": (
+                                "Optional knowledge domain — the daemon appends "
+                                "PROVISIONAL mnemosyne context for <project>:<domain> "
+                                "to the task body so the assignee gets specialist "
+                                "context with the brief. Set on clearly domain-scoped "
+                                "implementation tasks."
+                            ),
+                        },
                     },
                     "required": ["session_id", "chat_id", "body"],
                 },
@@ -1321,6 +1338,7 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
             args["body"],
             assignee_session_id=args.get("assignee"),
             private=args.get("private", False),
+            domain=args.get("domain"),
         )
     if name == "chat_task_update":
         return daemon_client.update_task_status(

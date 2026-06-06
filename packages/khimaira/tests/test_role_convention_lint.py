@@ -930,3 +930,21 @@ def test_lead_role_docs_contain_accountability_section():
         assert "until then it is convention" in content or "p2 enforcement pending" in content, (
             f"{lead_doc} missing P1 convention-marker (not enforced until P2)."
         )
+
+
+def test_analyst_md_contains_domain_specialist_consults():
+    """Analyst absorbed the retired leads' consult function (2026-06-06).
+    Guard the section so a doc rewrite can't silently drop the protocol."""
+    md = (ROLE_DIR / "analyst.md").read_text(encoding="utf-8")
+    assert "Domain-specialist consults" in md
+    assert "[domain=backend]" in md
+    assert "idle-by-default" in md  # the activation model must stay stated
+
+
+def test_tracker_md_contains_roster_health_watch():
+    """Tracker absorbed observer's judgment duties (2026-06-06). Guard the
+    section + the read-only boundary statement."""
+    md = (ROLE_DIR / "tracker.md").read_text(encoding="utf-8")
+    assert "Roster health watch" in md
+    assert "absorbed from observer" in md
+    assert "Stay read-only toward the working tree" in md
