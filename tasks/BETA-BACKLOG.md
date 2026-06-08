@@ -42,7 +42,7 @@ lost — but none of them gate the alpha milestone.
 
 ### Features (separate from the register)
 - **#61 — Themis fail-open under daemon downtime (axis A)**
-- **#60 — Mnemosyne lead-as-editor harvest v2**
+- ~~**#60 — Mnemosyne lead-as-editor harvest v2**~~ — MOOT (leads retired, 68db243)
 - **#42 / #52 / #53 / #64** — lead write-gate, distill/lint polish, mnemosyne client wiring, master solo-investigate
 
 ### Other tracks

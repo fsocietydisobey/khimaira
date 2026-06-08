@@ -1,5 +1,7 @@
 # Mnemosyne lead-as-editor harvest (v2 — the "all agents distilled" capture model)
 
+**STATUS: MOOT** — leads retired (2026-06-xx, see commit 68db243); lead-as-editor model no longer applies.
+
 **Status**: deferred, named 2026-05-28. The capture-side counterpart to the v2 retrieval task (`tasks/mnemosyne-retrieval-v2/`). Build when capture-v1's per-task hook proves insufficient to populate the brain to oracle-useful density, or when the missing-from-capture roles (master, architect, critic, verifier, observer, tracker, intake) start producing knowledge Joseph wants queryable.
 
 **Origin**: Architect's capture-layer consult (chat msg-5e476cbdbe50 and the C1-C6 expansion in msg-df07d5256991, 2026-05-27). Joseph's framing — "they all have important context" — drove the widening from domain-leads-only to all-roles. Today's `/khimaira-distill` and capture-v1 hook together cover ~one execution role per approved task; this spec is for the "every role's knowledge harvested, curated by leads or master, distilled into the right project:domain key" model.
