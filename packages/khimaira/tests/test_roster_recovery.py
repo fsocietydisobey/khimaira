@@ -374,12 +374,15 @@ class TestInjectTextAndSubmit:
         assert result is True
         # Index 0: ctrl+u (id-match); index 1: send-text (title-match);
         # index 2: get-text TOCTOU (id-match); index 3: send-key enter (title-match).
-        send_text_call = str(mock_kitty.call_args_list[1])
-        send_key_call = str(mock_kitty.call_args_list[3])
-        assert "title:agent-3" in send_text_call, "send-text must use title-match"
-        assert "title:agent-3" in send_key_call, "send-key must use title-match"
-        assert "id:10" not in send_text_call, "send-text must NOT use id-match when title given"
-        assert "id:10" not in send_key_call, "send-key must NOT use id-match when title given"
+        # Inspect actual arg tuples (not str(call) — repr doubles backslashes).
+        send_text_args = mock_kitty.call_args_list[1].args
+        send_key_args = mock_kitty.call_args_list[3].args
+        # Anchored exact-match (2026-06-07 cross-roster-nudge fix): kitty title:
+        # is an unanchored regex, so the match must be ^<escaped-title>$.
+        assert r"--match=title:^agent\-3$" in send_text_args, "send-text must use anchored title-match"
+        assert r"--match=title:^agent\-3$" in send_key_args, "send-key must use anchored title-match"
+        assert "--match=id:10" not in send_text_args, "send-text must NOT use id-match when title given"
+        assert "--match=id:10" not in send_key_args, "send-key must NOT use id-match when title given"
 
     def test_uses_id_match_when_title_empty(self):
         """Without window_title, falls back to id-match (backward compat)."""
@@ -1621,3 +1624,19 @@ class TestProcessWindowWakeDiskWIP:
 
         # B must be woken — A's edits in the shared repo do NOT suppress B's wake
         mock_inject.assert_called_once()
+
+
+class TestTitleMatchExact:
+    """kitty title: is an unanchored regex — _title_match_arg must anchor it
+    so a roster's `agent-1` nudge can't cross-fire its sister `muther-agent-1`."""
+
+    def test_anchors_and_escapes(self):
+        assert rr._title_match_arg("agent-1") == r"--match=title:^agent\-1$"
+
+    def test_substring_twin_would_not_match_anchored(self):
+        import re as _re
+        arg = rr._title_match_arg("agent-1")
+        pattern = arg.split("title:", 1)[1]  # ^agent\-1$
+        assert _re.search(pattern, "agent-1"), "must match its own window"
+        assert not _re.search(pattern, "muther-agent-1"), "must NOT match the sister roster twin"
+        assert not _re.search(pattern, "agent-11"), "must NOT match agent-11 (substring)"

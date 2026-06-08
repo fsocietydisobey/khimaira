@@ -470,6 +470,19 @@ def _distill_sync(session_id: str, role: str) -> None:
 # Guard (b): TOCTOU-safe injection
 # ---------------------------------------------------------------------------
 
+def _title_match_arg(window_title: str) -> str:
+    """Build an EXACT-match kitty ``--match=title:`` arg.
+
+    kitty's ``title:`` query is an *unanchored regular expression* (re.search),
+    so a bare ``title:agent-1`` is a SUBSTRING match — it also hits
+    ``muther-agent-1`` and every other ``*-agent-1`` twin. That substring
+    behavior cross-nudged a sister roster on 2026-06-07 (khimaira-0's manual
+    nudge woke all 12 muther-* windows). Anchor with ``^...$`` and escape the
+    title so only the exact window matches.
+    """
+    return f"--match=title:^{re.escape(window_title)}$"
+
+
 def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -> bool:
     """Inject ``text`` into a kitty window and submit with Enter.
 
@@ -492,7 +505,7 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     Returns True if submitted, False if aborted.
     """
     match_arg = (
-        f"--match=title:{window_title}" if window_title else f"--match=id:{window_id}"
+        _title_match_arg(window_title) if window_title else f"--match=id:{window_id}"
     )
     id_match = f"--match=id:{window_id}"
 
