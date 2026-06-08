@@ -79,6 +79,17 @@ ROLE_ANALYST = "analyst"
 ROLE_VERIFIER = "verifier"
 ROLE_TRACKER = "tracker"
 ROLE_MEMBER = "member"  # neutral catch-all; empty Themis ruleset (see member.yaml)
+
+# Idle-by-default consult roles: wake ONLY on directed consults/assignments,
+# never on undirected broadcasts. SINGLE SOURCE OF TRUTH — the _broadcast wake-
+# filter, the lint test, and any future Themis rule import THIS set. Do NOT infer
+# from ROLE_BUDGET comment text (only analyst/verifier are tagged there → inference
+# fails open on architect+critic). Critic is included (consult-idle in roster
+# operation) despite having no ROLE_BUDGET entry (its budget is orchestrator-chosen).
+IDLE_CONSULT_ROLES: frozenset[str] = frozenset(
+    {ROLE_ARCHITECT, ROLE_ANALYST, ROLE_CRITIC, ROLE_VERIFIER}
+)
+
 try:
     # Single-source registry: themis.data.VALID_ROLES is glob-derived from rule yamls
     # and auto-includes prefixed leads (e.g. jp-frontend-lead). Reuses the existing
@@ -112,10 +123,13 @@ except ImportError:
 # — no default; orchestrator picks per scope, and the directive emit is a
 # silent no-op when the role has no entry here.
 ROLE_BUDGET: dict[str, dict[str, str]] = {
-    ROLE_MASTER: {"model": "opus", "effort": "max"},
+    ROLE_MASTER: {"model": "opus[1m]", "effort": "max"},  # 1M context 2026-06-08
     ROLE_AGENT: {"model": "sonnet", "effort": "medium"},
     ROLE_OBSERVER: {"model": "sonnet", "effort": "low"},  # haiku→sonnet 2026-06-06
-    ROLE_ARCHITECT: {"model": "opus", "effort": "max"},  # synthesis/design sidecar
+    ROLE_ARCHITECT: {
+        "model": "opus",
+        "effort": "max",
+    },  # synthesis/design sidecar, idle-by-default
     ROLE_INTAKE: {"model": "sonnet", "effort": "medium"},  # user-facing front-end
     ROLE_ANALYST: {
         "model": "opus",
@@ -1194,9 +1208,7 @@ def send_message(
         "chat_id": chat_id,
         "sender_id": sender_session_id,
         "sender_name": member.get("session_name") or sender_session_id[:8],
-        "body": _offload_large_body(
-            chat_id, _msg_id, _sanitize_message_body(body)
-        ),
+        "body": _offload_large_body(chat_id, _msg_id, _sanitize_message_body(body)),
         "to": resolved_to,
         "private": effective_private,
     }
@@ -1398,9 +1410,7 @@ def create_task(
         "chat_id": chat_id,
         "sender_id": sender_session_id,
         "sender_name": member.get("session_name") or sender_session_id[:8],
-        "body": _offload_large_body(
-            chat_id, _task_id, _sanitize_message_body(body)
-        ),
+        "body": _offload_large_body(chat_id, _task_id, _sanitize_message_body(body)),
         "assignee_id": assignee_resolved,
         "assignee_name": assignee_name,
         "status": TASK_PENDING,
@@ -3622,6 +3632,7 @@ async def _post_synthetic_message(
     chat_id: str,
     body: str,
     kind: str = MSG,
+    to: "list[str] | None" = None,
 ) -> "dict[str, Any] | None":
     """Write a synthetic message into chat JSONL + broadcast via SSE.
 
@@ -3649,7 +3660,7 @@ async def _post_synthetic_message(
             "sender_id": _DAEMON_SENDER_ID,
             "sender_name": _DAEMON_SENDER_NAME,
             "body": body,
-            "to": None,
+            "to": to,
             "private": False,
         }
         _ensure_dir()
@@ -3706,12 +3717,25 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
     if record.get("kind") == MSG and record.get("to"):
         targeted = set(record["to"]) | {record.get("sender_id")}
 
+    # Wake-filter (Class A): an UNDIRECTED msg must not wake idle-by-default
+    # consult roles — they react to every broadcast (the cost leak) and then get
+    # false-flagged for the silence. Directed msgs (targeted is not None) always
+    # deliver. Missed undirected msgs backfill via the next-turn catch-up poll
+    # (_poll_missed_chat_events), so suppression is lossless.
+    member_roles = (room.get("meta", {}) or {}).get("member_roles") or {}
+
     # Default broadcast: to every accepted member (or filtered by `to`).
     for sid, member in room["members"].items():
         if member["state"] != ACCEPTED:
             continue
         if targeted is not None and sid not in targeted:
             continue
+        if (
+            targeted is None
+            and record.get("kind") == MSG
+            and member_roles.get(sid) in IDLE_CONSULT_ROLES
+        ):
+            continue  # idle consult role + undirected msg → suppress wake
         # Part F: resolve member sid → slot key so delivery follows the live
         # session across transfer/reattach. Slot-keyed subscriber receives the
         # event even when its membership entry is keyed to the prior sid.
@@ -3725,6 +3749,25 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
                 chat_id,
                 record.get("event_id"),
             )
+            # Directed-delivery durability (Class C): a DIRECTED msg to a member
+            # with no live SSE subscriber would be silently lost (the agent-4/6
+            # SSE-deaf black-hole). Drop a durable inbox notice so it survives to
+            # the target's next SessionStart/turn. Only for DIRECTED msgs —
+            # undirected broadcasts aren't worth a durable per-member notice.
+            if targeted is not None and record.get("kind") == MSG:
+                try:
+                    sessions_mod.post_notice(
+                        target_session_id=sid,
+                        text=(
+                            f"📨 Undelivered DIRECTED chat message in {chat_id} "
+                            f"from {record.get('sender_name') or record.get('sender_id')} "
+                            f"(SSE was not connected when sent). "
+                            f"Call chat_history(chat_id='{chat_id}') to read it."
+                        ),
+                        from_session_id="khimaira-daemon",
+                    )
+                except Exception:
+                    pass
             continue
         for q in queues:
             try:
