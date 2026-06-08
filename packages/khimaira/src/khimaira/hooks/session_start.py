@@ -413,7 +413,7 @@ _ROLE_BUDGET: dict[str, dict[str, str]] = {
     "agent": {"model": "sonnet", "effort": "medium"},
     "observer": {"model": "sonnet", "effort": "low"},
     "architect": {"model": "opus[1m]", "effort": "max"},
-    "intake": {"model": "sonnet", "effort": "medium"},
+    "intake": {"model": "opus[1m]", "effort": "medium"},
     "analyst": {"model": "opus", "effort": "max"},
     "verifier": {"model": "sonnet", "effort": "medium"},
     "tracker": {"model": "sonnet", "effort": "medium"},

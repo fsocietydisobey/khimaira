@@ -130,7 +130,7 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
         "model": "opus",
         "effort": "max",
     },  # synthesis/design sidecar, idle-by-default
-    ROLE_INTAKE: {"model": "sonnet", "effort": "medium"},  # user-facing front-end
+    ROLE_INTAKE: {"model": "opus[1m]", "effort": "medium"},  # 1M context 2026-06-08; user-facing front-end
     ROLE_ANALYST: {
         "model": "opus",
         "effort": "max",
