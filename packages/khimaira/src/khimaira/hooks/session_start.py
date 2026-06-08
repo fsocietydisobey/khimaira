@@ -1126,6 +1126,34 @@ def main() -> int:
         "on your next prompted turn. One call per session; do it first."
     )
 
+    # COMPACTION SHORT-CIRCUIT (2026-06-07 — the core re-inflation fix).
+    # Claude Code fires SessionStart on `source="compact"` immediately after a
+    # /compact summarizes the conversation. Re-injecting the full payload here —
+    # the 51KB role file + handoffs + tasks + active-sessions — refilled the
+    # context window within 1-2 prompts of every compaction, on every role,
+    # every roster: the single largest per-turn cost driver for long-lived
+    # sessions (especially master). After a compaction the agent RETAINS its
+    # role + work understanding in the summary; the ONLY thing it genuinely
+    # loses is the live SSE subscriber (bound to the pre-compaction subprocess),
+    # which the chat-registration nudge above re-establishes. So on compact we
+    # emit identity + chat-reg ONLY and skip every heavy block. Side-effect
+    # registrations above (ppid bridge, name, slot, auto-accept) still ran —
+    # those are cheap POSTs, not context. Startup/resume/clear keep the full
+    # surface (a genuinely fresh context DOES need the role file).
+    _source = (data.get("source") or "").strip().lower()
+    if _source == "compact":
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": "\n\n---\n\n".join(blocks),
+                    }
+                }
+            )
+        )
+        return 0
+
     # Optional context blocks — each needs a daemon HTTP call. Under a boot-storm the
     # daemon can be slow/erroring; an UNCAUGHT raise here previously took down the ENTIRE
     # hook output (the entry point swallows the exception → 0 bytes written), losing the

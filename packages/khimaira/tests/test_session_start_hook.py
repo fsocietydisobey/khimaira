@@ -508,3 +508,66 @@ def test_session_name_from_cmdline_proc_unreadable(hook_module, monkeypatch):
     import io
     monkeypatch.setattr(builtins, "open", _boom)
     assert hook_module._claude_session_name_from_cmdline() is None
+
+
+# ---------------------------------------------------------------------------
+# Compaction short-circuit (2026-06-07) — SessionStart fires on source=compact
+# right after /compact; re-injecting the full payload refills the window in
+# 1-2 prompts. On compact we emit identity + chat-reg ONLY.
+# ---------------------------------------------------------------------------
+
+
+def _run_main_with_source(hook_module, monkeypatch, capsys, source):
+    import io
+    import json as _json
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(_json.dumps({"session_id": "sess-x", "cwd": "/proj", "source": source})),
+    )
+    heavy_called = {"handoffs": 0, "roles": 0, "tasks": 0}
+
+    def _track(name):
+        def _fn(*a, **k):
+            heavy_called[name] += 1
+            return [] if name != "roles" else [{"role": "master", "chat_id": "c1"}]
+
+        return _fn
+
+    with (
+        patch.object(hook_module, "_post_ppid_bridge", lambda *a, **k: None, create=True),
+        patch.object(hook_module, "_ensure_chat_mcp_registered", lambda: None),
+        patch.object(hook_module, "_claude_session_name_from_cmdline", lambda: None),
+        patch.object(hook_module, "_http_post_json_retry", lambda *a, **k: None),
+        patch.object(hook_module, "_http_post_json", lambda *a, **k: None),
+        patch.object(hook_module, "_consume_inbox", lambda *a, **k: None),
+        patch.object(hook_module, "_discover_other_active_sessions", lambda *a, **k: None),
+        patch.object(hook_module, "_consume_handoffs", _track("handoffs")),
+        patch.object(hook_module, "_discover_chat_roles", _track("roles")),
+        patch.object(hook_module, "_fetch_hook_safe_tasks", _track("tasks")),
+    ):
+        rc = hook_module.main()
+    assert rc == 0
+    out = capsys.readouterr().out
+    ctx = _json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    return ctx, heavy_called
+
+
+def test_compact_source_emits_identity_and_chatreg_only(hook_module, monkeypatch, capsys):
+    ctx, heavy = _run_main_with_source(hook_module, monkeypatch, capsys, "compact")
+    # identity + chat-reg present
+    assert "khimaira session_id" in ctx
+    assert "real-time chat registration" in ctx
+    # heavy blocks NOT consumed (no role file, handoffs, tasks)
+    assert "📖 ROLE FILE" not in ctx
+    assert heavy["handoffs"] == 0, "compact must not consume handoffs"
+    assert heavy["tasks"] == 0, "compact must not fetch tasks"
+    # tiny payload
+    assert len(ctx) < 2000
+
+
+def test_startup_source_emits_full_surface(hook_module, monkeypatch, capsys):
+    ctx, heavy = _run_main_with_source(hook_module, monkeypatch, capsys, "startup")
+    # role discovery DID run (full surface)
+    assert heavy["roles"] >= 1
+    assert len(ctx) > 2000  # full payload, role file etc.
