@@ -209,7 +209,7 @@ async def _send_diagnostic_probe(
     try:
         from khimaira.monitor.chats import _post_synthetic_message
 
-        result = await _post_synthetic_message(chat_id, body)
+        result = await _post_synthetic_message(chat_id, body, to=[to_id])
         return result is not None
     except Exception:
         return False
@@ -309,7 +309,7 @@ async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:
     threshold = entry.get("threshold_s", _REPLY_OVERDUE_DEFAULT_S)
 
     # Phase 1: liveness check
-    if _session_active_within(to_id, _LIVENESS_WINDOW_S):
+    if _classify_unresponsive(to_id) in ("active", "busy"):
         async with _REGISTRY_LOCK:
             existing = _EXPECTED_REPLIES.get(key)
             if existing is not None:
@@ -332,6 +332,14 @@ async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:
     # Classify WHY before alarming the master — deaf/busy/dead are different
     # problems with different remedies (2026-06-08 muther false-positive fix).
     classification = _classify_unresponsive(to_id)
+
+    # B2 — kitty-independent fallback: when the window classifier can't tell
+    # (kitty unavailable → "unknown"), don't default to a death alarm if /proc
+    # says the process is alive. Downgrade to "deaf" (nudge), honoring the
+    # involuntary-signal class-invariant. Only no-window "dead" or a dead/None
+    # /proc stays presumed-dead.
+    if classification == "unknown" and _is_process_alive_for_session(to_id) is True:
+        classification = "deaf"
 
     # BUSY (long op, no new tool log yet) or ACTIVE (just logged activity) →
     # not stuck. Reschedule and reset probe state; do NOT notify the master.
@@ -1419,6 +1427,7 @@ def build_router():
         # returns the caller unchanged. Bounded bound = neutral-by-construction.
         try:
             from khimaira.monitor import sessions as _sess_mod
+
             current = _sess_mod.slot_resolve(caller)
             return current if current is not None else caller
         except Exception:
@@ -1764,7 +1773,9 @@ def build_router():
         req: SendReq,
         _actor: "str | None" = fastapi.Depends(require_actor),
     ) -> dict:
-        actor = _actor_or_body(_actor, req.sender_session_id, f"/chats/{chat_id}/messages")
+        actor = _actor_or_body(
+            _actor, req.sender_session_id, f"/chats/{chat_id}/messages"
+        )
         # Resolve: this send counts as a reply to any peer awaiting a response.
         if req.to:
             # Targeted send: resolve only named recipients.
@@ -1865,9 +1876,11 @@ def build_router():
             code = (
                 409
                 if "already claimed" in msg
-                else 403
-                if any(w in msg for w in ("creator", "assignee", "transition"))
-                else 404
+                else (
+                    403
+                    if any(w in msg for w in ("creator", "assignee", "transition"))
+                    else 404
+                )
             )
             raise fastapi.HTTPException(code, msg) from exc
 
@@ -1978,7 +1991,9 @@ def build_router():
         Collapses the master's 3N+K+2 call loop into one daemon HTTP call.
         Long-running when wait_for_acks=True (up to timeout_s seconds).
         """
-        actor = _actor_or_body(_actor, req.from_session_id, f"/chats/{chat_id}/assign-batch")
+        actor = _actor_or_body(
+            _actor, req.from_session_id, f"/chats/{chat_id}/assign-batch"
+        )
         try:
             return await chats.assign_batch(
                 chat_id,
@@ -2145,7 +2160,9 @@ def build_router():
         """Phase B v2: master-only role grant. Calls chats.chat_grant_role and
         immediately invalidates the Themis role cache for the affected sessions
         so the new role is enforced on the next tool call (no TTL wait)."""
-        actor = _actor_or_body(_actor, req.by_session_id, f"/chats/{chat_id}/grant-role")
+        actor = _actor_or_body(
+            _actor, req.by_session_id, f"/chats/{chat_id}/grant-role"
+        )
         try:
             result = chats.chat_grant_role(
                 chat_id,
@@ -2192,7 +2209,8 @@ def build_router():
         )
         if not actor:
             raise fastapi.HTTPException(
-                401, "X-Session-ID header required (or by_session_id query param in B.1)"
+                401,
+                "X-Session-ID header required (or by_session_id query param in B.1)",
             )
         try:
             return chats.delete(chat_id, actor)

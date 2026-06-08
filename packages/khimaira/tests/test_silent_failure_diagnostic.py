@@ -160,3 +160,78 @@ def test_threshold_inference_works_for_prefixed_names(monkeypatch):
     fake_state = {"status": {"name": "jp-architect-1"}}
     monkeypatch.setattr("khimaira.monitor.sessions.state", lambda sid: fake_state)
     assert api_chats._threshold_for_session("uuid", "chat-abc") == 180.0
+
+
+# ---------------------------------------------------------------------------
+# Class B: /proc fallback for kitty-"unknown" (B2 invariant)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b2_proc_fallback_downgrades_unknown_to_deaf(monkeypatch):
+    """Class B invariant (B2): when kitty returns 'unknown' AND /proc confirms
+    the process is alive, _diagnose_and_dispose must send a DEAF nudge notice
+    (body contains 'IDLE/DEAF'), NOT a PRESUMED-DEAD alarm. The fallback honors
+    the involuntary-signal invariant — a process we can verify alive is not dead.
+    """
+    from khimaira.monitor import chats as chats_mod
+
+    # Monkeypatch the kitty classifier to return "unknown".
+    monkeypatch.setattr(api_chats, "_classify_unresponsive", lambda sid: "unknown")
+    # /proc confirms the process is alive.
+    monkeypatch.setattr(api_chats, "_is_process_alive_for_session", lambda sid: True)
+    # Phase-1 liveness check must NOT short-circuit (we want to reach Phase 3).
+    # B1 uses _classify_unresponsive for Phase 1 now; "unknown" is not in ("active","busy"),
+    # so Phase 1 falls through correctly — no additional monkeypatch needed.
+
+    monkeypatch.setattr(
+        api_chats,
+        "_session_active_within",
+        lambda sid, window: False,
+    )
+
+    notices: list[str] = []
+
+    async def fake_post_notice(target_session_id, text, from_session_id=None, **kw):
+        notices.append(text)
+
+    monkeypatch.setattr(
+        api_chats,
+        "_resolve_master_session_id",
+        lambda chat_id: "master-sid",
+    )
+
+    import khimaira.monitor.sessions as sessions_mod
+
+    monkeypatch.setattr(
+        sessions_mod,
+        "post_notice",
+        lambda target_session_id, text, from_session_id=None, **kw: notices.append(text),
+    )
+
+    # Synthesize an entry that has already been probed (probe_sent_at set) so
+    # _diagnose_and_dispose reaches Phase 3 directly.
+    now = time.time()
+    key = ("to-session", "from-session")
+    entry = {
+        "to": "to-session",
+        "from": "from-session",
+        "chat_id": "chat-test",
+        "ts": now - 120,
+        "probe_sent_at": now - 60,
+        "threshold_s": 90.0,
+    }
+
+    # Seed _EXPECTED_REPLIES so pop() in Phase 3 finds the entry.
+    api_chats._EXPECTED_REPLIES[key] = entry
+
+    await api_chats._diagnose_and_dispose(key, entry, now)
+
+    assert notices, "No notice was sent — _diagnose_and_dispose silently did nothing."
+    combined = " ".join(notices)
+    assert "IDLE/DEAF" in combined, (
+        f"Expected IDLE/DEAF nudge notice (B2 downgrade), got: {combined!r}"
+    )
+    assert "PRESUMED-DEAD" not in combined, (
+        f"Got PRESUMED-DEAD alarm despite /proc confirming process alive: {combined!r}"
+    )

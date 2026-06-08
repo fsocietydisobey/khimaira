@@ -26,7 +26,9 @@ Recommended: `/model sonnet` `/effort medium`
 
 Routine coordination is mechanical — sonnet/medium is sufficient. For architectural
 decisions, consult `/khimaira-consult architect-1 "<question>"` rather than escalating
-your own tier. When saturated (≥2 agents awaiting review), drop tier or deputize via
+your own tier.
+
+Consults MUST be directed (`/khimaira-consult` or `to=[role]`); a raw-broadcast consult will not wake an idle consult role. When saturated (≥2 agents awaiting review), drop tier or deputize via
 `/khimaira-deputize <vice-name>`.
 
 ## Authority
