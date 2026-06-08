@@ -714,9 +714,9 @@ def test_master_role_budget_is_opus_max():
     chats_master_match = re.search(r'ROLE_MASTER:\s*(\{[^}]+\})', chats_src)
     assert chats_master_match, "ROLE_MASTER entry not found in chats.py ROLE_BUDGET"
     chats_master_budget = ast.literal_eval(chats_master_match.group(1))
-    assert chats_master_budget.get("model") == "opus", (
-        f"chats.py ROLE_BUDGET master model must be 'opus', got {chats_master_budget.get('model')!r}. "
-        "Joseph confirmed opus/max 2026-05-30. Do not change without explicit approval."
+    assert str(chats_master_budget.get("model")).startswith("opus"), (
+        f"chats.py ROLE_BUDGET master model must be opus-tier, got {chats_master_budget.get('model')!r}. "
+        "Joseph confirmed opus/max 2026-05-30; opus[1m] (1M context) added 2026-06-08. Must not be sonnet."
     )
     assert chats_master_budget.get("effort") == "max", (
         f"chats.py ROLE_BUDGET master effort must be 'max', got {chats_master_budget.get('effort')!r}."
@@ -726,8 +726,8 @@ def test_master_role_budget_is_opus_max():
     session_master_match = re.search(r'"master":\s*(\{[^}]+\})', session_start_src)
     assert session_master_match, "master entry not found in session_start.py _ROLE_BUDGET"
     session_master_budget = ast.literal_eval(session_master_match.group(1))
-    assert session_master_budget.get("model") == "opus", (
-        f"session_start.py _ROLE_BUDGET master model must be 'opus', got {session_master_budget.get('model')!r}. "
+    assert str(session_master_budget.get("model")).startswith("opus"), (
+        f"session_start.py _ROLE_BUDGET master model must be opus-tier, got {session_master_budget.get('model')!r}. "
         "chats.py and session_start.py must stay in sync."
     )
     assert session_master_budget.get("effort") == "max", (
@@ -968,4 +968,43 @@ def test_session_start_has_compact_short_circuit():
         "blocks (the compaction re-inflation fix). The unit test "
         "test_compact_source_emits_identity_and_chatreg_only guards behavior; "
         "this guards the source-level branch against silent removal."
+    )
+
+
+def test_idle_consult_roles_constant_and_doc_coherence():
+    """IDLE_CONSULT_ROLES must equal {architect,analyst,critic,verifier} AND every
+    role whose roles/<role>.md contains 'idle-by-default' must be in the constant.
+    Catches: constant updated without doc, or doc updated without constant.
+    """
+    from khimaira.monitor.chats import IDLE_CONSULT_ROLES
+
+    expected = frozenset({"architect", "analyst", "critic", "verifier"})
+    assert IDLE_CONSULT_ROLES == expected, (
+        f"IDLE_CONSULT_ROLES mismatch: got {set(IDLE_CONSULT_ROLES)}, expected {set(expected)}"
+    )
+
+    # Every role doc tagged "idle-by-default" must appear in the constant.
+    doc_tagged: set[str] = set()
+    for md_path in ROLE_DIR.glob("*.md"):
+        role_name = md_path.stem  # e.g. "architect", "critic"
+        if "idle-by-default" in md_path.read_text(encoding="utf-8"):
+            doc_tagged.add(role_name)
+
+    missing_from_constant = doc_tagged - IDLE_CONSULT_ROLES
+    assert not missing_from_constant, (
+        f"Role(s) tagged 'idle-by-default' in their role doc but absent from "
+        f"IDLE_CONSULT_ROLES: {missing_from_constant}. Add them to the constant."
+    )
+
+
+def test_master_md_contains_consults_must_be_directed():
+    """Regression guard: master.md must instruct that consults be directed.
+    The wake-filter (IDLE_CONSULT_ROLES) is self-correcting — a raw-broadcast
+    consult silently fails because idle roles don't wake. This doc line is the
+    human-readable explanation of why.
+    """
+    content = (ROLE_DIR / "master.md").read_text(encoding="utf-8")
+    assert "Consults MUST be directed" in content, (
+        "master.md missing 'Consults MUST be directed' directive. "
+        "This is the human-readable companion to the IDLE_CONSULT_ROLES wake-filter."
     )

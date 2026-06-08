@@ -1653,7 +1653,7 @@ def test_chat_create_room_emits_master_directive_to_creator(isolated_chats):
     d = directives[0]
     assert d["to"] == ["alice-uuid"]
     assert d["meta"]["role"] == c.ROLE_MASTER
-    assert d["meta"]["model"] == "opus"
+    assert d["meta"]["model"] == "opus[1m]"  # master → 1M context 2026-06-08
     assert d["meta"]["effort"] == "max"
     assert "🎚️ Role updated: you are now master" in d["body"]
     assert "/model opus" in d["body"]
@@ -1699,7 +1699,7 @@ def test_chat_grant_role_master_swap_emits_two_directives(isolated_chats):
 
     by_target = {d["to"][0]: d for d in new_directives}
     assert by_target["bob"]["meta"]["role"] == c.ROLE_MASTER
-    assert by_target["bob"]["meta"]["model"] == "opus"
+    assert by_target["bob"]["meta"]["model"] == "opus[1m]"  # master → 1M context 2026-06-08
     assert by_target["alice"]["meta"]["role"] == c.ROLE_AGENT
     assert by_target["alice"]["meta"]["model"] == "sonnet"
 
@@ -1769,7 +1769,7 @@ def test_set_creator_emits_master_directive(isolated_chats):
     d = post[-1]
     assert d["to"] == ["bob-uuid"]
     assert d["meta"]["role"] == c.ROLE_MASTER
-    assert d["meta"]["model"] == "opus"
+    assert d["meta"]["model"] == "opus[1m]"  # master → 1M context 2026-06-08
     assert d["meta"]["effort"] == "max"
     assert "🎚️ Role updated: you are now master" in d["body"]
     assert "/model opus" in d["body"]
@@ -2134,7 +2134,7 @@ def test_deputize_resume_round_trip_single_chat_full_state(isolated_chats):
     swap_directives = post_directives[2:]
     by_target = {d["to"][0]: d for d in swap_directives}
     assert by_target["alice"]["meta"]["role"] == c.ROLE_MASTER
-    assert by_target["alice"]["meta"]["model"] == "opus"
+    assert by_target["alice"]["meta"]["model"] == "opus[1m]"  # master → 1M context 2026-06-08
     assert by_target["vice"]["meta"]["role"] == c.ROLE_AGENT
     assert by_target["vice"]["meta"]["model"] == "sonnet"
 
@@ -4195,3 +4195,160 @@ def test_no_two_live_chats_share_majority_members(isolated_chats):
                 f"Invariant violated: {cid_a} and {cid_b} share "
                 f"{overlap_ratio:.0%} active members"
             )
+
+
+# ---------------------------------------------------------------------------
+# Class A: idle-consult wake-filter invariant
+# ---------------------------------------------------------------------------
+
+
+def test_broadcast_wake_filter_suppresses_undirected_for_idle_consult_roles(
+    isolated_chats,
+):
+    """Class A invariant: _broadcast of an undirected MSG must NOT deliver to
+    an IDLE_CONSULT_ROLES member's SSE queue. A DIRECTED MSG (to=[sid]) to
+    the same member MUST deliver. Both directions verified in one test.
+    """
+    import asyncio
+    import queue as stdlib_queue
+
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    _make_session(sessions_mod, "master-sid")
+    _make_session(sessions_mod, "architect-sid")
+
+    # Create room and accept both members.
+    room = c.create_room("master-sid", ["architect-sid"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "architect-sid")
+
+    # Grant architect role so member_roles is set.
+    c.chat_grant_role(chat_id, "master-sid", "architect-sid", c.ROLE_ARCHITECT)
+
+    # Wire up a live SSE queue for architect-sid.
+    arch_queue: asyncio.Queue = asyncio.Queue()
+    c._subscribers["architect-sid"] = [arch_queue]
+
+    try:
+        # --- Undirected broadcast (no `to`) ---
+        record_undirected = {
+            "kind": c.MSG,
+            "event_id": "evt-undirected",
+            "id": "msg-undirected",
+            "ts": "2026-01-01T00:00:00Z",
+            "chat_id": chat_id,
+            "sender_id": "master-sid",
+            "sender_name": "master",
+            "body": "hey everyone",
+            "to": None,
+            "private": False,
+        }
+        c._broadcast(chat_id, record_undirected)
+        assert arch_queue.empty(), (
+            "IDLE_CONSULT_ROLE (architect) received an undirected MSG — "
+            "wake-filter failed to suppress."
+        )
+
+        # --- Directed broadcast (to=[architect-sid]) ---
+        record_directed = {
+            "kind": c.MSG,
+            "event_id": "evt-directed",
+            "id": "msg-directed",
+            "ts": "2026-01-01T00:00:01Z",
+            "chat_id": chat_id,
+            "sender_id": "master-sid",
+            "sender_name": "master",
+            "body": "consult for you",
+            "to": ["architect-sid", "master-sid"],
+            "private": False,
+        }
+        c._broadcast(chat_id, record_directed)
+        assert not arch_queue.empty(), (
+            "IDLE_CONSULT_ROLE (architect) did NOT receive a directed MSG — "
+            "wake-filter over-suppressed."
+        )
+    finally:
+        c._subscribers.pop("architect-sid", None)
+
+
+# ---------------------------------------------------------------------------
+# Class C: directed-delivery durability invariant
+# ---------------------------------------------------------------------------
+
+
+def test_broadcast_directed_no_subscriber_drops_durable_notice(
+    isolated_chats, monkeypatch
+):
+    """Class C invariant: a DIRECTED MSG to a member with no live SSE queue
+    must call sessions_mod.post_notice so the message survives to their next
+    turn. An UNDIRECTED MSG to a subscriber-less member must NOT call
+    post_notice (no spam for broadcast misses).
+    """
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    _make_session(sessions_mod, "master-sid")
+    _make_session(sessions_mod, "agent-sid")
+
+    room = c.create_room("master-sid", ["agent-sid"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "agent-sid")
+
+    # Capture post_notice calls.
+    notices: list[dict] = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "post_notice",
+        lambda target_session_id, text, from_session_id=None, **kw: notices.append(
+            {"target": target_session_id, "text": text}
+        ),
+    )
+
+    # Ensure agent-sid has NO subscriber queue.
+    c._subscribers.pop("agent-sid", None)
+
+    # --- Directed MSG: must drop a notice ---
+    directed_record = {
+        "kind": c.MSG,
+        "event_id": "evt-dir",
+        "id": "msg-dir",
+        "ts": "2026-01-01T00:00:00Z",
+        "chat_id": chat_id,
+        "sender_id": "master-sid",
+        "sender_name": "master",
+        "body": "task for you",
+        "to": ["agent-sid", "master-sid"],
+        "private": False,
+    }
+    c._broadcast(chat_id, directed_record)
+    directed_notices = [n for n in notices if n["target"] == "agent-sid"]
+    assert len(directed_notices) == 1, (
+        "Directed MSG to disconnected member must trigger exactly one post_notice. "
+        f"Got {len(directed_notices)}."
+    )
+    assert "chat_history" in directed_notices[0]["text"], (
+        "Durability notice must instruct recipient to call chat_history."
+    )
+
+    notices.clear()
+
+    # --- Undirected MSG: must NOT drop a notice ---
+    undirected_record = {
+        "kind": c.MSG,
+        "event_id": "evt-undir",
+        "id": "msg-undir",
+        "ts": "2026-01-01T00:00:01Z",
+        "chat_id": chat_id,
+        "sender_id": "master-sid",
+        "sender_name": "master",
+        "body": "broadcast",
+        "to": None,
+        "private": False,
+    }
+    c._broadcast(chat_id, undirected_record)
+    undirected_notices = [n for n in notices if n["target"] == "agent-sid"]
+    assert len(undirected_notices) == 0, (
+        "Undirected MSG must NOT call post_notice for a disconnected member. "
+        f"Got {len(undirected_notices)}."
+    )
