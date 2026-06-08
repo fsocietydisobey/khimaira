@@ -1057,6 +1057,53 @@ def latest_pending_chat_id(session_id: str) -> str | None:
 # message bodies). Re-exported here for backward-compat with existing tests.
 _sanitize_message_body = sessions_mod.sanitize_agent_text
 
+# Chat-body fan-out cap (2026-06-07 — the money-printer fix). A chat message
+# fans out over SSE to EVERY accepted member; an uncapped body means one large
+# post (a design doc, a 270k-token LangGraph trace) is ingested by all N members
+# and re-bills each member's full context window — the dominant roster cost
+# driver. Over the cap, the daemon OFFLOADS the full body to a per-chat artifact
+# file and stores a short preview + pointer in the chat. Members get the gist and
+# read the file on demand only if it's relevant to their task. Content is never
+# lost; fan-out is bounded.
+_CHAT_BODY_CAP_CHARS = 4000
+_CHAT_BODY_PREVIEW_CHARS = 800
+
+
+def _artifacts_dir(chat_id: str) -> Path:
+    return _chat_dir() / "artifacts" / chat_id
+
+
+def _offload_large_body(chat_id: str, record_id: str, body: str) -> str:
+    """If ``body`` exceeds the fan-out cap, write it to a per-chat artifact file
+    and return a preview + pointer; otherwise return ``body`` unchanged.
+
+    Fail-open: if the artifact write fails for any reason, fall back to a
+    hard truncation with a pointer-less marker so an oversized body can NEVER
+    fan out in full (the whole point of the cap).
+    """
+    if len(body) <= _CHAT_BODY_CAP_CHARS:
+        return body
+
+    preview = body[:_CHAT_BODY_PREVIEW_CHARS].rstrip()
+    total = len(body)
+    try:
+        adir = _artifacts_dir(chat_id)
+        adir.mkdir(parents=True, exist_ok=True)
+        path = adir / f"{record_id}.md"
+        path.write_text(body, encoding="utf-8")
+        return (
+            f"{preview}\n\n"
+            f"… ✂️ body truncated for chat fan-out ({total:,} chars total). "
+            f"FULL CONTENT: `{path}` — Read it ONLY if it's relevant to your task; "
+            f"do not pull it into context reflexively."
+        )
+    except OSError:
+        return (
+            f"{preview}\n\n"
+            f"… ✂️ body truncated for chat fan-out ({total:,} chars; "
+            f"artifact write failed — ask the sender to re-post as a file pointer)."
+        )
+
 
 def _check_not_observer(room: dict[str, Any], sid: str, action: str) -> None:
     """Phase B v2: observers can read everything but cannot write. Pre-check
@@ -1138,15 +1185,18 @@ def send_message(
                 )
             resolved_to.append(rid)
 
+    _msg_id = "msg-" + uuid.uuid4().hex[:12]
     record = {
         "kind": MSG,
         "event_id": _new_event_id(),
-        "id": "msg-" + uuid.uuid4().hex[:12],
+        "id": _msg_id,
         "ts": _now_iso(),
         "chat_id": chat_id,
         "sender_id": sender_session_id,
         "sender_name": member.get("session_name") or sender_session_id[:8],
-        "body": _sanitize_message_body(body),
+        "body": _offload_large_body(
+            chat_id, _msg_id, _sanitize_message_body(body)
+        ),
         "to": resolved_to,
         "private": effective_private,
     }
@@ -1339,15 +1389,18 @@ def create_task(
     if domain:
         body = _inject_domain_context(body, domain, sender_session_id)
 
+    _task_id = "task-" + uuid.uuid4().hex[:12]
     record = {
         "kind": TASK,
         "event_id": _new_event_id(),
-        "id": "task-" + uuid.uuid4().hex[:12],
+        "id": _task_id,
         "ts": _now_iso(),
         "chat_id": chat_id,
         "sender_id": sender_session_id,
         "sender_name": member.get("session_name") or sender_session_id[:8],
-        "body": _sanitize_message_body(body),
+        "body": _offload_large_body(
+            chat_id, _task_id, _sanitize_message_body(body)
+        ),
         "assignee_id": assignee_resolved,
         "assignee_name": assignee_name,
         "status": TASK_PENDING,
