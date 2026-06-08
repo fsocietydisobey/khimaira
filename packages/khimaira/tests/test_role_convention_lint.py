@@ -948,3 +948,24 @@ def test_tracker_md_contains_roster_health_watch():
     assert "Roster health watch" in md
     assert "absorbed from observer" in md
     assert "Stay read-only toward the working tree" in md
+
+
+def test_session_start_has_compact_short_circuit():
+    """Regression guard: SessionStart must short-circuit on source=compact
+    (fcace52). Claude Code re-fires SessionStart after /compact; without this
+    branch the hook re-injects the full ~70KB payload into the just-compacted
+    window — the #1 long-session cost leak. A refactor must not silently drop it.
+    See memory: sessionstart-fires-on-compact.
+    """
+    src = (
+        REPO_ROOT / "packages/khimaira/src/khimaira/hooks/session_start.py"
+    ).read_text()
+    assert 'source") or ""' in src or 'data.get("source")' in src, (
+        "session_start.py must read the SessionStart `source` field"
+    )
+    assert '== "compact"' in src, (
+        "session_start.py must branch on source == 'compact' to skip heavy "
+        "blocks (the compaction re-inflation fix). The unit test "
+        "test_compact_source_emits_identity_and_chatreg_only guards behavior; "
+        "this guards the source-level branch against silent removal."
+    )
