@@ -48,6 +48,34 @@ _ENDPOINT = os.environ.get("KHIMAIRA_ENDPOINT", "http://127.0.0.1:8740").rstrip(
 _HTTP_TIMEOUT_S = 1.5
 
 
+def _claude_session_name_from_cmdline() -> str | None:
+    """Read claude's ``-n`` / ``--name`` value from the parent process cmdline.
+
+    The hook runs as a subprocess of the ``claude`` process; the parent's
+    cmdline carries the full invocation including the roster's
+    ``claude-chat -n <NAME>`` flag. Parsing it lets the hook auto-register
+    the session's friendly name server-side WITHOUT each agent having to call
+    ``session_set_name()`` itself — the same LLM-independent-critical-path
+    pattern as the ppid-bridge auto-registration.
+
+    Returns the name slug or None. Linux-only (reads ``/proc``); any failure
+    returns None (the agent can still name itself the old way).
+    """
+    try:
+        with open(f"/proc/{os.getppid()}/cmdline", "rb") as f:
+            args = f.read().split(b"\0")
+    except OSError:
+        return None
+    for i, arg in enumerate(args):
+        if arg in (b"-n", b"--name") and i + 1 < len(args):
+            val = args[i + 1].decode("utf-8", errors="replace").strip()
+            return val or None
+        if arg.startswith(b"--name="):
+            val = arg[len(b"--name=") :].decode("utf-8", errors="replace").strip()
+            return val or None
+    return None
+
+
 def _ensure_chat_mcp_registered() -> None:
     """Claude Code's MCP supervisor periodically prunes the khimaira-chat
     entry (subprocess errors during daemon restart trigger removal).
@@ -950,6 +978,28 @@ def main() -> int:
             "/api/chats/register-pending-session",
             {"ppid": os.getppid(), "session_id": session_id},
         )
+    except Exception:
+        pass
+
+    # Auto-register the roster session name from claude's `-n <name>` flag, so
+    # a session is name-addressable at boot WITHOUT the agent calling
+    # session_set_name() itself (which a freshly-booted idle session often
+    # never does — the name-collision class). The daemon's set_name only
+    # claims a free name (or one held by a stale >30-min session) and surfaces
+    # `merge_needed` on a live collision rather than clobbering — so this is
+    # safe to fire unconditionally. Best-effort; never blocks boot. We do NOT
+    # overwrite a name the session already set for itself.
+    try:
+        _cli_name = _claude_session_name_from_cmdline()
+        if _cli_name:
+            _existing = _http_get_json(
+                f"/api/sessions/{urllib.parse.quote(session_id)}"
+            )
+            if not ((_existing or {}).get("name") or "").strip():
+                _http_post_json(
+                    f"/api/sessions/{urllib.parse.quote(session_id)}/name",
+                    {"name": _cli_name},
+                )
     except Exception:
         pass
 

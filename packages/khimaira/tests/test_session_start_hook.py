@@ -439,3 +439,72 @@ def test_inject_domain_memory_answer_is_capped(hook_module, monkeypatch):
     out = hook_module._inject_domain_memory("sess-x", "/proj", chat_role="master")
     assert len(out) < 5000
     assert "truncated" in out
+
+
+# ---------------------------------------------------------------------------
+# Auto-name from cmdline — register the roster name at boot, LLM-independent.
+# ---------------------------------------------------------------------------
+
+
+def test_session_name_from_cmdline_short_flag(hook_module, monkeypatch):
+    monkeypatch.setattr(
+        hook_module.os, "getppid", lambda: 4242
+    )
+    fake = b"claude\x00-n\x00muther-agent-3\x00--model\x00sonnet\x00"
+    import builtins, io
+
+    real_open = builtins.open
+
+    def _fake_open(path, *a, **k):
+        if str(path) == "/proc/4242/cmdline":
+            return io.BytesIO(fake)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", _fake_open)
+    assert hook_module._claude_session_name_from_cmdline() == "muther-agent-3"
+
+
+def test_session_name_from_cmdline_equals_form(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module.os, "getppid", lambda: 4242)
+    fake = b"claude\x00--name=khimaira-0\x00--model\x00opus\x00"
+    import builtins, io
+
+    real_open = builtins.open
+    monkeypatch.setattr(
+        builtins,
+        "open",
+        lambda p, *a, **k: io.BytesIO(fake)
+        if str(p) == "/proc/4242/cmdline"
+        else real_open(p, *a, **k),
+    )
+    assert hook_module._claude_session_name_from_cmdline() == "khimaira-0"
+
+
+def test_session_name_from_cmdline_absent(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module.os, "getppid", lambda: 4242)
+    fake = b"claude\x00--model\x00sonnet\x00"  # no -n
+    import builtins, io
+
+    real_open = builtins.open
+    monkeypatch.setattr(
+        builtins,
+        "open",
+        lambda p, *a, **k: io.BytesIO(fake)
+        if str(p) == "/proc/4242/cmdline"
+        else real_open(p, *a, **k),
+    )
+    assert hook_module._claude_session_name_from_cmdline() is None
+
+
+def test_session_name_from_cmdline_proc_unreadable(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module.os, "getppid", lambda: 999999)
+    import builtins
+
+    def _boom(p, *a, **k):
+        if str(p) == "/proc/999999/cmdline":
+            raise OSError("no such proc")
+        return io.BytesIO(b"")
+
+    import io
+    monkeypatch.setattr(builtins, "open", _boom)
+    assert hook_module._claude_session_name_from_cmdline() is None
