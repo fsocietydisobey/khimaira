@@ -206,6 +206,17 @@ def build_app():
         scheduler_mod.replay()
         asyncio.create_task(scheduler_mod.scheduler_loop())
 
+    # Registry auto-GC — reap session records whose kitty windows are gone.
+    # Every roster relaunch mints fresh records; without this the registry
+    # climbs unbounded (16 → 60+ in a day) and every session_list() dumps all
+    # of them into the master's context (the boot-tax measured 2026-06-08).
+    # Conservative: NO-OP when kitty can't enumerate windows.
+    @app.on_event("startup")
+    async def _start_registry_gc() -> None:
+        from . import registry_gc
+
+        asyncio.create_task(registry_gc.registry_gc_loop())
+
     # Chat MCP registration watchdog. Claude Code intermittently prunes
     # the khimaira-chat entry from ~/.claude.json (subprocess errors
     # during daemon restart, MCP supervisor health-check, or some
