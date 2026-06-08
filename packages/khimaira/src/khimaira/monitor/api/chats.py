@@ -120,6 +120,62 @@ def _session_active_within(session_id: str, window_s: float) -> bool:
     return False
 
 
+def _classify_unresponsive(session_id: str) -> str:
+    """Classify WHY a session hasn't replied — deaf vs busy vs dead vs active.
+
+    The old presumed-dead heuristic ("no SSE heartbeat / no tool activity in
+    60s") conflated three very different states and fired alarming false
+    positives (2026-06-08 muther report: a verifier flagged dead at 365s while
+    legitimately running pytest; idle agents flagged dead while merely awaiting
+    a turn). This adds kitty-window ground truth:
+
+      "active" — recent tool/touch activity (the existing liveness signal).
+      "busy"   — window present AND showing a work indicator (spinner /
+                 "esc to interrupt" / compacting). Legitimately working on a
+                 long op (pytest, large-artifact read) with no NEW tool log yet.
+      "deaf"   — window present, prompt idle. The push was enqueued but the
+                 agent never took a turn to process it (the Claude Code host
+                 doesn't wake an idle loop on an SSE message). Needs a nudge,
+                 NOT a death notice.
+      "dead"   — no kitty window for this session. Genuinely gone.
+      "unknown"— kitty unavailable / can't tell → caller falls back to the
+                 prior conservative behavior (fire presumed-dead).
+
+    Fail-open: any error returns "unknown" so we never crash the sweep.
+    """
+    try:
+        if _session_active_within(session_id, _LIVENESS_WINDOW_S):
+            return "active"
+
+        from khimaira.monitor import roster_recovery as _rr
+        from khimaira.monitor import sessions as _sess
+
+        # session_id → session name (the kitty window title)
+        name = None
+        try:
+            st = _sess.state(session_id, recent=0)
+            name = (st or {}).get("name")
+        except Exception:
+            name = None
+        if not name:
+            return "unknown"
+
+        windows = _rr._discover_roster_windows()
+        if not windows:
+            return "unknown"  # kitty unreachable — don't assert dead
+
+        win = next((w for w in windows if w.get("raw_name") == name), None)
+        if win is None:
+            return "dead"  # window for this named session is gone
+
+        screen = _rr._get_screen(win["window_id"])
+        if screen is None:
+            return "unknown"  # couldn't read — stay conservative
+        return "busy" if _rr._is_busy(screen) else "deaf"
+    except Exception:
+        return "unknown"
+
+
 def _resolve_master_session_id(chat_id: str) -> str | None:
     """Find the session_id with role=master in this chat. None if not found."""
     try:
@@ -272,7 +328,21 @@ async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:
         # Don't fire presumed-dead notice yet — wait one tick for probe response
         return
 
-    # Phase 3: presumed dead (probe was sent on prior tick, X still silent)
+    # Phase 3: probe was sent on prior tick, X still silent on the chat channel.
+    # Classify WHY before alarming the master — deaf/busy/dead are different
+    # problems with different remedies (2026-06-08 muther false-positive fix).
+    classification = _classify_unresponsive(to_id)
+
+    # BUSY (long op, no new tool log yet) or ACTIVE (just logged activity) →
+    # not stuck. Reschedule and reset probe state; do NOT notify the master.
+    if classification in ("busy", "active"):
+        async with _REGISTRY_LOCK:
+            existing = _EXPECTED_REPLIES.get(key)
+            if existing is not None:
+                existing["ts"] = ts_now
+                existing["probe_sent_at"] = None
+        return
+
     async with _REGISTRY_LOCK:
         _EXPECTED_REPLIES.pop(key, None)
 
@@ -287,17 +357,36 @@ async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:
         "from_id": from_id,
         "to_id": to_id,
         "elapsed_s": elapsed_s,
+        "classification": classification,
     }
 
     probe_age_s = ts_now - probe_sent_at
-    body = (
-        f"🚨 PRESUMED-DEAD SESSION — `{to_id}` has not responded to "
-        f"chat_send_to from `{from_id}` after {elapsed_s:.0f}s "
-        f"(role-threshold: {threshold:.0f}s). Diagnostic probe sent "
-        f"{probe_age_s:.0f}s ago also received no reply. session_state shows "
-        f"no tool activity in the last {_LIVENESS_WINDOW_S:.0f}s. "
-        f"Decide: re-dispatch / retry / investigate. chat_id={chat_id}"
-    )
+    if classification == "deaf":
+        # Window is alive but idle — the push was enqueued and never processed
+        # (host doesn't wake an idle loop on SSE). This is the common case and
+        # it's ACTIONABLE, not a death. Tell the master to nudge, not panic.
+        body = (
+            f"😴 IDLE/DEAF SESSION — `{to_id}` has a live window but hasn't "
+            f"taken a turn for the chat_send_to from `{from_id}` ({elapsed_s:.0f}s; "
+            f"role-threshold {threshold:.0f}s). The push is enqueued, not lost — "
+            f"an idle Claude Code loop doesn't wake on an SSE message. REMEDY: "
+            f"`/khimaira-nudge {to_id}` (or wake its window) to force the turn. "
+            f"NOT presumed-dead. chat_id={chat_id}"
+        )
+    else:
+        # "dead" (no window) or "unknown" (kitty unavailable → conservative).
+        win_note = (
+            "no kitty window found for this session — likely genuinely gone"
+            if classification == "dead"
+            else "window-state could not be verified"
+        )
+        body = (
+            f"🚨 PRESUMED-DEAD SESSION — `{to_id}` has not responded to "
+            f"chat_send_to from `{from_id}` after {elapsed_s:.0f}s "
+            f"(role-threshold: {threshold:.0f}s). Diagnostic probe sent "
+            f"{probe_age_s:.0f}s ago also received no reply; {win_note}. "
+            f"Decide: re-dispatch / retry / investigate. chat_id={chat_id}"
+        )
     try:
         from khimaira.monitor import sessions as sessions_mod
 
