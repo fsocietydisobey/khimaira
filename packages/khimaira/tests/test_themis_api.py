@@ -1479,15 +1479,19 @@ def test_p0_no_regression_pure_matcher_rules_still_block(
 
     importlib.reload(themis_api)
 
+    # Canary rule: IN-INTAKE-3 (NO_STANDALONE_AGENTS) — pure matcher, severity
+    # block. Was IN-INTAKE-1 until 430e1fd removed it (Joseph-directed: intake
+    # has executor-level write access); that relax updated five test files but
+    # missed this one.
     r = themis_client.post(
         "/api/themis/check",
-        json={"session_id": s1, "tool_name": "Edit", "tool_input": {}},
+        json={"session_id": s1, "tool_name": "Task", "tool_input": {}},
     )
 
     assert r.status_code == 200
     body = r.json()
-    assert body["ok"] is False  # IN-INTAKE-1 still fires
-    assert body["violation"]["rule_id"] == "IN-INTAKE-1"
+    assert body["ok"] is False  # IN-INTAKE-3 still fires
+    assert body["violation"]["rule_id"] == "IN-INTAKE-3"
 
 
 # ---------------------------------------------------------------------------

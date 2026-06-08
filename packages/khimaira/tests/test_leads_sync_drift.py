@@ -76,6 +76,14 @@ def _khimaira_central_manifest_path() -> Path:
     reason="Phase C: central manifest ~/.local/share/khimaira/leads/khimaira.toml does not exist yet",
     strict=False,
 )
+@pytest.mark.skip(
+    reason="leads retired 2026-06-06 (rate-limit pressure; analyst absorbed the "
+    "consult function, assign-time domain injection replaced standing leads). "
+    "The on-disk lead YAMLs evolved past the generator (locked-base extends: "
+    "refactor + accountability sections) — reconciling a generator for dormant "
+    "roles is not worth it. If leads are ever un-retired, reconcile "
+    "leads/sync.py against the on-disk rules FIRST, then unskip."
+)
 def test_khimaira_leads_manifest_matches_generated():
     """Run leads sync --check against khimaira's own central manifest.
 
