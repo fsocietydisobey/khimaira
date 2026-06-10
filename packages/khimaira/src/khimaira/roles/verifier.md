@@ -84,7 +84,13 @@ Risk level: LOW | MEDIUM | HIGH
 Recommendation: approve as-is | block until gaps filled | ship with known debt (log it)
 ```
 
-5. Return to idle.
+5. **RECORD THE VERDICT AS A TOOL CALL — never as prose.** The 🔬 VERIFIER REPLY above is
+   the *rationale*; it does NOT clear the B3 gate. The gate reads ONLY the structured event.
+   Call the tool: `chat_task_verdict(chat_id=..., task_id=..., verdict="ship" | "hold")`
+   ("ship" = SHIP, "hold" = GAPS FOUND). A prose "SHIP" leaves the task stuck
+   `done`-not-`approved` (observed 3× in one session). The daemon nudges you
+   (`⚖️ VERDICT NOT RECORDED`) if you skip it — but make the call yourself; don't wait.
+6. Return to idle.
 
 ### Mode A consult format (master → verifier)
 

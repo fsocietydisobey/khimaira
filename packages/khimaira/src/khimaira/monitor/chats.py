@@ -1214,6 +1214,17 @@ def send_message(
     }
     _append(chat_id, record)
 
+    # Verdict-via-prose nudge (2026-06-09): critic/verifier repeatedly post a
+    # thorough prose review to the chat but never make the structured
+    # chat_task_verdict call the B3 gate reads — so the task sits done-not-approved
+    # (3rd recurrence in one jeevy session). Behavioral→structural: when a
+    # verdict-role posts to a chat with a done gate-task awaiting THEIR verdict and
+    # they haven't recorded it, nudge them once. Best-effort; never breaks send.
+    try:
+        _maybe_nudge_missing_verdict(chat_id, sender_session_id, room)
+    except Exception:
+        log.debug("chats: verdict-nudge raised (non-fatal)", exc_info=True)
+
     # #14 auto-BEGIN: if this message is a compliant ready-ack, check the auto-BEGIN gate.
     _m_ack = _ACK_RE.search(record.get("body") or "")
     if _m_ack:
@@ -1643,6 +1654,98 @@ def signal_task_start(
     _append(chat_id, record)
     log.info("chats: task %s signal=start by %s in %s", task_id, by_session_id, chat_id)
     return record
+
+
+# Verdict-nudge dedup — (chat_id, task_id, sender_id) already nudged this daemon
+# lifetime. In-memory: a re-nudge after a daemon restart is harmless.
+_VERDICT_NUDGED: set[tuple[str, str, str]] = set()
+
+# Which verdicts each reviewer role is responsible for (mirror of
+# record_gate_verdict's _VERDICT_AUTHOR_ROLES, inverted).
+_ROLE_VERDICTS: dict[str, frozenset[str]] = {
+    ROLE_CRITIC: frozenset({"approve", "changes"}),
+    ROLE_VERIFIER: frozenset({"ship", "hold"}),
+}
+
+
+def _maybe_nudge_missing_verdict(
+    chat_id: str, sender_session_id: str, room: dict[str, Any]
+) -> None:
+    """If a verdict-role member posts to a chat that has a done gate-task
+    awaiting THEIR structured verdict — and they haven't recorded it — post a
+    one-line notice reminding them to call chat_task_verdict (not prose).
+
+    Targeted + deduped: nudges once per (chat, task, reviewer) per daemon
+    lifetime. Structural trigger (role + open gate + no verdict), NOT prose
+    content-matching — so it can't misread a nuanced review.
+    """
+    member_roles = (room.get("meta") or {}).get("member_roles") or {}
+    sender_role = member_roles.get(sender_session_id)
+    if sender_role not in _ROLE_VERDICTS:
+        return  # not a reviewer role — nothing to nudge
+
+    messages = room.get("messages", [])
+
+    # Current status per task + which tasks this sender already verdicted.
+    status_by_task: dict[str, str] = {}
+    gate_role_by_task: dict[str, str | None] = {}
+    gate_required_by_task: dict[str, bool] = {}
+    verdicted_by_sender: set[str] = set()
+    for m in messages:
+        k = m.get("kind")
+        if k == TASK:
+            tid = m.get("id")
+            if tid:
+                status_by_task[tid] = m.get("status") or TASK_PENDING
+                gate_role_by_task[tid] = m.get("verdict_role")
+                gate_required_by_task[tid] = bool(m.get("gate_required"))
+        elif k == TASK_UPDATE:
+            tid = m.get("task_id")
+            if tid and m.get("status"):
+                status_by_task[tid] = m["status"]
+        elif k == TASK_VERDICT:
+            if m.get("by_session_id") == sender_session_id and m.get("task_id"):
+                verdicted_by_sender.add(m["task_id"])
+
+    # A task awaits THIS reviewer's verdict if it is `done`, wants this role's
+    # verdict (explicit verdict_role match, or a gate_required work-task), and
+    # this reviewer hasn't recorded a verdict for it.
+    for tid, status in status_by_task.items():
+        if status != TASK_DONE:
+            continue
+        wants_this_role = (
+            gate_role_by_task.get(tid) == sender_role
+            or gate_required_by_task.get(tid)
+        )
+        if not wants_this_role:
+            continue
+        if tid in verdicted_by_sender:
+            continue
+        key = (chat_id, tid, sender_session_id)
+        if key in _VERDICT_NUDGED:
+            continue
+        _VERDICT_NUDGED.add(key)
+        verdict_opts = " | ".join(sorted(_ROLE_VERDICTS[sender_role]))
+        try:
+            sessions_mod.post_notice(
+                target_session_id=sender_session_id,
+                text=(
+                    f"⚖️ VERDICT NOT RECORDED — task {tid} is done and awaiting your "
+                    f"{sender_role} verdict, but the B3 gate reads only the STRUCTURED "
+                    f"event, not chat prose. A prose review does NOT clear the gate. "
+                    f"Call the TOOL: chat_task_verdict(chat_id={chat_id!r}, "
+                    f"task_id={tid!r}, verdict=<{verdict_opts}>). Your written review "
+                    f"stands as the rationale; this is the one structured call that "
+                    f"actually records it."
+                ),
+                from_session_id="khimaira-daemon",
+            )
+            log.info(
+                "chats: verdict-nudge → %s (role=%s, task=%s, chat=%s)",
+                sender_session_id[:8], sender_role, tid, chat_id,
+            )
+        except Exception:
+            log.debug("chats: verdict-nudge post_notice failed", exc_info=True)
 
 
 def record_gate_verdict(

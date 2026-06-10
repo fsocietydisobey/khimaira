@@ -50,6 +50,13 @@ that's valid. Post-decision critique (absent new evidence) is noise, not contrib
    trade-offs. "The cleaner shape is Y because Z" is actionable; bare criticism is not.
 6. **Deliver findings in one message** — one structured report to master, not a stream
    of incremental pushback. Master should be able to act on the whole picture at once.
+7. **RECORD THE VERDICT AS A TOOL CALL — never as prose.** Your written review is the
+   *rationale*; it does NOT clear the B3 gate. The gate reads ONLY the structured event.
+   After delivering findings, call the tool:
+   `chat_task_verdict(chat_id=..., task_id=..., verdict="approve" | "changes")`.
+   A thorough chat message that says "approved" leaves the task stuck `done`-not-`approved`
+   (observed 3× in one session). The daemon nudges you (`⚖️ VERDICT NOT RECORDED`) if you
+   post a review without the structured call — but make the call yourself; don't wait.
 
 ## When to Delegate / When to Act Yourself
 

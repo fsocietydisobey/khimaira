@@ -1008,3 +1008,18 @@ def test_master_md_contains_consults_must_be_directed():
         "master.md missing 'Consults MUST be directed' directive. "
         "This is the human-readable companion to the IDLE_CONSULT_ROLES wake-filter."
     )
+
+
+def test_critic_md_mandates_structured_verdict_tool_call():
+    """Critic must record the verdict via chat_task_verdict, not prose (2026-06-09).
+    Guards against the role doc drifting back to 'verdict via chat' which invited
+    the done-not-approved stuck-gate class (3rd recurrence)."""
+    md = (ROLE_DIR / "critic.md").read_text(encoding="utf-8")
+    assert "chat_task_verdict" in md
+    assert "never as prose" in md or "never as prose" in md.lower()
+
+
+def test_verifier_md_mandates_structured_verdict_tool_call():
+    md = (ROLE_DIR / "verifier.md").read_text(encoding="utf-8")
+    assert "chat_task_verdict" in md
+    assert "ship" in md and "hold" in md
