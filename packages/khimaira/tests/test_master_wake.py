@@ -29,7 +29,7 @@ def _run(coro):
 def _wire(mod, monkeypatch, *, idle_s, role_windows, screen=""):
     """Stub sessions.state (master idle_s) + roster_recovery window/inject."""
     import khimaira.monitor.sessions as sess
-    monkeypatch.setattr(sess, "state", lambda sid: {"last_active_age_s": idle_s})
+    monkeypatch.setattr(sess, "summary", lambda sid: {"last_active_age_s": idle_s})
     import khimaira.monitor.roster_recovery as rr
     monkeypatch.setattr(rr, "_discover_roster_windows", lambda: role_windows)
     monkeypatch.setattr(rr, "_get_screen", lambda wid: screen)

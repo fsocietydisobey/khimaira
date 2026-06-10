@@ -1214,6 +1214,13 @@ def send_message(
     }
     _append(chat_id, record)
 
+    # Dispatch-wake: a TARGETED send to an idle agent is a dispatch the agent
+    # won't see until it turns — wake it. Broadcasts (no `to`) don't wake.
+    if resolved_to:
+        _auto_wake_targeted_idle(
+            [(rid, (room["members"].get(rid) or {}).get("session_name")) for rid in resolved_to]
+        )
+
     # Verdict-via-prose nudge (2026-06-09): critic/verifier repeatedly post a
     # thorough prose review to the chat but never make the structured
     # chat_task_verdict call the B3 gate reads — so the task sits done-not-approved
@@ -1444,6 +1451,11 @@ def create_task(
         "domain": domain,
     }
     _append(chat_id, record)
+
+    # Dispatch-wake: a task assigned to an idle agent won't surface until it turns.
+    if assignee_resolved:
+        _auto_wake_targeted_idle([(assignee_resolved, assignee_name)])
+
     log.info(
         "chats: task %s created in %s by %s (assignee=%s assignee_role=%s gate_required=%s auto_begin=%s required_agents=%s)",
         record["id"],
@@ -1654,6 +1666,76 @@ def signal_task_start(
     _append(chat_id, record)
     log.info("chats: task %s signal=start by %s in %s", task_id, by_session_id, chat_id)
     return record
+
+
+# Dispatch-wake (2026-06-10) — close the dispatch-to-idle loop. When master
+# routes work to an idle agent (targeted send / task assignment), the SSE push is
+# TURN-GATED: an idle Claude Code loop won't take a turn on it, so the dispatch
+# sits unsurfaced until something else wakes the agent. The daemon already detects
+# this (deaf/busy/dead classifier) and notifies master — but master nudging is
+# drift-prone (muther GAP refinement). This CLOSES the loop: fire the kitty wake
+# itself, removing master from the wake loop. Auto-wake (Joseph-chosen).
+_DISPATCH_WAKE_ENABLED = os.environ.get("KHIMAIRA_DISPATCH_WAKE", "1") != "0"
+_DISPATCH_WAKE_IDLE_MIN_S = float(os.environ.get("KHIMAIRA_DISPATCH_WAKE_IDLE_S", "20"))
+_DISPATCH_WAKE_COOLDOWN_S = float(os.environ.get("KHIMAIRA_DISPATCH_WAKE_COOLDOWN_S", "30"))
+_last_dispatch_wake: dict[str, float] = {}
+
+
+def _dispatch_wake_worker(target_id: str, target_name: str) -> None:
+    """Wake one idle dispatch target via kitty. Runs in a daemon thread so the
+    send never pays the ~0.3s inject latency. Conservative: idle-only (active
+    agents see the push), window busy-check (don't inject over a spinner), and a
+    per-target cooldown (don't re-wake on every message of a burst). Fail-open.
+    """
+    try:
+        now = time.time()
+        if now - _last_dispatch_wake.get(target_id, 0.0) < _DISPATCH_WAKE_COOLDOWN_S:
+            return
+        summ = sessions_mod.summary(target_id)
+        idle_s = float((summ or {}).get("last_active_age_s") or 0)
+        if idle_s < _DISPATCH_WAKE_IDLE_MIN_S:
+            return  # actively turning → it will process the push on its own
+
+        from khimaira.monitor import roster_recovery as rr
+
+        win = next(
+            (w for w in rr._discover_roster_windows() if w.get("raw_name") == target_name),
+            None,
+        )
+        if win is None:
+            return
+        wid = win["window_id"]
+        screen = rr._get_screen(wid)
+        if screen is not None and rr._is_busy(screen):
+            return  # mid-work — leave it
+        text = (
+            "⏰ dispatch from master — call chat_my_chats(session_id=<yours>) to "
+            "re-register SSE, then act on the task/message just routed to you. The "
+            "push was enqueued; this nudge surfaces it. Act now — don't wait."
+        )
+        if rr._inject_text_and_submit(wid, text, target_name):
+            _last_dispatch_wake[target_id] = now
+            log.info(
+                "chats: dispatch-wake → %s (%s, idle %.0fs)",
+                target_id[:8], target_name, idle_s,
+            )
+    except Exception:
+        log.debug("chats: dispatch-wake worker failed", exc_info=True)
+
+
+def _auto_wake_targeted_idle(targets: list[tuple[str, str | None]]) -> None:
+    """Spawn a wake worker per (session_id, session_name) dispatch target.
+    Best-effort, threaded; never blocks or breaks the caller.
+    """
+    if not _DISPATCH_WAKE_ENABLED:
+        return
+    import threading
+
+    for sid, name in targets:
+        if sid and name:
+            threading.Thread(
+                target=_dispatch_wake_worker, args=(sid, name), daemon=True
+            ).start()
 
 
 # Verdict-nudge dedup — (chat_id, task_id, sender_id) already nudged this daemon

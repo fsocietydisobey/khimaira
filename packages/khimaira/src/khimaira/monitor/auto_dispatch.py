@@ -325,7 +325,9 @@ async def _maybe_wake_idle_master(master_id: str, owed_count: int) -> None:
     try:
         from khimaira.monitor import sessions as sessions_mod
 
-        st = await loop.run_in_executor(None, lambda: sessions_mod.state(master_id))
+        # summary() exposes last_active_age_s; state() does NOT (latent bug — the
+        # idle gate would always read 0 and the wake would never fire).
+        st = await loop.run_in_executor(None, lambda: sessions_mod.summary(master_id))
         idle_s = float((st or {}).get("last_active_age_s") or 0)
     except Exception:
         return
