@@ -1023,3 +1023,13 @@ def test_verifier_md_mandates_structured_verdict_tool_call():
     md = (ROLE_DIR / "verifier.md").read_text(encoding="utf-8")
     assert "chat_task_verdict" in md
     assert "ship" in md and "hold" in md
+
+
+def test_master_md_documents_idle_drive_wake():
+    """Master-drive wake (2026-06-10): master.md must document that the daemon
+    structurally wakes master on idle-roster-with-owed-work, and master must
+    DRIVE on that wake. Guards the behavioral→structural promotion."""
+    md = (ROLE_DIR / "master.md").read_text(encoding="utf-8")
+    assert "Idle-roster drive is now structurally backed" in md
+    assert "auto-dispatch" in md.lower()
+    assert "DRIVE" in md

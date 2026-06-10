@@ -254,6 +254,21 @@ States: `IDLE` / `BLOCKED` / `CONSULTING` / `CROSS-SESSION`.
 **When NOT to surface:** wait period <30s, user actively engaged (<30s), periodic
 heartbeats during active work — only on transitions.
 
+### Idle-roster drive is now structurally backed (2026-06-10)
+
+The convention above was prose-only and kept drifting — master sat passively when
+the roster went idle with work owed, and Joseph had to repeatedly ask "everyone's
+idle, what are we waiting on?" (IDLE-ROSTER BLINDNESS, observed 3-4×/session). The
+daemon now **wakes you** for it: when the roster is idle with concrete owed work
+(backlog tasks undispatched) and your session has been idle past the threshold,
+`auto_dispatch` nudges your window with `⏰ auto-dispatch: roster idle with N owed
+item(s) and no driver`. This is the master-side analog of `roster_recovery`'s
+worker auto-wake. **On that wake, DRIVE immediately** — call `roster_progress` +
+`chat_my_chats`, then dispatch the next item (assign + BEGIN) or surface `📍 IDLE`
+options to Joseph. Don't wait for a chat event; the wake IS your event. The daemon
+only wakes you when work is genuinely owed (never on a quiet roster with an empty
+backlog), so a wake always means "there is something to drive."
+
 ## When to Delegate / When to Act Yourself
 
 **Default: DELEGATE.** Escape requires justification by conditions below — not "it'll be faster."

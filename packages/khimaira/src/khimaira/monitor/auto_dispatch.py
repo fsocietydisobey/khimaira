@@ -292,6 +292,78 @@ def _rank_task_agent_pairs(
 # Rail #4 — Dispatch proposal
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Master-drive wake (2026-06-10) — the master-side analog of roster_recovery's
+# worker auto-wake. Closes IDLE-ROSTER BLINDNESS (muther GAP report): master is
+# purely event-driven, so when the roster goes idle with owed work undispatched,
+# master sits passively and the user becomes the scheduler. Conservative trigger:
+# wake master ONLY when there is concrete owed work (backlog) AND the master
+# session has itself been idle past the threshold. No owed work → never wakes.
+# ---------------------------------------------------------------------------
+
+_MASTER_WAKE_ENABLED = os.environ.get("KHIMAIRA_MASTER_WAKE", "1") != "0"
+_MASTER_WAKE_IDLE_MIN_S = float(os.environ.get("KHIMAIRA_MASTER_WAKE_IDLE_S", "180"))
+_MASTER_WAKE_COOLDOWN_S = float(os.environ.get("KHIMAIRA_MASTER_WAKE_COOLDOWN_S", "300"))
+_last_master_wake: dict[str, float] = {}
+
+
+async def _maybe_wake_idle_master(master_id: str, owed_count: int) -> None:
+    """Nudge an idle master's window to DRIVE when concrete work is owed.
+
+    Gated by owed_count>0 (the Conservative trigger — never nags on a quiet
+    roster with nothing queued), the master's own idle time (don't interrupt a
+    master mid-turn), a cooldown (don't re-wake every sweep), and a window
+    busy-check (don't inject over an active spinner). Best-effort; never raises.
+    """
+    if not _MASTER_WAKE_ENABLED or owed_count <= 0:
+        return
+    now = time.time()
+    if now - _last_master_wake.get(master_id, 0.0) < _MASTER_WAKE_COOLDOWN_S:
+        return
+
+    loop = asyncio.get_event_loop()
+    try:
+        from khimaira.monitor import sessions as sessions_mod
+
+        st = await loop.run_in_executor(None, lambda: sessions_mod.state(master_id))
+        idle_s = float((st or {}).get("last_active_age_s") or 0)
+    except Exception:
+        return
+    if idle_s < _MASTER_WAKE_IDLE_MIN_S:
+        return  # master is actively working — events will drive it
+
+    try:
+        from khimaira.monitor import roster_recovery as rr
+
+        wins = await loop.run_in_executor(None, rr._discover_roster_windows)
+        master_win = next((w for w in wins if w.get("role") == "master"), None)
+        if master_win is None:
+            return
+        wid = master_win["window_id"]
+        screen = await loop.run_in_executor(None, lambda: rr._get_screen(wid))
+        if screen is not None and rr._is_busy(screen):
+            return  # master window is mid-work — don't inject
+
+        text = (
+            f"⏰ auto-dispatch: roster idle with {owed_count} owed item(s) and no "
+            "driver. DRIVE now — call roster_progress + chat_my_chats, then dispatch "
+            "the next item (assign + BEGIN) or, if nothing is actionable, surface "
+            "'roster idle — here's what's next' to Joseph. Don't wait for an event."
+        )
+        ok = await loop.run_in_executor(
+            None,
+            lambda: rr._inject_text_and_submit(wid, text, master_win.get("raw_name", "")),
+        )
+        if ok:
+            _last_master_wake[master_id] = now
+            _log.info(
+                "auto-dispatch: woke idle master %s to drive (owed=%d, idle=%.0fs)",
+                master_id[:8], owed_count, idle_s,
+            )
+    except Exception:
+        _log.debug("auto-dispatch: master-wake failed", exc_info=True)
+
+
 async def _emit_dispatch_proposal(
     master_id: str,
     task: dict[str, Any],
@@ -496,6 +568,12 @@ async def auto_dispatch_sweep() -> None:
         pairs = _rank_task_agent_pairs(backlog, available)
         for task, agent in pairs:
             await _emit_dispatch_proposal(master_id, task, agent)
+
+        # Step 3: if owed work remains undispatched and the master is idle,
+        # WAKE it to drive (proposals/notices are inert against an idle master —
+        # the IDLE-ROSTER BLINDNESS gap). backlog is non-empty here (early-return
+        # above), so owed_count>0 is the Conservative trigger.
+        await _maybe_wake_idle_master(master_id, len(backlog))
 
     except Exception as exc:
         _log.warning("auto-dispatch: sweep error: %s", exc)
