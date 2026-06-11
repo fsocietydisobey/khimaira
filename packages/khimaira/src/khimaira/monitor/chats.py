@@ -1681,11 +1681,21 @@ _DISPATCH_WAKE_COOLDOWN_S = float(os.environ.get("KHIMAIRA_DISPATCH_WAKE_COOLDOW
 _last_dispatch_wake: dict[str, float] = {}
 
 
-def _dispatch_wake_worker(target_id: str, target_name: str) -> None:
-    """Wake one idle dispatch target via kitty. Runs in a daemon thread so the
-    send never pays the ~0.3s inject latency. Conservative: idle-only (active
-    agents see the push), window busy-check (don't inject over a spinner), and a
-    per-target cooldown (don't re-wake on every message of a burst). Fail-open.
+_DEFAULT_DISPATCH_WAKE_MSG = (
+    "⏰ dispatch from master — call chat_my_chats(session_id=<yours>) to "
+    "re-register SSE, then act on the task/message just routed to you. The "
+    "push was enqueued; this nudge surfaces it. Act now — don't wait."
+)
+
+
+def _dispatch_wake_worker(
+    target_id: str, target_name: str, message: str | None = None
+) -> None:
+    """Wake one idle target via kitty. Runs in a daemon thread so the send never
+    pays the ~0.3s inject latency. Conservative: idle-only (active sessions see
+    the push), window busy-check (don't inject over a spinner), and a per-target
+    cooldown (don't re-wake on a burst). `message` overrides the default dispatch
+    text (used by the gate-complete master-wake). Fail-open.
     """
     try:
         now = time.time()
@@ -1708,19 +1718,68 @@ def _dispatch_wake_worker(target_id: str, target_name: str) -> None:
         screen = rr._get_screen(wid)
         if screen is not None and rr._is_busy(screen):
             return  # mid-work — leave it
-        text = (
-            "⏰ dispatch from master — call chat_my_chats(session_id=<yours>) to "
-            "re-register SSE, then act on the task/message just routed to you. The "
-            "push was enqueued; this nudge surfaces it. Act now — don't wait."
-        )
-        if rr._inject_text_and_submit(wid, text, target_name):
+        if rr._inject_text_and_submit(wid, message or _DEFAULT_DISPATCH_WAKE_MSG, target_name):
             _last_dispatch_wake[target_id] = now
             log.info(
-                "chats: dispatch-wake → %s (%s, idle %.0fs)",
-                target_id[:8], target_name, idle_s,
+                "chats: wake → %s (%s, idle %.0fs)", target_id[:8], target_name, idle_s
             )
     except Exception:
-        log.debug("chats: dispatch-wake worker failed", exc_info=True)
+        log.debug("chats: wake worker failed", exc_info=True)
+
+
+def _maybe_wake_master_on_gate_complete(
+    chat_id: str, task_id: str, room: dict[str, Any]
+) -> None:
+    """When the verdict just recorded COMPLETES a dual-verdict gate (both critic
+    AND verifier have now voted on this task), wake the master to act on it.
+
+    Closes the dead-SSE commit-miss (muther GAP #1, 2026-06-11): the master's SSE
+    subscriber doesn't survive compaction, so it can miss the verdict-completion
+    event and strand a fully-approved task uncommitted. The daemon now drives the
+    master on completion instead of relying on it to see the event live. Reuses
+    the (now duplicate-safe) wake; conservative guards live in the worker.
+    """
+    crit = ver = None
+    for m in room.get("messages", []):
+        if m.get("kind") != TASK_VERDICT or m.get("task_id") != task_id:
+            continue
+        v = m.get("verdict")
+        if v in ("approve", "changes"):
+            crit = v
+        elif v in ("ship", "hold"):
+            ver = v
+    if crit is None or ver is None:
+        return  # gate not yet complete — only one reviewer has voted
+
+    member_roles = (room.get("meta") or {}).get("member_roles") or {}
+    master_id = next((sid for sid, r in member_roles.items() if r == ROLE_MASTER), None)
+    if not master_id:
+        return
+    master_name = (room["members"].get(master_id) or {}).get("session_name")
+    if not master_name:
+        return
+
+    if crit == "approve" and ver == "ship":
+        msg = (
+            f"⏰ DUAL-VERDICT COMPLETE for {task_id}: critic=approve + verifier=ship "
+            "are RECORDED (you may not have seen them live if your SSE dropped post-"
+            "compaction). Call chat_my_chats to re-register, then COMMIT + approve "
+            "the task now. Don't wait for an event — this IS the event."
+        )
+    else:
+        msg = (
+            f"⏰ both verdicts in for {task_id} (critic={crit}, verifier={ver} — not "
+            "dual-positive). Call chat_my_chats, then dispatch rework or approve per "
+            "the outcome. Don't wait for an event."
+        )
+
+    import threading
+
+    threading.Thread(
+        target=_dispatch_wake_worker,
+        args=(master_id, master_name, msg),
+        daemon=True,
+    ).start()
 
 
 def _auto_wake_targeted_idle(targets: list[tuple[str, str | None]]) -> None:
@@ -1903,6 +1962,13 @@ def record_gate_verdict(
         by_session_id,
         chat_id,
     )
+    # If this verdict completes a dual-verdict gate, wake the master to act —
+    # closes the dead-SSE commit-miss. Re-load so the just-appended verdict is
+    # visible. Best-effort; never affects the verdict-record result.
+    try:
+        _maybe_wake_master_on_gate_complete(chat_id, task_id, load_room(chat_id))
+    except Exception:
+        log.debug("chats: gate-complete wake raised (non-fatal)", exc_info=True)
     return record
 
 

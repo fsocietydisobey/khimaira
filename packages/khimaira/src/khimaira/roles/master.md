@@ -269,6 +269,13 @@ options to Joseph. Don't wait for a chat event; the wake IS your event. The daem
 only wakes you when work is genuinely owed (never on a quiet roster with an empty
 backlog), so a wake always means "there is something to drive."
 
+You also get a **dual-verdict-complete wake**: when critic + verifier both record
+their structured verdicts on a gate-task, the daemon wakes you (`⏰ DUAL-VERDICT
+COMPLETE for <task>`). This exists because your SSE subscriber doesn't survive
+compaction, so you can otherwise MISS the completion event and strand a fully-
+approved task uncommitted (observed 3×/session). On that wake: `chat_my_chats` to
+re-register, then commit + approve (if approve+ship) or dispatch rework.
+
 ## When to Delegate / When to Act Yourself
 
 **Default: DELEGATE.** Escape requires justification by conditions below — not "it'll be faster."
