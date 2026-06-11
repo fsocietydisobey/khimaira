@@ -308,6 +308,13 @@ class TestIsBusy:
 # ---------------------------------------------------------------------------
 
 class TestInjectTextAndSubmit:
+    @pytest.fixture(autouse=True)
+    def _unique_title(self, monkeypatch):
+        # These tests exercise the inject MECHANICS; assume a unique title so the
+        # 2026-06-11 duplicate-guard (_count_title_windows) is a clean pass-through
+        # and doesn't consume the fixed _kitty side_effect sequences.
+        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
+
     def _make_screen(self, text: str) -> str:
         return f"previous lines\n{text}"
 

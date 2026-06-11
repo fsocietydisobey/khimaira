@@ -483,6 +483,99 @@ def _title_match_arg(window_title: str) -> str:
     return f"--match=title:^{re.escape(window_title)}$"
 
 
+# ---------------------------------------------------------------------------
+# Duplicate-window reaping (2026-06-11) — the title-match substrate fix.
+#
+# The ENTIRE roster-coordination substrate is title-anchored kitty matching
+# (manual nudges, busy/state reads, AND the daemon's auto-wake/dispatch-wake).
+# A session restart/resume can spawn a fresh role-titled window WITHOUT closing
+# the prior one, leaving TWO windows with the identical title. The anchored
+# ^...$ regex (the cross-roster fix) guards substring bleed but does NOTHING
+# against an EXACT duplicate — both match. Result: send-text injects into both
+# (garbling the live agent), get-text reads one NON-DETERMINISTICALLY (stale
+# shell vs live), nudges "don't land", busy-checks misclassify, and master can
+# watch a dead shell while the live agent files its verdict elsewhere
+# (compounding the commit-miss gap). muther filed this 2026-06-11; Joseph: "huge".
+#
+# Fix: reap the STALE duplicate so each title resolves to exactly one window.
+# Live-vs-stale is read from kitty's foreground_processes: a live agent window
+# has the `claude` binary running in the foreground; a stale shell (after the
+# agent exited + `exec bash`) does not. Reap only when exactly one live window
+# remains (safe); on ambiguity (0 or ≥2 live), loud-log and reap NOTHING.
+# ---------------------------------------------------------------------------
+
+def _window_is_live(win: dict[str, Any]) -> bool:
+    """True if the kitty window has a running `claude` agent in its foreground
+    processes (vs a stale shell left after the agent exited)."""
+    for proc in win.get("foreground_processes") or []:
+        cmd = proc.get("cmdline") or []
+        if cmd and os.path.basename(str(cmd[0])) == "claude":
+            return True
+    return False
+
+
+def _reap_duplicate_windows() -> int:
+    """Reap stale duplicate-titled windows so title-match is deterministic.
+
+    Returns the number of windows reaped. Safe-by-construction: a title's stale
+    window(s) are closed ONLY when exactly one LIVE window remains for that
+    title. Ambiguous cases (no live, or multiple live) are loud-logged and left
+    untouched — never guess which to close. Fail-open (kitty errors → 0).
+    """
+    raw = _kitty("ls")
+    if not raw:
+        return 0
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return 0
+
+    by_title: dict[str, list[dict[str, Any]]] = {}
+    for os_win in data:
+        for tab in os_win.get("tabs", []):
+            for win in tab.get("windows", []):
+                title = (win.get("title") or "").strip()
+                if title:
+                    by_title.setdefault(title, []).append(win)
+
+    reaped = 0
+    for title, wins in by_title.items():
+        if len(wins) < 2:
+            continue
+        live = [w for w in wins if _window_is_live(w)]
+        stale = [w for w in wins if not _window_is_live(w)]
+        if len(live) == 1 and stale:
+            for w in stale:
+                if _kitty("close-window", f"--match=id:{w['id']}") is not None:
+                    reaped += 1
+                    _log.warning(
+                        "roster-recovery: reaped STALE duplicate window id=%d "
+                        "title=%r (kept live id=%d)",
+                        w["id"], title, live[0]["id"],
+                    )
+        else:
+            _log.error(
+                "roster-recovery: AMBIGUOUS duplicate title %r — %d window(s), "
+                "%d live; NOT reaping. Title-match is unreliable for this role "
+                "until resolved (map by session_id, or close one manually).",
+                title, len(wins), len(live),
+            )
+    return reaped
+
+
+def _count_title_windows(window_title: str) -> int:
+    """Count live kitty windows whose title exactly matches. -1 if kitty
+    can't answer (caller treats unknown conservatively)."""
+    raw = _kitty("ls", _title_match_arg(window_title))
+    if raw is None:
+        return -1
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return -1
+    return sum(len(t.get("windows", [])) for o in data for t in o.get("tabs", []))
+
+
 def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -> bool:
     """Inject ``text`` into a kitty window and submit with Enter.
 
@@ -504,6 +597,23 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
 
     Returns True if submitted, False if aborted.
     """
+    # Duplicate-title guard (2026-06-11): a title-match inject into a duplicated
+    # title hits BOTH windows (garbling the live agent). If >1 window shares this
+    # title, self-heal once (reap the stale duplicate) then re-check; if STILL
+    # ambiguous, ABORT loud rather than inject into the wrong/both windows.
+    if window_title:
+        n = _count_title_windows(window_title)
+        if n > 1:
+            _reap_duplicate_windows()
+            n = _count_title_windows(window_title)
+        if n > 1:
+            _log.error(
+                "roster-recovery: REFUSING inject into %r — %d windows share "
+                "this title (ambiguous after reap). Nudge/wake skipped.",
+                window_title, n,
+            )
+            return False
+
     match_arg = (
         _title_match_arg(window_title) if window_title else f"--match=id:{window_id}"
     )
@@ -1521,9 +1631,11 @@ async def check_once() -> None:
     """Single sweep of all discovered roster windows."""
     if not _env_enabled():
         return
-    windows = await asyncio.get_running_loop().run_in_executor(
-        None, _discover_roster_windows
-    )
+    loop = asyncio.get_running_loop()
+    # Reap stale duplicate-titled windows FIRST so every title-anchored op this
+    # sweep (and every external nudge/busy-read) resolves to exactly one window.
+    await loop.run_in_executor(None, _reap_duplicate_windows)
+    windows = await loop.run_in_executor(None, _discover_roster_windows)
     for win in windows:
         try:
             await _process_window(win)
