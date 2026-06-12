@@ -23,6 +23,21 @@ from .metadata import scanner as meta_scanner
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8740
 
+# Strong references to long-lived background tasks. asyncio.create_task() keeps
+# only a WEAK reference, so a fire-and-forget watcher can be garbage-collected
+# mid-flight — observed live: auto_dispatch_loop logged "loop started" then was
+# silently collected during its first sleep(90), never sweeping (muther GAP #1
+# F3 backstop never ran). Keep refs here so the GC can't reap them.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """create_task + retain a strong reference until the task completes."""
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
 
 def _assert_loopback(host: str) -> None:
     """`127.0.0.1` binding is the auth layer — refuse anything else."""
@@ -145,7 +160,7 @@ def build_app():
                 if _chats._CURSORS_DIRTY:
                     _chats.save_cursors()
 
-        asyncio.create_task(_loop())
+        _spawn(_loop())
 
     # Expected-reply overdue watcher — fires session_post_notice to both sides
     # when a chat_send_to recipient hasn't replied within _REPLY_OVERDUE_S.
@@ -153,7 +168,7 @@ def build_app():
     async def _start_overdue_watcher() -> None:
         from .api.chats import _overdue_watcher
 
-        asyncio.create_task(_overdue_watcher())
+        _spawn(_overdue_watcher())
 
     # Guard-4 + #13b-light watcher — escalates sessions silent-while-obligated
     # beyond the CC retry/request grace window; fast-escalates dead processes.
@@ -161,7 +176,7 @@ def build_app():
     async def _start_guard4_watcher() -> None:
         from .api.chats import _guard4_watcher
 
-        asyncio.create_task(_guard4_watcher())
+        _spawn(_guard4_watcher())
 
     # Roster auto-recovery watcher — distills + compacts kitty windows at high
     # context usage; wakes idle sessions with pending obligations.
@@ -169,7 +184,7 @@ def build_app():
     async def _start_roster_recovery_watcher() -> None:
         from . import roster_recovery
 
-        asyncio.create_task(roster_recovery.watcher_loop())
+        _spawn(roster_recovery.watcher_loop())
 
     # #14 Auto-dispatch — periodic sweep proposing idle-agent → backlog-task
     # assignments to master (Hybrid A+ mode). Opt-out: KHIMAIRA_AUTO_DISPATCH=0.
@@ -177,7 +192,7 @@ def build_app():
     async def _start_auto_dispatch_loop() -> None:
         from . import auto_dispatch
 
-        asyncio.create_task(auto_dispatch.auto_dispatch_loop())
+        _spawn(auto_dispatch.auto_dispatch_loop())
 
     # Guard-5 — roster-progress monitor. Fires when ≥K sessions are idle
     # AND a blocking gate has had no state-change >T_stall. Per-session
@@ -186,7 +201,7 @@ def build_app():
     async def _start_guard5_watcher() -> None:
         from . import guard5
 
-        asyncio.create_task(guard5.guard5_loop())
+        _spawn(guard5.guard5_loop())
 
     # Guard-6 — heartbeat-liveness detector. Fires when a roster member has
     # gone dark (no activity) regardless of whether it owes anything.
@@ -195,7 +210,7 @@ def build_app():
     async def _start_guard6_watcher() -> None:
         from . import guard6
 
-        asyncio.create_task(guard6.guard6_loop())
+        _spawn(guard6.guard6_loop())
 
     # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
     # Replay-on-boot recovers stuck-firing tasks; worker tick fires due tasks.
@@ -204,7 +219,7 @@ def build_app():
         from . import scheduler as scheduler_mod
 
         scheduler_mod.replay()
-        asyncio.create_task(scheduler_mod.scheduler_loop())
+        _spawn(scheduler_mod.scheduler_loop())
 
     # Registry auto-GC — reap session records whose kitty windows are gone.
     # Every roster relaunch mints fresh records; without this the registry
@@ -215,7 +230,7 @@ def build_app():
     async def _start_registry_gc() -> None:
         from . import registry_gc
 
-        asyncio.create_task(registry_gc.registry_gc_loop())
+        _spawn(registry_gc.registry_gc_loop())
 
     # Chat MCP registration watchdog. Claude Code intermittently prunes
     # the khimaira-chat entry from ~/.claude.json (subprocess errors
@@ -270,7 +285,7 @@ def build_app():
                     )
                 await asyncio.sleep(30)
 
-        asyncio.create_task(_watchdog())
+        _spawn(_watchdog())
 
     # Auto-scan: kick off background metadata enrichment for any project
     # whose cache is missing or stale. The worker drains serially so we
@@ -312,7 +327,7 @@ def build_app():
                         )
                 await asyncio.sleep(300)  # 5 min between passes
 
-        asyncio.create_task(_loop())
+        _spawn(_loop())
 
     # Self-watch — periodic invariant checks that the daemon's claims
     # match the underlying truth (DB → API consistency, observation
@@ -343,14 +358,14 @@ def build_app():
                     )
                 await asyncio.sleep(300)  # 5 min between passes
 
-        asyncio.create_task(_loop())
+        _spawn(_loop())
 
     # Heartbeat store GC — drop runs idle longer than the TTL.
     @app.on_event("startup")
     async def _start_heartbeat_gc() -> None:
         from . import heartbeats as heartbeats_module
 
-        asyncio.create_task(heartbeats_module.gc_loop())
+        _spawn(heartbeats_module.gc_loop())
 
     # Attach supervisor — auto-reattach khimaira_observer when target venvs
     # rebuild. Two parts:
@@ -378,7 +393,7 @@ def build_app():
                     file=sys.stderr,
                 )
 
-        asyncio.create_task(_supervisor())
+        _spawn(_supervisor())
 
     # Transcript watcher — sync Claude Code /rename events to khimaira
     # session names within ~100ms instead of waiting for next user prompt.
@@ -395,7 +410,7 @@ def build_app():
                     file=sys.stderr,
                 )
 
-        asyncio.create_task(_watcher())
+        _spawn(_watcher())
 
     # Static frontend — only mount if dist/ exists; otherwise serve a placeholder
     dist = ui_build.dist_dir()
