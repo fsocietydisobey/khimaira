@@ -340,9 +340,17 @@ async def _maybe_wake_idle_master(
         st = await loop.run_in_executor(None, lambda: sessions_mod.summary(master_id))
         idle_s = float((st or {}).get("last_active_age_s") or 0)
     except Exception:
+        _log.warning("auto-dispatch: master-wake summary() failed", exc_info=True)
         return
     if idle_s < _MASTER_WAKE_IDLE_MIN_S:
-        return  # master is actively working — events will drive it
+        # F1 observability: owed work exists but master looks active — say so, so a
+        # "why didn't it wake?" is a log lookup, not a forensic.
+        _log.info(
+            "auto-dispatch: master-wake skipped — master active (idle %.0fs < %ds), "
+            "owed=%d commit_ready=%d",
+            idle_s, int(_MASTER_WAKE_IDLE_MIN_S), owed_count, len(committable),
+        )
+        return
 
     try:
         from khimaira.monitor import roster_recovery as rr
@@ -350,11 +358,18 @@ async def _maybe_wake_idle_master(
         wins = await loop.run_in_executor(None, rr._discover_roster_windows)
         master_win = next((w for w in wins if w.get("role") == "master"), None)
         if master_win is None:
+            _log.info(
+                "auto-dispatch: master-wake skipped — no master window discoverable "
+                "(%d windows, owed=%d commit_ready=%d). Master process may be a "
+                "windowless zombie.",
+                len(wins), owed_count, len(committable),
+            )
             return
         wid = master_win["window_id"]
         screen = await loop.run_in_executor(None, lambda: rr._get_screen(wid))
         if screen is not None and rr._is_busy(screen):
-            return  # master window is mid-work — don't inject
+            _log.info("auto-dispatch: master-wake skipped — master window busy")
+            return
 
         if committable:
             shown = ", ".join(committable[:8])
