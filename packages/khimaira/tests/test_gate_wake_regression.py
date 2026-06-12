@@ -195,7 +195,8 @@ def test_active_chat_masters_per_chat_no_global_abort(tmp_path, monkeypatch):
     (tmp_path / "chat-bbb.jsonl").write_text("{}")
     monkeypatch.setattr(chats_mod, "_chat_dir", lambda: tmp_path)
     rooms = {
-        "chat-aaa": {"meta": {"member_roles": {"m-live": "master", "a1": "agent"}}},
+        "chat-aaa": {"meta": {"member_roles": {"m-live": "master", "a1": "agent"}},
+                     "members": {"m-live": {"session_name": "muther"}}},
         "chat-bbb": {"meta": {"member_roles": {"m-dead": "master"}}},
     }
     monkeypatch.setattr(chats_mod, "load_room", lambda cid: rooms[cid])
@@ -212,8 +213,9 @@ def test_active_chat_masters_per_chat_no_global_abort(tmp_path, monkeypatch):
         (sess_dir / mid).mkdir()
     monkeypatch.setattr(sessions_mod, "_BASE_DIR", sess_dir)
     # TWO masters across chats — the global resolver would abort; per-chat resolves
-    # each, and the liveness filter drops the dead one.
-    assert ad._active_chat_masters() == [("chat-aaa", "m-live")]
+    # each, and the liveness filter drops the dead one. 3rd tuple = master_name
+    # (for the cross-roster unscoped window fallback).
+    assert ad._active_chat_masters() == [("chat-aaa", "m-live", "muther")]
 
 
 def test_active_chat_masters_dedups_same_master(tmp_path, monkeypatch):
@@ -226,7 +228,8 @@ def test_active_chat_masters_dedups_same_master(tmp_path, monkeypatch):
     monkeypatch.setattr(chats_mod, "_chat_dir", lambda: tmp_path)
     monkeypatch.setattr(
         chats_mod, "load_room",
-        lambda cid: {"meta": {"member_roles": {"m": "master"}}},
+        lambda cid: {"meta": {"member_roles": {"m": "master"}},
+                     "members": {"m": {"session_name": "mm"}}},
     )
     monkeypatch.setattr(sessions_mod, "summary", lambda sid: {"last_active_age_s": 50.0})
     sess_dir = tmp_path / "sessions"
@@ -234,7 +237,7 @@ def test_active_chat_masters_dedups_same_master(tmp_path, monkeypatch):
     (sess_dir / "m").mkdir()  # #18 guard: live master must have a session dir
     monkeypatch.setattr(sessions_mod, "_BASE_DIR", sess_dir)
     # one live master in two chats → woken once, first chat wins
-    assert ad._active_chat_masters() == [("chat-aaa", "m")]
+    assert ad._active_chat_masters() == [("chat-aaa", "m", "mm")]
 
 
 @pytest.mark.asyncio
@@ -242,16 +245,16 @@ async def test_reconcile_wakes_per_chat_master(monkeypatch):
     from khimaira.monitor import auto_dispatch as ad
     from khimaira.monitor import chats as chats_mod
 
-    monkeypatch.setattr(ad, "_active_chat_masters", lambda: [("chat-x", "master-1")])
+    monkeypatch.setattr(ad, "_active_chat_masters", lambda: [("chat-x", "master-1", "mname")])
     monkeypatch.setattr(chats_mod, "committable_gate_tasks", lambda cid: ["t1", "t2"])
     calls = []
 
-    async def fake_wake(mid, owed, committable=None):
-        calls.append((mid, owed, committable))
+    async def fake_wake(mid, owed, committable=None, master_name=""):
+        calls.append((mid, owed, committable, master_name))
 
     monkeypatch.setattr(ad, "_maybe_wake_idle_master", fake_wake)
     await ad._reconcile_commit_ready()
-    assert calls == [("master-1", 0, ["t1", "t2"])]
+    assert calls == [("master-1", 0, ["t1", "t2"], "mname")]
 
 
 @pytest.mark.asyncio
@@ -259,7 +262,7 @@ async def test_reconcile_skips_chat_with_no_committable(monkeypatch):
     from khimaira.monitor import auto_dispatch as ad
     from khimaira.monitor import chats as chats_mod
 
-    monkeypatch.setattr(ad, "_active_chat_masters", lambda: [("chat-x", "master-1")])
+    monkeypatch.setattr(ad, "_active_chat_masters", lambda: [("chat-x", "master-1", "mname")])
     monkeypatch.setattr(chats_mod, "committable_gate_tasks", lambda cid: [])
     called = []
 

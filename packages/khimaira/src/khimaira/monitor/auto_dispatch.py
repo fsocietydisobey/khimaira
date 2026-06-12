@@ -308,7 +308,8 @@ _last_master_wake: dict[str, float] = {}
 
 
 async def _maybe_wake_idle_master(
-    master_id: str, owed_count: int, committable: list[str] | None = None
+    master_id: str, owed_count: int, committable: list[str] | None = None,
+    master_name: str = "",
 ) -> None:
     """Nudge an idle master's window to DRIVE when concrete work is owed.
 
@@ -357,12 +358,21 @@ async def _maybe_wake_idle_master(
 
         wins = await loop.run_in_executor(None, rr._discover_roster_windows)
         master_win = next((w for w in wins if w.get("role") == "master"), None)
+        if master_win is None and master_name:
+            # Cross-roster fallback (#19 class applied to the reconcile wake):
+            # _discover_roster_windows is scoped to THIS daemon's roster, so a
+            # reconcile for ANOTHER roster's master (one daemon, many rosters)
+            # finds 0 windows. Look the exact master up unscoped by name — strips
+            # kitty's ✳ activity-marker too. This is what let muther's commit-wake
+            # skip "no master window" while her window was live.
+            master_win = await loop.run_in_executor(
+                None, rr._window_for_session_name, master_name
+            )
         if master_win is None:
             _log.info(
                 "auto-dispatch: master-wake skipped — no master window discoverable "
-                "(%d windows, owed=%d commit_ready=%d). Master process may be a "
-                "windowless zombie.",
-                len(wins), owed_count, len(committable),
+                "(%d roster windows, name=%r, owed=%d commit_ready=%d).",
+                len(wins), master_name, owed_count, len(committable),
             )
             return
         wid = master_win["window_id"]
@@ -422,7 +432,7 @@ def _active_chat_masters() -> list[tuple[str, str]]:
     from khimaira.monitor import chats as chats_mod
     from khimaira.monitor import sessions as sessions_mod
 
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     chat_dir = chats_mod._chat_dir()
     if not chat_dir.exists():
         return out
@@ -450,7 +460,13 @@ def _active_chat_masters() -> list[tuple[str, str]]:
             continue
         if idle_s <= _CHAT_MASTER_LIVE_MAX_S:
             seen.add(master_id)
-            out.append((chat_id, master_id))
+            # master_name for the cross-roster unscoped window fallback (the
+            # roster-scoped _discover_roster_windows misses another roster's
+            # master — muther note-2 class, applied to the reconcile wake path).
+            master_name = (
+                (room.get("members") or {}).get(master_id) or {}
+            ).get("session_name") or ""
+            out.append((chat_id, master_id, master_name))
     return out
 
 
@@ -468,7 +484,7 @@ async def _reconcile_commit_ready() -> None:
     except Exception:
         _log.warning("auto-dispatch: active-chat-master scan failed", exc_info=True)
         return
-    for chat_id, master_id in chat_masters:
+    for chat_id, master_id, master_name in chat_masters:
         try:
             committable = await loop.run_in_executor(
                 None, chats_mod.committable_gate_tasks, chat_id
@@ -484,7 +500,7 @@ async def _reconcile_commit_ready() -> None:
                 "for master %s",
                 chat_id, len(committable), master_id[:8],
             )
-            await _maybe_wake_idle_master(master_id, 0, committable)
+            await _maybe_wake_idle_master(master_id, 0, committable, master_name=master_name)
 
 
 async def _emit_dispatch_proposal(

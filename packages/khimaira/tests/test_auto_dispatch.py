@@ -621,7 +621,7 @@ class TestActiveChatMastersDeadUUIDGuard:
         ):
             result = ad._active_chat_masters()
 
-        masters = {mid for _cid, mid in result}
+        masters = {mid for _cid, mid, _name in result}
         assert live_master in masters, "live master must be included"
         assert dead_master not in masters, "dead master must be excluded"
         # The storm-causing call: summary() must NEVER run for the dead UUID.
