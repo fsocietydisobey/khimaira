@@ -706,9 +706,19 @@ async def auto_dispatch_loop() -> None:
         _PROPOSAL_TTL_S,
         _IDLE_MIN_S,
     )
-    while True:
-        await asyncio.sleep(_AUTO_DISPATCH_INTERVAL_S)
-        try:
-            await auto_dispatch_sweep()
-        except Exception as exc:
-            _log.warning("auto-dispatch: loop error: %s", exc)
+    try:
+        while True:
+            await asyncio.sleep(_AUTO_DISPATCH_INTERVAL_S)
+            try:
+                await auto_dispatch_sweep()
+            except Exception as exc:
+                _log.warning("auto-dispatch: loop error: %s", exc)
+    except asyncio.CancelledError:
+        raise  # normal on daemon shutdown
+    except BaseException as exc:
+        # Observability: the loop must never die silently (it has historically —
+        # the whole auto_dispatch feature can be inert with only "loop started" in
+        # the log). Surface any unexpected exit loudly.
+        _log.error("auto-dispatch: LOOP EXITED unexpectedly via %s: %s",
+                   type(exc).__name__, exc)
+        raise
