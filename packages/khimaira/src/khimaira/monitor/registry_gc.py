@@ -37,7 +37,15 @@ log = logging.getLogger("monitor.registry_gc")
 # Tunables (env-overridable).
 _REAP_IDLE_MIN_S = float(os.environ.get("KHIMAIRA_REGISTRY_REAP_IDLE_S", "1800"))  # 30 min
 _GC_INTERVAL_S = float(os.environ.get("KHIMAIRA_REGISTRY_GC_INTERVAL_S", "600"))  # 10 min
-_GC_ENABLED = os.environ.get("KHIMAIRA_REGISTRY_GC", "1") != "0"
+# DEFAULT-OFF (2026-06-12, muther symptom 2): the reap keys liveness on kitty
+# window-TITLE enumeration. When a live agent's window title ≠ its session name
+# (the recurring title-match gremlin) or kitty returns a transient empty set, the
+# reap false-positives and DELETES a live session's record — observed deleting
+# muther-agent-3 (had_decisions=True) repeatedly, dropping it from session_list
+# while its window stayed alive. Re-enable (default "1") only after the reap
+# resolves liveness by session-id/process, not fragile title-match. Opt back in
+# per-run with KHIMAIRA_REGISTRY_GC=1. Cost while off: registry bloat (cosmetic).
+_GC_ENABLED = os.environ.get("KHIMAIRA_REGISTRY_GC", "0") != "0"
 
 
 def _live_window_titles() -> set[str] | None:
