@@ -2953,6 +2953,125 @@ def set_creator(chat_id: str, new_creator_session_id: str) -> dict[str, Any]:
     return new_meta
 
 
+def _session_is_live(session_id: str) -> bool:
+    """True if `session_id` has a registry dir AND was active recently.
+
+    Reaped sessions (dir gone) and sessions stale beyond
+    ``KHIMAIRA_MASTER_LIVE_S`` (default 1200s) are treated as dead. This is the
+    safety property of :func:`reseat_master` — it fires only when the old master
+    is genuinely gone, never to hijack a live one.
+    """
+    from . import sessions as _sessions
+
+    if not (_sessions._BASE_DIR / session_id).is_dir():
+        return False
+    try:
+        age = _sessions.summary(session_id).get("last_active_age_s")
+    except Exception:  # noqa: BLE001 — any lookup failure = treat as not-live
+        return False
+    if age is None:
+        return False
+    return age < int(os.environ.get("KHIMAIRA_MASTER_LIVE_S", "1200"))
+
+
+def reseat_master(chat_id: str, new_master_session_id: str) -> dict[str, Any]:
+    """Recover an orphaned roster: seat a NEW session as master after the prior
+    master session has DIED (window/process exited; registry-GC'd).
+
+    Fills the dead-master gap. ``chat_grant_role`` is master-only (the dead
+    master can't call it) and ``transfer_membership`` needs the dead session as
+    the live donor — neither works when the master is gone. ``reseat_master``
+    needs neither, but **REFUSES while the current master is still live**
+    (registered + active within ``KHIMAIRA_MASTER_LIVE_S``), so it can't hijack
+    an active roster — use ``chat_grant_role`` / ``chat_transfer_membership`` for
+    a live handoff.
+
+    Atomic from the caller's view:
+      1. ``new_master`` must be a registered session.
+      2. The incumbent master (if any) must NOT be live.
+      3. ``new_master`` is added as an ACCEPTED member if not already one (admin
+         add — no invite/accept handshake, since the inviter-of-record is gone).
+      4. A single META write promotes ``new_master`` to master, demotes the dead
+         incumbent to agent, and sets ``created_by = new_master``.
+      5. The master role-directive is emitted to ``new_master``.
+
+    Raises ValueError if ``new_master`` is unregistered or the incumbent is live.
+    """
+    new_master_session_id = _resolve_or_uuid(new_master_session_id)
+    _assert_session_registered(new_master_session_id)
+    room = load_room(chat_id)
+
+    existing_meta = dict(room.get("meta") or {})
+    member_roles = dict(existing_meta.get("member_roles") or {})
+
+    # Identify the incumbent master: member_roles is authoritative, created_by
+    # is the v1-era fallback.
+    incumbent = next(
+        (
+            sid
+            for sid, r in member_roles.items()
+            if r == ROLE_MASTER and sid != new_master_session_id
+        ),
+        None,
+    )
+    if incumbent is None:
+        cb = existing_meta.get("created_by")
+        if cb and cb != new_master_session_id:
+            incumbent = cb
+
+    if incumbent and _session_is_live(incumbent):
+        raise ValueError(
+            f"Current master {incumbent!r} of {chat_id!r} is still live; "
+            f"reseat_master only recovers a DEAD master. For a live handoff use "
+            f"chat_grant_role or chat_transfer_membership."
+        )
+
+    # Admin member-add: the dead incumbent who would normally invite is gone, so
+    # add new_master directly as ACCEPTED if not already a member.
+    member = room["members"].get(new_master_session_id)
+    if not member or member.get("state") != ACCEPTED:
+        _append(
+            chat_id,
+            {
+                "kind": MEMBER,
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "chat_id": chat_id,
+                "session_id": new_master_session_id,
+                "session_name": _resolve_session_name(new_master_session_id)
+                or new_master_session_id[:8],
+                "state": ACCEPTED,
+            },
+        )
+
+    # Single META write: promote new master, demote the dead incumbent. Mirrors
+    # the single-master invariant chat_grant_role preserves on a live swap.
+    member_roles[new_master_session_id] = ROLE_MASTER
+    if incumbent:
+        member_roles[incumbent] = ROLE_AGENT
+    new_name = (
+        _resolve_session_name(new_master_session_id) or new_master_session_id[:8]
+    )
+    new_meta = {
+        **{k: v for k, v in existing_meta.items() if k != "event_id"},
+        "kind": META,
+        "event_id": _new_event_id(),
+        "ts": _now_iso(),
+        "created_by": new_master_session_id,
+        "created_by_name": new_name,
+        "member_roles": member_roles,
+    }
+    _append(chat_id, new_meta)
+    _emit_role_directive(chat_id, new_master_session_id, ROLE_MASTER)
+    log.info(
+        "chats: reseat_master %s for orphaned chat %s (dead incumbent=%s)",
+        new_master_session_id,
+        chat_id,
+        incumbent,
+    )
+    return new_meta
+
+
 def chat_grant_role(
     chat_id: str,
     by_session_id: str,

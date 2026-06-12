@@ -1355,6 +1355,10 @@ class GrantRoleReq(BaseModel):
     demote_to: str = "agent"
 
 
+class ReseatMasterReq(BaseModel):
+    new_master_session_id: str
+
+
 class RejectReq(BaseModel):
     session_id: str
 
@@ -2195,6 +2199,33 @@ def build_router():
                 code = 422
             else:
                 code = 404
+            raise fastapi.HTTPException(code, msg) from exc
+
+    @router.post("/chats/{chat_id}/reseat-master")
+    async def reseat_master(chat_id: str, req: ReseatMasterReq) -> dict:
+        """Dead-master recovery: seat a new session as master of an orphaned
+        roster (the prior master session died / was registry-GC'd). REFUSES if
+        the incumbent master is still live — use grant-role / transfer for a
+        live handoff. Invalidates the Themis role cache so the new master is
+        enforced on its next tool call."""
+        try:
+            result = chats.reseat_master(chat_id, req.new_master_session_id)
+            _inval(req.new_master_session_id)
+            try:
+                from .themis import clear_role_cache
+
+                clear_role_cache()
+            except Exception:
+                pass
+            return result
+        except ValueError as exc:
+            msg = str(exc)
+            if "still live" in msg:
+                code = 409
+            elif "No session" in msg:
+                code = 404
+            else:
+                code = 422
             raise fastapi.HTTPException(code, msg) from exc
 
     @router.delete("/chats/{chat_id}")

@@ -761,6 +761,32 @@ def _build_server() -> Server:
                 },
             ),
             types.Tool(
+                name="chat_reseat_master",
+                description=(
+                    "Dead-master recovery: seat a NEW session as master of an "
+                    "orphaned roster after the prior master session died (window/"
+                    "process exited; registry-GC'd). Fills the gap where "
+                    "chat_grant_role (master-only) and chat_transfer_membership "
+                    "(needs the dead session as live donor) both fail. REFUSES if "
+                    "the incumbent master is still live — use those tools for a "
+                    "live handoff. Adds the new master as an accepted member if "
+                    "needed, promotes it, demotes the dead incumbent, and emits "
+                    "the master role-directive."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "chat_id": {"type": "string"},
+                        "new_master_session_id": {
+                            "type": "string",
+                            "description": "Session id or name of the new master to seat.",
+                        },
+                    },
+                    "required": ["session_id", "chat_id", "new_master_session_id"],
+                },
+            ),
+            types.Tool(
                 name="chat_accept",
                 description=(
                     "Accept an invite into a chat. If chat_id is omitted, "
@@ -1265,6 +1291,10 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
             args["target_session_id"],
             args["role"],
             demote_to=args.get("demote_to", "agent"),
+        )
+    if name == "chat_reseat_master":
+        return daemon_client.reseat_master(
+            args["chat_id"], args["new_master_session_id"]
         )
     if name == "chat_accept":
         chat_id = args.get("chat_id")

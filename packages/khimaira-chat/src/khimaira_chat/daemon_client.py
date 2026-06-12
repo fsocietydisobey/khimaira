@@ -191,6 +191,27 @@ def grant_role(
     return resp.json()
 
 
+def reseat_master(
+    chat_id: str,
+    new_master_session_id: str,
+    *,
+    base: str = DEFAULT_BASE,
+) -> dict[str, Any]:
+    """Dead-master recovery: seat a new session as master of an orphaned roster.
+
+    Needs no authenticated master caller (the prior master is gone) — the daemon
+    refuses if the incumbent master is still live, which is the safety property.
+    """
+    resp = _request_with_retry(
+        "POST",
+        f"{base}/api/chats/{chat_id}/reseat-master",
+        json={"new_master_session_id": new_master_session_id},
+        timeout=10.0,
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
 def accept(chat_id: str, session_id: str, *, base: str = DEFAULT_BASE) -> dict[str, Any]:
     resp = _request_with_retry(
         "POST",
