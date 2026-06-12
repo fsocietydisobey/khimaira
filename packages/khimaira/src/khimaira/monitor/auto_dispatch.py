@@ -402,20 +402,83 @@ async def _maybe_wake_idle_master(
         _log.warning("auto-dispatch: master-wake failed", exc_info=True)
 
 
-def _get_committable_tasks(master_id: str) -> list[str]:
-    """All commit-ready (reviewed dual-positive, uncommitted) task ids across the
-    master's chats. The level-triggered backstop for muther GAP #1 — independent
-    of dispatch backlog, so it fires even when there is nothing left to assign.
-    """
-    from khimaira.monitor import chats
+# Per-chat master resolution: a chat's master is unambiguous (one master in its
+# member_roles). The GLOBAL _resolve_session_for_role("master") aborts once >1
+# session has ever held master across all chats (the normal steady state), which
+# silently disabled the entire sweep — including the commit-ready backstop. The
+# reconcile below resolves master PER CHAT and filters to live masters, so cross-
+# roster history can't disable it.
+_CHAT_MASTER_LIVE_MAX_S = float(
+    os.environ.get("KHIMAIRA_RECONCILE_MASTER_LIVE_S", "3600")
+)
 
-    out: list[str] = []
-    try:
-        for c in chats.my_chats(master_id):
-            out.extend(chats.committable_gate_tasks(c["chat_id"]))
-    except Exception:
-        _log.warning("auto-dispatch: committable-task scan failed", exc_info=True)
+
+def _active_chat_masters() -> list[tuple[str, str]]:
+    """[(chat_id, master_id)] for chats whose master session is currently live
+    (active within _CHAT_MASTER_LIVE_MAX_S). Per-chat member_roles resolution —
+    never hits the global cross-roster ambiguity abort. Dedups by master so one
+    live master with many chats isn't woken N times per sweep.
+    """
+    from khimaira.monitor import chats as chats_mod
+    from khimaira.monitor import sessions as sessions_mod
+
+    out: list[tuple[str, str]] = []
+    chat_dir = chats_mod._chat_dir()
+    if not chat_dir.exists():
+        return out
+    seen: set[str] = set()
+    for path in sorted(chat_dir.glob("chat-*.jsonl")):
+        chat_id = path.stem
+        try:
+            room = chats_mod.load_room(chat_id)
+        except Exception:
+            continue
+        member_roles = (room.get("meta") or {}).get("member_roles") or {}
+        master_id = next((s for s, r in member_roles.items() if r == "master"), None)
+        if not master_id or master_id in seen:
+            continue
+        try:
+            summ = sessions_mod.summary(master_id)
+            idle_s = float((summ or {}).get("last_active_age_s") or 1e9)
+        except Exception:
+            continue
+        if idle_s <= _CHAT_MASTER_LIVE_MAX_S:
+            seen.add(master_id)
+            out.append((chat_id, master_id))
     return out
+
+
+async def _reconcile_commit_ready() -> None:
+    """Per-chat commit-ready backstop (muther GAP #1, F3). For each live roster
+    chat, wake its master for any dual-verdict-complete tasks awaiting commit.
+    Independent of the global master resolver, so it fires even when the dispatch
+    flow below can't resolve a single global master.
+    """
+    from khimaira.monitor import chats as chats_mod
+
+    loop = asyncio.get_event_loop()
+    try:
+        chat_masters = await loop.run_in_executor(None, _active_chat_masters)
+    except Exception:
+        _log.warning("auto-dispatch: active-chat-master scan failed", exc_info=True)
+        return
+    for chat_id, master_id in chat_masters:
+        try:
+            committable = await loop.run_in_executor(
+                None, chats_mod.committable_gate_tasks, chat_id
+            )
+        except Exception:
+            _log.warning(
+                "auto-dispatch: committable scan failed for %s", chat_id, exc_info=True
+            )
+            continue
+        if committable:
+            _log.info(
+                "auto-dispatch: reconcile — chat %s has %d commit-ready task(s) "
+                "for master %s",
+                chat_id, len(committable), master_id[:8],
+            )
+            await _maybe_wake_idle_master(master_id, 0, committable)
 
 
 async def _emit_dispatch_proposal(
@@ -579,6 +642,13 @@ async def auto_dispatch_sweep() -> None:
     if not _env_auto_dispatch_enabled():
         return
 
+    # Per-chat commit-ready reconcile FIRST. It resolves each live chat's master
+    # from that chat's own member_roles, so it fires even when the global resolver
+    # below aborts on cross-roster ambiguity (the bug that silently disabled the
+    # whole sweep once >1 roster had ever existed). This is the muther GAP #1 F3
+    # backstop and must not be gated behind the global master resolution.
+    await _reconcile_commit_ready()
+
     try:
         from khimaira.monitor.roster_recovery import _resolve_session_for_role
 
@@ -587,7 +657,7 @@ async def auto_dispatch_sweep() -> None:
             None, _resolve_session_for_role, "master"
         )
         if not master_id:
-            _log.debug("auto-dispatch: no master session found, skipping sweep")
+            _log.debug("auto-dispatch: no global master (dispatch flow skipped)")
             return
 
         # Fetch backlog + available agents concurrently
@@ -595,51 +665,34 @@ async def auto_dispatch_sweep() -> None:
         agents_fut = loop.run_in_executor(None, _get_available_agents)
         backlog, available = await asyncio.gather(backlog_fut, agents_fut)
 
-        # Commit-ready tasks (reviewed, awaiting master commit) are owed work even
-        # when there's nothing left to DISPATCH — so compute them BEFORE the
-        # dispatch-backlog early-return. The old `if not backlog: return` skipped
-        # the master-wake entirely on a roster whose only owed work was commits,
-        # which is exactly the muther GAP #1 stranding (F3).
-        committable = await loop.run_in_executor(
-            None, _get_committable_tasks, master_id
-        )
-
-        if not backlog and not committable:
-            _log.debug("auto-dispatch: no backlog or commit-ready tasks, sweep done")
+        if not backlog:
+            _log.debug("auto-dispatch: no backlog tasks, sweep done")
             _PENDING_PROPOSALS.clear()
             return
 
-        if backlog:
-            _log.debug(
-                "auto-dispatch: backlog=%d task(s), available=%d agent(s), "
-                "commit_ready=%d",
-                len(backlog), len(available), len(committable),
-            )
+        _log.debug(
+            "auto-dispatch: backlog=%d task(s), available=%d agent(s)",
+            len(backlog), len(available),
+        )
 
-            # Step 1: handle TTL expirations for existing proposals
-            backlog_by_id = {t["task_id"]: t for t in backlog}
-            for task_id, proposal in list(_PENDING_PROPOSALS.items()):
-                if task_id not in backlog_by_id:
-                    # Task completed, cancelled, or moved out of backlog — prune
-                    _PENDING_PROPOSALS.pop(task_id, None)
-                    continue
-                if _proposal_expired(proposal):
-                    await _handle_ttl_expiry(
-                        master_id, backlog_by_id[task_id], proposal
-                    )
+        # Step 1: handle TTL expirations for existing proposals
+        backlog_by_id = {t["task_id"]: t for t in backlog}
+        for task_id, proposal in list(_PENDING_PROPOSALS.items()):
+            if task_id not in backlog_by_id:
+                # Task completed, cancelled, or moved out of backlog — prune
+                _PENDING_PROPOSALS.pop(task_id, None)
+                continue
+            if _proposal_expired(proposal):
+                await _handle_ttl_expiry(master_id, backlog_by_id[task_id], proposal)
 
-            # Step 2: rank and emit new proposals
-            pairs = _rank_task_agent_pairs(backlog, available)
-            for task, agent in pairs:
-                await _emit_dispatch_proposal(master_id, task, agent)
-        else:
-            # No dispatch work — but commit-ready tasks remain. Drop stale proposals.
-            _PENDING_PROPOSALS.clear()
+        # Step 2: rank and emit new proposals
+        pairs = _rank_task_agent_pairs(backlog, available)
+        for task, agent in pairs:
+            await _emit_dispatch_proposal(master_id, task, agent)
 
-        # Step 3: if owed work remains (dispatch backlog OR commit-ready) and the
-        # master is idle, WAKE it to drive (proposals/notices are inert against an
-        # idle master — the IDLE-ROSTER BLINDNESS gap).
-        await _maybe_wake_idle_master(master_id, len(backlog), committable)
+        # Step 3: if dispatch backlog remains undispatched and the master is idle,
+        # WAKE it to drive. (Commit-ready owed work is handled per-chat above.)
+        await _maybe_wake_idle_master(master_id, len(backlog))
 
     except Exception as exc:
         _log.warning("auto-dispatch: sweep error: %s", exc)

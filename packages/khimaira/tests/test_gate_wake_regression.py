@@ -179,3 +179,81 @@ def test_no_window_logs_reason(patched_worker, caplog):
         chats._dispatch_wake_worker("x", "nonexistent", "msg", role_hint="nope")
     assert injected == []
     assert any("wake skipped" in r.message or "no window" in r.message for r in caplog.records)
+
+
+# ----------------------------------------------------------- per-chat resolver
+# The global _resolve_session_for_role("master") aborts once >1 session has ever
+# held master (27-way ambiguity in the wild), silently disabling the whole sweep.
+# Per-chat resolution + a liveness filter must dodge that.
+
+def test_active_chat_masters_per_chat_no_global_abort(tmp_path, monkeypatch):
+    from khimaira.monitor import auto_dispatch as ad
+    from khimaira.monitor import chats as chats_mod
+    from khimaira.monitor import sessions as sessions_mod
+
+    (tmp_path / "chat-aaa.jsonl").write_text("{}")
+    (tmp_path / "chat-bbb.jsonl").write_text("{}")
+    monkeypatch.setattr(chats_mod, "_chat_dir", lambda: tmp_path)
+    rooms = {
+        "chat-aaa": {"meta": {"member_roles": {"m-live": "master", "a1": "agent"}}},
+        "chat-bbb": {"meta": {"member_roles": {"m-dead": "master"}}},
+    }
+    monkeypatch.setattr(chats_mod, "load_room", lambda cid: rooms[cid])
+    idle = {"m-live": 100.0, "m-dead": 999999.0}  # m-dead beyond live window
+    monkeypatch.setattr(
+        sessions_mod, "summary", lambda sid: {"last_active_age_s": idle.get(sid, 1e9)}
+    )
+    # TWO masters across chats — the global resolver would abort; per-chat resolves
+    # each, and the liveness filter drops the dead one.
+    assert ad._active_chat_masters() == [("chat-aaa", "m-live")]
+
+
+def test_active_chat_masters_dedups_same_master(tmp_path, monkeypatch):
+    from khimaira.monitor import auto_dispatch as ad
+    from khimaira.monitor import chats as chats_mod
+    from khimaira.monitor import sessions as sessions_mod
+
+    (tmp_path / "chat-aaa.jsonl").write_text("{}")
+    (tmp_path / "chat-bbb.jsonl").write_text("{}")
+    monkeypatch.setattr(chats_mod, "_chat_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        chats_mod, "load_room",
+        lambda cid: {"meta": {"member_roles": {"m": "master"}}},
+    )
+    monkeypatch.setattr(sessions_mod, "summary", lambda sid: {"last_active_age_s": 50.0})
+    # one live master in two chats → woken once, first chat wins
+    assert ad._active_chat_masters() == [("chat-aaa", "m")]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_wakes_per_chat_master(monkeypatch):
+    from khimaira.monitor import auto_dispatch as ad
+    from khimaira.monitor import chats as chats_mod
+
+    monkeypatch.setattr(ad, "_active_chat_masters", lambda: [("chat-x", "master-1")])
+    monkeypatch.setattr(chats_mod, "committable_gate_tasks", lambda cid: ["t1", "t2"])
+    calls = []
+
+    async def fake_wake(mid, owed, committable=None):
+        calls.append((mid, owed, committable))
+
+    monkeypatch.setattr(ad, "_maybe_wake_idle_master", fake_wake)
+    await ad._reconcile_commit_ready()
+    assert calls == [("master-1", 0, ["t1", "t2"])]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_chat_with_no_committable(monkeypatch):
+    from khimaira.monitor import auto_dispatch as ad
+    from khimaira.monitor import chats as chats_mod
+
+    monkeypatch.setattr(ad, "_active_chat_masters", lambda: [("chat-x", "master-1")])
+    monkeypatch.setattr(chats_mod, "committable_gate_tasks", lambda cid: [])
+    called = []
+
+    async def fake_wake(*a, **k):
+        called.append(a)
+
+    monkeypatch.setattr(ad, "_maybe_wake_idle_master", fake_wake)
+    await ad._reconcile_commit_ready()
+    assert called == [], "no committable → no wake"
