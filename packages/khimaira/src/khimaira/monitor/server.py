@@ -571,12 +571,20 @@ def serve(*, port: int = DEFAULT_PORT, host: str = DEFAULT_HOST) -> None:
     # to override the host (defense against accidental 0.0.0.0).
     os.environ.pop("UVICORN_HOST", None)
 
-    # #18 deep-dive knob (default "auto" = unchanged prod behavior, picks uvloop
-    # if installed). Set KHIMAIRA_UVICORN_LOOP=asyncio to force the stdlib loop —
-    # the decisive test for whether the auto_dispatch freeze is uvloop-specific.
-    # Wakes under asyncio → uvloop is the culprit; still frozen → introspect
-    # loop._scheduled (which uvloop, being a C extension, doesn't expose).
-    loop = os.environ.get("KHIMAIRA_UVICORN_LOOP", "auto")
+    # #18 FIX: default the event loop to stdlib asyncio, NOT uvloop. uvloop is a
+    # NECESSARY condition for the auto_dispatch_loop freeze — proven audit-grade by
+    # a prod loop-swap (same daemon/state/code; uvloop→asyncio flipped auto_dispatch
+    # from frozen to healthy). uvloop's libuv timer heap orphans auto_dispatch_loop's
+    # first sleep timer under a prod-specific co-factor; stdlib is immune, and the
+    # throughput delta is negligible for this I/O-light local daemon. Override with
+    # KHIMAIRA_UVICORN_LOOP=uvloop only to reproduce the freeze for mechanism work.
+    # See tasks/issue-18-auto-dispatch-freeze/CHARACTERIZATION.md.
+    loop = os.environ.get("KHIMAIRA_UVICORN_LOOP", "asyncio")
+    import logging as _logging
+
+    _logging.getLogger("khimaira.monitor.server").info(
+        "serve: event loop=%s, port=%d", loop, port
+    )
 
     uvicorn.run(
         app, host=host, port=port, log_level="info", access_log=False, loop=loop
