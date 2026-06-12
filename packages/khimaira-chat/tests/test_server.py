@@ -977,3 +977,40 @@ class TestCompactionReslot:
 
         # Must not raise
         srv._maybe_reslot("fail-session")
+
+
+# ---------------------------------------------------------------------------
+# task_verdict routes to non-authors (master sees verdicts land in-context)
+# Until 2026-06-12 the router dropped task_verdict ("all other kinds → skip"),
+# so the master never saw a verdict and dual-verdict-complete commits stalled.
+# ---------------------------------------------------------------------------
+
+
+def test_task_verdict_by_other_emits():
+    record = {
+        "kind": "task_verdict",
+        "chat_id": "chat-1",
+        "task_id": "task-abc",
+        "verdict": "ship",
+        "by_session_id": OTHER_SID,
+        "by_name": "verifier-1",
+    }
+    decision = _route_record(record, MY_SID)
+    assert decision is not None
+    content, meta = decision
+    assert "task-abc" in content
+    assert "ship" in content
+    assert meta["kind"] == "task_verdict"
+    assert meta["verdict"] == "ship"
+
+
+def test_task_verdict_skipped_for_author():
+    record = {
+        "kind": "task_verdict",
+        "chat_id": "chat-1",
+        "task_id": "task-abc",
+        "verdict": "approve",
+        "by_session_id": MY_SID,
+        "by_name": "me",
+    }
+    assert _route_record(record, MY_SID) is None

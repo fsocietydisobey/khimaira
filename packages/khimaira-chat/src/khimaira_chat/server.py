@@ -582,6 +582,29 @@ def _route_record(record: dict[str, Any], my_session_id: str) -> tuple[str, dict
         }
         return content, meta
 
+    if kind == "task_verdict":
+        # B3 gate verdicts (critic approve/changes, verifier ship/hold). The
+        # daemon broadcasts these to every member, but until now this router
+        # dropped them ("all other kinds → skip") — so the MASTER never saw a
+        # verdict land in-context and dual-verdict-complete commits stalled until
+        # a manual poll (muther 2026-06-12). Emit like task_update: everyone but
+        # the reviewer who filed it sees it (covers master-sees-dual-verdict).
+        by_session_id = record.get("by_session_id")
+        if by_session_id == my_session_id:
+            return None  # the reviewer doesn't need their own verdict echoed
+        task_id = record.get("task_id", "")
+        by_name = record.get("by_name") or by_session_id or ""
+        verdict = record.get("verdict", "")
+        content = f"⚖️ verdict on task {task_id}: {verdict} (by {by_name})"
+        meta = {
+            "chat_id": str(record.get("chat_id", "")),
+            "kind": "task_verdict",
+            "task_id": str(task_id),
+            "verdict": str(verdict),
+            "sender": str(by_name),
+        }
+        return content, meta
+
     if kind == "task_signal":
         by_session_id = record.get("by_session_id")
         if by_session_id == my_session_id:
