@@ -437,6 +437,12 @@ def _active_chat_masters() -> list[tuple[str, str]]:
         master_id = next((s for s, r in member_roles.items() if r == "master"), None)
         if not master_id or master_id in seen:
             continue
+        # #18: skip masters whose session dir no longer exists. A reaped/dead
+        # master can't be woken anyway, and resolving a dead UUID forces
+        # resolve_session_id's tier-4 all-chat re-parse (the read-amplification
+        # that starved the sweep). Live masters keep their fast tier-1 path.
+        if not (sessions_mod._BASE_DIR / master_id).is_dir():
+            continue
         try:
             summ = sessions_mod.summary(master_id)
             idle_s = float((summ or {}).get("last_active_age_s") or 1e9)

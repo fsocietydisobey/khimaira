@@ -420,7 +420,98 @@ def active_roster_member_ids(
     return member_ids
 
 
+# #18 perf: _compute_active_roster_for_resolution re-reads + JSON-parses EVERY
+# chat file on every call. resolve_session_id tier-4 reaches it for any UUID
+# that misses tier-1 (e.g. dead/reaped master UUIDs still in chat member_roles),
+# and hot callers (auto_dispatch reconcile) resolve ~N masters per pass →
+# O(N × all-chat-bytes) re-parse storm. Cache the result, keyed by
+# (active_window_s, chat-dir signature) and bounded by a short TTL, so repeated
+# resolves in one pass share a single computation.
+_ROSTER_RESOLUTION_TTL = float(
+    os.environ.get("KHIMAIRA_ROSTER_RESOLUTION_TTL_S", "2.0")  # safety-net TTL ceiling
+)
+# (cached_at, key=(active_window_s, chat_dir_signature), result)
+_roster_resolution_cache: tuple[float, tuple, tuple[set[str], bool]] | None = None
+_roster_resolution_lock = None  # lazy init to avoid threading import on cold path
+
+
+def _chat_dir_signature() -> tuple | None:
+    """stat-only fingerprint (count, max_mtime, total_size) of the chat dir.
+
+    Invalidates the roster-resolution cache the instant ANY chat file is
+    added/removed/appended — so a membership change (create_room/accept) is
+    reflected immediately rather than masked for the TTL (which would let
+    resolve_session_id miss an ambiguity abort). stat-only: no read/parse, so
+    it stays O(chats)-stat, not O(chat-bytes)-read. Returns None on error →
+    caller falls back to never-cache (safe).
+    """
+    try:
+        from khimaira.monitor import chats as _chats_mod  # noqa: PLC0415
+
+        chat_dir = _chats_mod._chat_dir()
+        if not chat_dir.exists():
+            return (0, 0.0, 0)
+        count = 0
+        max_mtime = 0.0
+        total_size = 0
+        for p in chat_dir.glob("chat-*.jsonl"):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            count += 1
+            total_size += st.st_size
+            if st.st_mtime > max_mtime:
+                max_mtime = st.st_mtime
+        return (count, max_mtime, total_size)
+    except Exception:
+        return None
+
+
 def _active_roster_for_resolution(
+    active_window_s: float | None = None,
+) -> tuple[set[str], bool]:
+    """Cached wrapper around _compute_active_roster_for_resolution (#18).
+
+    Caches (member_ids, had_error), keyed by (active_window_s, chat-dir
+    signature) and bounded by _ROSTER_RESOLUTION_TTL. The signature key makes
+    the cache CORRECT (any chat change → recompute), while collapsing the
+    repeated full-chat re-parse that a single resolve-heavy pass (auto_dispatch
+    reconcile, #18) would otherwise trigger.
+    """
+    global _roster_resolution_cache, _roster_resolution_lock
+
+    if active_window_s is None:
+        active_window_s = _ROSTER_ACTIVE_CHAT_WINDOW_S
+
+    sig = _chat_dir_signature()
+    key = (active_window_s, sig)
+
+    cache = _roster_resolution_cache
+    if cache is not None and sig is not None:
+        cached_at, cached_key, cached_result = cache
+        if cached_key == key and time.time() - cached_at < _ROSTER_RESOLUTION_TTL:
+            return cached_result
+
+    if _roster_resolution_lock is None:
+        import threading
+
+        _roster_resolution_lock = threading.Lock()
+
+    with _roster_resolution_lock:
+        # Double-check after acquiring — another thread may have refreshed.
+        cache = _roster_resolution_cache
+        if cache is not None and sig is not None:
+            cached_at, cached_key, cached_result = cache
+            if cached_key == key and time.time() - cached_at < _ROSTER_RESOLUTION_TTL:
+                return cached_result
+        result = _compute_active_roster_for_resolution(active_window_s)
+        if sig is not None:  # only cache when we have a valid signature to key on
+            _roster_resolution_cache = (time.time(), key, result)
+        return result
+
+
+def _compute_active_roster_for_resolution(
     active_window_s: float | None = None,
 ) -> tuple[set[str], bool]:
     """Like active_roster_member_ids but exposes the error flag for P2 resolution.

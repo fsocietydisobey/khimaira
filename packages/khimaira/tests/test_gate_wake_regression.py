@@ -203,6 +203,14 @@ def test_active_chat_masters_per_chat_no_global_abort(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sessions_mod, "summary", lambda sid: {"last_active_age_s": idle.get(sid, 1e9)}
     )
+    # #18 guard: a live master has a session dir on disk. Create both so the
+    # dir-exists guard passes for each — m-dead is then dropped by the LIVENESS
+    # filter (the behavior under test), not by the guard.
+    sess_dir = tmp_path / "sessions"
+    sess_dir.mkdir()
+    for mid in ("m-live", "m-dead"):
+        (sess_dir / mid).mkdir()
+    monkeypatch.setattr(sessions_mod, "_BASE_DIR", sess_dir)
     # TWO masters across chats — the global resolver would abort; per-chat resolves
     # each, and the liveness filter drops the dead one.
     assert ad._active_chat_masters() == [("chat-aaa", "m-live")]
@@ -221,6 +229,10 @@ def test_active_chat_masters_dedups_same_master(tmp_path, monkeypatch):
         lambda cid: {"meta": {"member_roles": {"m": "master"}}},
     )
     monkeypatch.setattr(sessions_mod, "summary", lambda sid: {"last_active_age_s": 50.0})
+    sess_dir = tmp_path / "sessions"
+    sess_dir.mkdir()
+    (sess_dir / "m").mkdir()  # #18 guard: live master must have a session dir
+    monkeypatch.setattr(sessions_mod, "_BASE_DIR", sess_dir)
     # one live master in two chats → woken once, first chat wins
     assert ad._active_chat_masters() == [("chat-aaa", "m")]
 

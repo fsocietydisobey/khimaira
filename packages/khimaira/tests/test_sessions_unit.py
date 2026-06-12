@@ -1589,3 +1589,55 @@ class TestAutoRetirePrior:
             "revoked sid must not appear in list_sessions — alive-guard would "
             "skip it (retired-intentionally ≠ dark-stall)"
         )
+
+
+# ---------------------------------------------------------------------------
+# #18 — _active_roster_for_resolution caching (read-amplification fix)
+# ---------------------------------------------------------------------------
+
+
+def test_active_roster_for_resolution_caches_within_ttl(monkeypatch):
+    """The (member_ids, had_error) computation re-parses EVERY chat file; it
+    MUST be cached so repeated resolves in one sweep share a single computation
+    (#18 storm fix) — but it MUST recompute the instant the chat-dir signature
+    changes (so a membership change can't be masked) and after the TTL ceiling."""
+    import khimaira.monitor.sessions as s
+
+    # Reset module-level cache state for a clean, deterministic run.
+    s._roster_resolution_cache = None
+    s._roster_resolution_lock = None
+
+    clock = {"t": 1_000.0}
+    sig = {"v": ("sig", 1, 100)}
+    monkeypatch.setattr(s.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(s, "_chat_dir_signature", lambda: sig["v"])
+
+    calls = {"n": 0}
+
+    def fake_compute(window):
+        calls["n"] += 1
+        return {f"sid-{calls['n']}"}, False
+
+    monkeypatch.setattr(s, "_compute_active_roster_for_resolution", fake_compute)
+
+    # 1) Stable signature, within TTL → compute runs exactly once.
+    first = s._active_roster_for_resolution()
+    for _ in range(4):
+        assert s._active_roster_for_resolution() == first
+    assert calls["n"] == 1, "compute must run once for a stable chat dir within TTL"
+
+    # 2) CORRECTNESS: signature change (a chat file added/changed) → recompute
+    #    NOW, even though we're still within the TTL window.
+    sig["v"] = ("sig", 2, 200)
+    changed = s._active_roster_for_resolution()
+    assert calls["n"] == 2, "signature change must invalidate the cache immediately"
+    assert changed != first
+
+    # 3) Stable sig again but past the TTL ceiling → recompute (safety net).
+    clock["t"] += s._ROSTER_RESOLUTION_TTL + 1.0
+    s._active_roster_for_resolution()
+    assert calls["n"] == 3, "compute must re-run after the TTL expires"
+
+    # cleanup so module-level cache doesn't leak into other tests
+    s._roster_resolution_cache = None
+    s._roster_resolution_lock = None

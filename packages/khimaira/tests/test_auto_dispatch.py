@@ -574,3 +574,57 @@ class TestAutoDispatchSweep:
 
         assert notices == []
         monkeypatch.delenv("KHIMAIRA_AUTO_DISPATCH")
+
+
+# ---------------------------------------------------------------------------
+# #18 — _active_chat_masters dead-UUID guard (read-amplification fix)
+# ---------------------------------------------------------------------------
+
+class TestActiveChatMastersDeadUUIDGuard:
+    """A master whose session dir no longer exists must be skipped BEFORE
+    summary() — resolving a dead UUID forces resolve_session_id's tier-4
+    all-chat re-parse (the #18 read storm that starved the sweep)."""
+
+    def test_skips_no_dir_master_before_summary(self, tmp_path, monkeypatch):
+        import khimaira.monitor.chats as chats_mod
+        import khimaira.monitor.sessions as sessions_mod
+
+        chat_dir = tmp_path / "chats"
+        chat_dir.mkdir()
+        (chat_dir / "chat-dead.jsonl").write_text("")
+        (chat_dir / "chat-live.jsonl").write_text("")
+
+        dead_master = "deadbeef-0000-4000-8000-000000000001"
+        live_master = "5ec0ffee-0000-4000-8000-000000000002"
+
+        # Only the live master has a session dir on disk.
+        base = tmp_path / "sessions"
+        base.mkdir()
+        (base / live_master).mkdir()
+
+        def fake_load_room(chat_id):
+            m = dead_master if chat_id == "chat-dead" else live_master
+            return {"meta": {"member_roles": {m: "master"}}, "members": {}, "messages": []}
+
+        summary_calls: list[str] = []
+
+        def fake_summary(sid):
+            summary_calls.append(sid)
+            return {"last_active_age_s": 10.0}
+
+        monkeypatch.setattr(sessions_mod, "_BASE_DIR", base)
+        monkeypatch.setattr(sessions_mod, "summary", fake_summary)
+
+        with (
+            patch.object(chats_mod, "_chat_dir", return_value=chat_dir),
+            patch.object(chats_mod, "load_room", side_effect=fake_load_room),
+        ):
+            result = ad._active_chat_masters()
+
+        masters = {mid for _cid, mid in result}
+        assert live_master in masters, "live master must be included"
+        assert dead_master not in masters, "dead master must be excluded"
+        # The storm-causing call: summary() must NEVER run for the dead UUID.
+        assert summary_calls == [live_master], (
+            f"summary() must only run for the live master, got {summary_calls}"
+        )
