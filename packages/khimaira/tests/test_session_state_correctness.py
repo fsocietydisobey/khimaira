@@ -224,3 +224,79 @@ def test_heartbeat_fires_for_non_file_edit_tools(isolated_state, monkeypatch):
                     f"tool_name conditional at line {back_idx + 1}: {ln.strip()}"
                 )
                 break
+
+
+# ---------------------------------------------------------------------------
+# Busy-status staleness tier (muther GAP symptom 1, 2026-06-12) — a quiet
+# 'researching'/'blocked' must not read as busy and make master conclude
+# "no free executor". Direct unit tests of _compute_effective_status are
+# deterministic (synthetic last_tool_call_ts), no sleeps.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def busy_stale_thresholds(monkeypatch: pytest.MonkeyPatch):
+    # busy-stale fires at 1s; unreachable far away so we isolate the new tier
+    monkeypatch.setenv("KHIMAIRA_BUSY_STALE_S", "1")
+    monkeypatch.setenv("KHIMAIRA_DEMOTE_THRESHOLD_S", "100")
+    yield
+
+
+def test_active_work_status_stale_reads_idle(busy_stale_thresholds):
+    from khimaira.monitor.sessions import _compute_effective_status
+
+    old = time.time() - 5  # quiet 5s: past busy-stale(1), before unreachable(100)
+    out = _compute_effective_status({"status": "researching"}, old)
+    assert out["effective_status"] == "idle"
+    assert out["status_stale"] is True
+    assert out["status_inactive_s"] >= 1
+    assert out["status"] == "researching"  # raw label preserved
+
+
+def test_waiting_status_stale_flagged_not_idle(busy_stale_thresholds):
+    from khimaira.monitor.sessions import _compute_effective_status
+
+    old = time.time() - 5
+    out = _compute_effective_status({"status": "blocked"}, old)
+    # waiting state: flagged stale but NOT rewritten to idle (a real block
+    # shouldn't read as free)
+    assert out["status_stale"] is True
+    assert out["effective_status"] == "blocked"
+
+
+def test_fresh_busy_status_is_trusted(busy_stale_thresholds):
+    from khimaira.monitor.sessions import _compute_effective_status
+
+    out = _compute_effective_status({"status": "researching"}, time.time())
+    assert out["effective_status"] == "researching"
+    assert out.get("status_stale") in (None, False)
+
+
+def test_idle_status_unaffected_by_stale_tier(busy_stale_thresholds):
+    from khimaira.monitor.sessions import _compute_effective_status
+
+    out = _compute_effective_status({"status": "idle"}, time.time() - 5)
+    assert out["effective_status"] == "idle"
+    assert out.get("status_stale") in (None, False)  # 'idle' isn't a busy label
+
+
+def test_unreachable_still_wins_over_busy_stale(monkeypatch):
+    # regression: very long silence → unreachable, not just 'idle'
+    monkeypatch.setenv("KHIMAIRA_BUSY_STALE_S", "1")
+    monkeypatch.setenv("KHIMAIRA_DEMOTE_THRESHOLD_S", "2")
+    from khimaira.monitor.sessions import _compute_effective_status
+
+    out = _compute_effective_status({"status": "researching"}, time.time() - 10)
+    assert out["effective_status"] == "unreachable"
+
+
+def test_summary_surfaces_effective_status(isolated_state, busy_stale_thresholds):
+    from khimaira.monitor.sessions import set_status, summary
+
+    sid = "test-busy-stale-summary"
+    isolated_state._session_dir(sid).mkdir(exist_ok=True, parents=True)
+    set_status(sid, "researching")
+    time.sleep(1.5)  # past busy-stale(1)
+    s = summary(sid)
+    assert s["effective_status"] == "idle"
+    assert s["status_stale"] is True

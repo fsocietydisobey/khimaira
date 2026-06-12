@@ -1493,19 +1493,37 @@ _USABLE_STATUSES = frozenset(
 )
 
 
+# Status strings that imply the session is ACTIVELY computing. If one of these
+# is set but the session has gone quiet (no heartbeat/tool activity) past the
+# busy-stale window, the label is stale — the session finished and went idle
+# without updating it. We surface that so master doesn't read a stale
+# 'researching' as "no free executor" (muther GAP symptom 1, 2026-06-12).
+_ACTIVE_WORK_STATUSES = frozenset(
+    {"researching", "implementing", "debugging", "working", "reviewing", "in_progress"}
+)
+# Waiting states are legitimately idle-but-not-free; flag staleness but DON'T
+# rewrite to 'idle' (a real block shouldn't read as available).
+_WAITING_STATUSES = frozenset({"blocked", "awaiting-review", "awaiting_review"})
+
+
 def _compute_effective_status(
     status: dict | None, last_tool_call_ts: float | None
 ) -> dict:
     """Return status dict with `effective_status` field added.
 
-    Reads KHIMAIRA_DEMOTE_THRESHOLD_S at call time (not module-level) so
-    test fixtures can monkeypatch the env var without needing importlib.reload.
+    Reads thresholds at call time (not module-level) so test fixtures can
+    monkeypatch env vars without importlib.reload.
 
-    effective_status == status["status"] when subscriber is alive
-    (last_sse_heartbeat OR last_tool_call within threshold). Otherwise
-    effective_status = "unreachable" + adds `demoted_at` + `demoted_reason`.
+    Three tiers, by time since the last heartbeat/tool activity:
+      - alive + fresh         → effective_status == raw status (trust it)
+      - busy label, gone quiet > KHIMAIRA_BUSY_STALE_S (default 150s) → status
+        is stale: add `status_stale` + `status_inactive_s`; for ACTIVE-WORK
+        labels also set effective_status='idle' (it's not actually working);
+        WAITING labels keep their label but are flagged.
+      - silent > KHIMAIRA_DEMOTE_THRESHOLD_S (default 20m) → 'unreachable'.
     """
     demote_threshold_s = int(os.environ.get("KHIMAIRA_DEMOTE_THRESHOLD_S", 20 * 60))
+    busy_stale_s = int(os.environ.get("KHIMAIRA_BUSY_STALE_S", 150))
 
     if not isinstance(status, dict):
         return {"effective_status": "unknown"}
@@ -1527,13 +1545,24 @@ def _compute_effective_status(
 
     candidates = [ts for ts in (last_hb_ts, last_tool_call_ts) if ts is not None]
     most_recent: float | None = max(candidates) if candidates else None
+    inactive_s = (now - most_recent) if most_recent is not None else None
 
-    if most_recent is None or (now - most_recent) > demote_threshold_s:
+    if most_recent is None or (inactive_s is not None and inactive_s > demote_threshold_s):
         out["effective_status"] = "unreachable"
         out["demoted_at"] = _now_iso()
         out["demoted_reason"] = (
             f"no SSE heartbeat or tool activity in last {demote_threshold_s}s"
         )
+    elif (
+        inactive_s is not None
+        and inactive_s > busy_stale_s
+        and raw_status in (_ACTIVE_WORK_STATUSES | _WAITING_STATUSES)
+    ):
+        out["status_stale"] = True
+        out["status_inactive_s"] = int(inactive_s)
+        if raw_status in _ACTIVE_WORK_STATUSES:
+            # not actually computing — let master see it as free
+            out["effective_status"] = "idle"
     return out
 
 
@@ -1616,11 +1645,17 @@ def summary(session_id: str) -> dict:
     questions = _read_jsonl(sd / "questions.jsonl")
     open_question_count = sum(1 for q in questions if q.get("status") == "open")
     status_path = sd / "status.json"
-    status = json.loads(status_path.read_text()) if status_path.exists() else None
+    status_raw = json.loads(status_path.read_text()) if status_path.exists() else None
+    # Apply staleness so a quiet 'researching'/'blocked' doesn't read as busy
+    # (muther GAP symptom 1). last_mtime is the most-recent activity timestamp.
+    # Preserve None when there's no status.json (don't synthesize a dict).
+    status = _compute_effective_status(status_raw, last_mtime or None) if status_raw else None
 
     return {
         "session_id": session_id,
         "status": status,
+        "effective_status": status.get("effective_status") if status else None,
+        "status_stale": status.get("status_stale", False) if status else False,
         "decision_count": decision_count,
         "file_touch_count": file_touch_count,
         "open_question_count": open_question_count,
