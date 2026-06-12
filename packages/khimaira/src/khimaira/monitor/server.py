@@ -267,6 +267,70 @@ def build_app():
 
         _spawn(_taskdump())
 
+    # DEBUG (#18 canary, gated): the auto_dispatch sleep-loop freezes on the live
+    # daemon (uvloop timer never fires) but NOT in any lab repro (load/SSE-churn
+    # ruled out). This spawns two control loops at auto_dispatch's interval —
+    # an asyncio.sleep loop and a loop.call_later self-rescheduler — at the same
+    # startup position, to discriminate the freeze in the REAL env:
+    #   sleep silent + call_later ticks  -> task-wakeup timer orphaned; fix=call_later/piggyback
+    #   sleep ticks  (auto_dispatch dead)-> specific to the auto_dispatch coroutine
+    #   both tick                        -> auto_dispatch-coro-specific, dig there
+    # Enable: KHIMAIRA_DEBUG_CANARY=1 (pair with KHIMAIRA_AUTO_DISPATCH_S=5 for
+    # speed). Grep monitor.log for "CANARY". Remove after #18 is root-caused.
+    @app.on_event("startup")
+    async def _start_debug_canary() -> None:
+        if os.environ.get("KHIMAIRA_DEBUG_CANARY") != "1":
+            return
+        import logging as _logging
+
+        from . import auto_dispatch as _ad
+
+        log = _logging.getLogger("khimaira.monitor.canary")
+        interval = _ad._AUTO_DISPATCH_INTERVAL_S
+        log.warning("CANARY armed (interval=%.0fs, same position as auto_dispatch)", interval)
+
+        # A — bare sleep loop (matches roster_recovery's structure; should fire).
+        async def _canary_a_bare() -> None:
+            n = 0
+            while True:
+                await asyncio.sleep(interval)
+                n += 1
+                log.warning("CANARY-A bare-sleep tick %d", n)
+
+        # B — sleep loop wrapped in auto_dispatch_loop's EXACT outer structure
+        # (try / except CancelledError: raise / except BaseException) with a no-op
+        # inner sweep. This is the lone structural difference vs the firing loops.
+        # B freezes + A fires  -> the try/except-around-await IS the trigger
+        #                         (and rules out pure singleton: B is a distinct coro).
+        # B fires              -> not the structure; it's auto_dispatch identity/sweep.
+        async def _canary_b_trywrap() -> None:
+            n = 0
+            try:
+                while True:
+                    await asyncio.sleep(interval)
+                    n += 1
+                    log.warning("CANARY-B trywrap-sleep tick %d", n)
+                    try:
+                        pass  # no-op stand-in for auto_dispatch_sweep()
+                    except Exception:  # noqa: BLE001
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001
+                log.error("CANARY-B trywrap EXITED via %s: %s", type(exc).__name__, exc)
+                raise
+
+        # D — loop.call_later self-rescheduler (loop-level timer, not task-suspended).
+        def _canary_d_call_later(loop, box) -> None:
+            box[0] += 1
+            log.warning("CANARY-D call_later tick %d", box[0])
+            loop.call_later(interval, _canary_d_call_later, loop, box)
+
+        _spawn(_canary_a_bare())
+        _spawn(_canary_b_trywrap())
+        loop = asyncio.get_event_loop()
+        loop.call_later(interval, _canary_d_call_later, loop, [0])
+
     # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
     # Replay-on-boot recovers stuck-firing tasks; worker tick fires due tasks.
     @app.on_event("startup")

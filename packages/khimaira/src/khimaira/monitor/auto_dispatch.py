@@ -731,6 +731,13 @@ async def auto_dispatch_loop() -> None:
     try:
         while True:
             await asyncio.sleep(_AUTO_DISPATCH_INTERVAL_S)
+            # #18 canary (gated): proves the loop's sleep actually completes. If
+            # this never logs while server.py's A/B/D canaries tick, the freeze is
+            # intrinsic to THIS coroutine. Paired with a 2nd-instance spawn it forks
+            # SINGLETON (first-task-targeted) vs FUNCTION/MODULE (the coro as defined
+            # freezes anywhere). Remove with the rest of the #18 instrumentation.
+            if os.environ.get("KHIMAIRA_DEBUG_CANARY") == "1":
+                _log.warning("auto-dispatch: AD-WOKE tick")
             try:
                 await auto_dispatch_sweep()
             except Exception as exc:
