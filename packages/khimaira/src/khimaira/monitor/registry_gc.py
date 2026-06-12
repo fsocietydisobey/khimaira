@@ -37,25 +37,42 @@ log = logging.getLogger("monitor.registry_gc")
 # Tunables (env-overridable).
 _REAP_IDLE_MIN_S = float(os.environ.get("KHIMAIRA_REGISTRY_REAP_IDLE_S", "1800"))  # 30 min
 _GC_INTERVAL_S = float(os.environ.get("KHIMAIRA_REGISTRY_GC_INTERVAL_S", "600"))  # 10 min
-# DEFAULT-OFF (2026-06-12, muther symptom 2): the reap keys liveness on kitty
-# window-TITLE enumeration. When a live agent's window title ≠ its session name
-# (the recurring title-match gremlin) or kitty returns a transient empty set, the
-# reap false-positives and DELETES a live session's record — observed deleting
-# muther-agent-3 (had_decisions=True) repeatedly, dropping it from session_list
-# while its window stayed alive. Re-enable (default "1") only after the reap
-# resolves liveness by session-id/process, not fragile title-match. Opt back in
-# per-run with KHIMAIRA_REGISTRY_GC=1. Cost while off: registry bloat (cosmetic).
-_GC_ENABLED = os.environ.get("KHIMAIRA_REGISTRY_GC", "0") != "0"
+# RE-ENABLED 2026-06-12 after the muther-symptom-2 false-positive reaps were
+# fixed at the source: liveness now matches the drift-proof launch `-n` name
+# (not just the mutable window title), and a transient empty kitty result is
+# treated as can't-tell rather than reap-everything. Opt out with
+# KHIMAIRA_REGISTRY_GC=0 if a new false-positive class surfaces.
+_GC_ENABLED = os.environ.get("KHIMAIRA_REGISTRY_GC", "1") != "0"
 
 
-def _live_window_titles() -> set[str] | None:
-    """Return the set of live kitty window titles, or None if kitty is
-    UNAVAILABLE (the no-op signal — caller must reap nothing).
+def _name_from_cmdline(cmdline: list[str]) -> str | None:
+    """Extract the Claude Code session name from a `-n <name>` launch flag.
+    This is the STABLE identity: set at window launch, it never drifts the way
+    the window TITLE does. Matching on it (not just title) is what stops a live
+    agent whose title drifted from being mistaken for windowless."""
+    for i, tok in enumerate(cmdline):
+        if tok == "-n" and i + 1 < len(cmdline):
+            return (cmdline[i + 1] or "").strip() or None
+        if tok.startswith("-n") and len(tok) > 2:
+            return tok[2:].strip() or None
+        if tok.startswith("--session-name="):
+            return tok.split("=", 1)[1].strip() or None
+    return None
 
-    None vs empty-set is load-bearing: None = "can't tell" (skip the sweep);
-    empty set = "kitty answered, zero windows" (everything is genuinely
-    reapable). In practice the daemon's own observation tooling keeps at
-    least one window, but the distinction is what makes the headless case safe.
+
+def _live_window_identities() -> set[str] | None:
+    """Return the set of identities (names) that prove a LIVE window, or None if
+    kitty is UNAVAILABLE (the no-op signal — caller must reap nothing).
+
+    Each live window contributes BOTH its current title AND its launch `-n` name
+    (from the foreground process cmdline). Title-only matching false-reaped live
+    agents whose title drifted from their session name (muther symptom 2); the
+    launch name is drift-proof.
+
+    None vs empty-set is load-bearing: None = "can't tell" (skip). An empty set
+    ("kitty answered, zero windows") is treated as suspicious by the caller and
+    also skips — the daemon's own tooling keeps ≥1 window, so empty almost always
+    means a transient kitty hiccup, not a genuinely empty desktop.
     """
     try:
         from khimaira.monitor import roster_recovery as rr
@@ -70,14 +87,18 @@ def _live_window_titles() -> set[str] | None:
     except (json.JSONDecodeError, ValueError):
         return None
 
-    titles: set[str] = set()
+    names: set[str] = set()
     for os_win in data:
         for tab in os_win.get("tabs", []):
             for win in tab.get("windows", []):
                 t = (win.get("title") or "").strip()
                 if t:
-                    titles.add(t)
-    return titles
+                    names.add(t)
+                for proc in win.get("foreground_processes", []):
+                    nm = _name_from_cmdline(proc.get("cmdline") or [])
+                    if nm:
+                        names.add(nm)
+    return names
 
 
 def reap_windowless_sessions() -> dict:
@@ -90,9 +111,15 @@ def reap_windowless_sessions() -> dict:
       - it has been idle >= _REAP_IDLE_MIN_S,
       - it is not the daemon's own session (delete_session enforces this too).
     """
-    live = _live_window_titles()
+    live = _live_window_identities()
     if live is None:
         return {"reaped": 0, "skipped": "kitty-unavailable"}
+    if not live:
+        # "Zero windows" is almost always a transient kitty hiccup, not a real
+        # empty desktop (the daemon's own tooling keeps ≥1 window). Reaping the
+        # whole registry on a transient empty was a mass false-positive path —
+        # treat empty as can't-tell and skip.
+        return {"reaped": 0, "skipped": "kitty-empty-suspicious"}
 
     try:
         from khimaira.monitor import sessions as sessions_mod
