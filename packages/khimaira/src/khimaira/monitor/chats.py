@@ -1689,42 +1689,75 @@ _DEFAULT_DISPATCH_WAKE_MSG = (
 
 
 def _dispatch_wake_worker(
-    target_id: str, target_name: str, message: str | None = None
+    target_id: str,
+    target_name: str,
+    message: str | None = None,
+    *,
+    cooldown_key: str | None = None,
+    role_hint: str | None = None,
 ) -> None:
     """Wake one idle target via kitty. Runs in a daemon thread so the send never
     pays the ~0.3s inject latency. Conservative: idle-only (active sessions see
-    the push), window busy-check (don't inject over a spinner), and a per-target
-    cooldown (don't re-wake on a burst). `message` overrides the default dispatch
-    text (used by the gate-complete master-wake). Fail-open.
+    the push), window busy-check (don't inject over a spinner), and a cooldown
+    (don't re-wake on a burst). `message` overrides the default dispatch text.
+
+    Observability (F1, muther GAP #1 2026-06-11): EVERY suppression path logs its
+    reason at INFO. The prior silent `return`s made a non-firing wake impossible to
+    diagnose — 12 verdicts produced zero wake lines and no clue why.
+
+    cooldown_key (F2): the cooldown dedup bucket. Defaults to target_id, but the
+    gate-complete wake passes f"{master_id}:{task_id}" so a burst of DISTINCT-task
+    completions each wakes the master instead of collapsing to the first.
+
+    role_hint (F4): prefer matching the target window by ROLE (robust — the
+    auto_dispatch master-wake does this) before falling back to the fragile exact
+    raw_name match. A session_name ≠ window-title mismatch silently killed every
+    wake before this.
     """
+    ck = cooldown_key or target_id
     try:
         now = time.time()
-        if now - _last_dispatch_wake.get(target_id, 0.0) < _DISPATCH_WAKE_COOLDOWN_S:
+        if now - _last_dispatch_wake.get(ck, 0.0) < _DISPATCH_WAKE_COOLDOWN_S:
+            log.info("chats: wake skipped — cooldown (key=%s) for %s", ck, target_name)
             return
         summ = sessions_mod.summary(target_id)
         idle_s = float((summ or {}).get("last_active_age_s") or 0)
         if idle_s < _DISPATCH_WAKE_IDLE_MIN_S:
-            return  # actively turning → it will process the push on its own
+            log.info(
+                "chats: wake skipped — target active (idle %.0fs < %ds) %s",
+                idle_s, int(_DISPATCH_WAKE_IDLE_MIN_S), target_name,
+            )
+            return
 
         from khimaira.monitor import roster_recovery as rr
 
-        win = next(
-            (w for w in rr._discover_roster_windows() if w.get("raw_name") == target_name),
-            None,
-        )
+        wins = rr._discover_roster_windows()
+        win = None
+        if role_hint:
+            win = next((w for w in wins if w.get("role") == role_hint), None)
         if win is None:
+            win = next((w for w in wins if w.get("raw_name") == target_name), None)
+        if win is None:
+            log.info(
+                "chats: wake skipped — no window for %s (name=%r role=%r, %d windows)",
+                target_id[:8], target_name, role_hint, len(wins),
+            )
             return
         wid = win["window_id"]
         screen = rr._get_screen(wid)
         if screen is not None and rr._is_busy(screen):
-            return  # mid-work — leave it
+            log.info("chats: wake skipped — window busy %s", target_name)
+            return
         if rr._inject_text_and_submit(wid, message or _DEFAULT_DISPATCH_WAKE_MSG, target_name):
-            _last_dispatch_wake[target_id] = now
+            _last_dispatch_wake[ck] = now
             log.info(
-                "chats: wake → %s (%s, idle %.0fs)", target_id[:8], target_name, idle_s
+                "chats: wake → %s (%s, idle %.0fs, key=%s)",
+                target_id[:8], target_name, idle_s, ck,
             )
+        else:
+            log.info("chats: wake FAILED — inject returned false for %s", target_name)
     except Exception:
-        log.debug("chats: wake worker failed", exc_info=True)
+        log.warning("chats: wake worker raised for %s", target_name, exc_info=True)
 
 
 def _maybe_wake_master_on_gate_complete(
@@ -1754,9 +1787,17 @@ def _maybe_wake_master_on_gate_complete(
     member_roles = (room.get("meta") or {}).get("member_roles") or {}
     master_id = next((sid for sid, r in member_roles.items() if r == ROLE_MASTER), None)
     if not master_id:
+        log.info(
+            "chats: gate-complete wake — no master in member_roles for %s (task %s)",
+            chat_id, task_id,
+        )
         return
     master_name = (room["members"].get(master_id) or {}).get("session_name")
     if not master_name:
+        log.info(
+            "chats: gate-complete wake — master %s has no session_name in %s",
+            master_id[:8], chat_id,
+        )
         return
 
     if crit == "approve" and ver == "ship":
@@ -1778,8 +1819,49 @@ def _maybe_wake_master_on_gate_complete(
     threading.Thread(
         target=_dispatch_wake_worker,
         args=(master_id, master_name, msg),
+        kwargs={"cooldown_key": f"{master_id}:{task_id}", "role_hint": ROLE_MASTER},
         daemon=True,
     ).start()
+
+
+def committable_gate_tasks(chat_id: str) -> list[str]:
+    """Task ids that are `done` with BOTH structured verdicts dual-POSITIVE
+    (critic=approve + verifier=ship) but NOT yet `approved`/`changes_requested` —
+    i.e. fully reviewed and awaiting the master's commit.
+
+    The level-triggered backstop (F3, muther GAP #1) reads this every sweep so a
+    commit-ready task can't be stranded by a missed edge-event. Excludes anything
+    the master already acted on (status moved off `done`), so the reconcile wake
+    naturally stops once committed.
+    """
+    return _committable_task_ids(load_room(chat_id))
+
+
+def _committable_task_ids(room: dict[str, Any]) -> list[str]:
+    """Pure core of committable_gate_tasks — operates on a loaded room dict so it
+    can be unit-tested without touching disk."""
+    status_by_task: dict[str, str] = {}
+    crit_by_task: dict[str, str] = {}
+    ver_by_task: dict[str, str] = {}
+    for m in room.get("messages", []):
+        k = m.get("kind")
+        if k == TASK and m.get("id"):
+            status_by_task[m["id"]] = m.get("status") or TASK_PENDING
+        elif k == TASK_UPDATE and m.get("task_id") and m.get("status"):
+            status_by_task[m["task_id"]] = m["status"]
+        elif k == TASK_VERDICT and m.get("task_id"):
+            v = m.get("verdict")
+            if v in ("approve", "changes"):
+                crit_by_task[m["task_id"]] = v
+            elif v in ("ship", "hold"):
+                ver_by_task[m["task_id"]] = v
+    return [
+        tid
+        for tid, status in status_by_task.items()
+        if status == TASK_DONE
+        and crit_by_task.get(tid) == "approve"
+        and ver_by_task.get(tid) == "ship"
+    ]
 
 
 def _auto_wake_targeted_idle(targets: list[tuple[str, str | None]]) -> None:

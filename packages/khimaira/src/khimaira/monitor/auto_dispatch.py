@@ -307,15 +307,25 @@ _MASTER_WAKE_COOLDOWN_S = float(os.environ.get("KHIMAIRA_MASTER_WAKE_COOLDOWN_S"
 _last_master_wake: dict[str, float] = {}
 
 
-async def _maybe_wake_idle_master(master_id: str, owed_count: int) -> None:
+async def _maybe_wake_idle_master(
+    master_id: str, owed_count: int, committable: list[str] | None = None
+) -> None:
     """Nudge an idle master's window to DRIVE when concrete work is owed.
 
-    Gated by owed_count>0 (the Conservative trigger — never nags on a quiet
-    roster with nothing queued), the master's own idle time (don't interrupt a
-    master mid-turn), a cooldown (don't re-wake every sweep), and a window
-    busy-check (don't inject over an active spinner). Best-effort; never raises.
+    Owed work is EITHER dispatch backlog (owed_count) OR commit-ready tasks
+    (committable: reviewed dual-positive, awaiting the master's commit). The
+    commit-ready case is the level-triggered backstop for muther GAP #1 — if the
+    edge-event wake at verdict-completion was suppressed, this catches the stranded
+    task on the next sweep. Commit-ready takes message priority since that's the
+    exact stranding observed (3 reviewed tasks sat uncommitted until manual nudge).
+
+    Gated by total-owed>0 (the Conservative trigger — never nags on a quiet
+    roster), the master's own idle time, a cooldown, and a window busy-check.
+    Best-effort; never raises.
     """
-    if not _MASTER_WAKE_ENABLED or owed_count <= 0:
+    committable = committable or []
+    total_owed = owed_count + len(committable)
+    if not _MASTER_WAKE_ENABLED or total_owed <= 0:
         return
     now = time.time()
     if now - _last_master_wake.get(master_id, 0.0) < _MASTER_WAKE_COOLDOWN_S:
@@ -346,12 +356,22 @@ async def _maybe_wake_idle_master(master_id: str, owed_count: int) -> None:
         if screen is not None and rr._is_busy(screen):
             return  # master window is mid-work — don't inject
 
-        text = (
-            f"⏰ auto-dispatch: roster idle with {owed_count} owed item(s) and no "
-            "driver. DRIVE now — call roster_progress + chat_my_chats, then dispatch "
-            "the next item (assign + BEGIN) or, if nothing is actionable, surface "
-            "'roster idle — here's what's next' to Joseph. Don't wait for an event."
-        )
+        if committable:
+            shown = ", ".join(committable[:8])
+            more = "" if len(committable) <= 8 else f" (+{len(committable) - 8} more)"
+            text = (
+                f"⏰ {len(committable)} reviewed task(s) — critic=approve + verifier=ship "
+                f"are RECORDED and awaiting your COMMIT + approve: {shown}{more}. Call "
+                "chat_my_chats + roster_progress, COMMIT each, then approve "
+                "(chat_task_update → approved). Don't wait for an event — this IS it."
+            )
+        else:
+            text = (
+                f"⏰ auto-dispatch: roster idle with {owed_count} owed item(s) and no "
+                "driver. DRIVE now — call roster_progress + chat_my_chats, then dispatch "
+                "the next item (assign + BEGIN) or, if nothing is actionable, surface "
+                "'roster idle — here's what's next' to Joseph. Don't wait for an event."
+            )
         ok = await loop.run_in_executor(
             None,
             lambda: rr._inject_text_and_submit(wid, text, master_win.get("raw_name", "")),
@@ -359,11 +379,28 @@ async def _maybe_wake_idle_master(master_id: str, owed_count: int) -> None:
         if ok:
             _last_master_wake[master_id] = now
             _log.info(
-                "auto-dispatch: woke idle master %s to drive (owed=%d, idle=%.0fs)",
-                master_id[:8], owed_count, idle_s,
+                "auto-dispatch: woke idle master %s (dispatch_owed=%d, commit_ready=%d, "
+                "idle=%.0fs)",
+                master_id[:8], owed_count, len(committable), idle_s,
             )
     except Exception:
-        _log.debug("auto-dispatch: master-wake failed", exc_info=True)
+        _log.warning("auto-dispatch: master-wake failed", exc_info=True)
+
+
+def _get_committable_tasks(master_id: str) -> list[str]:
+    """All commit-ready (reviewed dual-positive, uncommitted) task ids across the
+    master's chats. The level-triggered backstop for muther GAP #1 — independent
+    of dispatch backlog, so it fires even when there is nothing left to assign.
+    """
+    from khimaira.monitor import chats
+
+    out: list[str] = []
+    try:
+        for c in chats.my_chats(master_id):
+            out.extend(chats.committable_gate_tasks(c["chat_id"]))
+    except Exception:
+        _log.warning("auto-dispatch: committable-task scan failed", exc_info=True)
+    return out
 
 
 async def _emit_dispatch_proposal(
@@ -543,39 +580,51 @@ async def auto_dispatch_sweep() -> None:
         agents_fut = loop.run_in_executor(None, _get_available_agents)
         backlog, available = await asyncio.gather(backlog_fut, agents_fut)
 
-        if not backlog:
-            _log.debug("auto-dispatch: no backlog tasks, sweep done")
+        # Commit-ready tasks (reviewed, awaiting master commit) are owed work even
+        # when there's nothing left to DISPATCH — so compute them BEFORE the
+        # dispatch-backlog early-return. The old `if not backlog: return` skipped
+        # the master-wake entirely on a roster whose only owed work was commits,
+        # which is exactly the muther GAP #1 stranding (F3).
+        committable = await loop.run_in_executor(
+            None, _get_committable_tasks, master_id
+        )
+
+        if not backlog and not committable:
+            _log.debug("auto-dispatch: no backlog or commit-ready tasks, sweep done")
             _PENDING_PROPOSALS.clear()
             return
 
-        _log.debug(
-            "auto-dispatch: backlog=%d task(s), available=%d agent(s)",
-            len(backlog),
-            len(available),
-        )
+        if backlog:
+            _log.debug(
+                "auto-dispatch: backlog=%d task(s), available=%d agent(s), "
+                "commit_ready=%d",
+                len(backlog), len(available), len(committable),
+            )
 
-        # Step 1: handle TTL expirations for existing proposals
-        backlog_by_id = {t["task_id"]: t for t in backlog}
-        for task_id, proposal in list(_PENDING_PROPOSALS.items()):
-            if task_id not in backlog_by_id:
-                # Task completed, cancelled, or moved out of backlog — prune
-                _PENDING_PROPOSALS.pop(task_id, None)
-                continue
-            if _proposal_expired(proposal):
-                await _handle_ttl_expiry(
-                    master_id, backlog_by_id[task_id], proposal
-                )
+            # Step 1: handle TTL expirations for existing proposals
+            backlog_by_id = {t["task_id"]: t for t in backlog}
+            for task_id, proposal in list(_PENDING_PROPOSALS.items()):
+                if task_id not in backlog_by_id:
+                    # Task completed, cancelled, or moved out of backlog — prune
+                    _PENDING_PROPOSALS.pop(task_id, None)
+                    continue
+                if _proposal_expired(proposal):
+                    await _handle_ttl_expiry(
+                        master_id, backlog_by_id[task_id], proposal
+                    )
 
-        # Step 2: rank and emit new proposals
-        pairs = _rank_task_agent_pairs(backlog, available)
-        for task, agent in pairs:
-            await _emit_dispatch_proposal(master_id, task, agent)
+            # Step 2: rank and emit new proposals
+            pairs = _rank_task_agent_pairs(backlog, available)
+            for task, agent in pairs:
+                await _emit_dispatch_proposal(master_id, task, agent)
+        else:
+            # No dispatch work — but commit-ready tasks remain. Drop stale proposals.
+            _PENDING_PROPOSALS.clear()
 
-        # Step 3: if owed work remains undispatched and the master is idle,
-        # WAKE it to drive (proposals/notices are inert against an idle master —
-        # the IDLE-ROSTER BLINDNESS gap). backlog is non-empty here (early-return
-        # above), so owed_count>0 is the Conservative trigger.
-        await _maybe_wake_idle_master(master_id, len(backlog))
+        # Step 3: if owed work remains (dispatch backlog OR commit-ready) and the
+        # master is idle, WAKE it to drive (proposals/notices are inert against an
+        # idle master — the IDLE-ROSTER BLINDNESS gap).
+        await _maybe_wake_idle_master(master_id, len(backlog), committable)
 
     except Exception as exc:
         _log.warning("auto-dispatch: sweep error: %s", exc)
