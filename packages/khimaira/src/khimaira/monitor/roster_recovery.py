@@ -301,6 +301,47 @@ def _discover_roster_windows() -> list[dict[str, Any]]:
     return roster
 
 
+def _window_for_session_name(name: str) -> dict[str, Any] | None:
+    """Find ONE kitty window for session `name`, UNSCOPED by roster.
+
+    For TARGETED wakes where the exact target session is known. Unlike
+    `_discover_roster_windows()` — which is cross-project roster-scoped and
+    returns NOTHING for a session on a different roster — this searches every
+    window by name. That roster-scoping is correct for "list MY roster" but
+    wrong for "wake THIS specific session": with one daemon serving multiple
+    rosters, a gate-complete wake for another roster's master found 0 windows
+    and silently skipped (muther note-2: dual-verdict tasks never committed).
+
+    Matches the window title (stripping kitty's leading activity/bell markers
+    like "✳ " that break exact title-match) OR a `-n/-r <name>` token in the
+    window cmdline (drift-proof — set at launch).
+    """
+    raw = _kitty("ls")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    target = (name or "").strip()
+    if not target:
+        return None
+    for os_win in data:
+        for tab in os_win.get("tabs", []):
+            for win in tab.get("windows", []):
+                wid = win.get("id")
+                if wid is None:
+                    continue
+                title = (win.get("title") or "").strip()
+                title_clean = title.lstrip("✳🔔★*• ").strip()
+                cmdline = " ".join(str(c) for c in (win.get("cmdline") or []))
+                m = re.search(r"\s-(?:r|n)\s+(\S+)", cmdline)
+                cmd_name = m.group(1) if m else None
+                if target in (title, title_clean, cmd_name):
+                    return {"window_id": wid, "raw_name": target, "cmdline": cmdline}
+    return None
+
+
 def _get_screen(window_id: int) -> str | None:
     """Read current screen text for a kitty window."""
     return _kitty("get-text", f"--match=id:{window_id}")

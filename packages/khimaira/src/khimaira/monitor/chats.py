@@ -1738,8 +1738,14 @@ def _dispatch_wake_worker(
         if win is None:
             win = next((w for w in wins if w.get("raw_name") == target_name), None)
         if win is None:
+            # Cross-roster fallback: _discover_roster_windows is scoped to THIS
+            # daemon's roster, so a targeted wake for another roster's session
+            # (one daemon, many rosters) finds nothing. Look the exact session up
+            # unscoped by name (muther note-2: dual-verdict wakes hit 0 windows).
+            win = rr._window_for_session_name(target_name)
+        if win is None:
             log.info(
-                "chats: wake skipped — no window for %s (name=%r role=%r, %d windows)",
+                "chats: wake skipped — no window for %s (name=%r role=%r, %d roster windows)",
                 target_id[:8], target_name, role_hint, len(wins),
             )
             return

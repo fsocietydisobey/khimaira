@@ -99,3 +99,40 @@ def test_inject_proceeds_after_reap_resolves(rr, monkeypatch):
     monkeypatch.setattr(rr, "_kitty", lambda *a, **k: "")  # all kitty ops succeed
     ok = rr._inject_text_and_submit(5, "/compact", "muther-critic-1")
     assert ok is True, "after reap resolves the duplicate, inject proceeds"
+
+
+# --- _window_for_session_name: unscoped targeted lookup (muther note-2 fix) ----
+
+def test_window_for_session_name_matches_title(rr, monkeypatch):
+    ls = [{"tabs": [{"windows": [
+        {"id": 1, "title": "muther-agent-1", "cmdline": ["bash", "-ic", "claude-chat -n muther-agent-1"]},
+        {"id": 2, "title": "other", "cmdline": ["bash"]},
+    ]}]}]
+    monkeypatch.setattr(rr, "_kitty", lambda *a: json.dumps(ls))
+    w = rr._window_for_session_name("muther-agent-1")
+    assert w and w["window_id"] == 1
+
+
+def test_window_for_session_name_strips_activity_marker(rr, monkeypatch):
+    # kitty prepends "✳ " to active windows — must still match (the muther agent-3 case)
+    ls = [{"tabs": [{"windows": [
+        {"id": 5, "title": "✳ muther-agent-3", "cmdline": ["bash", "--posix"]},
+    ]}]}]
+    monkeypatch.setattr(rr, "_kitty", lambda *a: json.dumps(ls))
+    w = rr._window_for_session_name("muther-agent-3")
+    assert w and w["window_id"] == 5
+
+
+def test_window_for_session_name_matches_cmdline_when_title_drifts(rr, monkeypatch):
+    ls = [{"tabs": [{"windows": [
+        {"id": 7, "title": "totally-drifted", "cmdline": ["bash", "-ic", "cd x && claude-chat -n muther"]},
+    ]}]}]
+    monkeypatch.setattr(rr, "_kitty", lambda *a: json.dumps(ls))
+    w = rr._window_for_session_name("muther")
+    assert w and w["window_id"] == 7
+
+
+def test_window_for_session_name_no_match(rr, monkeypatch):
+    ls = [{"tabs": [{"windows": [{"id": 1, "title": "a", "cmdline": ["bash"]}]}]}]
+    monkeypatch.setattr(rr, "_kitty", lambda *a: json.dumps(ls))
+    assert rr._window_for_session_name("nonexistent") is None
