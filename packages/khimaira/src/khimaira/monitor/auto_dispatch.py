@@ -306,10 +306,67 @@ _MASTER_WAKE_IDLE_MIN_S = float(os.environ.get("KHIMAIRA_MASTER_WAKE_IDLE_S", "1
 _MASTER_WAKE_COOLDOWN_S = float(os.environ.get("KHIMAIRA_MASTER_WAKE_COOLDOWN_S", "300"))
 _last_master_wake: dict[str, float] = {}
 
+# When a master owes committable work but the wake can't be DELIVERED (no live
+# window discoverable, or inject fails because the window is dead/unresponsive),
+# the old behavior gave up at INFO and the roster sat idle until a human noticed
+# (muther 2026-06-12: a dual-verdict's commit sat stranded; the wake inject hit a
+# dead master window and "returned false" silently). Escalate it loudly instead.
+_MASTER_UNREACHABLE_ALERT_S = float(
+    os.environ.get("KHIMAIRA_MASTER_UNREACHABLE_ALERT_S", "600")
+)
+_last_master_unreachable_alert: dict[str, float] = {}
+
+
+async def _escalate_master_unreachable(
+    chat_id: "str | None",
+    master_id: str,
+    master_name: str,
+    committable: list[str],
+    owed_count: int,
+    reason: str,
+) -> None:
+    """Surface an UNDELIVERABLE master-wake: a WARNING always, plus a rate-limited
+    🩺 chat alert (per master) pointing at chat_reseat_master for the dead-master
+    case. Best-effort; never raises."""
+    _log.warning(
+        "auto-dispatch: master-wake UNDELIVERABLE for %s (%s) — %s; owed=%d commit_ready=%d",
+        master_id[:8],
+        master_name or "?",
+        reason,
+        owed_count,
+        len(committable),
+    )
+    if chat_id is None:
+        return
+    now = time.time()
+    if (
+        now - _last_master_unreachable_alert.get(master_id, 0.0)
+        < _MASTER_UNREACHABLE_ALERT_S
+    ):
+        return
+    _last_master_unreachable_alert[master_id] = now
+    n = owed_count + len(committable)
+    tail = f" Commit-ready: {', '.join(committable[:8])}." if committable else ""
+    body = (
+        f"⚠️ master {master_name or master_id[:8]} has {n} owed item(s) "
+        f"({len(committable)} commit-ready) but the wake is UNDELIVERABLE — {reason}. "
+        f"The roster is stalled on the master. If the master session is DEAD, recover "
+        f"it with chat_reseat_master(chat_id, <new_master_session_id>); it can then "
+        f"commit the reviewed work.{tail}"
+    )
+    try:
+        from khimaira.monitor import chats as _chats
+
+        await _chats._post_synthetic_message(chat_id, body)
+    except Exception:
+        _log.warning(
+            "auto-dispatch: failed to post master-unreachable alert", exc_info=True
+        )
+
 
 async def _maybe_wake_idle_master(
     master_id: str, owed_count: int, committable: list[str] | None = None,
-    master_name: str = "",
+    master_name: str = "", chat_id: "str | None" = None,
 ) -> None:
     """Nudge an idle master's window to DRIVE when concrete work is owed.
 
@@ -369,10 +426,11 @@ async def _maybe_wake_idle_master(
                 None, rr._window_for_session_name, master_name
             )
         if master_win is None:
-            _log.info(
-                "auto-dispatch: master-wake skipped — no master window discoverable "
-                "(%d roster windows, name=%r, owed=%d commit_ready=%d).",
-                len(wins), master_name, owed_count, len(committable),
+            # Owed work but NO live window to wake → undeliverable, not a benign
+            # skip. Escalate (the master session is likely dead/closed).
+            await _escalate_master_unreachable(
+                chat_id, master_id, master_name, committable, owed_count,
+                reason=f"no master window discoverable ({len(wins)} roster windows)",
             )
             return
         wid = master_win["window_id"]
@@ -407,6 +465,13 @@ async def _maybe_wake_idle_master(
                 "auto-dispatch: woke idle master %s (dispatch_owed=%d, commit_ready=%d, "
                 "idle=%.0fs)",
                 master_id[:8], owed_count, len(committable), idle_s,
+            )
+        else:
+            # inject returned False → the window is dead/unresponsive (the TOCTOU
+            # guard caught it). This is the silent-stranding path muther hit.
+            await _escalate_master_unreachable(
+                chat_id, master_id, master_name, committable, owed_count,
+                reason="wake inject failed — master window dead or unresponsive",
             )
     except Exception:
         _log.warning("auto-dispatch: master-wake failed", exc_info=True)
@@ -500,7 +565,9 @@ async def _reconcile_commit_ready() -> None:
                 "for master %s",
                 chat_id, len(committable), master_id[:8],
             )
-            await _maybe_wake_idle_master(master_id, 0, committable, master_name=master_name)
+            await _maybe_wake_idle_master(
+                master_id, 0, committable, master_name=master_name, chat_id=chat_id
+            )
 
 
 async def _emit_dispatch_proposal(

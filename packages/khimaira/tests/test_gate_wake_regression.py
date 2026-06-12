@@ -249,12 +249,12 @@ async def test_reconcile_wakes_per_chat_master(monkeypatch):
     monkeypatch.setattr(chats_mod, "committable_gate_tasks", lambda cid: ["t1", "t2"])
     calls = []
 
-    async def fake_wake(mid, owed, committable=None, master_name=""):
-        calls.append((mid, owed, committable, master_name))
+    async def fake_wake(mid, owed, committable=None, master_name="", chat_id=None):
+        calls.append((mid, owed, committable, master_name, chat_id))
 
     monkeypatch.setattr(ad, "_maybe_wake_idle_master", fake_wake)
     await ad._reconcile_commit_ready()
-    assert calls == [("master-1", 0, ["t1", "t2"], "mname")]
+    assert calls == [("master-1", 0, ["t1", "t2"], "mname", "chat-x")]
 
 
 @pytest.mark.asyncio
@@ -272,3 +272,68 @@ async def test_reconcile_skips_chat_with_no_committable(monkeypatch):
     monkeypatch.setattr(ad, "_maybe_wake_idle_master", fake_wake)
     await ad._reconcile_commit_ready()
     assert called == [], "no committable → no wake"
+
+
+# ----------------------------------------------------------- undeliverable wake
+# muther 2026-06-12: a dual-verdict's commit sat stranded because the master-wake
+# hit a dead window and "returned false" — silently, at INFO. The roster idled
+# until Joseph noticed. An undeliverable wake (no live window / failed inject)
+# with committable work must now escalate VISIBLY, pointing at chat_reseat_master.
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_wake_escalates_when_no_window(monkeypatch):
+    from khimaira.monitor import auto_dispatch as ad
+    from khimaira.monitor import roster_recovery as rr
+    from khimaira.monitor import sessions as sessions_mod
+    from khimaira.monitor import chats as chats_mod
+
+    ad._last_master_unreachable_alert.clear()
+    # master is idle past the wake threshold
+    monkeypatch.setattr(sessions_mod, "summary", lambda sid: {"last_active_age_s": 9999})
+    # no master window discoverable, scoped OR unscoped → undeliverable
+    monkeypatch.setattr(rr, "_discover_roster_windows", lambda: [])
+    monkeypatch.setattr(rr, "_window_for_session_name", lambda name: None)
+
+    posted: list[tuple[str, str]] = []
+
+    async def fake_post(chat_id, body, *a, **k):
+        posted.append((chat_id, body))
+
+    monkeypatch.setattr(chats_mod, "_post_synthetic_message", fake_post)
+
+    await ad._maybe_wake_idle_master(
+        "master-dead", 0, ["t1", "t2"], master_name="muther", chat_id="chat-x"
+    )
+
+    assert len(posted) == 1, "undeliverable wake with committable work must escalate"
+    chat_id, body = posted[0]
+    assert chat_id == "chat-x"
+    assert "chat_reseat_master" in body
+    assert "UNDELIVERABLE" in body
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_alert_is_rate_limited(monkeypatch):
+    from khimaira.monitor import auto_dispatch as ad
+    from khimaira.monitor import roster_recovery as rr
+    from khimaira.monitor import sessions as sessions_mod
+    from khimaira.monitor import chats as chats_mod
+
+    ad._last_master_unreachable_alert.clear()
+    monkeypatch.setattr(sessions_mod, "summary", lambda sid: {"last_active_age_s": 9999})
+    monkeypatch.setattr(rr, "_discover_roster_windows", lambda: [])
+    monkeypatch.setattr(rr, "_window_for_session_name", lambda name: None)
+
+    posted: list = []
+
+    async def fake_post(chat_id, body, *a, **k):
+        posted.append(body)
+
+    monkeypatch.setattr(chats_mod, "_post_synthetic_message", fake_post)
+
+    for _ in range(3):
+        await ad._maybe_wake_idle_master(
+            "m", 0, ["t1"], master_name="muther", chat_id="chat-x"
+        )
+    assert len(posted) == 1, "repeated undeliverable wakes alert once per cooldown"
