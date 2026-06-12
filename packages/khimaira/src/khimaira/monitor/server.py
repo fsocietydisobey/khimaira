@@ -212,6 +212,61 @@ def build_app():
 
         _spawn(guard6.guard6_loop())
 
+    # DEBUG (#18 diagnostic, gated + one-shot): locate where auto_dispatch is
+    # parked. py-spy can't see a suspended coroutine; only in-process
+    # all_tasks().print_stack() can. Enable with KHIMAIRA_DEBUG_TASKDUMP=1;
+    # fires ONCE at +KHIMAIRA_DEBUG_TASKDUMP_S (default 150s), read-only, then
+    # returns. Captures: serving-loop identity, every task's await frame, each
+    # task's loop id (cross-loop check), and whether auto_dispatch_loop is even
+    # present on the serving loop. Remove after #18 is root-caused.
+    @app.on_event("startup")
+    async def _start_debug_taskdump() -> None:
+        if os.environ.get("KHIMAIRA_DEBUG_TASKDUMP") != "1":
+            return
+
+        async def _taskdump() -> None:
+            import io
+            import logging as _logging
+
+            log = _logging.getLogger("khimaira.monitor.taskdump")
+            delay = float(os.environ.get("KHIMAIRA_DEBUG_TASKDUMP_S", "150"))
+            await asyncio.sleep(delay)
+
+            loop = asyncio.get_running_loop()
+            uv = type(loop).__module__.startswith("uvloop")
+            tasks = list(asyncio.all_tasks(loop))
+            log.warning(
+                "TASKDUMP: serving-loop id=%s repr=%r uvloop=%s tasks=%d",
+                id(loop), loop, uv, len(tasks),
+            )
+            saw_ad = False
+            for t in tasks:
+                coro = t.get_coro()
+                name = getattr(coro, "__qualname__", repr(coro))
+                if "auto_dispatch_loop" in name:
+                    saw_ad = True
+                buf = io.StringIO()
+                try:
+                    t.print_stack(file=buf)
+                except Exception as exc:  # noqa: BLE001
+                    buf.write(f"<print_stack err: {exc}>")
+                try:
+                    tloop_id = id(t.get_loop())
+                except Exception:  # noqa: BLE001
+                    tloop_id = None
+                log.warning(
+                    "TASKDUMP task name=%s coro=%s done=%s loop_id=%s same_loop=%s\n%s",
+                    t.get_name(), name, t.done(), tloop_id,
+                    tloop_id == id(loop), buf.getvalue(),
+                )
+            if not saw_ad:
+                log.warning(
+                    "TASKDUMP: auto_dispatch_loop task ABSENT from serving-loop "
+                    "all_tasks() — cross-loop or task died (THIS would be the finding)."
+                )
+
+        _spawn(_taskdump())
+
     # Persistent scheduler — daemon-side replacement for ScheduleWakeup.
     # Replay-on-boot recovers stuck-firing tasks; worker tick fires due tasks.
     @app.on_event("startup")
