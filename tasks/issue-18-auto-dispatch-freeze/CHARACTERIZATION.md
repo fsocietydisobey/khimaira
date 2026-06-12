@@ -1,9 +1,33 @@
-# #18 — auto_dispatch loop freeze: characterization (PARKED 2026-06-12)
+# #18 — auto_dispatch loop freeze: RESOLVED (uvloop-specific) 2026-06-12
 
-> Status: **root cause PARKED** after exhaustive offline elimination.
-> User-facing symptom is **covered by a deployed workaround** (piggyback, `c7dda69`).
-> This document is the durable record for a future live-daemon deep-dive — the chat
-> thread (`chat-3e677725c16e`, khimaira-0 + void) is not discoverable long-term.
+> Status: **RESOLVED.** Root cause = **uvloop**. Fixed by defaulting the daemon's
+> event loop to stdlib asyncio (`a44293e`); the piggyback workaround (`c7dda69`)
+> remains as belt-and-suspenders. The sections below are the original
+> characterization (kept for the historical record + the offline harness).
+>
+> ## RESOLUTION (the answer the offline rig couldn't reach)
+>
+> The freeze is **uvloop-specific** — proven **audit-grade** by a production
+> loop-swap: the same daemon, same state, same code, bounced from uvloop to stdlib
+> asyncio (`KHIMAIRA_UVICORN_LOOP=asyncio`), took `auto_dispatch_loop` from frozen
+> to healthy (`AD-WOKE` fired every interval; reconcile resumed). uvloop is a
+> **necessary** condition: uvloop's libuv timer heap orphans `auto_dispatch_loop`'s
+> first `asyncio.sleep` timer under a still-unidentified prod-specific co-factor
+> (a forked daemon on *forced* uvloop with empty/real-state/SSE still wakes
+> offline — so uvloop alone is necessary but not sufficient; the exact libuv
+> mechanism remains open but no longer matters for the fix).
+>
+> **Fix (`a44293e`):** `serve()` defaults `KHIMAIRA_UVICORN_LOOP` to `asyncio`
+> instead of `auto`. stdlib removes the necessary condition, so the freeze cannot
+> occur regardless of the unknown co-factor. Throughput delta is negligible for
+> this I/O-light local daemon; correctness >> throughput (a frozen auto_dispatch
+> silently breaks dispatch + commit-reconcile). Override with
+> `KHIMAIRA_UVICORN_LOOP=uvloop` only to reproduce the freeze for mechanism work.
+>
+> Why the loop-swap was the decisive test (not introspection): uvloop is a C
+> extension and does **not** expose its libuv timer heap to Python, so dumping
+> `loop._scheduled` (stdlib-only) was impossible under uvloop. Swapping the loop
+> was the one test that could localize it.
 
 ## Symptom
 
