@@ -26,9 +26,13 @@ from dotenv import load_dotenv
 from langgraph.types import Command
 from mcp.server.fastmcp import FastMCP
 
-# Load .env from the project root
+# Load .env. `_project_root` is the package dir (packages/khimaira); load its
+# .env first (most-specific wins), then fall back to the monorepo-root .env so a
+# repo-level var (e.g. MNEMOSYNE_ORACLE_URL) is honored from either file. Without
+# the fallback, a var set only at the repo root is silently ignored here.
 _project_root = Path(__file__).parent.parent.parent.parent
 load_dotenv(_project_root / ".env")
+load_dotenv(_project_root.parent.parent / ".env")  # monorepo root (no override)
 
 from khimaira.prompts.builder import build_prompt
 from khimaira.dispatch.runners import run_claude, run_gemini
