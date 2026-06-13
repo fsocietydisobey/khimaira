@@ -174,6 +174,54 @@ async def health() -> str:
 
 
 @mcp.tool()
+@logged_tool("mnemosyne_ask")
+async def mnemosyne_ask(question: str, max_tokens: int = 256) -> str:
+    """Ask the local mnemosyne codebase oracle about khimaira.
+
+    The oracle is a local model (Qwen2.5-Coder-7B, continued-pretrained on the
+    khimaira codebase + instruction-tuned on accumulated team knowledge), served
+    via vLLM on local GPU — zero API cost, private. Use it for quick codebase
+    grounding: "what does module X do", "where is the logic for Y", "how does Z
+    work in khimaira", "what's the vocabulary around W".
+
+    ⚠️ It is a FAST, FALLIBLE reference — NOT a source of truth. It can be
+    confidently WRONG, especially on recent changes (its knowledge is a periodic
+    snapshot, not live). Always verify a fact against the live source before
+    acting on it; never commit code based on its answer alone. You are the
+    fact-checker; the oracle is the reference librarian.
+
+    Requires the vLLM server reachable at MNEMOSYNE_ORACLE_URL (default
+    http://127.0.0.1:18000 — forward the spark port:
+    `ssh -L 18000:localhost:18000 spark`).
+
+    Args:
+        question: the codebase question to ask.
+        max_tokens: max answer length (default 256).
+
+    Returns:
+        The oracle's answer, or an "unreachable" hint if the server is down.
+    """
+    from khimaira.hooks.mnemosyne_client import ask_oracle
+
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: ask_oracle(question, max_tokens=max_tokens)
+    )
+    if result is None:
+        return (
+            "⚠️ mnemosyne oracle unreachable. Is vLLM serving the model? "
+            "Default endpoint is http://127.0.0.1:18000 (set MNEMOSYNE_ORACLE_URL "
+            "to override). If it's on spark, forward it: "
+            "`ssh -L 18000:localhost:18000 spark`."
+        )
+    usage = result.get("usage") or {}
+    tok = usage.get("completion_tokens", "?")
+    return (
+        f"🔮 mnemosyne oracle ({result.get('model', 'khimaira')}, {tok} tok — "
+        f"verify before acting):\n\n{result['answer']}"
+    )
+
+
+@mcp.tool()
 @logged_tool("list_tasks")
 async def list_tasks(hook_safe_only: bool = False) -> str:
     """List open tasks across every configured external task source.

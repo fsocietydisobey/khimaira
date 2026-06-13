@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 
 _MNEMOSYNE_BASE = "http://127.0.0.1:8766"
+# The trained codebase-oracle MODEL (vLLM, OpenAI-compatible) — distinct from the
+# knowledge STORE on 8766. Default assumes the spark port is forwarded locally.
+_ORACLE_BASE = os.environ.get("MNEMOSYNE_ORACLE_URL", "http://127.0.0.1:18000")
 
 _log = logging.getLogger(__name__)
 
@@ -97,4 +101,56 @@ def query(
         return data
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         _log.warning("mnemosyne query failed (domain=%r): %s", domain, exc)
+        return None
+
+
+def ask_oracle(
+    question: str,
+    *,
+    max_tokens: int = 256,
+    temperature: float = 0.3,
+    timeout: float = 60.0,
+) -> dict | None:
+    """Ask the local codebase-oracle MODEL (vLLM) a question.
+
+    Distinct from query(): query() reads the distilled-knowledge STORE (8766);
+    this generates an answer from the TRAINED MODEL via its OpenAI-compatible
+    /v1/chat/completions endpoint (vLLM, default 127.0.0.1:18000 — override with
+    MNEMOSYNE_ORACLE_URL, e.g. an SSH-forwarded spark port).
+
+    Returns {"answer", "model", "usage"} or None on any failure.
+    Fail-open: URLError/OSError/TimeoutError/ValueError → None (never raises).
+
+    The answer is a FAST, FALLIBLE reference — verify facts against live source.
+    """
+    payload = json.dumps(
+        {
+            "model": "khimaira",
+            "messages": [{"role": "user", "content": question}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            f"{_ORACLE_BASE}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        answer = (
+            ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        ).strip()
+        if not answer:
+            return None
+        return {
+            "answer": answer,
+            "model": data.get("model", "khimaira"),
+            "usage": data.get("usage", {}),
+        }
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        _log.warning("mnemosyne oracle ask failed: %s", exc)
         return None
