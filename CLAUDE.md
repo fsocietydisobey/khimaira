@@ -259,6 +259,36 @@ works." The test is documentation that doesn't go stale.
 If a hook fails, fix the failure, don't bypass. Bypassed hooks are
 how today's "it worked yesterday" bugs got into main.
 
+## Mnemosyne oracle (`mnemosyne_ask`)
+
+A local codebase oracle: Qwen2.5-Coder-7B continued-pretrained on this
+repo's source + SFT'd on accumulated team knowledge, served via vLLM on
+the DGX Spark (zero API cost, fully private — no source ever leaves the
+LAN). Consult it with the `mnemosyne_ask(question)` MCP tool for fast
+grounding instead of cold-reading files: "what does module X do",
+"where's the logic for Y", "how does Z work", "what's the vocabulary
+around W".
+
+**It is a FAST, FALLIBLE reference — NOT a source of truth.** It
+hallucinates *confidently*, especially on:
+- **recent changes** — its knowledge is a periodic snapshot (re-baked on
+  demand, not live), so anything newer than the last bake is invisible to it.
+- **cross-codebase / infra facts** — observed failures: it called the chat
+  store "Postgres JSONB" (it's JSONL) and stated the monitor daemon runs on
+  port 8766 (it's 8740).
+
+**Rule:** ALWAYS verify a fact against the live source before acting; never
+commit code on its answer alone. You are the fact-checker; the oracle is the
+reference librarian — use it to orient quickly, then confirm with the real
+files. Treat its output exactly like a confident senior who's been on
+vacation for a week: usually right about the shape of things, sometimes wrong
+on specifics, never authoritative on what changed recently.
+
+Reachable at `MNEMOSYNE_ORACLE_URL` (machine-local `.env`; default
+`http://127.0.0.1:18000`). Re-bake from current source with
+`~/dev/ai-lab/mnemosyne/scripts/refresh_oracle.sh` (safe-swap: the live model
+is only replaced if the new bake trains + validates).
+
 ## Pointers
 
 | What | Where |
@@ -270,3 +300,4 @@ how today's "it worked yesterday" bugs got into main.
 | Observer template | `packages/khimaira/src/khimaira/attach/observer_template/` |
 | Slash commands | `~/.claude/commands/*.md` (symlinked from dotfiles) |
 | Discoverability | `khimaira tools` or `/tools` |
+| Mnemosyne oracle | `mnemosyne_ask` tool; serve/train scripts in `~/dev/ai-lab/mnemosyne/scripts/` |
