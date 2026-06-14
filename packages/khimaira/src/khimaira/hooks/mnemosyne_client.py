@@ -14,9 +14,18 @@ import urllib.error
 import urllib.request
 
 _MNEMOSYNE_BASE = "http://127.0.0.1:8766"
-# The trained codebase-oracle MODEL (vLLM, OpenAI-compatible) — distinct from the
-# knowledge STORE on 8766. Default assumes the spark port is forwarded locally.
+# The trained codebase-oracle MODELS (vLLM, OpenAI-compatible) — distinct from the
+# knowledge STORE on 8766. One vLLM instance per codebase; each serves a different
+# served-model-name on its own port. Defaults assume spark ports forwarded locally.
 _ORACLE_BASE = os.environ.get("MNEMOSYNE_ORACLE_URL", "http://127.0.0.1:18000")
+_JEEVY_BASE = os.environ.get("MNEMOSYNE_JEEVY_URL", "http://127.0.0.1:18001")
+
+# project → (base_url, served_model_name). ask_oracle(project=...) routes here.
+_ORACLES: dict[str, tuple[str, str]] = {
+    "khimaira": (_ORACLE_BASE, "khimaira"),
+    "jeevy": (_JEEVY_BASE, "jeevy"),
+}
+_DEFAULT_PROJECT = "khimaira"
 
 _log = logging.getLogger(__name__)
 
@@ -107,25 +116,38 @@ def query(
 def ask_oracle(
     question: str,
     *,
+    project: str = _DEFAULT_PROJECT,
     max_tokens: int = 256,
     temperature: float = 0.3,
     timeout: float = 60.0,
 ) -> dict | None:
-    """Ask the local codebase-oracle MODEL (vLLM) a question.
+    """Ask a local codebase-oracle MODEL (vLLM) a question.
 
     Distinct from query(): query() reads the distilled-knowledge STORE (8766);
-    this generates an answer from the TRAINED MODEL via its OpenAI-compatible
-    /v1/chat/completions endpoint (vLLM, default 127.0.0.1:18000 — override with
-    MNEMOSYNE_ORACLE_URL, e.g. an SSH-forwarded spark port).
+    this generates an answer from a TRAINED MODEL via its OpenAI-compatible
+    /v1/chat/completions endpoint. One vLLM per codebase — `project` selects
+    which (see _ORACLES). khimaira -> :18000, jeevy -> :18001 by default;
+    override the base URLs with MNEMOSYNE_ORACLE_URL / MNEMOSYNE_JEEVY_URL.
 
     Returns {"answer", "model", "usage"} or None on any failure.
     Fail-open: URLError/OSError/TimeoutError/ValueError → None (never raises).
+    An unknown `project` falls back to the default oracle (logged).
 
     The answer is a FAST, FALLIBLE reference — verify facts against live source.
     """
+    base, model = _ORACLES.get(project, (None, None))
+    if base is None:
+        _log.warning(
+            "mnemosyne: unknown project %r (known: %s) — using %r",
+            project,
+            ", ".join(_ORACLES),
+            _DEFAULT_PROJECT,
+        )
+        base, model = _ORACLES[_DEFAULT_PROJECT]
+
     payload = json.dumps(
         {
-            "model": "khimaira",
+            "model": model,
             "messages": [{"role": "user", "content": question}],
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -134,7 +156,7 @@ def ask_oracle(
     ).encode("utf-8")
     try:
         req = urllib.request.Request(
-            f"{_ORACLE_BASE}/v1/chat/completions",
+            f"{base}/v1/chat/completions",
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -148,9 +170,9 @@ def ask_oracle(
             return None
         return {
             "answer": answer,
-            "model": data.get("model", "khimaira"),
+            "model": data.get("model", model),
             "usage": data.get("usage", {}),
         }
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        _log.warning("mnemosyne oracle ask failed: %s", exc)
+        _log.warning("mnemosyne oracle ask failed (project=%r): %s", project, exc)
         return None

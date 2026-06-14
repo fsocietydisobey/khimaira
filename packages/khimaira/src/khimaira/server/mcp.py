@@ -179,14 +179,22 @@ async def health() -> str:
 
 @mcp.tool()
 @logged_tool("mnemosyne_ask")
-async def mnemosyne_ask(question: str, max_tokens: int = 256) -> str:
-    """Ask the local mnemosyne codebase oracle about khimaira.
+async def mnemosyne_ask(
+    question: str, project: str = "khimaira", max_tokens: int = 256
+) -> str:
+    """Ask a local mnemosyne codebase oracle about khimaira or jeevy.
 
-    The oracle is a local model (Qwen2.5-Coder-7B, continued-pretrained on the
-    khimaira codebase + instruction-tuned on accumulated team knowledge), served
+    Each oracle is a local model (Qwen2.5-Coder-7B, continued-pretrained on one
+    codebase's source + instruction-tuned on accumulated team knowledge), served
     via vLLM on local GPU — zero API cost, private. Use it for quick codebase
     grounding: "what does module X do", "where is the logic for Y", "how does Z
-    work in khimaira", "what's the vocabulary around W".
+    work", "what's the vocabulary around W".
+
+    There is one oracle PER codebase — pass `project` to pick which:
+        - "khimaira" (default) — the khimaira platform/monorepo
+        - "jeevy" — the jeevy_portal codebase
+    Ask the khimaira oracle khimaira questions and the jeevy oracle jeevy
+    questions; a codebase oracle knows nothing about the other codebase.
 
     ⚠️ It is a FAST, FALLIBLE reference — NOT a source of truth. It can be
     confidently WRONG, especially on recent changes (its knowledge is a periodic
@@ -194,12 +202,12 @@ async def mnemosyne_ask(question: str, max_tokens: int = 256) -> str:
     acting on it; never commit code based on its answer alone. You are the
     fact-checker; the oracle is the reference librarian.
 
-    Requires the vLLM server reachable at MNEMOSYNE_ORACLE_URL (default
-    http://127.0.0.1:18000 — forward the spark port:
-    `ssh -L 18000:localhost:18000 spark`).
+    Each oracle is a vLLM server: khimaira on MNEMOSYNE_ORACLE_URL (default
+    :18000), jeevy on MNEMOSYNE_JEEVY_URL (default :18001).
 
     Args:
         question: the codebase question to ask.
+        project: which oracle — "khimaira" (default) or "jeevy".
         max_tokens: max answer length (default 256).
 
     Returns:
@@ -208,14 +216,14 @@ async def mnemosyne_ask(question: str, max_tokens: int = 256) -> str:
     from khimaira.hooks.mnemosyne_client import ask_oracle
 
     result = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: ask_oracle(question, max_tokens=max_tokens)
+        None, lambda: ask_oracle(question, project=project, max_tokens=max_tokens)
     )
     if result is None:
         return (
-            "⚠️ mnemosyne oracle unreachable. Is vLLM serving the model? "
-            "Default endpoint is http://127.0.0.1:18000 (set MNEMOSYNE_ORACLE_URL "
-            "to override). If it's on spark, forward it: "
-            "`ssh -L 18000:localhost:18000 spark`."
+            f"⚠️ mnemosyne {project} oracle unreachable. Is its vLLM serving? "
+            "khimaira defaults to http://127.0.0.1:18000 (MNEMOSYNE_ORACLE_URL), "
+            "jeevy to http://127.0.0.1:18001 (MNEMOSYNE_JEEVY_URL). If on spark, "
+            "forward the port, e.g. `ssh -L 18001:localhost:18001 spark`."
         )
     usage = result.get("usage") or {}
     tok = usage.get("completion_tokens", "?")
