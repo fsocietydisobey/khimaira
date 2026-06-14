@@ -284,10 +284,16 @@ files. Treat its output exactly like a confident senior who's been on
 vacation for a week: usually right about the shape of things, sometimes wrong
 on specifics, never authoritative on what changed recently.
 
-Reachable at `MNEMOSYNE_ORACLE_URL` (machine-local `.env`; default
-`http://127.0.0.1:18000`). Re-bake from current source with
-`~/dev/ai-lab/mnemosyne/scripts/refresh_oracle.sh` (safe-swap: the live model
-is only replaced if the new bake trains + validates).
+There are TWO oracles, one per codebase — pass `mnemosyne_ask(question,
+project=...)` to pick: `"khimaira"` (default, the platform monorepo) or
+`"jeevy"` (the jeevy_portal codebase). Each knows ONLY its own codebase; ask
+the jeevy oracle jeevy questions, the khimaira oracle khimaira questions.
+
+Reachable at `MNEMOSYNE_ORACLE_URL` (khimaira, default `:18000`) and
+`MNEMOSYNE_JEEVY_URL` (jeevy, default `:18001`) — both machine-local `.env`,
+served by separate vLLM instances on the Spark. Re-bake from current source
+with `~/dev/ai-lab/mnemosyne/scripts/refresh_oracle.sh` (safe-swap: the live
+model is only replaced if the new bake trains + validates).
 
 ## Pointers
 
