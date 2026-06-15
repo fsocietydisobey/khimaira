@@ -1038,3 +1038,32 @@ def test_master_md_documents_idle_drive_wake():
     assert "Idle-roster drive is now structurally backed" in md
     assert "auto-dispatch" in md.lower()
     assert "DRIVE" in md
+
+
+def test_no_state_changing_git_promotion_present():
+    """Behavioral→structural promotion (2026-06-15): "roster agents never run
+    state-changing git" must exist as BOTH the agent.md role-doc subsection AND
+    the Themis rule (IN-AGENT-7 block for agents, IN-MASTER-10 warn for master).
+    Guards the 3-layer promotion from silent regression — the behavioral
+    guardrail was ignored and caused a near-data-loss git-stash incident."""
+    # Layer 1 — role-doc
+    agent_md = (ROLE_DIR / "agent.md").read_text(encoding="utf-8")
+    assert "state-changing git" in agent_md.lower(), "agent.md missing no-git subsection"
+    assert "Git is human-only" in agent_md, "agent.md missing human-only framing"
+    assert "IN-AGENT-7" in agent_md, "agent.md should cross-ref the Themis rule"
+
+    # Layer 2a — agent BLOCK rule
+    agent_yaml = (THEMIS_RULES / "agent.yaml").read_text(encoding="utf-8")
+    assert "IN-AGENT-7" in agent_yaml, "agent.yaml missing IN-AGENT-7"
+    assert "NO_STATE_CHANGING_GIT" in agent_yaml, "missing rule name"
+    assert "severity: block" in agent_yaml.split("IN-AGENT-7", 1)[1], (
+        "IN-AGENT-7 must be severity: block"
+    )
+    assert "git\\s+stash" in agent_yaml, "rule must cover git stash (the incident verb)"
+
+    # Layer 2b — master WARN (so master can run human-authorized recovery)
+    master_yaml = (THEMIS_RULES / "master.yaml").read_text(encoding="utf-8")
+    assert "IN-MASTER-10" in master_yaml, "master.yaml missing IN-MASTER-10"
+    assert "severity: warn" in master_yaml.split("IN-MASTER-10", 1)[1], (
+        "IN-MASTER-10 must be severity: warn (master recovery path)"
+    )

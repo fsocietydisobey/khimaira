@@ -110,3 +110,42 @@ invariants:
 
       No active task (ad-hoc commit)? → allowed without verdicts.
       Daemon unreachable? → hook fail-opens at the network layer (D7 / #61 axis-A).
+
+  - id: IN-AGENT-7
+    name: NO_STATE_CHANGING_GIT
+    severity: block
+    matchers:
+      # State-changing git verbs in SUBCOMMAND position (directly after `git `).
+      # Conservative (per detection caveat: false-negatives beat false-positives
+      # that would block read-only git): matches `git <verb>` — misses
+      # `git -C /p <verb>` (acceptable) but never false-positives on read-only
+      # git like `git log --grep=commit`. `commit` is EXCLUDED — governed by
+      # IN-AGENT-6 (gate-before-commit), the one sanctioned agent git write.
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+(push|pull|checkout|switch|merge|rebase|reset|cherry-pick|clean|restore|am|revert)\b'
+      # stash is state-changing EXCEPT the read-only `git stash list|show` forms.
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+stash\b(?!\s+(?:list|show))'
+    message: |
+      🛑 Themis IN-AGENT-7 (NO_STATE_CHANGING_GIT): this Bash command runs a
+      state-changing git op. Agents NEVER mutate git state — git is human-only
+      (the user / master handles it under explicit authorization).
+
+      Blocked: stash (+ pop/drop/clear), push, pull, checkout, switch, merge,
+      rebase, reset, cherry-pick, clean, restore, am, revert.
+      Allowed (INSPECT, don't mutate): status, log, diff, show, stash list,
+      stash show, ls-tree, rev-parse, branch (list), cat-file.
+
+      To inspect a PRIOR state, use Read / file tools — NOT `git stash` or
+      `git checkout`. If a git mutation seems genuinely required, escalate to
+      master; do not run it yourself.
+
+      WHY (2026-06-15): a build agent ran `git stash` mid-multi-task-build and
+      stashed 866 lines across 3 in-flight tasks → tree went inconsistent →
+      near data-loss + a ~30 min roster stall. The behavioral guardrail was
+      ignored; this is the structural enforcement. (commit is NOT blocked here —
+      it is governed by IN-AGENT-6's gate-before-commit flow.)

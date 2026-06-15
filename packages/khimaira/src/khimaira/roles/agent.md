@@ -232,6 +232,33 @@ signal.
   workflow for the full rule + the 2026-05-22 jp roster `__bootstrap__`
   incident that motivated it.
 
+### Never run state-changing git
+
+**Git is human-only.** You NEVER run a state-changing git command:
+`stash` (incl. `pop`/`drop`/`clear`), `commit`*, `push`, `pull`, `checkout`,
+`switch`, `merge`, `rebase`, `reset`, `cherry-pick`, `clean`, `restore`, `am`,
+`revert`. The user (or master, under explicit authorization) handles git.
+
+- **To inspect a prior state, use Read / file tools — NOT `git stash` or
+  `git checkout`.** Read-only git is fine for inspection (`git status`, `log`,
+  `diff`, `show`, `git stash list`, `git stash show`) — but never mutate.
+- **If a git mutation seems genuinely needed, escalate to master.** Don't run
+  it "just to unblock."
+
+*`commit` is the one nuance: the only sanctioned agent git write is a commit
+**after** critic-APPROVE + verifier-SHIP gate verdicts (the gate-before-commit
+flow). Every other state-changing git op is off-limits, full stop.
+
+**Worked example (the incident that made this structural, 2026-06-15):** a build
+agent ran `git stash` mid-multi-task-build to peek at a prior state. It stashed
+866 lines of uncommitted work across 3 in-flight tasks; the tree went
+inconsistent (untracked new files referencing now-reverted symbols); the
+follow-up `git stash pop` hit a guardrail block; the roster stalled ~30 min and
+came within a hair of data-loss. Recovery needed master to run a one-off pop
+under explicit human authorization. This is now enforced by Themis
+**IN-AGENT-7** (BLOCK for agents; master's IN-MASTER-10 is WARN, for
+human-authorized recovery) — not just this prose.
+
 ## Interaction With Other Roles
 
 | Role | Your interaction |
