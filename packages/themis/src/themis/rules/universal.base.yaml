@@ -1,0 +1,55 @@
+# Themis rules — UNIVERSAL base
+#
+# Auto-prepended to EVERY role's rule chain by load_rules()
+# (universal.base → <role>.base → instance). Rules here apply to ALL roster
+# roles unless an instance OVERRIDES them by id (e.g. master downgrades the git
+# block to a warn). Keep this file TINY — only truly cross-role invariants
+# belong here. Rules are NOT locked, so an instance may override severity.
+#
+# This closes the fail-open-on-new-role class: a cross-cutting security
+# invariant lives in ONE place and auto-covers every current + future role,
+# instead of being duplicated per-role (where a new/returning role silently
+# misses it — exactly the gap Themis exists to prevent).
+role: universal
+invariants:
+  - id: IN-UNIVERSAL-1
+    name: NO_STATE_CHANGING_GIT
+    severity: block
+    matchers:
+      # State-changing git verbs in SUBCOMMAND position (directly after `git `).
+      # Conservative (per the detection caveat: false-negatives beat false-
+      # positives that would block read-only git and break inspection):
+      #   - matches `git <verb>` — misses `git -C /p <verb>` (acceptable)
+      #   - never false-positives on read-only git like `git log --grep=commit`
+      # `commit` is intentionally EXCLUDED — it is governed per-role by the
+      # gate-before-commit rule (IN-AGENT-6), where post-gate commits are the
+      # sanctioned path. Blocking it here would conflict with that design.
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+(push|pull|checkout|switch|merge|rebase|reset|cherry-pick|clean|restore|am|revert)\b'
+      # stash is state-changing EXCEPT the read-only `git stash list|show` forms.
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+stash\b(?!\s+(?:list|show))'
+    message: |
+      🛑 Themis IN-UNIVERSAL-1 (NO_STATE_CHANGING_GIT): this Bash command runs a
+      state-changing git op. Roster agents NEVER mutate git state — git is
+      human-only (the user / master handles it under explicit authorization).
+
+      Blocked: stash (+ pop/drop/clear), push, pull, checkout, switch, merge,
+      rebase, reset, cherry-pick, clean, restore, am, revert.
+      Allowed (INSPECT, don't mutate): status, log, diff, show, stash list,
+      stash show, ls-tree, rev-parse, branch (list), cat-file.
+
+      To inspect a PRIOR state, use Read / file tools — NOT `git stash` or
+      `git checkout`. If a git mutation seems genuinely required, escalate to
+      master; do not run it yourself.
+
+      WHY (2026-06-15): a build agent ran `git stash` mid-multi-task-build and
+      stashed 866 lines across 3 in-flight tasks → the tree went inconsistent →
+      near data-loss + a ~30 min roster stall. The behavioral guardrail was
+      ignored; this is the structural enforcement.
+      (master overrides this to a WARN — IN-MASTER-10 — for human-authorized
+      one-off recovery, e.g. the recovery `git stash pop` from that incident.)

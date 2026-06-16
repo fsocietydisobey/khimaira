@@ -500,25 +500,37 @@ def test_migration_equivalence_flat_roles(rules_dir: Path, monkeypatch):
 
 
 def test_t8_non_lead_roles_equal_pre_post_migration():
-    """T8 (real rules): the 10 non-lead roles load identically via load_rules.
+    """T8 (real rules): each non-lead role's OWN (per-file) invariants are
+    unchanged by the extends migration.
 
-    Non-lead roles have no `extends:` field, so load_rules == load_rules_flat.
-    This regression-guard catches accidental changes to non-lead roles during migration.
+    As of 2026-06-16 every role (lead or not) additionally inherits
+    universal.base — the loader auto-prepends it (previously dormant). So the
+    merged load == the role's flat per-file invariants PLUS the universal
+    invariants, with each role's own invariants unchanged (severity included).
+    A role MAY override a universal id (master downgrades IN-UNIVERSAL-1 to warn)
+    — that override lives in the role's own file, so it's covered by the
+    own-invariants check. Catches accidental per-role drift while acknowledging
+    the universal layer.
     """
     NON_LEAD_ROLES = [
         "agent", "analyst", "architect", "critic", "intake",
         "master", "member", "observer", "tracker", "verifier",
     ]
+    universal_ids = {inv.id for inv in load_rules_flat("universal.base").invariants}
     for role in NON_LEAD_ROLES:
         rs_new = load_rules(role)
-        rs_flat = load_rules_flat(role)
+        rs_flat = load_rules_flat(role)  # role's own file only, no universal
         new_ids = {inv.id for inv in rs_new.invariants}
         flat_ids = {inv.id for inv in rs_flat.invariants}
-        assert new_ids == flat_ids, (
-            f"Non-lead role {role!r}: merged load ids {new_ids} != flat load ids {flat_ids}"
+        # merged set == role's own invariants ∪ the universal invariants
+        assert new_ids == flat_ids | universal_ids, (
+            f"Non-lead role {role!r}: merged ids {new_ids} != own {flat_ids} "
+            f"∪ universal {universal_ids}"
         )
         new_by_id = {inv.id: inv for inv in rs_new.invariants}
         flat_by_id = {inv.id: inv for inv in rs_flat.invariants}
+        # each role's OWN invariants (incl. any override of a universal id) are
+        # byte-for-byte severity-stable; universal-only ids aren't in flat_ids.
         for inv_id in flat_ids:
             assert new_by_id[inv_id].severity == flat_by_id[inv_id].severity, (
                 f"Role {role!r}, rule {inv_id!r}: severity changed"

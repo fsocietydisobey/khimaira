@@ -170,14 +170,17 @@ invariants:
       transitions only; other status transitions (in_progress, done,
       changes_requested) are not blocked.
 
-  - id: IN-MASTER-10
+  # Override of the universal NO_STATE_CHANGING_GIT block (universal.base.yaml):
+  # same id → master's copy wins for the master role only; every other role
+  # keeps the universal BLOCK. Master is WARN (not block) because master
+  # legitimately runs explicitly-human-authorized one-off git ops (e.g. the
+  # recovery `git stash pop` from the 2026-06-15 incident); a hard block would
+  # have wrongly stopped that recovery. Matchers re-declared (override replaces
+  # the whole invariant by id).
+  - id: IN-UNIVERSAL-1
     name: NO_STATE_CHANGING_GIT
     severity: warn
     matchers:
-      # Same detection as agent IN-AGENT-7, but WARN not block: master
-      # legitimately runs explicitly-human-authorized one-off git ops (e.g. the
-      # recovery `git stash pop` from the 2026-06-15 incident). A hard block
-      # would have wrongly stopped that recovery. Agents are hard-blocked.
       - tool: Bash
         tool_input_field:
           field: command
@@ -187,8 +190,8 @@ invariants:
           field: command
           pattern: '\bgit\s+stash\b(?!\s+(?:list|show))'
     message: |
-      ⚠️ Themis IN-MASTER-10 (NO_STATE_CHANGING_GIT) — master WARN: you are
+      ⚠️ Themis IN-UNIVERSAL-1 (NO_STATE_CHANGING_GIT) — master WARN: you are
       running a state-changing git op. Allowed for master ONLY under explicit
       human authorization (e.g. a one-off recovery). Confirm Joseph authorized
-      this specific op; agents are hard-blocked (IN-AGENT-7) from the same
-      commands. If this is routine roster work, it should be a human action.
+      this specific op; agents are hard-blocked from the same commands. If this
+      is routine roster work, it should be a human action, not a master op.

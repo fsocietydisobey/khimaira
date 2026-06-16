@@ -280,8 +280,18 @@ def _resolve_extends_chain(start_name: str) -> list[tuple[str, dict[str, Any]]]:
         if parent is None:
             break
         current = str(parent)
-    # chain is [instance, base, universal] — reverse to get universal→base→instance.
+    # chain is [instance, base, ...] — reverse to get ...→base→instance.
     chain.reverse()
+    # Auto-prepend universal.base so its rules apply to EVERY role without each
+    # role file needing an explicit `extends: universal.base`. This makes the
+    # documented order (universal → base → instance) real: previously
+    # universal.base was DORMANT (it only loaded if a role explicitly extended
+    # it, which nothing did — a false-green mechanism). Skip if already in the
+    # chain (explicit extends) or if we are resolving universal.base itself.
+    _UNIVERSAL = "universal.base"
+    if start_name != _UNIVERSAL and not any(n == _UNIVERSAL for n, _ in chain):
+        if (_RULES_DIR / f"{_UNIVERSAL}.yaml").exists():
+            chain.insert(0, (_UNIVERSAL, _load_doc(_UNIVERSAL)))
     return chain
 
 

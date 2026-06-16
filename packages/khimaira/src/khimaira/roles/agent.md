@@ -256,8 +256,9 @@ inconsistent (untracked new files referencing now-reverted symbols); the
 follow-up `git stash pop` hit a guardrail block; the roster stalled ~30 min and
 came within a hair of data-loss. Recovery needed master to run a one-off pop
 under explicit human authorization. This is now enforced by Themis
-**IN-AGENT-7** (BLOCK for agents; master's IN-MASTER-10 is WARN, for
-human-authorized recovery) — not just this prose.
+**IN-UNIVERSAL-1** (a universal-base rule: BLOCK for every non-master role;
+master overrides it to WARN for human-authorized recovery) — not just this
+prose.
 
 ## Interaction With Other Roles
 

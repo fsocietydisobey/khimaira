@@ -1043,27 +1043,46 @@ def test_master_md_documents_idle_drive_wake():
 def test_no_state_changing_git_promotion_present():
     """Behavioral→structural promotion (2026-06-15): "roster agents never run
     state-changing git" must exist as BOTH the agent.md role-doc subsection AND
-    the Themis rule (IN-AGENT-7 block for agents, IN-MASTER-10 warn for master).
-    Guards the 3-layer promotion from silent regression — the behavioral
-    guardrail was ignored and caused a near-data-loss git-stash incident."""
+    the Themis rule. The rule is IN-UNIVERSAL-1 (universal.base BLOCK, applies to
+    every role) with a master WARN override. Guards the promotion from silent
+    regression — the behavioral guardrail was ignored and caused a near-data-loss
+    git-stash incident."""
     # Layer 1 — role-doc
     agent_md = (ROLE_DIR / "agent.md").read_text(encoding="utf-8")
     assert "state-changing git" in agent_md.lower(), "agent.md missing no-git subsection"
     assert "Git is human-only" in agent_md, "agent.md missing human-only framing"
-    assert "IN-AGENT-7" in agent_md, "agent.md should cross-ref the Themis rule"
+    assert "IN-UNIVERSAL-1" in agent_md, "agent.md should cross-ref the Themis rule"
 
-    # Layer 2a — agent BLOCK rule
-    agent_yaml = (THEMIS_RULES / "agent.yaml").read_text(encoding="utf-8")
-    assert "IN-AGENT-7" in agent_yaml, "agent.yaml missing IN-AGENT-7"
-    assert "NO_STATE_CHANGING_GIT" in agent_yaml, "missing rule name"
-    assert "severity: block" in agent_yaml.split("IN-AGENT-7", 1)[1], (
-        "IN-AGENT-7 must be severity: block"
+    # Layer 2a — universal BLOCK rule (applies to every role via auto-prepend)
+    universal = (THEMIS_RULES / "universal.base.yaml").read_text(encoding="utf-8")
+    assert "IN-UNIVERSAL-1" in universal, "universal.base.yaml missing IN-UNIVERSAL-1"
+    assert "NO_STATE_CHANGING_GIT" in universal, "missing rule name"
+    assert "severity: block" in universal.split("IN-UNIVERSAL-1", 1)[1], (
+        "IN-UNIVERSAL-1 must default to severity: block"
     )
-    assert "git\\s+stash" in agent_yaml, "rule must cover git stash (the incident verb)"
+    assert "git\\s+stash" in universal, "rule must cover git stash (the incident verb)"
 
-    # Layer 2b — master WARN (so master can run human-authorized recovery)
+    # Layer 2b — master WARN override (so master can run human-authorized recovery)
     master_yaml = (THEMIS_RULES / "master.yaml").read_text(encoding="utf-8")
-    assert "IN-MASTER-10" in master_yaml, "master.yaml missing IN-MASTER-10"
-    assert "severity: warn" in master_yaml.split("IN-MASTER-10", 1)[1], (
-        "IN-MASTER-10 must be severity: warn (master recovery path)"
+    assert "IN-UNIVERSAL-1" in master_yaml, "master.yaml missing the warn override"
+    assert "severity: warn" in master_yaml.split("IN-UNIVERSAL-1", 1)[1], (
+        "master.yaml IN-UNIVERSAL-1 override must be severity: warn"
+    )
+
+    # Behavioral: the universal rule must actually resolve onto a non-overriding
+    # role (block) and be downgraded for master (warn) — guards the loader
+    # auto-prepend from regressing back to dormant.
+    from themis.data import load_rules
+
+    agent_inv = next(
+        (i for i in load_rules("agent").invariants if i.id == "IN-UNIVERSAL-1"), None
+    )
+    assert agent_inv is not None and agent_inv.severity.value == "block", (
+        "IN-UNIVERSAL-1 must resolve as BLOCK for agent (universal auto-prepend live)"
+    )
+    master_inv = next(
+        (i for i in load_rules("master").invariants if i.id == "IN-UNIVERSAL-1"), None
+    )
+    assert master_inv is not None and master_inv.severity.value == "warn", (
+        "IN-UNIVERSAL-1 must resolve as WARN for master (override live)"
     )

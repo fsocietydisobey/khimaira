@@ -136,7 +136,11 @@ class TestLoadRules:
 
     def test_intake_has_three_invariants(self):
         rs = load_rules("intake")
-        assert len(rs.invariants) == 3
+        # Count intake's OWN invariants — exclude universal.base rules
+        # (auto-prepended to every role since 2026-06-16), so this stays stable
+        # as universal rules are added.
+        own = [inv for inv in rs.invariants if not inv.id.startswith("IN-UNIVERSAL")]
+        assert len(own) == 3
 
     def test_master_in_master_1_has_conditions(self):
         rs = load_rules("master")
