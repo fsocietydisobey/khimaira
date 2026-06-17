@@ -1086,3 +1086,17 @@ def test_no_state_changing_git_promotion_present():
     assert master_inv is not None and master_inv.severity.value == "warn", (
         "IN-UNIVERSAL-1 must resolve as WARN for master (override live)"
     )
+
+
+def test_verifier_md_has_seam_coverage_check():
+    """Escaped-bugs flywheel, Phase 1 (2026-06-16): verifier.md must carry the
+    seam-coverage check (consult the escaped-bugs corpus + the L0 assert-it-runs
+    rule before SHIP). Guards the gate-upgrade from silent regression — a green
+    unit suite over a mocked seam must not auto-SHIP."""
+    md = (ROLE_DIR / "verifier.md").read_text(encoding="utf-8")
+    assert "Seam-coverage check" in md, "verifier.md missing seam-coverage step"
+    assert "khimaira-recall-bugs" in md, "verifier.md should invoke the recall command"
+    assert "assert-it-runs" in md, "verifier.md missing the L0 assert-it-runs rule"
+    # the seam-class vocabulary must be present so the verifier can name the class
+    for cls in ("entry-path", "producer-mechanism", "mock-vs-schema", "SQL-logic"):
+        assert cls in md, f"verifier.md missing seam-class {cls!r}"

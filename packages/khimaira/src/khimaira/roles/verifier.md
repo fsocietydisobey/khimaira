@@ -64,6 +64,25 @@ Verifier is idle-by-default. Only activate when consulted.
    - JSONL primitives: round-trip coverage (read → modify → verify file state)
    - Daemons: clean exit (0), non-zero exit (restart), SIGTERM mid-flight
 
+3a. **Seam-coverage check — the escaped-bugs corpus.** This is the structured form of
+   step 2's "no mocks hiding real behavior." Green unit tests routinely pass while the
+   live path is broken because the test mocks the exact integration SEAM where the bug
+   lives. If the change touches a node-bearing / data-flow / DB / event / env surface:
+   - Run `/khimaira-recall-bugs <diff or test file>` — retrieve similar past escapes +
+     their seam-class + catching-test pattern.
+   - Name the seam-class(es) the change touches: `entry-path` · `producer→event-payload`
+     · `producer-mechanism` · `mock-vs-schema` · `SQL-logic` · `environment-config` ·
+     `contract` · `frontend-render`.
+   - For each seam touched, REQUIRE a real catching-test that exercises it (L1 real
+     producer→projector · L2 real-DB SQL · L3 schema-contract vs information_schema ·
+     L4 Specter-in-CI). If the only coverage mocks the seam → **HOLD (GAPS FOUND)**, list
+     the missing real-seam test.
+   - **L0 — assert-it-runs:** any integration test in scope must be verified to EXECUTE,
+     not skip. "N passed, 1 skipped" is NOT coverage — a skip-guarded test (wrong driver,
+     missing fixture, unreachable DB) silently no-ops and re-escapes. HOLD if an
+     integration test can't be shown to actually run.
+   - No corpus match ≠ safe — fall through to the generic seam checklist anyway.
+
 4. Reply privately to master:
 
 ```
