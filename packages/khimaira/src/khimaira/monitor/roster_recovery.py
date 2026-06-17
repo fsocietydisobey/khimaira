@@ -63,6 +63,10 @@ _RATE_LIMIT_COOLDOWN_S = 600.0  # 10 min between rate-limit escalations per wind
 # count as ALIVE-BUT-WORKING. Errs long (recoverable-default): a false-no-wake
 # delay self-heals next cycle; a false-wake interrupting active work is the harm.
 _WIP_THRESHOLD_S = float(os.environ.get("KHIMAIRA_WIP_THRESHOLD_S", "900"))  # 15 min
+# Clock-skew epsilon for the unconsumed-chat signal: a message ts (daemon ISO clock)
+# is compared against last_active (filesystem mtime clock). Require the message to be
+# at least this many seconds newer so a borderline-equal can't false-fire.
+_TS_SKEW_EPSILON_S = float(os.environ.get("KHIMAIRA_TS_SKEW_EPSILON_S", "2.0"))
 
 # Patterns that indicate the terminal is actively working (NOT idle).
 _BUSY_MARKERS = ("esc to interrupt", "compacting…", "compacting...", "compacting ")
@@ -787,6 +791,86 @@ def _session_has_pending_invite(session_id: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def _iso_to_epoch(ts: str | None) -> float:
+    """Parse a daemon ISO-8601 timestamp to epoch seconds; 0.0 if unparseable."""
+    if not ts:
+        return 0.0
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(ts).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _session_has_unread_inbox(session_id: str) -> bool:
+    """Return True if the session has >=1 unread inbox note (peek — never marks read).
+
+    Healthy/active sessions drain their inbox each turn (pending_notes mark_read, or
+    the 3-surface auto-expire), so this is empty on a quiet roster and non-zero only
+    on an SSE-deaf idle session with notices / handoffs piling up unread. Covers
+    session_post_notice / post_handoff. Fail-open: False on any read error.
+    """
+    try:
+        from khimaira.monitor import sessions as sessions_mod
+
+        return bool(sessions_mod.pending_notes(session_id, mark_read=False))
+    except Exception:
+        return False
+
+
+def _session_has_unconsumed_chat(session_id: str) -> bool:
+    """Return True if an inbound chat message arrived AFTER the session's last action.
+
+    Premise-correct peer-reply signal. An idle session keeps its SSE subscriber
+    alive, so the chat cursor (which advances on SSE DELIVERY, chats.py event
+    generator) can't distinguish "delivered" from "acted on" — it lags only if the
+    SSE physically disconnects. Instead compare each message's ts against the
+    session's last_active mtime (the last OBSERVABLE action): chat receipt writes
+    the CHAT dir (messages + cursors.jsonl), never the session dir, so last_active
+    is not polluted by delivery and the signal self-clears on the session's next turn.
+
+    Excludes self-sent + SYSTEM messages. Clock-skew safe: message ts (daemon ISO)
+    and last_active (filesystem mtime) are two clocks, so require ts > last_active +
+    _TS_SKEW_EPSILON_S. Fail-open: False on any read error.
+    """
+    try:
+        from khimaira.monitor import chats as chats_mod
+        from khimaira.monitor import sessions as sessions_mod
+
+        summary = sessions_mod.summary(session_id)
+        last_active_epoch = time.time() - float(summary.get("last_active_age_s") or 0.0)
+        threshold = last_active_epoch + _TS_SKEW_EPSILON_S
+
+        try:
+            sid = chats_mod._resolve_or_uuid(session_id)
+        except Exception:
+            sid = session_id
+
+        chat_dir = chats_mod._chat_dir()
+        if not chat_dir.exists():
+            return False
+        for chat_path in chat_dir.glob("chat-*.jsonl"):
+            try:
+                room = chats_mod.load_room(chat_path.stem)
+                member = room["members"].get(sid)
+                if not member or member.get("state") != chats_mod.ACCEPTED:
+                    continue
+                for m in room.get("messages", []):
+                    if m.get("kind") != chats_mod.MSG:
+                        continue
+                    sender = m.get("sender_id")
+                    if sender == sid or sender == chats_mod.SYSTEM_SENDER_ID:
+                        continue
+                    if _iso_to_epoch(m.get("ts")) > threshold:
+                        return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1586,7 +1670,19 @@ async def _process_window(win: dict[str, Any]) -> None:
         has_pending_invite = await asyncio.get_running_loop().run_in_executor(
             None, _session_has_pending_invite, session_id
         )
-        if not obligations and not has_pending_task and not has_pending_invite:
+        has_unread_inbox = await asyncio.get_running_loop().run_in_executor(
+            None, _session_has_unread_inbox, session_id
+        )
+        has_unconsumed_chat = await asyncio.get_running_loop().run_in_executor(
+            None, _session_has_unconsumed_chat, session_id
+        )
+        if (
+            not obligations
+            and not has_pending_task
+            and not has_pending_invite
+            and not has_unread_inbox
+            and not has_unconsumed_chat
+        ):
             return
 
         rows = sessions_mod.list_sessions(use_cache=True)
@@ -1642,7 +1738,7 @@ async def _process_window(win: dict[str, Any]) -> None:
         if time.time() - last_attempt < _COMPACT_COOLDOWN_S:
             return
 
-        wake_msg = "⏰ resume: call chat_my_chats + act on your pending task"
+        wake_msg = "⏰ resume: call chat_my_chats + act on your inbox / pending work"
         submitted = await asyncio.get_running_loop().run_in_executor(
             None, _inject_text_and_submit, window_id, wake_msg, raw_name
         )
