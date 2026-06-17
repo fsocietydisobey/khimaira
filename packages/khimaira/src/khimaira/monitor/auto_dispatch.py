@@ -367,6 +367,7 @@ async def _escalate_master_unreachable(
 async def _maybe_wake_idle_master(
     master_id: str, owed_count: int, committable: list[str] | None = None,
     master_name: str = "", chat_id: "str | None" = None,
+    wake_text: str = "",
 ) -> None:
     """Nudge an idle master's window to DRIVE when concrete work is owed.
 
@@ -380,6 +381,11 @@ async def _maybe_wake_idle_master(
     Gated by total-owed>0 (the Conservative trigger — never nags on a quiet
     roster), the master's own idle time, a cooldown, and a window busy-check.
     Best-effort; never raises.
+
+    `wake_text`, when provided, overrides the inject message — used by the Guard-5
+    stall bridge to deliver a stall-specific nudge ("task X stalled on <role>'s
+    verdict") instead of the default dispatch/commit text, while reusing all the
+    same guards (cooldown, idle, busy, unreachable-escalation).
     """
     committable = committable or []
     total_owed = owed_count + len(committable)
@@ -439,7 +445,9 @@ async def _maybe_wake_idle_master(
             _log.info("auto-dispatch: master-wake skipped — master window busy")
             return
 
-        if committable:
+        if wake_text:
+            text = wake_text
+        elif committable:
             shown = ", ".join(committable[:8])
             more = "" if len(committable) <= 8 else f" (+{len(committable) - 8} more)"
             text = (

@@ -417,6 +417,12 @@ async def _guard5_escalate(
             )
         except Exception:
             pass
+
+        # Path 3: a notice does NOT wake a turn-gated session. If the escalation
+        # target is the chat's MASTER, also wake its window. (Same-role-peer targets
+        # that owe a verdict are already woken by roster_recovery._process_window via
+        # the Path-1 owed-verdict obligation — this bridge closes only the master case.)
+        await _wake_master_window_on_stall(gate, k_idle, target_session_id)
     else:
         # Terminal case: no reachable target — loud log + handoff
         log.warning(
@@ -439,6 +445,53 @@ async def _guard5_escalate(
             )
         except Exception:
             pass
+
+
+async def _wake_master_window_on_stall(
+    gate: dict[str, Any], k_idle: int, target_session_id: str
+) -> None:
+    """If the escalation target is the chat's master, wake its window once.
+
+    A turn-gated master receives the Guard-5 notice but never gets a turn to act on
+    it (the muther stall). Bridge into auto_dispatch._maybe_wake_idle_master — which
+    wraps roster_recovery's window discovery + kitty inject and carries its own
+    per-master 300s cooldown + idle/busy/unreachable guards — so a confirmed stall
+    actually nudges the master. We do NOT add a parallel actuator; we reuse that one.
+    Fires only when the target is the master (per-chat member_roles); same-role-peer
+    targets are handled by the Path-1 owed-verdict obligation. Best-effort; never
+    raises.
+    """
+    try:
+        from khimaira.monitor import chats as chats_mod
+
+        room = chats_mod.load_room(gate["chat_id"])
+        member_roles = (room.get("meta") or {}).get("member_roles") or {}
+        if member_roles.get(target_session_id) != chats_mod.ROLE_MASTER:
+            return  # target is a same-role peer / coordinator — not the master case
+
+        master_name = (room.get("members", {}).get(target_session_id) or {}).get(
+            "session_name", ""
+        )
+        task_id = gate.get("task_id") or ""
+        role = gate.get("assignee_role") or "reviewer"
+        wake_text = (
+            f"⏰ pipeline stalled: task-{task_id[:8]} awaiting {role}'s verdict "
+            f"({k_idle} session(s) idle, >{_T_STALL_S / 60:.0f} min no change). Call "
+            "roster_progress + chat_my_chats, then nudge the reviewer or reassign / "
+            "collapse the gate. Don't wait for an event — this IS it."
+        )
+
+        from khimaira.monitor import auto_dispatch as ad_mod
+
+        await ad_mod._maybe_wake_idle_master(
+            target_session_id,
+            owed_count=1,
+            master_name=master_name or "",
+            chat_id=gate["chat_id"],
+            wake_text=wake_text,
+        )
+    except Exception:
+        log.debug("guard5: master-wake bridge failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
