@@ -678,6 +678,25 @@ def _auto_create_review_tasks(
         pass  # fail-open: AUTO-create is best-effort
 
 
+# Recency window for the direct-verdict obligation: only a task whose done-TRANSITION
+# is within this many seconds counts as a live mid-review stall. Without it, a
+# long-lived roster's accumulated done-not-approved backlog all backfills as "owed"
+# on deploy and storms reviewers (caught in muther live-verify 2026-06-17).
+_OWED_VERDICT_WINDOW_S = float(os.environ.get("KHIMAIRA_OWED_VERDICT_WINDOW_S", "3600"))
+
+
+def _iso_epoch_or_none(ts: str | None) -> float | None:
+    """Parse a daemon ISO-8601 timestamp to epoch seconds; None if absent/unparseable."""
+    if not ts:
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(ts).timestamp()
+    except Exception:
+        return None
+
+
 def _get_session_obligations(session_id: str) -> list[dict]:
     """Find tasks where session_id is assignee with status pending or in_progress.
 
@@ -688,6 +707,7 @@ def _get_session_obligations(session_id: str) -> list[dict]:
     Fail-open: errors scanning a chat are silently skipped.
     """
     obligations: list[dict] = []
+    now = time.time()  # for the direct-verdict recency gate
     # Guard-5: resolve the session's current role for role-class obligation matching.
     # Fail-open: if role can't be resolved, only named-assignee obligations apply.
     session_role: str | None = None
@@ -732,11 +752,22 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                                 "verdict_role": line.get("verdict_role"),
                                 "status": line.get("status"),
                                 "begin_fired": False,
+                                "done_ts": (
+                                    line.get("ts")
+                                    if line.get("status") == chats.TASK_DONE
+                                    else None
+                                ),
                             }
                     elif k == chats.TASK_UPDATE:
                         tid = line.get("task_id")
                         if tid and tid in tasks:
                             tasks[tid]["status"] = line.get("status")
+                            if line.get("status") == chats.TASK_DONE:
+                                # done-TRANSITION ts (latest wins) — drives the
+                                # owed-verdict recency filter so a long-lived roster's
+                                # accumulated done-not-approved backlog doesn't all
+                                # backfill as "owed" on deploy.
+                                tasks[tid]["done_ts"] = line.get("ts")
                     elif k == chats.TASK_SIGNAL and line.get("signal") == "start":
                         tid = line.get("task_id")
                         if tid and tid in tasks:
@@ -843,6 +874,18 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                             # Not yet under review — review-initiation, not stall-
                             # recovery; master's normal dispatch + commit-ready
                             # reconcile cover cold-start.
+                            continue
+                        # Recency gate: only a RECENTLY-done task is a live mid-review
+                        # stall worth a wake. Without this, a long-lived roster's
+                        # accumulated done-not-approved BACKLOG (audit/research tasks
+                        # that skip the approve gate, done days ago) all backfills as
+                        # "owed" on deploy and storms every reviewer. done_ts is the
+                        # done-TRANSITION ts (not create ts); stale → skip.
+                        done_epoch = _iso_epoch_or_none(task.get("done_ts"))
+                        if (
+                            done_epoch is None
+                            or (now - done_epoch) > _OWED_VERDICT_WINDOW_S
+                        ):
                             continue
                         owes = (
                             reviewer_role == chats.ROLE_CRITIC and not has_crit

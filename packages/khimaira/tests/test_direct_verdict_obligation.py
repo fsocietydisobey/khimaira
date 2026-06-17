@@ -52,8 +52,18 @@ def _meta() -> dict:
     }
 
 
-def _done_task() -> dict:
-    return {"kind": chats.TASK, "id": WORK_TASK, "status": chats.TASK_DONE}
+def _done_task(ts: str | None = None) -> dict:
+    """A done work-task. Stamps a RECENT done-ts by default so it passes the
+    owed-verdict recency gate; pass an explicit old ts to test the stale-backlog skip.
+    """
+    from datetime import datetime, timezone
+
+    return {
+        "kind": chats.TASK,
+        "id": WORK_TASK,
+        "status": chats.TASK_DONE,
+        "ts": ts or datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _verdict(task_id: str, verdict: str, by: str) -> dict:
@@ -101,6 +111,61 @@ def test_changes_verdict_counts_as_critic_present(isolated_state):
         apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK
     )
     assert _owed(
+        apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
+    )
+
+
+# --- RECENCY (the muther long-lived-roster backlog storm) ------------------
+
+
+def test_stale_done_task_not_owed(isolated_state):
+    """A done task whose done-transition is older than the window → NOT owed.
+
+    The muther over-fire: a long-lived roster accumulates done-not-approved tasks
+    (audit/research that skip the gate, done days ago). Without a recency gate they
+    all backfill as "owed" on deploy and storm every reviewer.
+    """
+    _write_chat(
+        [
+            _meta(),
+            _done_task(ts="2020-01-01T00:00:00+00:00"),  # ancient done-transition
+            _verdict(WORK_TASK, "approve", CRITIC_SID),
+        ]
+    )
+
+    assert not _owed(
+        apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
+    )
+
+
+def test_recent_done_task_owed(isolated_state):
+    """A freshly-done partial-verdict task (within the window) → owed (live stall)."""
+    from datetime import datetime, timezone
+
+    _write_chat(
+        [
+            _meta(),
+            _done_task(ts=datetime.now(timezone.utc).isoformat()),
+            _verdict(WORK_TASK, "approve", CRITIC_SID),
+        ]
+    )
+
+    assert _owed(
+        apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
+    )
+
+
+def test_done_task_with_no_done_ts_not_owed(isolated_state):
+    """A done task with no parseable done-ts → NOT owed (can't prove recency → skip)."""
+    _write_chat(
+        [
+            _meta(),
+            {"kind": chats.TASK, "id": WORK_TASK, "status": chats.TASK_DONE},  # no ts
+            _verdict(WORK_TASK, "approve", CRITIC_SID),
+        ]
+    )
+
+    assert not _owed(
         apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
     )
 
