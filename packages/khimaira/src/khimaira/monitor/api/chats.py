@@ -711,6 +711,14 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                 verdicts: dict[str, dict] = (
                     {}
                 )  # task_id → {critic_approved, verifier_shipped}
+                # Direct-verdict tracking (the gate real rosters actually use):
+                # verdict PRESENCE per slot + per-chat member_roles, mirroring
+                # _committable_task_ids / _maybe_nudge_missing_verdict. Real rosters
+                # record verdicts straight on the work-task — gate-task wrappers
+                # (gate_for/gate_required) are dormant in practice.
+                crit_present: set[str] = set()  # task_id has a critic verdict
+                ver_present: set[str] = set()  # task_id has a verifier verdict
+                last_meta: dict | None = None  # latest META line wins (load_room)
                 for line in chats._read(chat_id):
                     k = line.get("kind")
                     if k == chats.TASK:
@@ -753,6 +761,14 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                                 v["verifier_shipped"] = True
                             elif verdict_val == "hold":
                                 v["verifier_shipped"] = False
+                            # Verdict PRESENCE per slot (distinct from satisfied —
+                            # a "changes"/"hold" still means the reviewer acted).
+                            if verdict_val in ("approve", "changes"):
+                                crit_present.add(ref_tid)
+                            elif verdict_val in ("ship", "hold"):
+                                ver_present.add(ref_tid)
+                    elif k == chats.META:
+                        last_meta = line
 
                 for task in tasks.values():
                     status = task.get("status")
@@ -803,6 +819,42 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                                     "begin_fired": task.get("begin_fired", False),
                                     "gate_for": gate_for,
                                     "verdict_role": task_verdict_role,
+                                }
+                            )
+
+                # Direct-verdict obligation — the gate real rosters use. Verdicts are
+                # recorded straight on the work-task (no gate-task wrapper); mirror
+                # _committable_task_ids. A reviewer-role MEMBER of this chat OWES a
+                # verdict iff a work-task is `done`, already carries >=1 verdict (proof
+                # it's under review — so we never nag on plain un-gated done tasks), and
+                # this member's verdict slot is still empty. Scoped per-chat via
+                # member_roles (like _maybe_nudge_missing_verdict), never the global
+                # role — a reviewer only owes verdicts in chats it actually reviews.
+                member_roles = (last_meta or {}).get("member_roles") or {}
+                reviewer_role = member_roles.get(session_id)
+                if reviewer_role in (chats.ROLE_CRITIC, chats.ROLE_VERIFIER):
+                    for task in tasks.values():
+                        if task.get("status") != chats.TASK_DONE:
+                            continue
+                        tid = task["task_id"]
+                        has_crit = tid in crit_present
+                        has_ver = tid in ver_present
+                        if not (has_crit or has_ver):
+                            # Not yet under review — review-initiation, not stall-
+                            # recovery; master's normal dispatch + commit-ready
+                            # reconcile cover cold-start.
+                            continue
+                        owes = (
+                            reviewer_role == chats.ROLE_CRITIC and not has_crit
+                        ) or (reviewer_role == chats.ROLE_VERIFIER and not has_ver)
+                        if owes:
+                            obligations.append(
+                                {
+                                    "task_id": tid,
+                                    "chat_id": chat_id,
+                                    "status": chats.TASK_DONE,
+                                    "begin_fired": task.get("begin_fired", False),
+                                    "owed_verdict": reviewer_role,
                                 }
                             )
             except Exception:
