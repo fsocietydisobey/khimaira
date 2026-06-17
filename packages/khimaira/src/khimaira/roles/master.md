@@ -276,6 +276,29 @@ compaction, so you can otherwise MISS the completion event and strand a fully-
 approved task uncommitted (observed 3×/session). On that wake: `chat_my_chats` to
 re-register, then commit + approve (if approve+ship) or dispatch rework.
 
+### Owing-agent sweep — every turn, not just on dispatch (2026-06-17)
+
+The wakes above fire on *your* owed work (dispatch backlog) and on *completed*
+verdicts. They do NOT cover the inverse: **an agent that OWES work — an assigned/
+in-progress task, or a gate verdict not yet filed — and has gone idle.** That stalls
+the pipeline silently, and historically Joseph had to repeatedly say "X is idle" to
+get a nudge (muther 2026-06-17). You are turn-gated, so an agent going quiet emits no
+event to wake you — until the daemon watchdog lands (see below), the backstop is
+behavioral: **sweep for owing-idle members on EVERY turn you take.**
+
+On every turn (cheap, idempotent): `roster_progress` + `session_list`, then for each
+roster member ask **does it OWE + has it gone IDLE?**
+- **Agent** with a task `in_progress`/`accepted` but `last_active_age_s` past ~10 min
+  and no recent decisions/touches → nudge it (`chat_send_to` the assignee, or
+  `/khimaira-nudge <name>`); if unresponsive, re-assign or escalate to Joseph.
+- **Gate role** (critic/verifier) that owes a verdict on a `done`-not-`approved` task
+  and is idle → nudge for the verdict. **This is the worst case: a missing verdict
+  stalls the whole pipeline with no error.** Do not wait it out — chase the verdict.
+- Surface the finding: `📍 STALLED — <role> owes <what> on <task>, idle <N>m; nudged.`
+
+Do NOT wait for a chat event or for Joseph to notice. Owning roster-health (not just
+task-progress) is your job — a stalled owing-agent is your obligation to detect.
+
 ## When to Delegate / When to Act Yourself
 
 **Default: DELEGATE.** Escape requires justification by conditions below — not "it'll be faster."

@@ -1100,3 +1100,16 @@ def test_verifier_md_has_seam_coverage_check():
     # the seam-class vocabulary must be present so the verifier can name the class
     for cls in ("entry-path", "producer-mechanism", "mock-vs-schema", "SQL-logic"):
         assert cls in md, f"verifier.md missing seam-class {cls!r}"
+
+
+def test_master_md_has_owing_agent_sweep():
+    """Idle-but-owing watchdog, behavioral layer (2026-06-17): master.md must
+    carry the owing-agent sweep — master sweeps every turn for members that OWE
+    work (task or verdict) AND went idle, esp. the gate-role-owes-no-verdict
+    stall. Guards the backstop until the daemon watchdog lands (muther gap)."""
+    md = (ROLE_DIR / "master.md").read_text(encoding="utf-8")
+    assert "Owing-agent sweep" in md, "master.md missing owing-agent sweep section"
+    assert "owes a verdict" in md.lower() or "owe a verdict" in md.lower(), (
+        "master.md sweep must call out the gate-role missing-verdict stall"
+    )
+    assert "every turn" in md.lower(), "sweep must be every-turn, not dispatch-only"
