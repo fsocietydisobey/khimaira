@@ -973,7 +973,17 @@ def _poll_missed_chat_events(session_id: str) -> str:
     except (OSError, json.JSONDecodeError):
         watermarks = {}
 
-    cutoff_iso = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    # Cold-start staleness bound ONLY. When a per-chat watermark exists the fetch
+    # below uses `&since=watermark`, so `messages` are already bounded to UNSEEN
+    # events — applying an age cap on top of that drops unseen-but-old dispatches,
+    # which is exactly the SSE-deaf-idle black hole (muther ISSUE 1/2, 2026-06-18):
+    # roster_recovery wake latency (idle floor 300s + cooldown 300s + WIP 900s) can
+    # exceed any short age cap, so a stale-but-unseen wake target stays invisible and
+    # the agent re-idles having seen nothing. The cap is therefore applied ONLY on
+    # cold-start (no watermark for the chat) to keep a brand-new session from
+    # replaying a full day of history. Default 60 min >> max wake latency; env-tunable.
+    _staleness_min = int(os.environ.get("KHIMAIRA_CHAT_POLL_STALENESS_MIN", "60"))
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(minutes=_staleness_min)).isoformat()
 
     try:
         url = f"{_ENDPOINT}/api/chats?session_id={urllib.parse.quote(session_id, safe='')}"
@@ -1011,11 +1021,14 @@ def _poll_missed_chat_events(session_id: str) -> str:
             if last_eid:
                 new_watermarks[chat_id] = last_eid
 
+        # Age cap applies ONLY on cold-start (no watermark). With a watermark the
+        # `&since=` fetch already bounds to unseen events, so an unseen-but-old
+        # dispatch (the SSE-deaf-idle case) MUST still surface regardless of age.
         new_msgs = [
             m for m in messages
             if m.get("kind") == "msg"
             and m.get("sender_id") != session_id
-            and (m.get("ts") or "") >= cutoff_iso
+            and (watermark is not None or (m.get("ts") or "") >= cutoff_iso)
         ]
         if new_msgs:
             all_new.append((chat_id, title, new_msgs))

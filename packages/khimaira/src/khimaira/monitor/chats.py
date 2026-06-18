@@ -4178,8 +4178,12 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
     # Wake-filter (Class A): an UNDIRECTED msg must not wake idle-by-default
     # consult roles — they react to every broadcast (the cost leak) and then get
     # false-flagged for the silence. Directed msgs (targeted is not None) always
-    # deliver. Missed undirected msgs backfill via the next-turn catch-up poll
-    # (_poll_missed_chat_events), so suppression is lossless.
+    # deliver. Unaddressed missed undirected msgs backfill via the next-turn
+    # catch-up poll (_poll_missed_chat_events in the UPS hook) — lossless ONLY
+    # within that poll's staleness window AND only once a turn fires. An ADDRESSED
+    # undirected msg to a dead-SSE seat is the exception (it can outlive the catch-up
+    # window before any wake lands), so it gets a durable notice below. See
+    # tasks/sse-deaf-idle-wake/SPEC.md (muther ISSUE 1, 2026-06-18).
     member_roles = (room.get("meta", {}) or {}).get("member_roles") or {}
 
     # Default broadcast: to every accepted member (or filtered by `to`).
@@ -4193,6 +4197,37 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
             and record.get("kind") == MSG
             and member_roles.get(sid) in IDLE_CONSULT_ROLES
         ):
+            # Wake suppressed (idle-consult role + undirected). BUT if the sender
+            # clearly ADDRESSED this member (named its seat, or @role / role:) yet
+            # forgot to direct the msg, a dead-SSE target silently loses it: the
+            # next-turn catch-up can't run until a wake forces a turn, and wake
+            # latency can exceed the catch-up window (muther ISSUE 1 Path C,
+            # 2026-06-18 — gate consult "reached NEITHER critic-1 nor verifier-1").
+            # For that addressed-but-undirected + SSE-dead case ONLY, drop the same
+            # durable inbox notice directed msgs get. Unaddressed chatter stays
+            # suppressed + notice-free so a busy room never spams an idle consult seat.
+            _c_role = (member_roles.get(sid) or "").lower()
+            _c_name = ((member or {}).get("session_name") or "").lower()
+            _c_body = (record.get("body") or "").lower()
+            _addressed = (bool(_c_name) and _c_name in _c_body) or any(
+                tok and tok in _c_body
+                for tok in (f"@{_c_role}", f"{_c_role}:", f"{_c_role}-")
+            )
+            if _addressed and not (_subscribers.get(_slot_subscriber_key(sid)) or _subscribers.get(sid)):
+                try:
+                    sessions_mod.post_notice(
+                        target_session_id=sid,
+                        text=(
+                            f"📨 You were addressed in an undirected chat message in "
+                            f"{chat_id} from "
+                            f"{record.get('sender_name') or record.get('sender_id')} "
+                            f"while idle (SSE not connected). "
+                            f"Call chat_history(chat_id='{chat_id}') to read it."
+                        ),
+                        from_session_id="khimaira-daemon",
+                    )
+                except Exception:
+                    pass
             continue  # idle consult role + undirected msg → suppress wake
         # Part F: resolve member sid → slot key so delivery follows the live
         # session across transfer/reattach. Slot-keyed subscriber receives the

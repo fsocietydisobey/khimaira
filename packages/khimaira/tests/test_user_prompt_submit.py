@@ -105,6 +105,93 @@ def test_poll_missed_chat_events_formats_correctly(hook_module):
 
 
 # ---------------------------------------------------------------------------
+# Fix B (muther ISSUE 1/2, 2026-06-18) — catch-up staleness cap decoupled from
+# wake latency: an unseen-but-old dispatch must surface once a watermark proves
+# it's unseen; the age cap applies ONLY on cold-start to bound first-poll replay.
+# ---------------------------------------------------------------------------
+
+
+def test_poll_surfaces_old_unseen_msg_when_watermark_present(hook_module):
+    """With a per-chat watermark, an unseen msg OLDER than the cap still surfaces.
+
+    The SSE-deaf-idle black hole: roster_recovery wake latency (idle floor 300s +
+    cooldown 300s + WIP 900s) can exceed the former 10-min age cap, so a stale-but-
+    unseen wake target would vanish from the catch-up and the agent re-idles having
+    seen nothing. The watermark bounds the fetch to unseen → age must not re-drop it.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    hook_module._WATERMARKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    hook_module._WATERMARKS_PATH.write_text(
+        json.dumps({CHAT_ID: "evt-000"}), encoding="utf-8"
+    )
+
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    chats_payload = {
+        "chats": [{"chat_id": CHAT_ID, "title": "t", "my_state": "accepted"}]
+    }
+    messages_payload = {
+        "messages": [
+            {
+                "kind": "msg",
+                "event_id": "evt-100",
+                "sender_id": "bbbbbbbb-0000-0000-0000-000000000002",
+                "sender_name": "master",
+                "ts": old_ts,
+                "body": "@critic please review the gate",
+            }
+        ]
+    }
+    with patch(
+        "khimaira.hooks.user_prompt_submit.urllib.request.urlopen",
+        side_effect=_mock_urlopen([chats_payload, messages_payload]),
+    ):
+        result = hook_module._poll_missed_chat_events(SESSION_ID)
+
+    assert "please review the gate" in result  # would be dropped by the old 10-min cap
+
+
+def test_poll_cold_start_age_bounds_first_replay(hook_module):
+    """With NO watermark (cold start), the age cap bounds replay: ancient dropped,
+    recent kept — so a brand-new session doesn't dump a full day of history."""
+    from datetime import datetime, timezone, timedelta
+
+    ancient_ts = (datetime.now(timezone.utc) - timedelta(minutes=180)).isoformat()
+    recent_ts = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    chats_payload = {
+        "chats": [{"chat_id": CHAT_ID, "title": "t", "my_state": "accepted"}]
+    }
+    messages_payload = {
+        "messages": [
+            {
+                "kind": "msg",
+                "event_id": "evt-old",
+                "sender_id": "bbbbbbbb-0000-0000-0000-000000000002",
+                "sender_name": "agent-2",
+                "ts": ancient_ts,
+                "body": "ancient chatter",
+            },
+            {
+                "kind": "msg",
+                "event_id": "evt-new",
+                "sender_id": "bbbbbbbb-0000-0000-0000-000000000002",
+                "sender_name": "agent-2",
+                "ts": recent_ts,
+                "body": "recent ping",
+            },
+        ]
+    }
+    with patch(
+        "khimaira.hooks.user_prompt_submit.urllib.request.urlopen",
+        side_effect=_mock_urlopen([chats_payload, messages_payload]),
+    ):
+        result = hook_module._poll_missed_chat_events(SESSION_ID)
+
+    assert "ancient chatter" not in result  # > 60-min cold-start cap → dropped
+    assert "recent ping" in result
+
+
+# ---------------------------------------------------------------------------
 # Task #66 — dynamic per-prompt context injection
 # ---------------------------------------------------------------------------
 

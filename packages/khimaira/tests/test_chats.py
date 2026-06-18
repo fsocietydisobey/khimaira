@@ -704,6 +704,66 @@ def test_send_message_no_to_preserves_broadcast(isolated_chats):
 
 
 # ---------------------------------------------------------------------------
+# Fix C (muther ISSUE 1 Path C, 2026-06-18) — an ADDRESSED-but-undirected msg to
+# an SSE-dead idle-consult seat gets a durable notice (wake stays suppressed);
+# unaddressed chatter stays notice-free so a busy room can't spam an idle seat.
+# ---------------------------------------------------------------------------
+
+
+def _dead_critic_room(c, sessions_mod):
+    """Two-member room: alice (creator) + critic-1 (role=critic), accepted, with
+    NO SSE subscriber for critic-1 (the dead-SSE idle-consult case)."""
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "critic-1-uuid", "critic-1")
+    c.create_room(
+        "alice-uuid",
+        ["critic-1-uuid"],
+        title="t",
+        member_roles={"critic-1-uuid": c.ROLE_CRITIC},
+    )
+    chat_id = c.my_chats("alice-uuid")[0]["chat_id"]
+    c.accept(chat_id, "critic-1-uuid")
+    return chat_id
+
+
+def test_suppressed_undirected_addressed_consult_posts_notice(isolated_chats):
+    """Undirected msg that NAMES the idle critic seat → durable notice survives."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _dead_critic_room(c, sessions_mod)
+    c.send_message(chat_id, "alice-uuid", "critic-1 please review the gate verdict")
+    notes = sessions_mod.pending_notes("critic-1-uuid", mark_read=False)
+    assert any("SSE not connected" in (n.get("text") or "") for n in notes)
+
+
+def test_suppressed_undirected_unaddressed_chatter_no_notice(isolated_chats):
+    """Undirected general chatter (does NOT address the critic) → no notice (anti-spam)."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _dead_critic_room(c, sessions_mod)
+    c.send_message(chat_id, "alice-uuid", "agent-2 shipped slice-E, nice work")
+    notes = sessions_mod.pending_notes("critic-1-uuid", mark_read=False)
+    assert not any("SSE not connected" in (n.get("text") or "") for n in notes)
+
+
+def test_directed_to_dead_critic_single_notice_unchanged(isolated_chats):
+    """Directed msg path unchanged: exactly one (directed) notice, no double-fire
+    from the new addressed-suppression branch (targeted bypasses suppression)."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _dead_critic_room(c, sessions_mod)
+    c.send_message(chat_id, "alice-uuid", "review please", to=["critic-1-uuid"])
+    notes = sessions_mod.pending_notes("critic-1-uuid", mark_read=False)
+    directed = [n for n in notes if "Undelivered DIRECTED" in (n.get("text") or "")]
+    addressed = [n for n in notes if "addressed in an undirected" in (n.get("text") or "")]
+    assert len(directed) == 1
+    assert len(addressed) == 0
+
+
+# ---------------------------------------------------------------------------
 # Phase B: tasks
 # ---------------------------------------------------------------------------
 
