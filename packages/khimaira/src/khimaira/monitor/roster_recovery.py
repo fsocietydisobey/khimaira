@@ -276,10 +276,36 @@ def _discover_roster_windows() -> list[dict[str, Any]]:
                 def _resolve_role(nm: str | None) -> str | None:
                     if not nm:
                         return None
-                    if infer_role_from_name is not None:
-                        return infer_role_from_name(nm)
-                    parts = nm.rsplit("-", 1)
-                    return parts[0] if (len(parts) == 2 and parts[1].isdigit()) else nm
+                    if infer_role_from_name is None:
+                        parts = nm.rsplit("-", 1)
+                        return (
+                            parts[0]
+                            if (len(parts) == 2 and parts[1].isdigit())
+                            else nm
+                        )
+                    # Try the full name first (registered prefixed leads like
+                    # jp-frontend-lead resolve directly via the themis registry).
+                    # Then progressively strip leading "<prefix>-" segments and
+                    # retry, so a prefixed-roster WORKER window (muther-critic-1,
+                    # jp-agent-1) whose prefix is NOT a registry role still resolves
+                    # to its base role (critic, agent). infer_role_from_name only
+                    # strips the trailing -<n>, leaving "muther-critic" → None — so
+                    # WITHOUT this, discovery dropped the ENTIRE prefixed roster
+                    # (every window → role=None → `if not role: continue`) and the
+                    # watchdog never woke a single muther-*/jp-* worker. Confirmed
+                    # audit-grade 2026-06-18: _discover_roster_windows returned 0 for
+                    # the live muther roster though all 10 seats were in-scope.
+                    # (muther ISSUE 1/2 Path A; roster_ids filter below still scopes
+                    # to THIS daemon's roster, so prefix-tolerance can't cross rosters.)
+                    candidate = nm
+                    while candidate:
+                        resolved = infer_role_from_name(candidate)
+                        if resolved:
+                            return resolved
+                        _head, _sep, _tail = candidate.partition("-")
+                        if not _sep:
+                            return None
+                        candidate = _tail
 
                 # Prefer the title; fall back to the command-string name. Use
                 # whichever resolves to a role so a stray title can't drop a window.

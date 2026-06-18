@@ -84,8 +84,8 @@ class TestDiscoverRosterWindows:
             assert rr._discover_roster_windows() == []
 
     def test_normalizes_prefixed_names(self):
-        """jp-agent-1 → role=jp-agent, jp-frontend-lead-1 → jp-frontend-lead."""
-        from khimaira.monitor.chats import infer_role_from_name
+        """Prefixed WORKER → base role (jp-agent-1 → agent); registered prefixed
+        LEAD keeps its prefix (jp-frontend-lead-1 → jp-frontend-lead)."""
         data = json.dumps([{"tabs": [{"windows": [
             {"id": 30, "cmdline": ["claude-chat", "-r", "jp-agent-1"]},
             {"id": 31, "cmdline": ["claude-chat", "-r", "jp-frontend-lead-1"]},
@@ -95,11 +95,39 @@ class TestDiscoverRosterWindows:
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
         ):
             windows = rr._discover_roster_windows()
-        roles = {w["role"] for w in windows}
-        # infer_role_from_name handles prefix-stripping; roles should be normalized
-        # (the exact result depends on _VALID_ROLES, but the raw suffix -1 is gone)
-        for w in windows:
-            assert not w["role"].endswith("-1"), "Numeric suffix must be stripped"
+        by_id = {w["window_id"]: w["role"] for w in windows}
+        # Prefix-tolerant resolver: jp-agent-1's prefix isn't a registry role, so
+        # it strips to the base "agent" (was dropped → role=None before the fix).
+        assert by_id.get(30) == "agent"
+        # A registered prefixed lead resolves directly (full-name match wins first).
+        assert by_id.get(31) == "jp-frontend-lead"
+
+    def test_resolves_arbitrary_prefix_worker_roles(self):
+        """muther ISSUE 1/2 Path A regression: a roster with an unregistered prefix
+        (muther-*) must still have its WORKER seats discovered. Before the fix,
+        infer_role_from_name('muther-critic-1') → None → every window dropped →
+        _discover_roster_windows returned 0 → the watchdog never woke a muther seat.
+        """
+        data = json.dumps([{"tabs": [{"windows": [
+            {"id": 40, "title": "muther-critic-1",
+             "cmdline": ["bash", "-ic", "claude-chat -n muther-critic-1"]},
+            {"id": 41, "title": "muther-verifier-1",
+             "cmdline": ["bash", "-ic", "claude-chat -n muther-verifier-1"]},
+            {"id": 42, "title": "muther-tracker-1",
+             "cmdline": ["bash", "-ic", "claude-chat -n muther-tracker-1"]},
+            {"id": 43, "title": "muther-agent-2",
+             "cmdline": ["bash", "-ic", "claude-chat -n muther-agent-2"]},
+        ]}]}])
+        with (
+            patch.object(rr, "_kitty", return_value=data),
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
+        ):
+            windows = rr._discover_roster_windows()
+        by_id = {w["window_id"]: w["role"] for w in windows}
+        assert by_id.get(40) == "critic"
+        assert by_id.get(41) == "verifier"
+        assert by_id.get(42) == "tracker"
+        assert by_id.get(43) == "agent"
 
 
 class TestDiscoverRosterWindowsScoping:
