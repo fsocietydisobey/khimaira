@@ -115,6 +115,16 @@ _HITL_PROMPT_RE = re.compile(
 # Roles that hold NO_FILE_EDIT permission; file-edit prompts on these → escalate.
 _NO_FILE_EDIT_ROLES = frozenset(["analyst", "observer", "tracker"])
 
+# Human-interface roles: the seats a HUMAN drives directly (intake = the user's
+# entry point into the roster; master = the orchestrator the user often pilots).
+# The watchdog NEVER auto-actuates these (no compact / wake / HITL inject) — the
+# human manages their own context + answers their own prompts. Auto-compacting the
+# user's interface window (muther-intake at 88-92%) was the 2026-06-18 incident:
+# even when the user is briefly tabbed away, /compact keystrokes land in the window
+# they type into. Agents stay fully auto-managed (that's muther ISSUE 2). Override
+# with KHIMAIRA_ROSTER_ACTUATE_INTERFACE=1 for fully-autonomous (no-human) rosters.
+_HUMAN_INTERFACE_ROLES = frozenset(["intake", "master"])
+
 
 # ---------------------------------------------------------------------------
 # Environment / opt-out
@@ -123,6 +133,22 @@ _NO_FILE_EDIT_ROLES = frozenset(["analyst", "observer", "tracker"])
 def _env_enabled() -> bool:
     """Return False if the global kill-switch is set."""
     return os.environ.get("KHIMAIRA_ROSTER_RECOVERY", "1") != "0"
+
+
+def _env_focus_inject_allowed() -> bool:
+    """Return True only if injecting into the user-FOCUSED window is explicitly
+    allowed (default False). The human-presence guard skips the focused window so
+    the watchdog never types under the user's cursor; set
+    KHIMAIRA_ROSTER_INJECT_FOCUSED=1 to override (e.g. headless/test rosters with
+    no human present)."""
+    return os.environ.get("KHIMAIRA_ROSTER_INJECT_FOCUSED", "0") == "1"
+
+
+def _env_actuate_interface_allowed() -> bool:
+    """Return True only if auto-actuating human-interface roles (intake/master) is
+    explicitly allowed (default False). Set KHIMAIRA_ROSTER_ACTUATE_INTERFACE=1 for
+    fully-autonomous rosters with no human driving the intake/master seats."""
+    return os.environ.get("KHIMAIRA_ROSTER_ACTUATE_INTERFACE", "0") == "1"
 
 
 def _env_auto_hitl_enabled() -> bool:
@@ -327,7 +353,18 @@ def _discover_roster_windows() -> list[dict[str, Any]]:
                         )
                         continue
 
-                roster.append({"window_id": wid, "role": role, "raw_name": raw_name, "cmdline": joined})
+                roster.append({
+                    "window_id": wid,
+                    "role": role,
+                    "raw_name": raw_name,
+                    "cmdline": joined,
+                    # Human-presence signal: the window the user is currently
+                    # focused on. NEVER inject (compact/wake/hitl) into it — doing
+                    # so types keystrokes under the user's cursor + scrolls them
+                    # out of place (muther-intake incident 2026-06-18, when Path A
+                    # first made human-driven windows discoverable).
+                    "is_focused": bool(win.get("is_focused")),
+                })
     return roster
 
 
@@ -1554,6 +1591,35 @@ async def _process_window(win: dict[str, Any]) -> None:
     if _session_opt_out(session_id):
         return
 
+    # Guard (HUMAN-PRESENCE): never inject into the window the user is focused on.
+    # is_focused (from kitty @ ls, captured at discovery this sweep) means the user
+    # is actively looking at / typing in this window — injecting /compact or a wake
+    # prompt would land keystrokes under their cursor and scroll them out of place.
+    # This skips ALL actuation (compact/wake/HITL) for the focused window; it stays
+    # eligible the moment the user tabs away. (muther-intake incident 2026-06-18 —
+    # Path A first made human-driven roster windows discoverable.) NOTE: do NOT key
+    # this on "auto mode on" — roster agents run in auto-accept mode by design, so
+    # that would disable the watchdog for every agent.
+    if win.get("is_focused") and not _env_focus_inject_allowed():
+        _log.debug(
+            "roster-recovery: skip window %d role=%s — user-focused (human present)",
+            window_id, role,
+        )
+        return
+
+    # Guard (HUMAN-INTERFACE): never auto-actuate the seats a human drives directly
+    # (intake = user's entry point; master = orchestrator). Unlike the focused guard,
+    # this holds even when the user is briefly tabbed away — the user's interface
+    # window must not be compacted/woken behind their back. (muther-intake at 92%
+    # kept getting /compact'd whenever the user looked at another window.)
+    if role in _HUMAN_INTERFACE_ROLES and not _env_actuate_interface_allowed():
+        _log.debug(
+            "roster-recovery: skip window %d role=%s — human-interface seat "
+            "(user manages own context)",
+            window_id, role,
+        )
+        return
+
     # Read window screen
     text = await asyncio.get_running_loop().run_in_executor(None, _get_screen, window_id)
     if text is None:
@@ -1667,13 +1733,24 @@ async def _process_window(win: dict[str, Any]) -> None:
         submitted = await asyncio.get_running_loop().run_in_executor(
             None, _inject_text_and_submit, window_id, "/compact", raw_name
         )
+        # STORM GUARD: cool down on EVERY attempt, success or abort. A failed
+        # actuation (TOCTOU mismatch / transient-busy) previously left the debounce
+        # unset, so it retried every 60s sweep — the muther-intake storm 2026-06-18.
+        # Cooling down on abort converts "retry every sweep" → "retry every cooldown".
+        _DEBOUNCE[action_key] = time.time()
         if submitted:
-            _DEBOUNCE[action_key] = time.time()
             _log.info(
                 "roster-recovery: /compact submitted to window %d role=%s session=%s",
                 window_id,
                 role,
                 session_id[:8],
+            )
+        else:
+            _log.debug(
+                "roster-recovery: /compact actuation aborted (TOCTOU/busy) window %d "
+                "role=%s — cooled down, will retry after cooldown not next sweep",
+                window_id,
+                role,
             )
         return
 
@@ -1768,8 +1845,11 @@ async def _process_window(win: dict[str, Any]) -> None:
         submitted = await asyncio.get_running_loop().run_in_executor(
             None, _inject_text_and_submit, window_id, wake_msg, raw_name
         )
+        # STORM GUARD: cool down on EVERY attempt, success or abort (see compact
+        # path). A wake that TOCTOU-aborts (e.g. the target window re-rendered)
+        # must NOT retry every 60s sweep — it cools down like a successful one.
+        _DEBOUNCE[action_key] = time.time()
         if submitted:
-            _DEBOUNCE[action_key] = time.time()
             _log.info(
                 "roster-recovery: wake injected to window %d role=%s session=%s",
                 window_id,
@@ -1782,6 +1862,13 @@ async def _process_window(win: dict[str, Any]) -> None:
             # debounced / not-idle) return early above and never pay the delay.
             if _WAKE_STAGGER_S > 0:
                 await asyncio.sleep(_WAKE_STAGGER_S)
+        else:
+            _log.debug(
+                "roster-recovery: wake actuation aborted (TOCTOU/busy) window %d "
+                "role=%s — cooled down, will retry after cooldown not next sweep",
+                window_id,
+                role,
+            )
     except Exception as exc:
         _log.debug("roster-recovery: wake-path error for %s: %s", role, exc)
 

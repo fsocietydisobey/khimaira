@@ -88,8 +88,15 @@ def _register_idle_seat(idle_s: float = 600.0) -> None:
             os.utime(p, (past, past))
 
 
-def _drive_process_window(monkeypatch) -> list[tuple[int, str]]:
-    """Run the real _process_window with kitty I/O boundaries mocked; return injects."""
+def _drive_process_window(
+    monkeypatch, *, win_extra: dict | None = None, inject_result: bool = True
+) -> list[tuple[int, str]]:
+    """Run the real _process_window with kitty I/O boundaries mocked; return injects.
+
+    win_extra: extra keys merged into the window dict (e.g. is_focused=True).
+    inject_result: what the mocked _inject_text_and_submit returns (False simulates
+    a TOCTOU abort, for the cooldown-on-failure guard).
+    """
     injected: list[tuple[int, str]] = []
 
     monkeypatch.setattr(rr, "_resolve_session_by_name", lambda name: SEAT_SID)
@@ -99,7 +106,7 @@ def _drive_process_window(monkeypatch) -> list[tuple[int, str]]:
     monkeypatch.setattr(
         rr,
         "_inject_text_and_submit",
-        lambda wid, text, name="": injected.append((wid, text)) or True,
+        lambda wid, text, name="": (injected.append((wid, text)), inject_result)[1],
     )
 
     win = {
@@ -108,6 +115,8 @@ def _drive_process_window(monkeypatch) -> list[tuple[int, str]]:
         "raw_name": SEAT_NAME,
         "cmdline": "claude",
     }
+    if win_extra:
+        win.update(win_extra)
     rr._DEBOUNCE.clear()  # fresh cooldown state
     asyncio.get_event_loop().run_until_complete(rr._process_window(win))
     return injected
@@ -143,3 +152,60 @@ def test_recent_owing_but_active_seat_stays_silent(isolated_state, monkeypatch):
     injected = _drive_process_window(monkeypatch)
 
     assert injected == []
+
+
+# ---------------------------------------------------------------------------
+# Guards added after the muther-intake injection storm (2026-06-18)
+# ---------------------------------------------------------------------------
+
+
+def test_user_focused_window_is_never_injected(isolated_state, monkeypatch):
+    """HUMAN-PRESENCE guard: a window the user is focused on (is_focused=True) is
+    skipped even when it has a recent owing obligation + is idle — injecting would
+    type under the user's cursor (the muther-intake incident)."""
+    _register_idle_seat(idle_s=600.0)
+    _write_owed_chat(done_epoch=time.time() - 120)  # would wake if not focused
+
+    injected = _drive_process_window(monkeypatch, win_extra={"is_focused": True})
+
+    assert injected == []
+
+
+def test_focus_override_env_allows_injection(isolated_state, monkeypatch):
+    """The override lets headless/test rosters inject into a focused window."""
+    monkeypatch.setenv("KHIMAIRA_ROSTER_INJECT_FOCUSED", "1")
+    _register_idle_seat(idle_s=600.0)
+    _write_owed_chat(done_epoch=time.time() - 120)
+
+    injected = _drive_process_window(monkeypatch, win_extra={"is_focused": True})
+
+    assert len(injected) == 1  # override → focused window CAN be injected
+
+
+def test_human_interface_role_is_never_actuated(isolated_state, monkeypatch):
+    """HUMAN-INTERFACE guard: an intake/master seat is never auto-actuated even when
+    unfocused + owing + idle — the user drives their own interface window (the
+    muther-intake-compaction incident: it got /compact'd whenever the user tabbed
+    away). Agents stay auto-managed."""
+    _register_idle_seat(idle_s=600.0)
+    _write_owed_chat(done_epoch=time.time() - 120)
+
+    # role=intake (human interface), is_focused=False (user is elsewhere) → still skipped
+    injected = _drive_process_window(
+        monkeypatch, win_extra={"role": chats.ROLE_INTAKE, "is_focused": False}
+    )
+
+    assert injected == []
+
+
+def test_failed_wake_actuation_sets_cooldown(isolated_state, monkeypatch):
+    """STORM guard: a wake that TOCTOU-aborts (inject returns False) must still set
+    the debounce, so it does NOT retry every sweep (the muther-intake retry storm)."""
+    _register_idle_seat(idle_s=600.0)
+    _write_owed_chat(done_epoch=time.time() - 120)
+
+    injected = _drive_process_window(monkeypatch, inject_result=False)
+
+    assert len(injected) == 1  # it attempted once
+    # ...but the cooldown is set despite the abort, so the next sweep is suppressed.
+    assert (WINDOW_ID, "wake") in rr._DEBOUNCE
