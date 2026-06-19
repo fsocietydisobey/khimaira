@@ -358,23 +358,27 @@ class TestInjectTextAndSubmit:
             result = rr._inject_text_and_submit(window_id=10, text="/compact")
         assert result is True
 
-    def test_aborts_on_toctou_mismatch_extra_after(self):
-        """User typed AFTER our text — buffer ends with /compact but has extra."""
-        screen = self._make_screen("/compact extra")  # user typed after
+    def test_submits_with_chrome_after_our_text(self):
+        """Chrome rendered AFTER our text (footer/menu/hint) no longer aborts — the
+        TOCTOU check verifies our text LANDED, not that the buffer is pristine. The
+        old exact-match aborted on every auto-mode/slash-menu window (2026-06-18); the
+        raced-user-input concern moved upstream to the busy/focus/human-interface
+        guards + the Ctrl-U pre-clear, which keep a human's keystrokes out of the
+        windows we inject into."""
+        screen = self._make_screen("/compact\n  ⏵⏵ auto mode on (shift+tab to cycle)")
         with patch.object(rr, "_kitty") as mock_kitty:
             mock_kitty.side_effect = ["", "", screen, ""]
             result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is False
-        assert "ctrl+c" in str(mock_kitty.call_args_list[-1])
+        assert result is True
 
-    def test_aborts_on_toctou_mismatch_extra_before(self):
-        """User typed BEFORE our text — endswith() would pass but exact match catches it."""
-        screen = self._make_screen("user_input/compact")  # user typed before
+    def test_submits_with_prompt_chrome_before_our_text(self):
+        """Prompt chrome BEFORE our text (the "> " prompt, box glyphs) still submits —
+        normalization strips prompt glyphs so the input line reconstructs."""
+        screen = self._make_screen("> /compact")
         with patch.object(rr, "_kitty") as mock_kitty:
             mock_kitty.side_effect = ["", "", screen, ""]
             result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is False, "Exact-match guard must catch user-before-our-text"
-        assert "ctrl+c" in str(mock_kitty.call_args_list[-1])
+        assert result is True
 
     def test_aborts_when_get_text_fails(self):
         """Can't verify buffer — abort conservatively."""
@@ -1707,7 +1711,23 @@ class TestInjectTOCTOUInputLine:
         result, enter = self._run(monkeypatch, buf, "/compact")
         assert result is True and enter
 
-    def test_user_typed_prefix_still_aborts(self, monkeypatch):
-        buf = "> user_was_typing/compact\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+    def test_wrapped_long_message_submits(self, monkeypatch):
+        # A long wake message WRAPS across terminal lines (the real failure: no single
+        # line equals/ends-with the full text). Normalize+reconstruct must still match.
+        buf = (
+            "> ⏰ resume: call chat_my_chats + act on\n"
+            "your inbox / pending work\n"
+            "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+        )
+        result, enter = self._run(
+            monkeypatch,
+            buf,
+            "⏰ resume: call chat_my_chats + act on your inbox / pending work",
+        )
+        assert result is True and enter
+
+    def test_text_absent_aborts(self, monkeypatch):
+        # Inject didn't land — buffer has only chrome, none of our text → abort safely.
+        buf = "  ⏵⏵ auto mode on (shift+tab to cycle)\n  3% until auto-compact\n"
         result, enter = self._run(monkeypatch, buf, "/compact")
         assert result is False and not enter
