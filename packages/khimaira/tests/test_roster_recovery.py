@@ -1675,3 +1675,39 @@ class TestTitleMatchExact:
         assert _re.search(pattern, "agent-1"), "must match its own window"
         assert not _re.search(pattern, "muther-agent-1"), "must NOT match the sister roster twin"
         assert not _re.search(pattern, "agent-11"), "must NOT match agent-11 (substring)"
+
+
+class TestInjectTOCTOUInputLine:
+    """TOCTOU verify must find our text on the INPUT line even when chrome renders
+    BELOW it (auto-mode footer, slash-command menu) — the muther wake/compact aborts
+    2026-06-18 — while still rejecting a raced user-typed prefix."""
+
+    def _run(self, monkeypatch, buffer: str, text: str):
+        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
+        monkeypatch.setattr(rr, "_get_screen", lambda wid: buffer)
+        monkeypatch.setattr(rr, "time", rr.time)  # keep real time; sleeps are tiny
+        calls: list[tuple] = []
+
+        def fake_kitty(*args, **kw):
+            calls.append(args)
+            return ""  # non-None = success for send-key/send-text
+
+        monkeypatch.setattr(rr, "_kitty", fake_kitty)
+        result = rr._inject_text_and_submit(900, text, "agent-1")
+        pressed_enter = any("enter" in a for a in calls)
+        return result, pressed_enter
+
+    def test_auto_mode_footer_below_input_submits(self, monkeypatch):
+        buf = "> ⏰ resume now please\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+        result, enter = self._run(monkeypatch, buf, "⏰ resume now please")
+        assert result is True and enter
+
+    def test_slash_command_menu_below_input_submits(self, monkeypatch):
+        buf = "> /compact\n  workflows\n  /config\n  /clear\n"
+        result, enter = self._run(monkeypatch, buf, "/compact")
+        assert result is True and enter
+
+    def test_user_typed_prefix_still_aborts(self, monkeypatch):
+        buf = "> user_was_typing/compact\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+        result, enter = self._run(monkeypatch, buf, "/compact")
+        assert result is False and not enter

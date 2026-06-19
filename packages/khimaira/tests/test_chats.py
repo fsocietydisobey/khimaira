@@ -4412,3 +4412,82 @@ def test_broadcast_directed_no_subscriber_drops_durable_notice(
         "Undirected MSG must NOT call post_notice for a disconnected member. "
         f"Got {len(undirected_notices)}."
     )
+
+
+# ---------------------------------------------------------------------------
+# ISSUE 3 hybrid (muther 2026-06-18): gate-complete auto-advance, solo-only
+# ---------------------------------------------------------------------------
+
+
+def _gate_room(c, sessions_mod):
+    """master + agent-1 + critic-1 + verifier-1, all accepted, role-bound."""
+    seats = {
+        "master-u": "master",
+        "agent-u": "agent-1",
+        "critic-u": "critic-1",
+        "verifier-u": "verifier-1",
+        "agent2-u": "agent-2",
+    }
+    for sid, name in seats.items():
+        _make_session(sessions_mod, sid, name)
+    c.create_room(
+        "master-u",
+        ["agent-u", "critic-u", "verifier-u", "agent2-u"],
+        title="t",
+        member_roles={
+            "agent-u": c.ROLE_AGENT,
+            "agent2-u": c.ROLE_AGENT,
+            "critic-u": c.ROLE_CRITIC,
+            "verifier-u": c.ROLE_VERIFIER,
+        },
+    )
+    chat_id = c.my_chats("master-u")[0]["chat_id"]
+    for sid in ("agent-u", "critic-u", "verifier-u", "agent2-u"):
+        c.accept(chat_id, sid)
+    return chat_id
+
+
+def _status_of(c, chat_id, tid):
+    for t in c.task_status(chat_id, "master-u"):
+        if t.get("id") == tid or t.get("task_id") == tid:
+            return t.get("status")
+    return None
+
+
+def test_gate_complete_auto_advances_solo_assignee_to_done(isolated_chats):
+    """Both verdicts on a SOLO-assignee in_progress task → auto-advance to done."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _gate_room(c, sessions_mod)
+    task = c.create_task(chat_id, "master-u", "do thing", assignee_session_id="agent-u")
+    tid = task["id"]
+    c.update_task_status(chat_id, tid, "agent-u", c.TASK_IN_PROGRESS)  # agent claims it
+
+    c.record_gate_verdict(chat_id, "critic-u", tid, "approve")
+    assert _status_of(c, chat_id, tid) == c.TASK_IN_PROGRESS  # one verdict — not yet
+    c.record_gate_verdict(chat_id, "verifier-u", tid, "ship")  # gate complete
+
+    assert _status_of(c, chat_id, tid) == c.TASK_DONE  # auto-advanced
+
+
+def test_gate_complete_does_not_auto_advance_multi_agent_task(isolated_chats):
+    """A multi-agent gated task keeps the explicit per-agent ack — NOT auto-advanced."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _gate_room(c, sessions_mod)
+    task = c.create_task(
+        chat_id,
+        "master-u",
+        "do thing",
+        assignee_session_id="agent-u",
+        required_agents=["agent-u", "agent2-u"],  # multi-agent gate
+    )
+    tid = task["id"]
+    c.update_task_status(chat_id, tid, "agent-u", c.TASK_IN_PROGRESS)
+
+    c.record_gate_verdict(chat_id, "critic-u", tid, "approve")
+    c.record_gate_verdict(chat_id, "verifier-u", tid, "ship")
+
+    assert _status_of(c, chat_id, tid) == c.TASK_IN_PROGRESS  # stays — multi-agent

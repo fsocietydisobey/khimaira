@@ -756,19 +756,36 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
         return False
 
     lines = [line.rstrip() for line in buffer.splitlines() if line.strip()]
-    last = lines[-1] if lines else ""
     expected = text.rstrip()
-    # Exact match: the last line must be ONLY our injected text.
-    # endswith() is insufficient — it passes if the user typed before our text
-    # (e.g. "user_input/compact" still endswith "/compact" but is a raced buffer).
-    if last != expected:
-        # Buffer has changed — user may have typed between our steps; abort
+    # TOCTOU verify: our injected text sits on the INPUT line, but that is NOT
+    # necessarily the LAST screen line — Claude Code renders chrome BELOW the input
+    # (the "⏵⏵ auto mode on" footer, the "N% until auto-compact" hint, a slash-command
+    # autocomplete menu when the text starts with "/"). The old "last line == text"
+    # check therefore aborted on every auto-accept-mode / slash-command window — the
+    # muther agents never got woken and /compact never landed (2026-06-18).
+    #
+    # Robust check: scan the recent lines for ONE that ENDS WITH our exact text
+    # preceded ONLY by prompt chrome (prompt glyphs + whitespace). This still rejects
+    # the raced-buffer case the exact-match guarded against — "user_input/compact" has
+    # a non-chrome prefix, so it fails — while tolerating the footer/menu below it.
+    _PROMPT_CHROME = set(" \t>│▌❯|")
+
+    def _is_our_input_line(line: str) -> bool:
+        if not line.endswith(expected):
+            return False
+        prefix = line[: len(line) - len(expected)]
+        return all(ch in _PROMPT_CHROME for ch in prefix)
+
+    if not any(_is_our_input_line(ln) for ln in lines[-12:]):
+        # Our text isn't cleanly on the input line — user may have typed, or the
+        # inject didn't land. Abort safely.
         _kitty("send-key", id_match, "ctrl+c")
         _log.warning(
-            "roster-recovery: TOCTOU mismatch on window %d — expected %r, got %r, aborted",
+            "roster-recovery: TOCTOU mismatch on window %d — expected input line %r "
+            "not found (last line %r), aborted",
             window_id,
             expected,
-            last,
+            lines[-1] if lines else "",
         )
         return False
 

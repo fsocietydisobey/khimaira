@@ -808,9 +808,22 @@ def _get_session_obligations(session_id: str) -> list[dict]:
 
                     # Named-assignee obligation (existing behavior)
                     if task.get("assignee_id") == session_id:
+                        tid = task["task_id"]
+                        # GATE-COMPLETE guard (ISSUE 3 / muther 2026-06-18): a task
+                        # with BOTH gate verdicts recorded (critic + verifier) is
+                        # substantively finished — the assignee no longer owes it;
+                        # only the master owes the commit + approve. Without this, a
+                        # task whose status-field is stuck at in_progress (the agent
+                        # did the work + got both verdicts, but the assignee-driven
+                        # done-transition never fired) reads as owed FOREVER → the
+                        # watchdog false-wakes an agent that is actually idle-and-done.
+                        # The assignee-vs-master obligation split is the lifecycle fix:
+                        # past the gate, the obligation belongs to master, not the agent.
+                        if tid in crit_present and tid in ver_present:
+                            continue
                         obligations.append(
                             {
-                                "task_id": task["task_id"],
+                                "task_id": tid,
                                 "chat_id": chat_id,
                                 "status": status,
                                 "begin_fired": task.get("begin_fired", False),

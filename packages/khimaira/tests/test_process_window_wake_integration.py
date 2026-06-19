@@ -118,7 +118,10 @@ def _drive_process_window(
     if win_extra:
         win.update(win_extra)
     rr._DEBOUNCE.clear()  # fresh cooldown state
-    asyncio.get_event_loop().run_until_complete(rr._process_window(win))
+    # asyncio.run() creates a FRESH loop each call — robust to test ordering. The old
+    # get_event_loop().run_until_complete broke when an earlier async test closed the
+    # shared loop (DeprecationWarning + RuntimeError under full-suite ordering).
+    asyncio.run(rr._process_window(win))
     return injected
 
 

@@ -29,6 +29,7 @@ from khimaira.monitor.api import chats as apichats
 CRITIC_SID = "11111111-1111-1111-1111-111111111111"
 VERIFIER_SID = "22222222-2222-2222-2222-222222222222"
 MASTER_SID = "33333333-3333-3333-3333-333333333333"
+AGENT_SID = "44444444-4444-4444-4444-444444444444"
 WORK_TASK = "task-deadbeef0001"
 CHAT_ID = "chat-feedface0001"
 
@@ -221,3 +222,55 @@ def test_pending_task_under_review_is_not_a_direct_verdict_obligation(isolated_s
     assert not _owed(
         apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
     )
+
+
+# --- ISSUE 3 (muther 2026-06-18): gate-complete task not owed by assignee ------
+
+
+def _assignee_meta() -> dict:
+    m = _meta()
+    m["member_roles"][AGENT_SID] = chats.ROLE_AGENT
+    return m
+
+
+def _named(obligations: list[dict], task_id: str) -> bool:
+    """True if a NAMED-assignee obligation (not a reviewer-role one) exists."""
+    return any(o.get("task_id") == task_id for o in obligations)
+
+
+def test_gate_complete_inprogress_task_not_owed_by_assignee(isolated_state):
+    """A task stuck at in_progress but with BOTH gate verdicts recorded is
+    gate-complete — the assignee no longer owes it. Without this guard the watchdog
+    false-wakes an agent whose work is finished + approved (the agent-2 recurrence)."""
+    _write_chat(
+        [
+            _assignee_meta(),
+            {
+                "kind": chats.TASK,
+                "id": WORK_TASK,
+                "status": chats.TASK_IN_PROGRESS,
+                "assignee_id": AGENT_SID,
+            },
+            _verdict(WORK_TASK, "approve", CRITIC_SID),
+            _verdict(WORK_TASK, "ship", VERIFIER_SID),
+        ]
+    )
+    assert not _named(apichats._get_session_obligations(AGENT_SID), WORK_TASK)
+
+
+def test_inprogress_task_partial_gate_still_owed_by_assignee(isolated_state):
+    """Control: an in_progress task with only ONE verdict is NOT gate-complete →
+    the assignee still owes it (don't over-suppress)."""
+    _write_chat(
+        [
+            _assignee_meta(),
+            {
+                "kind": chats.TASK,
+                "id": WORK_TASK,
+                "status": chats.TASK_IN_PROGRESS,
+                "assignee_id": AGENT_SID,
+            },
+            _verdict(WORK_TASK, "approve", CRITIC_SID),  # critic only — gate incomplete
+        ]
+    )
+    assert _named(apichats._get_session_obligations(AGENT_SID), WORK_TASK)

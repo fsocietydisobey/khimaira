@@ -1977,6 +1977,78 @@ def _maybe_nudge_missing_verdict(
             log.debug("chats: verdict-nudge post_notice failed", exc_info=True)
 
 
+def _maybe_auto_advance_gate_complete(chat_id: str, task_id: str) -> bool:
+    """Auto-advance a SOLO-assignee task to `done` when its gate just completed.
+
+    ISSUE 3 hybrid (muther 2026-06-18): when both gate verdicts (critic approve/changes
+    + verifier ship/hold — PRESENCE, both reviewers acted) are recorded on a task that
+    is still pending/in_progress AND has a single assignee (no multi-agent required_agents
+    set), the assignee-driven done-transition often never fires, leaving the status stuck
+    at in_progress forever — false AWAITING-ACK + false owing-idle wake target. The gate
+    completing IS sufficient evidence the agent's work is finished, so the system advances
+    it to `done` on the agent's behalf. Master still commits via the normal done → approved
+    path (the human/master gate is preserved). Multi-agent gated tasks are EXCLUDED — they
+    keep the explicit per-agent ack.
+
+    Returns True if it advanced the status, else False. Idempotent: a task already past
+    in_progress is left untouched.
+    """
+    status: str | None = None
+    assignee_id: str | None = None
+    required_agents: list[str] = []
+    crit_present = False
+    ver_present = False
+    for line in _read(chat_id):
+        k = line.get("kind")
+        if k == TASK and line.get("id") == task_id:
+            status = line.get("status")
+            assignee_id = line.get("assignee_id")
+            required_agents = list(line.get("required_agents") or [])
+        elif k == TASK_UPDATE and line.get("task_id") == task_id:
+            status = line.get("status")
+        elif k == TASK_VERDICT and line.get("task_id") == task_id:
+            v = line.get("verdict", "")
+            if v in ("approve", "changes"):
+                crit_present = True
+            elif v in ("ship", "hold"):
+                ver_present = True
+
+    if status not in (TASK_PENDING, TASK_IN_PROGRESS):
+        return False  # already terminal / past in_progress — nothing to advance
+    if not (crit_present and ver_present):
+        return False  # gate not complete yet
+    if not assignee_id:
+        return False  # unassigned task — no solo owner to advance on behalf of
+    # SOLO check: no multi-agent gate (required_agents empty or just the assignee).
+    if required_agents and set(required_agents) - {assignee_id}:
+        return False  # multi-agent gated task — keep the explicit per-agent ack
+
+    record = {
+        "kind": TASK_UPDATE,
+        "event_id": _new_event_id(),
+        "ts": _now_iso(),
+        "chat_id": chat_id,
+        "task_id": task_id,
+        "status": TASK_DONE,
+        "by_session_id": assignee_id,
+        "by_name": "khimaira-daemon (gate-auto)",
+        "note": (
+            "auto-advanced → done: gate complete (critic + verifier verdicts recorded) "
+            "on a solo-assignee task whose done-transition never fired (ISSUE 3 hybrid)."
+        ),
+        "private": False,
+        "to": None,
+    }
+    _append(chat_id, record)
+    log.info(
+        "chats: task %s AUTO-ADVANCED %s → done (gate complete, solo-assignee) in %s",
+        task_id,
+        status,
+        chat_id,
+    )
+    return True
+
+
 def record_gate_verdict(
     chat_id: str,
     by_session_id: str,
@@ -2043,6 +2115,16 @@ def record_gate_verdict(
         "by_name": member.get("session_name") or by_session_id[:8],
     }
     _append(chat_id, record)
+    # Hybrid lifecycle auto-advance (ISSUE 3 / muther 2026-06-18): if this verdict
+    # completes the gate (critic + verifier both recorded) on a SOLO-assignee task
+    # still stuck at pending/in_progress, advance its status to `done` so it stops
+    # reading in_progress forever (the agent did the work + passed the gate but the
+    # assignee-driven done-transition never fired). Solo-only per the ruling; master
+    # then commits via the normal done → approved path. Fail-open.
+    try:
+        _maybe_auto_advance_gate_complete(chat_id, task_id)
+    except Exception as exc:
+        log.warning("chats: gate-complete auto-advance failed for %s: %s", task_id, exc)
     log.info(
         "chats: task %s verdict=%r by %s in %s",
         task_id,
