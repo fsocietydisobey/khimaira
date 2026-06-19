@@ -32,6 +32,12 @@ def test_resolve_domain_non_lead_non_master_skipped():
         assert das._resolve_domain(name) is None, name
 
 
+def test_resolve_domain_named_master_via_master_names():
+    # "muther" (jeevy roster master) isn't *-0/*master* shaped — needs explicit decl.
+    assert das._resolve_domain("muther") is None  # without the hint
+    assert das._resolve_domain("muther", frozenset({"muther"})) == "orchestration"
+
+
 # --- the filter (settled / stale / low-value / role) -----------------------
 
 

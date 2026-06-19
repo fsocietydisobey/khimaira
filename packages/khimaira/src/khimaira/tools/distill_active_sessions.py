@@ -53,17 +53,18 @@ def _encode_cwd(project_root: str) -> str:
     return re.sub(r"[/_]", "-", project_root.rstrip("/"))
 
 
-def _resolve_domain(name: str) -> str | None:
+def _resolve_domain(name: str, master_names: frozenset[str] = frozenset()) -> str | None:
     """Map a session name to its mnemosyne domain, or None to skip.
 
     Lead names (``backend-lead-1``) -> their domain via detect_domain.
-    Master-shaped names -> ``orchestration``.
+    Master-shaped names (``*-0``, ``*master*``, or an explicit ``master_names``
+    entry like ``muther``/``janice``) -> ``orchestration``.
     Everything else (agent/critic/verifier/analyst/intake/tracker/observer) -> None.
     """
     domain = detect_domain(name)
     if domain != "general":
         return domain  # a real domain lead
-    if _MASTER_RE.search(name):
+    if name in master_names or _MASTER_RE.search(name):
         return "orchestration"
     return None  # non-lead, non-master — thin durable value, skip
 
@@ -77,6 +78,7 @@ def distill_active_sessions(
     max_chars: int,
     dry_run: bool,
     verbose: bool,
+    master_names: frozenset[str] = frozenset(),
 ) -> dict:
     """Distill settled master/lead sessions for one project. Returns a summary dict."""
     transcript_dir = _CLAUDE_PROJECTS / _encode_cwd(project_root)
@@ -117,7 +119,7 @@ def distill_active_sessions(
         if idle > recent_s:
             summary["skipped"]["stale"] += 1
             continue
-        domain = _resolve_domain(name)
+        domain = _resolve_domain(name, master_names)
         if domain is None:
             summary["skipped"]["low_value"] += 1
             if verbose:
@@ -167,11 +169,18 @@ def main() -> int:
                     help="Max idle days — older sessions are stale, not this cycle (default 8)")
     ap.add_argument("--max-chars", type=int, default=50_000,
                     help="Transcript truncation cap passed to extract_transcript")
+    ap.add_argument("--master-names", default="",
+                    help="Comma-separated session names to treat as masters "
+                         "(-> orchestration) when they aren't *-0/*master* shaped, "
+                         "e.g. 'muther,janice' for the jeevy roster.")
     ap.add_argument("--dry-run", action="store_true",
                     help="List what would be distilled without writing to the store")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
+    master_names = frozenset(
+        n.strip() for n in args.master_names.split(",") if n.strip()
+    )
     try:
         distill_active_sessions(
             project_root=args.project_root,
@@ -181,6 +190,7 @@ def main() -> int:
             max_chars=args.max_chars,
             dry_run=args.dry_run,
             verbose=args.verbose,
+            master_names=master_names,
         )
     except Exception as exc:  # fail-open: never break the bake
         print(f"[distill-active] non-fatal error: {exc}")
