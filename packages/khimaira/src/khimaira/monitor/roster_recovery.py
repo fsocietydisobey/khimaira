@@ -409,6 +409,132 @@ def _window_for_session_name(name: str) -> dict[str, Any] | None:
     return None
 
 
+def _roster_role_map() -> dict[str, Any]:
+    """session_id → role across all active chat rooms (member_roles).
+
+    The reverse of ``_resolve_session_for_role``: a forward sid→role lookup so a
+    registered window can be synthesized with the role its session holds. Last
+    writer wins on the rare cross-chat collision (a session in two rooms).
+    """
+    out: dict[str, Any] = {}
+    try:
+        from khimaira.monitor import chats as chats_mod
+
+        chat_dir = chats_mod._chat_dir()
+        if not chat_dir.exists():
+            return out
+        for chat_path in chat_dir.glob("chat-*.jsonl"):
+            try:
+                room = chats_mod.load_room(chat_path.stem)
+                member_roles: dict[str, str] = room["meta"].get("member_roles") or {}
+                for sid, r in member_roles.items():
+                    if r:
+                        out[sid] = r
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _union_registered_windows(
+    windows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add identity-registered windows the title-discovery pass missed.
+
+    For each roster member that registered a window_id (POST /sessions/{id}/window)
+    whose window is LIVE in kitty but was NOT found by title (non-role-shaped title),
+    synthesize a ``win`` dict so the wake reaches it by IDENTITY. This finishes task
+    #16 for the wake path: title-discovery drops any window whose title doesn't
+    resolve to a role, so a legitimately-roled member named e.g. "livyatan" was
+    silently unwakeable.
+
+    ADDITIVE: title-discovered windows are untouched; only previously-invisible
+    registered windows are appended (deduped by window_id) — so the live watchdog's
+    behavior on every currently-wakeable window is unchanged.
+
+    Two hard guards (kitty window_ids renumber on restart, so a registered wid can go
+    stale or be reused):
+      * LIVENESS — only synthesize for a wid that is present in this sweep's
+        ``kitty @ ls``; a stale wid must never be woken.
+      * is_focused — carried from that same ls pass so the human-presence /
+        human-interface guards in ``_process_window`` apply to registered windows
+        identically (never inject into Joseph's focused window).
+    """
+    try:
+        from khimaira.monitor import sessions as _sess_mod
+    except Exception:
+        return windows
+
+    roster_ids = _get_roster_member_ids()
+    if not roster_ids:
+        return windows  # fail-open: no canonical roster → don't synthesize
+
+    discovered_wids = {w.get("window_id") for w in windows}
+
+    # One kitty-ls pass → live window_id → window json (for is_focused). A registered
+    # wid absent here is stale (window closed / kitty renumbered) and is skipped.
+    live: dict[int, dict[str, Any]] = {}
+    raw = _kitty("ls")
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            data = []
+        for os_win in data:
+            for tab in os_win.get("tabs", []):
+                for w in tab.get("windows", []):
+                    wid = w.get("id")
+                    if wid is not None:
+                        live[wid] = w
+
+    role_by_sid = _roster_role_map()
+    name_by_sid: dict[str, str] = {}
+    try:
+        for row in _sess_mod.list_sessions(use_cache=True):
+            sid = row.get("session_id")
+            nm = row.get("name")
+            if sid and nm:
+                name_by_sid[sid] = nm
+    except Exception:
+        pass
+
+    added = 0
+    for sid in roster_ids:
+        wid = _sess_mod.get_session_window(sid)
+        if wid is None:
+            continue
+        if wid in discovered_wids:
+            continue  # already found by title — dedup, no double-wake
+        live_win = live.get(wid)
+        if live_win is None:
+            _log.debug(
+                "roster-recovery: registered window %s for %s is stale (not live) — skip",
+                wid, sid[:8],
+            )
+            continue  # LIVENESS gate: stale / renumbered wid
+        role = role_by_sid.get(sid)
+        if not role:
+            continue  # not a roled member → nothing to wake it as
+        windows.append({
+            "window_id": wid,
+            "role": role,
+            "raw_name": name_by_sid.get(sid) or sid,
+            "session_id": sid,            # carried → _process_window resolves directly
+            "cmdline": "",
+            "is_focused": bool(live_win.get("is_focused")),
+            "registered": True,
+        })
+        discovered_wids.add(wid)
+        added += 1
+    if added:
+        _log.info(
+            "roster-recovery: union added %d identity-registered window(s) the title "
+            "pass missed", added,
+        )
+    return windows
+
+
 def _get_screen(window_id: int) -> str | None:
     """Read current screen text for a kitty window."""
     return _kitty("get-text", f"--match=id:{window_id}")
@@ -1566,8 +1692,12 @@ async def _process_window(win: dict[str, Any]) -> None:
     # from ever firing: with 11 sessions all role='agent', _resolve_session_for_role
     # always returned None. The window title is unique — resolve_active_session
     # resolves it to the most-recently-active UUID.
-    session_id: str | None = None
-    if raw_name:
+    # Identity-registered windows (from _union_registered_windows) carry their sid
+    # directly — skip the fragile name→uuid resolution for them. Title-discovered
+    # windows lack the key (win.get → None), so they fall through to the existing
+    # name/role resolution UNCHANGED (additive).
+    session_id: str | None = win.get("session_id")
+    if not session_id and raw_name:
         session_id = await asyncio.get_running_loop().run_in_executor(
             None, _resolve_session_by_name, raw_name
         )
@@ -1898,6 +2028,9 @@ async def check_once() -> None:
     # sweep (and every external nudge/busy-read) resolves to exactly one window.
     await loop.run_in_executor(None, _reap_duplicate_windows)
     windows = await loop.run_in_executor(None, _discover_roster_windows)
+    # ADDITIVE: union in identity-registered windows the title pass missed (non-role-
+    # shaped titles). Title-discovered windows above are untouched.
+    windows = await loop.run_in_executor(None, _union_registered_windows, windows)
     for win in windows:
         try:
             await _process_window(win)

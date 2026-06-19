@@ -35,6 +35,27 @@ def test_ppid_unknown_session_returns_none(isolated_state):
     assert isolated_state.get_session_ppid("nonexistent-session-id") is None
 
 
+def test_window_round_trip(isolated_state):
+    """set_session_window persists to status.json; get_session_window reads it back."""
+    sid = "test-session-window"
+    isolated_state.set_session_window(sid, 4242)
+    assert isolated_state.get_session_window(sid) == 4242
+
+
+def test_window_unknown_session_returns_none(isolated_state):
+    """Unknown / unregistered session → None, no exception."""
+    assert isolated_state.get_session_window("nonexistent-window-session") is None
+
+
+def test_window_reregister_returns_latest(isolated_state):
+    """A re-registered window_id (kitty renumber) overwrites — get returns the LATEST,
+    never a stale wid. This is why get_session_window is read-through with no cache."""
+    sid = "test-session-window-rereg"
+    isolated_state.set_session_window(sid, 100)
+    isolated_state.set_session_window(sid, 200)
+    assert isolated_state.get_session_window(sid) == 200
+
+
 def test_ppid_written_to_status_json(isolated_state, tmp_path):
     """set_session_ppid persists ppid field into status.json."""
     import json, os

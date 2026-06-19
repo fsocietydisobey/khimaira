@@ -60,6 +60,11 @@ class SlotBindReq(BaseModel):
     window_id: int      # KITTY_WINDOW_ID — used to verify the TRAP-2 token file
 
 
+class WindowBindReq(BaseModel):
+    """Request body for POST /sessions/{id}/window (identity-based wake)."""
+    window_id: int      # KITTY_WINDOW_ID — registered for wake-by-session-id
+
+
 class AnswerReq(BaseModel):
     question_id: str
     answer: str
@@ -274,6 +279,21 @@ def build_router():
             "window_id": req.window_id,
             "bound": True,
         }
+
+    @router.post("/sessions/{session_id}/window")
+    async def post_window(session_id: str, req: WindowBindReq) -> dict:
+        """Register a session's kitty window_id for identity-based wake.
+
+        DELIBERATELY tokenless (unlike /slot's TRAP-2): the whole point is to make
+        standalone / non-role-titled sessions wakeable, and those have no
+        roster-token file — requiring one would re-exclude exactly the sessions this
+        fixes. Threat model is local + non-adversarial; the call is a self-assertion
+        ('my window is X') used only for wake-targeting, and roster_recovery
+        liveness-gates + is_focused-guards the wid before ever injecting, so a
+        mis-asserted window_id is low-harm.
+        """
+        sessions.set_session_window(session_id, req.window_id)
+        return {"session_id": session_id, "window_id": req.window_id, "registered": True}
 
     @router.get("/sessions/resolve/{query}")
     async def resolve(query: str) -> dict:

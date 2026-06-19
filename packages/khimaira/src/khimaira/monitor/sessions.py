@@ -276,6 +276,55 @@ def get_session_ppid(session_id: str) -> int | None:
     return None
 
 
+def set_session_window(session_id: str, window_id: int) -> None:
+    """Record the kitty window_id for session_id (for identity-based wake).
+
+    Persists to status.json["window_id"] so roster_recovery can wake a session by
+    its REGISTERED window even when the window TITLE isn't role-shaped (the
+    title-discovery path drops those). Registered UNCONDITIONALLY at SessionStart
+    whenever $KITTY_WINDOW_ID is present — NOT gated on a roster slot, which is why
+    standalone / oddly-named sessions previously never registered.
+    Fail-open: persistence errors are swallowed.
+    """
+    try:
+        path = _session_dir(session_id) / "status.json"
+        existing: dict = {}
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+        existing["window_id"] = int(window_id)
+        path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        _invalidate_list_sessions_cache()
+    except Exception:
+        pass
+
+
+def get_session_window(session_id: str) -> int | None:
+    """Return the registered kitty window_id for session_id, or None if unknown.
+
+    Read-through to status.json with NO in-memory cache: window_ids can change on
+    re-register (kitty renumbers on restart), so always read fresh — a stale cached
+    wid would wake a dead/reused window. roster_recovery liveness-gates the result
+    against `kitty @ ls` before acting on it.
+    """
+    try:
+        sd = _session_dir_read(session_id)
+        if sd is None:
+            return None
+        status_path = sd / "status.json"
+        if not status_path.is_file():
+            return None
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        wid = data.get("window_id")
+        if wid is not None:
+            return int(wid)
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Roster wind-down flag — shared signal for Guard-4 + Guard-5 suppression.
 # When the roster is deliberately offline (declared wind-down), both guards

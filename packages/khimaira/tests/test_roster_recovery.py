@@ -130,6 +130,105 @@ class TestDiscoverRosterWindows:
         assert by_id.get(43) == "agent"
 
 
+def _kitty_ls(*win_specs):
+    """Build a kitty @ ls JSON with the given (id, is_focused) windows."""
+    return json.dumps([{"tabs": [{"windows": [
+        {"id": wid, "is_focused": foc} for (wid, foc) in win_specs
+    ]}]}])
+
+
+class TestUnionRegisteredWindows:
+    """wake-by-session-id: identity-registered windows the title pass missed.
+
+    The catching-tests for the corpus seam wake-targets-window-by-title-not-session-
+    identity — a roled member whose window TITLE isn't role-shaped (e.g. "livyatan")
+    was silently unwakeable.
+    """
+
+    SID = "livyatan-sid-0000"
+
+    def test_wake_by_registered_window_id(self):
+        """A non-role-titled member with a LIVE registered window + role is unioned in."""
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((99, False))),
+            patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window",
+                  side_effect=lambda s: 99 if s == self.SID else None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": self.SID, "name": "livyatan"}]),
+        ):
+            out = rr._union_registered_windows([])  # title pass found nothing
+        assert len(out) == 1
+        w = out[0]
+        assert w["window_id"] == 99
+        assert w["role"] == "agent"
+        assert w["session_id"] == self.SID  # carried → _process_window resolves directly
+        assert w["registered"] is True
+        assert w["is_focused"] is False
+
+    def test_title_discovery_still_primary(self):
+        """A title-discovered window with NO registration is untouched (no regression)."""
+        title_win = {"window_id": 10, "role": "agent", "raw_name": "agent-1", "is_focused": False}
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({"agent-1-sid"})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((10, False))),
+            patch.object(rr, "_roster_role_map", return_value={"agent-1-sid": "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window", side_effect=lambda s: None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": "agent-1-sid", "name": "agent-1"}]),
+        ):
+            out = rr._union_registered_windows([dict(title_win)])
+        assert len(out) == 1
+        assert out[0]["window_id"] == 10
+        assert "registered" not in out[0]  # the live title path is untouched
+
+    def test_dedup_title_and_registered(self):
+        """A window BOTH title-discovered AND registered appears once (no double-wake)."""
+        title_win = {"window_id": 10, "role": "agent", "raw_name": "agent-1", "is_focused": False}
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((10, False))),
+            patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window",
+                  side_effect=lambda s: 10 if s == self.SID else None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": self.SID, "name": "livyatan"}]),
+        ):
+            out = rr._union_registered_windows([dict(title_win)])
+        assert [w["window_id"] for w in out] == [10]  # exactly once
+
+    def test_stale_registered_window_skipped(self):
+        """LIVENESS gate: a registered wid NOT live in kitty is never synthesized
+        (window_ids renumber on kitty restart → stale wid must not be woken)."""
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((10, False))),  # 77 not live
+            patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window",
+                  side_effect=lambda s: 77 if s == self.SID else None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": self.SID, "name": "livyatan"}]),
+        ):
+            out = rr._union_registered_windows([])
+        assert out == []  # stale wid dropped
+
+    def test_registered_window_carries_is_focused(self):
+        """is_focused carried from kitty-ls so the human-presence guard applies to
+        identity-discovered windows identically (never inject into a focused window)."""
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((99, True))),  # user focused
+            patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window",
+                  side_effect=lambda s: 99 if s == self.SID else None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": self.SID, "name": "livyatan"}]),
+        ):
+            out = rr._union_registered_windows([])
+        assert out[0]["is_focused"] is True
+
+
 class TestDiscoverRosterWindowsScoping:
     """Cross-project scoping: only sessions in active_roster_member_ids() pass."""
 
