@@ -837,6 +837,22 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     # title hits BOTH windows (garbling the live agent). If >1 window shares this
     # title, self-heal once (reap the stale duplicate) then re-check; if STILL
     # ambiguous, ABORT loud rather than inject into the wrong/both windows.
+    # Resolve the actuation match-arg. Prefer title-match (stable across restarts —
+    # window ids renumber, role titles don't), but kitty decorates LIVE window titles
+    # with dynamic activity markers (e.g. "✳ livyatan", a bell glyph, a thinking-state
+    # symbol) that an anchored ^name$ title-match cannot match. When that happens the
+    # title-match SILENTLY no-ops (rc=0, keystrokes go nowhere) and every wake aborts on
+    # the nonce check — the livyatan window-978 failure (2026-06-20): the union path
+    # passed the clean session name "livyatan" while the real kitty title was
+    # "✳ livyatan". The marker can also FLICKER on/off between discovery and inject for
+    # role-named windows. So branch on how many live windows the title actually matches:
+    #   n==1 → title-match (precise + restart-stable; the normal case)
+    #   n==0 → the (possibly decoration-prefixed/flickering) title matches no live
+    #          window; fall back to the id we resolved THIS sweep (fresh, not stale). If
+    #          the id is ALSO dead, the nonce TOCTOU catches it — safe either way.
+    #   n>1  → ambiguous duplicate title; reap the stale twin, re-check, abort if still
+    #          ambiguous rather than inject into the wrong/both windows.
+    use_title = False
     if window_title:
         n = _count_title_windows(window_title)
         if n > 1:
@@ -849,9 +865,16 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
                 window_title, n,
             )
             return False
+        use_title = n == 1
+        if n == 0:
+            _log.info(
+                "roster-recovery: title %r matches no live window (kitty title "
+                "decoration / marker flicker?) — falling back to id-match window %d",
+                window_title, window_id,
+            )
 
     match_arg = (
-        _title_match_arg(window_title) if window_title else f"--match=id:{window_id}"
+        _title_match_arg(window_title) if use_title else f"--match=id:{window_id}"
     )
     id_match = f"--match=id:{window_id}"
 

@@ -547,6 +547,19 @@ class TestInjectTextAndSubmit:
         assert r"--match=title:^agent\-3$" in send_enter, "send-key enter must use anchored title-match"
         assert "--match=id:10" not in send_text, "send-text must NOT use id-match when title given"
 
+    def test_falls_back_to_id_when_title_matches_no_window(self, monkeypatch):
+        """THE livyatan window-978 root cause (2026-06-20): the union path passes the
+        clean session name 'livyatan' as window_title, but kitty's real title is
+        '✳ livyatan' (dynamic activity marker), so the anchored ^livyatan$ title-match
+        finds ZERO windows and send-text silently no-ops (rc=0) → every wake aborts.
+        With a known window_id, fall back to id-match so the inject actually lands."""
+        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 0)  # decorated title misses
+        r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}", title="livyatan")
+        assert r is True, "must fall back to id-match and submit when title matches no window"
+        send_text = next(c for c in calls if c and c[0] == "send-text")
+        assert "--match=id:10" in str(send_text), "send-text must use id-match on title no-match"
+        assert "title:" not in str(send_text), "must NOT use the (non-matching) title-match"
+
     def test_uses_id_match_when_title_empty(self, monkeypatch):
         r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}")
         assert r is True
