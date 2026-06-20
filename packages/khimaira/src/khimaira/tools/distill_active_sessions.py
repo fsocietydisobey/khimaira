@@ -436,8 +436,9 @@ def main() -> int:
     ap.add_argument(
         "--max-chars",
         type=int,
-        default=50_000,
-        help="Transcript truncation cap passed to extract_transcript",
+        default=600_000,
+        help="Transcript window passed to extract_transcript (~150k tok; Haiku 200k "
+             "headroom). Over-budget → decision-dense whole-session selection.",
     )
     ap.add_argument(
         "--master-names",
