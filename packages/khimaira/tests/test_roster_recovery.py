@@ -442,103 +442,91 @@ class TestInjectTextAndSubmit:
         # and doesn't consume the fixed _kitty side_effect sequences.
         monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
 
-    def _make_screen(self, text: str) -> str:
-        return f"previous lines\n{text}"
+    def _drive(self, monkeypatch, screen_tmpl, *, send_fails=False, read_fails=False,
+               text="/compact", title=""):
+        """Stateful mock: capture the send-text inject (incl. the runtime verification
+        nonce) and ECHO it into the get-text screen via screen_tmpl(inject) — mirrors
+        reality, where the window renders what was typed. Returns (result, kitty_calls)."""
+        state = {"inject": None}
+        kitty_calls = []
 
-    def test_submits_when_buffer_matches(self):
-        screen_after_inject = self._make_screen("/compact")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = [
-                "",                           # send-key ctrl+u (clear stale input)
-                "",                           # send-text → success
-                screen_after_inject,          # get-text (TOCTOU verify)
-                "",                           # send-key enter → success
-            ]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is True
+        def fake_kitty(*args, **kw):
+            kitty_calls.append(args)
+            op = args[0] if args else ""
+            if op == "send-text":
+                if send_fails:
+                    return None
+                state["inject"] = args[-1]  # the injected text incl. "(sync wkNNNNN)"
+                return ""
+            return ""  # ctrl+u, send-key enter, ctrl+c
 
-    def test_submits_with_chrome_after_our_text(self):
-        """Chrome rendered AFTER our text (footer/menu/hint) no longer aborts — the
-        TOCTOU check verifies our text LANDED, not that the buffer is pristine. The
-        old exact-match aborted on every auto-mode/slash-menu window (2026-06-18); the
-        raced-user-input concern moved upstream to the busy/focus/human-interface
-        guards + the Ctrl-U pre-clear, which keep a human's keystrokes out of the
-        windows we inject into."""
-        screen = self._make_screen("/compact\n  ⏵⏵ auto mode on (shift+tab to cycle)")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", "", screen, ""]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is True
+        def fake_get_screen(_wid):
+            return None if read_fails else screen_tmpl(state["inject"] or "")
 
-    def test_submits_with_prompt_chrome_before_our_text(self):
-        """Prompt chrome BEFORE our text (the "> " prompt, box glyphs) still submits —
-        normalization strips prompt glyphs so the input line reconstructs."""
-        screen = self._make_screen("> /compact")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", "", screen, ""]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is True
+        monkeypatch.setattr(rr, "_kitty", fake_kitty)
+        monkeypatch.setattr(rr, "_get_screen", fake_get_screen)
+        result = rr._inject_text_and_submit(window_id=10, text=text, window_title=title)
+        return result, kitty_calls
 
-    def test_aborts_when_get_text_fails(self):
-        """Can't verify buffer — abort conservatively."""
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = [
-                "",    # send-key ctrl+u (clear)
-                "",    # send-text
-                None,  # get-text fails
-                "",    # ctrl+c
-            ]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is False
+    def test_submits_when_inject_lands(self, monkeypatch):
+        r, _ = self._drive(monkeypatch, lambda inj: f"previous lines\n{inj}")
+        assert r is True
 
-    def test_aborts_when_send_text_fails(self):
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = [
-                "",    # send-key ctrl+u (clear)
-                None,  # send-text fails
-            ]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is False
+    def test_submits_on_SATURATED_window(self, monkeypatch):
+        """THE 520k-token case (2026-06-20): a high-context session shows a big task
+        panel + "/clear to save Nk tokens" footer, pushing the input (w/ inject) FAR
+        above the last screen lines. The old last-15-lines scan missed it → wake never
+        landed. The unique-nonce + WHOLE-buffer scan finds it regardless of layout."""
+        def tmpl(inj):
+            panel = "\n".join(f"  ▸ task row {i}" for i in range(25))
+            footer = ("  ⏵⏵ auto mode on (shift+tab to cycle) · ctrl+t to hide tasks · "
+                      "← for agents                   new task? /clear to save 520.8k tokens")
+            return f"> {inj}\n{panel}\n{footer}"
+        r, _ = self._drive(monkeypatch, tmpl, text="⏰ resume: call chat_my_chats + act")
+        assert r is True
 
-    def test_uses_title_match_when_title_provided(self):
-        """When window_title is given, send-text and send-key enter use title-match.
-        ctrl+u (step 1) and TOCTOU get-text (step 3) always use id-match for safety."""
-        screen_after_inject = self._make_screen("/compact")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", "", screen_after_inject, ""]
-            result = rr._inject_text_and_submit(
-                window_id=10, text="/compact", window_title="agent-3"
-            )
-        assert result is True
-        # Index 0: ctrl+u (id-match); index 1: send-text (title-match);
-        # index 2: get-text TOCTOU (id-match); index 3: send-key enter (title-match).
-        # Inspect actual arg tuples (not str(call) — repr doubles backslashes).
-        send_text_args = mock_kitty.call_args_list[1].args
-        send_key_args = mock_kitty.call_args_list[3].args
-        # Anchored exact-match (2026-06-07 cross-roster-nudge fix): kitty title:
-        # is an unanchored regex, so the match must be ^<escaped-title>$.
-        assert r"--match=title:^agent\-3$" in send_text_args, "send-text must use anchored title-match"
-        assert r"--match=title:^agent\-3$" in send_key_args, "send-key must use anchored title-match"
-        assert "--match=id:10" not in send_text_args, "send-text must NOT use id-match when title given"
-        assert "--match=id:10" not in send_key_args, "send-key must NOT use id-match when title given"
+    def test_submits_with_chrome_after_our_text(self, monkeypatch):
+        r, _ = self._drive(
+            monkeypatch,
+            lambda inj: f"> {inj}\n  ⏵⏵ auto mode on (shift+tab to cycle)",
+        )
+        assert r is True
 
-    def test_uses_id_match_when_title_empty(self):
-        """Without window_title, falls back to id-match (backward compat)."""
-        screen_after_inject = self._make_screen("/compact")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", "", screen_after_inject, ""]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is True
-        calls = [str(c) for c in mock_kitty.call_args_list]
-        assert any("id:10" in c for c in calls), "id-match must be used when no title given"
+    def test_aborts_when_inject_absent(self, monkeypatch):
+        """Inject didn't land (window unresponsive) → nonce absent → abort safely."""
+        r, _ = self._drive(
+            monkeypatch,
+            lambda inj: "previous\n  ⏵⏵ auto mode on\n  3% until auto-compact",
+        )
+        assert r is False
 
-    def test_title_match_absent_title_fails_loudly(self):
+    def test_aborts_when_get_text_fails(self, monkeypatch):
+        r, _ = self._drive(monkeypatch, lambda inj: "x", read_fails=True)
+        assert r is False
+
+    def test_aborts_when_send_text_fails(self, monkeypatch):
+        r, _ = self._drive(monkeypatch, lambda inj: "x", send_fails=True)
+        assert r is False
+
+    def test_uses_title_match_when_title_provided(self, monkeypatch):
+        r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}", title="agent-3")
+        assert r is True
+        send_text = next(c for c in calls if c and c[0] == "send-text")
+        send_enter = next(c for c in calls if c and c[0] == "send-key" and "enter" in c)
+        assert r"--match=title:^agent\-3$" in send_text, "send-text must use anchored title-match"
+        assert r"--match=title:^agent\-3$" in send_enter, "send-key enter must use anchored title-match"
+        assert "--match=id:10" not in send_text, "send-text must NOT use id-match when title given"
+
+    def test_uses_id_match_when_title_empty(self, monkeypatch):
+        r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}")
+        assert r is True
+        assert any("id:10" in str(c) for c in calls), "id-match must be used when no title given"
+
+    def test_title_match_absent_title_fails_loudly(self, monkeypatch):
         """Title-match returning None (rc!=0 = window not found) → False, not silent."""
-        # kitty @ send-text --match=title:<absent> → rc != 0 → _kitty returns None
-        with patch.object(rr, "_kitty", return_value=None):
-            result = rr._inject_text_and_submit(
-                window_id=99, text="wake", window_title="dead-agent"
-            )
+        monkeypatch.setattr(rr, "_kitty", lambda *a, **k: None)
+        monkeypatch.setattr(rr, "_get_screen", lambda _wid: None)
+        result = rr._inject_text_and_submit(window_id=99, text="wake", window_title="dead-agent")
         assert result is False
 
 
@@ -1780,53 +1768,7 @@ class TestTitleMatchExact:
         assert not _re.search(pattern, "agent-11"), "must NOT match agent-11 (substring)"
 
 
-class TestInjectTOCTOUInputLine:
-    """TOCTOU verify must find our text on the INPUT line even when chrome renders
-    BELOW it (auto-mode footer, slash-command menu) — the muther wake/compact aborts
-    2026-06-18 — while still rejecting a raced user-typed prefix."""
-
-    def _run(self, monkeypatch, buffer: str, text: str):
-        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
-        monkeypatch.setattr(rr, "_get_screen", lambda wid: buffer)
-        monkeypatch.setattr(rr, "time", rr.time)  # keep real time; sleeps are tiny
-        calls: list[tuple] = []
-
-        def fake_kitty(*args, **kw):
-            calls.append(args)
-            return ""  # non-None = success for send-key/send-text
-
-        monkeypatch.setattr(rr, "_kitty", fake_kitty)
-        result = rr._inject_text_and_submit(900, text, "agent-1")
-        pressed_enter = any("enter" in a for a in calls)
-        return result, pressed_enter
-
-    def test_auto_mode_footer_below_input_submits(self, monkeypatch):
-        buf = "> ⏰ resume now please\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
-        result, enter = self._run(monkeypatch, buf, "⏰ resume now please")
-        assert result is True and enter
-
-    def test_slash_command_menu_below_input_submits(self, monkeypatch):
-        buf = "> /compact\n  workflows\n  /config\n  /clear\n"
-        result, enter = self._run(monkeypatch, buf, "/compact")
-        assert result is True and enter
-
-    def test_wrapped_long_message_submits(self, monkeypatch):
-        # A long wake message WRAPS across terminal lines (the real failure: no single
-        # line equals/ends-with the full text). Normalize+reconstruct must still match.
-        buf = (
-            "> ⏰ resume: call chat_my_chats + act on\n"
-            "your inbox / pending work\n"
-            "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
-        )
-        result, enter = self._run(
-            monkeypatch,
-            buf,
-            "⏰ resume: call chat_my_chats + act on your inbox / pending work",
-        )
-        assert result is True and enter
-
-    def test_text_absent_aborts(self, monkeypatch):
-        # Inject didn't land — buffer has only chrome, none of our text → abort safely.
-        buf = "  ⏵⏵ auto mode on (shift+tab to cycle)\n  3% until auto-compact\n"
-        result, enter = self._run(monkeypatch, buf, "/compact")
-        assert result is False and not enter
+# (TOCTOU input-line cases — auto-mode footer, slash-menu, wrapped, absent — are now
+# covered by TestInjectTextAndSubmit's nonce-echo tests, incl. the SATURATED-window
+# case. The old fixed-buffer class was removed when the verify moved to nonce-based
+# whole-buffer scanning 2026-06-20.)

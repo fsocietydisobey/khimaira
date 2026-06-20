@@ -860,8 +860,20 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     _kitty("send-key", id_match, "ctrl+u")
     time.sleep(0.05)
 
-    # Step 2: send text
-    if _kitty("send-text", match_arg, "--", text) is None:
+    # Step 2: send text WITH a unique verification nonce appended. The nonce makes the
+    # TOCTOU check robust to a SATURATED window — a long-running, high-context session
+    # showing the task panel + "/clear to save Nk tokens" footer (the COMMON state for
+    # exactly the long-lived sessions that idle and need waking). In that layout the
+    # input line (carrying the wrapped wake text) is pushed far ABOVE the last screen
+    # lines, so scanning only the last 15 lines for the static wake text misses it and
+    # aborts — the real cause of the 520k-token-window wake failure (2026-06-20). The
+    # nonce appears ONLY in the just-injected input (a prior wake used a DIFFERENT
+    # nonce, and submitted wakes in scrollback carry old nonces), so we can scan the
+    # WHOLE buffer for it with no stale false-positive. Cost: a small "(sync wkNNNNN)"
+    # marker rides along in the submitted prompt — the agent ignores it.
+    nonce = f"wk{int(time.time()) % 100000:05d}"
+    inject = f"{text}  (sync {nonce})"
+    if _kitty("send-text", match_arg, "--", inject) is None:
         _log.warning(
             "roster-recovery: send-text failed for window %d (%s)", window_id, match_arg
         )
@@ -881,31 +893,24 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
         )
         return False
 
-    lines = [line.rstrip() for line in buffer.splitlines() if line.strip()]
-    expected = text.rstrip()
-    # TOCTOU verify: confirm our injected text actually landed in the window's input.
-    # It is NOT reliably the LAST screen line, and it is NOT reliably a SINGLE line:
-    #   - Claude Code renders chrome BELOW the input (the "⏵⏵ auto mode on" footer, a
-    #     "N% until auto-compact" / "new task? /clear" hint, a slash-command menu when
-    #     the text starts with "/"), and
-    #   - a long wake message WRAPS across several terminal lines.
-    # The old "last line == text" check aborted on every auto-accept-mode window AND
-    # on every wrapped message — muther agents were never woken, /compact never landed
-    # (2026-06-18). So normalize the recent buffer (drop whitespace + prompt-box glyphs,
-    # which reconstructs wrapped text) and substring-check for our normalized text.
-    # The raced-user-typing concern the old exact-match guarded against is already
-    # covered upstream: we never inject into a busy/focused/human-interface window, so
-    # an idle agent window has no human typing into it during the 150ms verify window.
+    # Step 4 verify: scan the WHOLE captured buffer (whitespace + prompt-box glyphs
+    # stripped, so a wrapped inject reconstructs) for the unique nonce. Whole-buffer
+    # (not last-15-lines) is what makes this robust to the saturated/task-panel layout;
+    # the nonce is what makes whole-buffer scanning SAFE — only the current inject
+    # carries it, so no stale submitted-wake in scrollback can false-positive. Earlier
+    # fixes (last-line==text → last-15-lines substring) each fixed one layout and broke
+    # on the next; the nonce + whole-buffer is layout-agnostic.
     _NORM_STRIP = re.compile(r"[\s>│▌❯|]+")
-    buffer_norm = _NORM_STRIP.sub("", " ".join(lines[-15:]))
-    expected_norm = _NORM_STRIP.sub("", expected)
-    if not expected_norm or expected_norm not in buffer_norm:
-        # Our text isn't in the input buffer — the inject didn't land. Abort safely.
+    buffer_norm = _NORM_STRIP.sub("", buffer)
+    if nonce not in buffer_norm:
+        # The nonce isn't in the buffer — the inject didn't land. Abort safely.
         _kitty("send-key", id_match, "ctrl+c")
+        lines = [ln.rstrip() for ln in buffer.splitlines() if ln.strip()]
         _log.warning(
-            "roster-recovery: TOCTOU mismatch on window %d — injected text not found "
-            "in buffer (last line %r), aborted",
+            "roster-recovery: TOCTOU mismatch on window %d — nonce %s not found in "
+            "buffer (last line %r), aborted",
             window_id,
+            nonce,
             lines[-1] if lines else "",
         )
         return False
