@@ -35,19 +35,20 @@ def distill(
     transcript: str,
     session_slug: str,
     *,
-    timeout: float = 30.0,
+    timeout: float = 240.0,
 ) -> dict | None:
     """POST /distill; return parsed response dict or None on any failure.
 
     Fail-open: URLError, OSError, TimeoutError → None (never raises).
 
-    Timeout is 30s, not 2s: distillation runs an LLM pass over the full
-    transcript server-side. A 50-entry transcript already takes ~2.3s; real
-    session transcripts are 100× larger. A 2s timeout silently failed every
-    real distill — the OSError was caught and reported as None ("unreachable")
-    while the daemon was perfectly healthy. The failure path now logs a
-    warning so a future divergence is audible in the daemon log instead of
-    silently swallowed.
+    Timeout is 240s: distillation runs an LLM pass over the full transcript
+    server-side. Post-truncation-fix the window is ~600k chars (~150k tok), so a
+    Haiku distill runs ~20-90s — the old 30s cap silently None'd EVERY large
+    transcript (backfill, the Stop hook, AND the weekly active-distill all send
+    600k windows). Downstream is uncapped below this: the anthropic SDK default is
+    600s and uvicorn sets no request-duration timeout, so 240s is the binding cap
+    with safe headroom. The failure path logs a warning so a future divergence is
+    audible instead of silently swallowed.
     """
     payload = json.dumps(
         {"domain": domain, "transcript": transcript, "session_slug": session_slug},
