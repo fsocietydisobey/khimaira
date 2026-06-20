@@ -299,65 +299,31 @@ def test_extract_transcript_returns_none_for_nonexistent_path(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# decision-dense over-budget selection (task 4 — the truncation fix)
+# contiguous 600k window over-budget handling (task 4: bigger window, first/last-half)
 # ---------------------------------------------------------------------------
-
-_SIGNAL = (
-    "decided SIGNALTOKEN to fix the root-cause in mod.py because the design trade-off"
-)
-_FILLER = "FILLERTOKEN ok"  # < 40 chars → scores 0 (chatter, dropped)
+# A decision-dense whole-session SELECTION was tried + reverted — chat-shaped fragments
+# made the distiller continue the chat instead of distilling (0 pairs). The shipped
+# behavior is a bigger CONTIGUOUS window with first-half+last-half truncation.
 
 
-def test_decision_dense_keeps_midsession_signal_drops_chatter(tmp_path: Path):
-    """THE CORE WIN: high-signal blocks in the MIDDLE survive; first/last-half would
-    have dropped them. Decision-dense keeps signal, drops short chatter."""
+def test_over_budget_uses_contiguous_first_last_half(tmp_path: Path):
+    """Over-budget → first-half + last-half contiguous slice (the …[truncated]… marker),
+    NOT a reordered/gap-marked selection (which broke the distiller)."""
     jsonl = tmp_path / "s.jsonl"
-    recs = (
-        [{"role": "user", "content": _FILLER} for _ in range(6)]          # first region
-        + [{"role": "assistant", "content": _SIGNAL} for _ in range(6)]    # MIDDLE: signal
-        + [{"role": "user", "content": _FILLER} for _ in range(6)]         # last region
-    )
-    _write_jsonl(jsonl, recs)
-    result = extract_transcript("id", max_chars=600, transcript_path=str(jsonl))
-    assert result is not None
-    assert "SIGNALTOKEN" in result          # the middle signal was captured
-    assert "FILLERTOKEN" not in result      # short chatter dropped
-    assert "...[truncated]..." not in result  # decision-dense path, NOT the fallback
-
-
-def test_decision_dense_marks_gaps_between_noncontiguous_keeps(tmp_path: Path):
-    """Non-contiguous kept blocks get a …[gap]… marker so the distiller doesn't
-    infer false continuity across omitted spans."""
-    jsonl = tmp_path / "s.jsonl"
-    recs = []
-    for _ in range(5):
-        recs.append({"role": "assistant", "content": _SIGNAL})  # signal
-        recs.extend({"role": "user", "content": _FILLER} for _ in range(2))  # gap chatter
-    _write_jsonl(jsonl, recs)
-    # 5 signal (~92 ea = ~465) fit in 500, but full (~680) exceeds it → selection fires,
-    # short filler scores 0 and is dropped → the 5 kept blocks are non-contiguous.
-    result = extract_transcript("id", max_chars=500, transcript_path=str(jsonl))
-    assert result is not None
-    assert "SIGNALTOKEN" in result
-    assert "FILLERTOKEN" not in result
-    assert "…[gap]…" in result
-
-
-def test_pathological_all_chatter_falls_back_to_first_last(tmp_path: Path):
-    """Scoring-failure safety net: a pure-chatter (all-zero-score) over-budget
-    transcript falls back to first/last-half rather than returning near-empty."""
-    jsonl = tmp_path / "s.jsonl"
-    _write_jsonl(jsonl, [{"role": "user", "content": "ok"} for _ in range(200)])
+    body = "x" * 2000
+    _write_jsonl(jsonl, [{"role": "assistant", "content": body}])
     result = extract_transcript("id", max_chars=200, transcript_path=str(jsonl))
     assert result is not None
-    assert "...[truncated]..." in result  # fell back to _truncate
+    assert "...[truncated]..." in result          # contiguous first/last-half path
+    assert "…[gap]…" not in result                # no decision-dense gap markers
+    assert len(result) <= 200 + len("\n...[truncated]...\n")
 
-def test_underbudget_transcript_returned_whole(tmp_path: Path):
-    """Under the window → full transcript, no selection, no markers."""
+
+def test_under_budget_returned_whole(tmp_path: Path):
+    """Under the window → full transcript, no truncation."""
     jsonl = tmp_path / "s.jsonl"
-    _write_jsonl(jsonl, [{"role": "assistant", "content": _SIGNAL}])
+    _write_jsonl(jsonl, [{"role": "assistant", "content": "a coherent narrative block"}])
     result = extract_transcript("id", max_chars=600_000, transcript_path=str(jsonl))
     assert result is not None
-    assert "SIGNALTOKEN" in result
-    assert "…[gap]…" not in result
+    assert "coherent narrative" in result
     assert "...[truncated]..." not in result

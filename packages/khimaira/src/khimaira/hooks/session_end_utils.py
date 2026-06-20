@@ -13,32 +13,23 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 
 _DOMAINS = ("backend", "frontend", "data", "devops")
 
 # Distillation window. The distiller backend is Haiku (200k-token context), so a
-# ~150k-token (~600k-char) slice fits with headroom for the system prompt + output.
-# This replaces the old 50k cap (~0.3% of a 13-19MB master transcript). NOTE: this
-# assumes the Haiku backend — a flip to the 4096-ctx local oracle (distiller
-# DISTILLER_BASE_URL) would need a 32k re-serve first; the two must not silently
-# collide (see mnemosyne/docs/FOLLOWUP-oracle-as-distiller.md).
+# ~150k-token (~600k-char) CONTIGUOUS slice fits with headroom for the system prompt +
+# output — 12x the old 50k cap (~0.3% of a 13-19MB master transcript). Over-budget uses
+# first-half + last-half truncation (_truncate).
+#
+# A decision-dense whole-session SELECTION was tried + REVERTED (2026-06-20): the
+# reordered, gap-marked, chat-shaped fragments made Haiku CONTINUE the roster chat
+# instead of distilling it → 0 pairs (even with a forced-JSON prompt), while contiguous
+# 600k distills cleanly (~32 pairs/master). True whole-session coverage needs a
+# chunk-and-distill v2, not a selection format the distiller can't read. NOTE: 600k
+# assumes the Haiku backend; a flip to the 4096-ctx local oracle needs a 32k re-serve
+# first (see mnemosyne/docs/FOLLOWUP-oracle-as-distiller.md).
 _DEFAULT_MAX_CHARS = 600_000
-
-# Decision-dense scoring: when a transcript exceeds the window, keep the highest-SIGNAL
-# blocks across the WHOLE session (not the first/last-half, which drops the middle where
-# the work happens). Heuristic, no LLM — cheap pre-filter before the single Haiku pass.
-_SIGNAL_RE = re.compile(
-    r"\b(decid\w*|because|root[- ]?cause|fix(?:e[ds])?|chose|choos\w*|design\w*|"
-    r"instead of|trade-?off|gotcha|footgun|invariant|edge case|the bug|root of|"
-    r"approach|refactor\w*|never|always)\b",
-    re.IGNORECASE,
-)
-# File paths, code symbols, backtick spans — concrete grounding (vs vague prose).
-_CODEREF_RE = re.compile(
-    r"`[^`]+`|\b\w+\.(?:py|ts|tsx|js|jsx|md|sh|json|ya?ml|sql|toml)\b|\b\w+/[\w./-]+"
-)
 
 _PROJECTS_ROOT = (
     Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
@@ -154,9 +145,9 @@ def extract_transcript(
     If transcript_path is given (from Stop hook payload), read it directly.
     Otherwise, search ~/.claude/projects/ subdirectories for {session_id}.jsonl.
 
-    Over-budget handling: DECISION-DENSE selection — keep the highest-signal blocks
-    across the whole session (preserving original order, marking gaps), falling back
-    to first-half+last-half only on pathological low scoring yield. See _read_jsonl.
+    Over-budget handling: first-half + last-half truncation over the ~600k window
+    (contiguous, so the distiller sees coherent narrative). See _read_jsonl + the
+    _DEFAULT_MAX_CHARS note for why a decision-dense selection was reverted.
 
     Returns None if the transcript is unavailable or empty.
     """
@@ -212,63 +203,10 @@ def _read_jsonl(path: Path, max_chars: int) -> str | None:
         return None
 
     full = "\n".join(parts)
-    if len(full) <= max_chars:
-        return full
-    # Over budget: decision-dense whole-session selection, with first/last-half as a
-    # pathological-yield safety net only.
-    selected = _select_decision_dense(parts, max_chars)
-    return selected if selected is not None else _truncate(full, max_chars)
-
-
-def _score_block(block: str) -> float:
-    """Signal score for one ``[role]: text`` block. 0 = chatter (dropped)."""
-    body = block.split("]: ", 1)[-1]
-    if len(body) < 40:
-        return 0.0  # acks / one-liners carry no durable knowledge
-    score = 3.0 * len(_SIGNAL_RE.findall(block))
-    score += 1.5 * len(_CODEREF_RE.findall(block))
-    score += min(len(body) / 500.0, 4.0)  # substantive-prose bonus, capped
-    return score
-
-
-def _select_decision_dense(parts: list[str], max_chars: int) -> str | None:
-    """Keep the highest-signal blocks (whole-session) up to max_chars, in ORIGINAL
-    order, marking non-contiguous gaps so the distiller doesn't infer false continuity.
-
-    Returns None to signal "fall back to first/last-half" ONLY on pathological yield
-    (scorer broke / pure-chatter transcript): < a handful of blocks kept, or < 15%
-    of the budget filled. Above that floor the curated selection is RETURNED even if
-    under-budget — a sparse-but-real selection beats first/last padding (master ruling).
-    """
-    ranked = sorted(
-        ((i, _score_block(b), b) for i, b in enumerate(parts)),
-        key=lambda t: t[1],
-        reverse=True,
-    )
-    kept: list[tuple[int, str]] = []
-    total = 0
-    for idx, score, block in ranked:
-        if score <= 0:
-            continue  # skip zero-signal chatter entirely
-        add = len(block) + 1  # +1 for the join newline
-        if total + add > max_chars:
-            continue  # too big for the remaining budget; try lower-scored, smaller blocks
-        kept.append((idx, block))
-        total += add
-
-    # Pathological-yield safety net: scorer failure or a transcript with ~no signal.
-    if len(kept) < 5 or total < int(max_chars * 0.15):
-        return None
-
-    kept.sort(key=lambda t: t[0])  # restore chronological order for the distiller
-    out: list[str] = []
-    prev_idx: int | None = None
-    for idx, block in kept:
-        if prev_idx is not None and idx != prev_idx + 1:
-            out.append("…[gap]…")  # omitted low-signal span between kept blocks
-        out.append(block)
-        prev_idx = idx
-    return "\n".join(out)
+    # Over budget → first-half + last-half (contiguous). A decision-dense whole-session
+    # selection was tried + reverted — see the _DEFAULT_MAX_CHARS note (it broke the
+    # distiller: chat-shaped fragments → Haiku continued the chat → 0 pairs).
+    return _truncate(full, max_chars)
 
 
 def _truncate(text: str, max_chars: int) -> str:
