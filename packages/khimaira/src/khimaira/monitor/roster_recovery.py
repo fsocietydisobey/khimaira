@@ -823,10 +823,12 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     Steps:
     1. Clear any pre-existing input with Ctrl-U (line-kill) so stale nudge text
        from a prior aborted cycle doesn't pollute the TOCTOU check.
-    2. Send the text (does NOT submit yet).
-    3. Wait briefly for the terminal to echo it.
-    4. Re-read the buffer via id (precise) — verify it ends with ONLY our text
-       (TOCTOU guard). Abort + clear (Ctrl-C) if changed.
+    2. Send the text + a unique nonce (does NOT submit yet).
+    3. POLL the buffer (up to ~1.8s) until the nonce echoes — accommodates slow
+       re-render on saturated high-context windows where a single fixed-delay read
+       would race the render and false-abort.
+    4. Verify the nonce is present (TOCTOU guard). Abort + clear (Ctrl-C) if it
+       never appears within the poll ceiling.
     5. Submit with Enter.
 
     Returns True if submitted, False if aborted.
@@ -879,40 +881,51 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
         )
         return False
 
-    # Step 3: brief pause for echo
-    time.sleep(0.15)
-
-    # Step 4: TOCTOU — re-read and verify
-    buffer = _get_screen(window_id)
-    if buffer is None:
-        # Can't verify — abort safely
-        _kitty("send-key", id_match, "ctrl+c")
-        _log.warning(
-            "roster-recovery: TOCTOU verify read failed for window %d — aborted",
-            window_id,
-        )
-        return False
-
-    # Step 4 verify: scan the WHOLE captured buffer (whitespace + prompt-box glyphs
-    # stripped, so a wrapped inject reconstructs) for the unique nonce. Whole-buffer
-    # (not last-15-lines) is what makes this robust to the saturated/task-panel layout;
-    # the nonce is what makes whole-buffer scanning SAFE — only the current inject
-    # carries it, so no stale submitted-wake in scrollback can false-positive. Earlier
-    # fixes (last-line==text → last-15-lines substring) each fixed one layout and broke
-    # on the next; the nonce + whole-buffer is layout-agnostic.
+    # Step 3+4: TOCTOU — POLL the buffer until the nonce echoes, up to a bound.
+    # A single fixed sleep+read fails on SATURATED windows (the 520k-token, task-panel
+    # sessions that are exactly the ones idling and needing a wake): at high context the
+    # Claude Code TUI re-renders slowly, so the injected nonce hasn't been painted into
+    # the screen buffer within 0.15s — the single read captures the PRE-inject screen,
+    # finds no nonce, and aborts. The send-text DID land (manual nudges to the same
+    # window succeed); only the readback raced the render. Polling accommodates both
+    # regimes: a fast normal window passes on iteration 1 (~0.1s); a slow high-context
+    # window gets up to ~1.8s for the echo to appear. (2026-06-20 — the real fix for the
+    # livyatan window-978 wake failures that the nonce/whole-buffer change alone didn't
+    # close, because the bug was a render-vs-readback TIMING race, not a scan-scope miss.)
     _NORM_STRIP = re.compile(r"[\s>│▌❯|]+")
-    buffer_norm = _NORM_STRIP.sub("", buffer)
-    if nonce not in buffer_norm:
-        # The nonce isn't in the buffer — the inject didn't land. Abort safely.
+    buffer: str | None = None
+    last_read_failed = False
+    for _ in range(12):  # 12 × 0.15s ≈ 1.8s ceiling
+        time.sleep(0.15)
+        buffer = _get_screen(window_id)
+        if buffer is None:
+            last_read_failed = True
+            continue
+        last_read_failed = False
+        # Scan the WHOLE captured buffer (whitespace + prompt-box glyphs stripped, so a
+        # wrapped inject reconstructs) for the unique nonce. Whole-buffer (not
+        # last-15-lines) is what makes this robust to the saturated/task-panel layout;
+        # the nonce is what makes whole-buffer scanning SAFE — only the current inject
+        # carries it, so no stale submitted-wake in scrollback can false-positive.
+        if nonce in _NORM_STRIP.sub("", buffer):
+            break
+    else:
+        # Nonce never echoed within the poll ceiling — abort safely.
         _kitty("send-key", id_match, "ctrl+c")
-        lines = [ln.rstrip() for ln in buffer.splitlines() if ln.strip()]
-        _log.warning(
-            "roster-recovery: TOCTOU mismatch on window %d — nonce %s not found in "
-            "buffer (last line %r), aborted",
-            window_id,
-            nonce,
-            lines[-1] if lines else "",
-        )
+        if last_read_failed or buffer is None:
+            _log.warning(
+                "roster-recovery: TOCTOU verify read failed for window %d — aborted",
+                window_id,
+            )
+        else:
+            lines = [ln.rstrip() for ln in buffer.splitlines() if ln.strip()]
+            _log.warning(
+                "roster-recovery: TOCTOU mismatch on window %d — nonce %s not found in "
+                "buffer after poll (last line %r), aborted",
+                window_id,
+                nonce,
+                lines[-1] if lines else "",
+            )
         return False
 
     # Step 5: submit

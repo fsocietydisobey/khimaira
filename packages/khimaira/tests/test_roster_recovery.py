@@ -447,6 +447,7 @@ class TestInjectTextAndSubmit:
         """Stateful mock: capture the send-text inject (incl. the runtime verification
         nonce) and ECHO it into the get-text screen via screen_tmpl(inject) — mirrors
         reality, where the window renders what was typed. Returns (result, kitty_calls)."""
+        monkeypatch.setattr(rr.time, "sleep", lambda _s: None)  # skip real poll waits
         state = {"inject": None}
         kitty_calls = []
 
@@ -491,6 +492,35 @@ class TestInjectTextAndSubmit:
             lambda inj: f"> {inj}\n  ⏵⏵ auto mode on (shift+tab to cycle)",
         )
         assert r is True
+
+    def test_submits_when_nonce_echoes_late(self, monkeypatch):
+        """THE livyatan window-978 case (2026-06-20): at 520k tokens the Claude Code TUI
+        re-renders slowly, so the injected nonce isn't painted into the screen buffer on
+        the FIRST read — a single fixed-delay readback raced the render and false-aborted.
+        The poll re-reads until the echo appears. Here the first 4 reads show the
+        pre-inject screen (no nonce); the 5th echoes it. Must still submit."""
+        monkeypatch.setattr(rr.time, "sleep", lambda _s: None)  # don't actually wait ~1.8s
+        state = {"inject": None, "reads": 0}
+        calls = []
+
+        def fake_kitty(*args, **kw):
+            calls.append(args)
+            if args and args[0] == "send-text":
+                state["inject"] = args[-1]
+                return ""
+            return ""
+
+        def fake_get_screen(_wid):
+            state["reads"] += 1
+            if state["reads"] < 5:
+                return "  ⏵⏵ auto mode on (shift+tab to cycle) · ctrl+t to hide tasks"
+            return f"> {state['inject']}\n  ⏵⏵ auto mode on"
+
+        monkeypatch.setattr(rr, "_kitty", fake_kitty)
+        monkeypatch.setattr(rr, "_get_screen", fake_get_screen)
+        r = rr._inject_text_and_submit(window_id=978, text="⏰ resume", window_title="")
+        assert r is True, "late echo within the poll ceiling must still submit"
+        assert any(c and c[0] == "send-key" and "enter" in c for c in calls), "must press enter"
 
     def test_aborts_when_inject_absent(self, monkeypatch):
         """Inject didn't land (window unresponsive) → nonce absent → abort safely."""
