@@ -2233,6 +2233,44 @@ _GATE_ABSENT = "absent"
 _GATE_ERROR = "error"
 
 
+def _last_round_reset_ts(room: dict[str, Any], task_id: str) -> str:
+    """Timestamp of the most recent transition that REOPENS a task for a fresh
+    review round (done → any non-terminal status: pending / in_progress /
+    changes_requested = sent back for rework). Verdicts recorded BEFORE this are
+    stale prior-round verdicts that must not satisfy the current gate; verdicts
+    AFTER it (or all of them, if never reopened) are current.
+
+    Keys on the REOPEN, deliberately NOT on the last done-transition. A
+    done-transition is the gate CLOSING — including the daemon's gate-auto-advance
+    (`_maybe_auto_advance_gate_complete`) and a manual master →done — not a new
+    round; `done → approved` is the gate SUCCEEDING, also not a reopen. Keying on
+    last-done wrongly invalidated the very critic+verifier verdicts that TRIGGERED
+    an auto-advance→done: master's subsequent →approved then saw zero verdicts and
+    IN-MASTER-9 false-blocked it (audit 2026-06-21, muther task 625; the identical
+    task 623 succeeded only because no auto-advance had fired yet).
+    """
+    transitions: list[tuple[str, str]] = []
+    for m in room.get("messages", []):
+        k = m.get("kind")
+        if k == TASK and m.get("id") == task_id:
+            transitions.append((m.get("ts", ""), m.get("status") or TASK_PENDING))
+        elif k == TASK_UPDATE and m.get("task_id") == task_id:
+            st = m.get("status") or m.get("new_status")
+            if st:
+                transitions.append((m.get("ts", ""), st))
+    transitions.sort(key=lambda t: t[0])
+    last_reset = ""
+    prev: str | None = None
+    for ts, st in transitions:
+        # A reopen = leaving DONE for any non-terminal status. NOT done→done (no-op)
+        # and NOT done→approved (gate success). Anything else (pending/in_progress/
+        # changes_requested) is rework → resets the verdict round.
+        if prev == TASK_DONE and st not in (TASK_DONE, TASK_APPROVED):
+            last_reset = max(last_reset, ts)
+        prev = st
+    return last_reset
+
+
 def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
     """Return the gate-verdict state for the session's current active task.
 
@@ -2312,16 +2350,10 @@ def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
         except Exception:
             return _GATE_ERROR
 
-        # Find the most recent 'done' transition timestamp for this task.
-        last_done_ts: str = ""
-        for msg in room.get("messages", []):
-            kind = msg.get("kind")
-            if kind == TASK and msg.get("id") == task_id:
-                if msg.get("status") == TASK_DONE:
-                    last_done_ts = max(last_done_ts, msg.get("ts", ""))
-            elif kind == TASK_UPDATE and msg.get("task_id") == task_id:
-                if (msg.get("status") or msg.get("new_status")) == TASK_DONE:
-                    last_done_ts = max(last_done_ts, msg.get("ts", ""))
+        # Invalidate stale prior-round verdicts: the round resets on a REOPEN
+        # (done→pending/in_progress), NOT on the last done-transition — last-done is
+        # poisoned by the daemon's gate-auto-advance. See _last_round_reset_ts.
+        last_reset_ts = _last_round_reset_ts(room, task_id)
 
         critic_verdict: str | None = None
         verifier_verdict: str | None = None
@@ -2330,8 +2362,8 @@ def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
                 continue
             if msg.get("task_id") != task_id:
                 continue
-            # Skip verdicts from prior rounds (before the current done transition).
-            if last_done_ts and msg.get("ts", "") < last_done_ts:
+            # Skip verdicts from a prior review round (before the last reopen).
+            if last_reset_ts and msg.get("ts", "") < last_reset_ts:
                 continue
             v = msg.get("verdict")
             if v in ("approve", "changes"):
@@ -2385,21 +2417,14 @@ def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] |
             member = room["members"].get(sid)
             if not member or member["state"] != ACCEPTED:
                 continue
-            # Find the most recent 'done' transition timestamp (Guard-5 Part A: invalidation).
-            last_done_ts_by: str = ""
-            for msg in room.get("messages", []):
-                kind = msg.get("kind")
-                if (
-                    kind == TASK
-                    and msg.get("id") == task_id
-                    and msg.get("status") == TASK_DONE
-                ):
-                    last_done_ts_by = max(last_done_ts_by, msg.get("ts", ""))
-                elif kind == TASK_UPDATE and msg.get("task_id") == task_id:
-                    if (msg.get("status") or msg.get("new_status")) == TASK_DONE:
-                        last_done_ts_by = max(last_done_ts_by, msg.get("ts", ""))
+            # Invalidate stale prior-round verdicts on a REOPEN (done→active), NOT on
+            # the last done-transition (Guard-5 Part A). last-done is poisoned by the
+            # daemon's gate-auto-advance, which writes a done FROM these very verdicts
+            # → they'd be wrongly treated as prior-round → IN-MASTER-9 false-blocks
+            # master's →approved (audit 2026-06-21, task 625). See _last_round_reset_ts.
+            last_reset_ts = _last_round_reset_ts(room, task_id)
 
-            # Scan verdicts from the current done round only.
+            # Scan verdicts from the current review round only.
             critic_verdict: str | None = None
             verifier_verdict: str | None = None
             for msg in room.get("messages", []):
@@ -2407,8 +2432,8 @@ def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] |
                     continue
                 if msg.get("task_id") != task_id:
                     continue
-                if last_done_ts_by and msg.get("ts", "") < last_done_ts_by:
-                    continue  # prior-round verdict — skip
+                if last_reset_ts and msg.get("ts", "") < last_reset_ts:
+                    continue  # prior review round — skip
                 v = msg.get("verdict")
                 if v in ("approve", "changes"):
                     critic_verdict = v
