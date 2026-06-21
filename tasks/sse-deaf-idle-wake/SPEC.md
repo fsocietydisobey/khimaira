@@ -85,3 +85,28 @@ Daemon bounce (muther notified first). B is in the UPS hook (per-session, picked
 turn — no bounce needed for B itself, but bundle). C is daemon-side `chats.py` → bounce. Run
 full `roster_recovery` + `chats` + `user_prompt_submit` test suites green first.
 roster_recovery.py / guard5.py / auto_dispatch.py are MANUAL-FORMATTED — never whole-file black.
+
+---
+
+## Fresh repro + recurrence evidence (2026-06-21, jeevy roster master)
+
+The original fix (catchup-staleness-cap) did NOT close this. New repro from a long
+P2 jeevy session: roster workers (critic ×3, architect ×4 = ~7× one session) went
+SSE-silent after idle — SSE subscriber dropped, never re-registered chat_my_chats →
+received nothing → daemon false-flagged "unreachable/hung >613s" though ALIVE. The
+daemon's own auto-wake (roster_recovery send-text) did NOT catch them before 613s.
+Recovery required a manual kitty nudge EVERY time → a per-turn tax on master.
+
+**IMPORTANT caveat (2026-06-21):** this was observed against a STALE daemon — the
+running monitor was the 09:45 instance, and `monitor restart` had been silently
+no-op'ing (see tasks/monitor-restart-noop), so the session's wake-actuator fix
+(ce7af6e id-match) was NOT actually live. RE-EVALUATE BUG-1 frequency now that the
+daemon genuinely serves the wake fixes — some of the "auto-wake didn't fire" may have
+been the stale daemon. The SSE-subscriber-dies-on-idle root is still real regardless.
+
+### Three fix directions (from the jeevy master, all sound)
+- (a) daemon-side heartbeat-driven SSE re-registration so idle sessions stay reachable
+- (b) auto-wake fires BEFORE the 613s "hung" threshold + readback-verifies it landed
+      (ties to ce7af6e + the WIP-guard commit-stall #23 — same idle-but-owed-not-caught class)
+- (c) the "hung" flag distinguishes process-DEAD from SSE-unsubscribed-but-ALIVE (kills
+      the false positive)
