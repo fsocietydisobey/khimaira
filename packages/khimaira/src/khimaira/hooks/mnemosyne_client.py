@@ -120,6 +120,7 @@ def ask_oracle(
     project: str = _DEFAULT_PROJECT,
     max_tokens: int = 256,
     temperature: float = 0.3,
+    repetition_penalty: float = 1.3,
     timeout: float = 60.0,
 ) -> dict | None:
     """Ask a local codebase-oracle MODEL (vLLM) a question.
@@ -152,6 +153,12 @@ def ask_oracle(
             "messages": [{"role": "user", "content": question}],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            # repetition_penalty (vLLM-native sampling param, accepted on the
+            # OpenAI-compatible endpoint) breaks the small-7B degeneration into
+            # repetition loops at ~200-256 tokens (2026-06-20 re-bake validation
+            # artifact — grounding was fine, the output tail degenerated). 1.3 is
+            # firm enough to stop the loop without harming a normal answer.
+            "repetition_penalty": repetition_penalty,
         },
         separators=(",", ":"),
     ).encode("utf-8")
