@@ -1113,3 +1113,32 @@ def test_master_md_has_owing_agent_sweep():
         "master.md sweep must call out the gate-role missing-verdict stall"
     )
     assert "every turn" in md.lower(), "sweep must be every-turn, not dispatch-only"
+
+
+def test_in_agent_7_themis_rule_present():
+    """Regression guard: IN-AGENT-7 (NO_SELF_DISPATCH_EDIT) must stay in agent.yaml.
+
+    Structural promotion of the agent-self-dispatch class (jeevy-agent-2 2026-06-21):
+    behavioral role-doc discipline drifts; the warn-rule + its condition must persist.
+    """
+    content = (THEMIS_RULES / "agent.yaml").read_text()
+    assert "IN-AGENT-7" in content, "agent.yaml missing IN-AGENT-7 rule"
+    assert "NO_SELF_DISPATCH_EDIT" in content, "missing rule name"
+    assert (
+        "agent_edit_without_assigned_task" in content
+    ), "missing condition check reference"
+    assert "severity: warn" in content.split("IN-AGENT-7", 1)[1].split("IN-AGENT-8", 1)[0], (
+        "IN-AGENT-7 must be severity=warn (autonomous initiative is wanted; nudge not block)"
+    )
+
+
+def test_agent_md_contains_no_self_dispatch_section():
+    """Regression guard: agent.md must keep the no-self-dispatch / propose-then-wait
+    discipline (the role-doc layer of the IN-AGENT-7 3-layer promotion)."""
+    content = (ROLE_DIR / "agent.md").read_text()
+    lowered = content.lower()
+    assert "self-dispatch" in lowered, "agent.md missing the self-dispatch discipline"
+    assert "IN-AGENT-7" in content, "agent.md missing the IN-AGENT-7 cross-reference"
+    assert (
+        "propose" in lowered and "wait" in lowered
+    ), "agent.md missing the propose-then-wait instruction"

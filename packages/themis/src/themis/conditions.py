@@ -571,3 +571,30 @@ def gate_verdicts_incomplete(payload: dict[str, Any]) -> bool:
     return True  # unknown shape → fail closed
 
 _REGISTRY["gate_verdicts_incomplete"] = gate_verdicts_incomplete
+
+
+_ASSIGN_SENTINEL = object()
+
+
+def agent_edit_without_assigned_task(payload: dict[str, Any]) -> bool:
+    """True (warn) when an agent edits files while holding NO in_progress assigned task.
+
+    The self-dispatch / BEGIN-gate-jump footgun (jeevy-agent-2, 2026-06-21): an eager
+    agent treats visible-needed-work in the roster chat as a cue to edit BEFORE master
+    assigns a task and signals start. Reads payload['has_in_progress_assignment'] (bool)
+    set by the IN-AGENT-7 enrichment for edit tools. Tri-state, fail-open:
+      - key absent → enrichment didn't run (non-edit tool / error) → False (no warn)
+      - True  → agent holds an active assignment → False (no warn — legitimate work)
+      - False → no active assignment → True (WARN: propose + wait for the task)
+
+    WARN, not block: autonomous agent initiative is a WANTED capability — this nudges
+    the agent to route its initiative through assignment + gate, it does not lock the
+    agent to propose-only. Master still captures good unsolicited work into a gated task.
+    """
+    v = payload.get("has_in_progress_assignment", _ASSIGN_SENTINEL)
+    if v is _ASSIGN_SENTINEL:
+        return False  # enrichment didn't run → fail-open (no warn)
+    return v is False
+
+
+_REGISTRY["agent_edit_without_assigned_task"] = agent_edit_without_assigned_task

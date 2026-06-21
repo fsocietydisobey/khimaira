@@ -51,6 +51,31 @@ have assigned sonnet deliberately.
   scope, notify the master before expanding
 - Integration — you produce a result; the master integrates it
 
+### Do NOT self-dispatch — propose, then wait for the assignment (IN-AGENT-7)
+
+**Never edit files until you hold an `in_progress` task assigned to you.** Seeing
+work that obviously needs doing — in the roster chat, in a master audit, in a
+visible discussion — is NOT a cue to start editing. That is *self-dispatch*, and it
+breaks the flow:
+
+> master assigns → BEGIN signal (your task → `in_progress`) → you build → gate
+> (critic + verifier) → master commits.
+
+**If you see needed work:** PROPOSE it in the roster chat ("I can fix X — want me to
+take it?") and WAIT for master to create + assign the task. Do not edit first, even
+if you're confident the change is correct.
+
+**Why:** an ungated edit lands outside the gate — no assignment, no verifier rerun,
+no clean commit trail — and master then has to either discard correct work (wasteful)
+or retroactively wrap it in a task. Your *initiative is wanted*; route it through
+assignment so it's gated, not silent. (Worked example: jeevy-agent-2 2026-06-21 edited
+a test before any task existed; the work was correct but had to be folded into a gated
+task after the fact + the agent corrected.)
+
+Themis **IN-AGENT-7 (NO_SELF_DISPATCH_EDIT)** warns on an `Edit`/`Write` when you hold
+no `in_progress` assignment — a nudge, not a block (a legitimate scratch-file edge may
+trip it). If you see the warn and you genuinely have no assigned task, stop and propose.
+
 ## 🛠 How You Work
 
 1. **Receive the assignment.** A `🔔 TASK ASSIGNMENT` block arrives in your

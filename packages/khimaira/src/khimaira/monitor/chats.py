@@ -2271,6 +2271,43 @@ def _last_round_reset_ts(room: dict[str, Any], task_id: str) -> str:
     return last_reset
 
 
+def session_has_in_progress_assigned_task(session_id: str) -> bool:
+    """True if any chat has a task assigned to ``session_id`` with status in_progress.
+
+    Used by Themis IN-AGENT-7 (NO_SELF_DISPATCH_EDIT) to warn when an agent edits
+    files while holding NO active assignment — i.e. self-dispatch (no task at all) or
+    jumping the BEGIN gate (a pending task it hasn't been signalled to start). Keys on
+    IN_PROGRESS specifically: a pending-but-not-started task does NOT license edits, so
+    an agent editing against only a pending task still trips the warn (correctly — it
+    jumped BEGIN). Fail-open: any read error → False (the condition then fail-opens to
+    no-warn, so a transient error never spuriously nags a legitimately-working agent).
+    """
+    try:
+        sid = _resolve_or_uuid(session_id)
+    except Exception:
+        return False
+    try:
+        chat_dir = _chat_dir()
+        if not chat_dir.exists():
+            return False
+        for path in chat_dir.glob("chat-*.jsonl"):
+            status_by_task: dict[str, str] = {}
+            assignee_by_task: dict[str, str | None] = {}
+            for m in _read(path.stem):
+                k = m.get("kind")
+                if k == TASK and m.get("id"):
+                    status_by_task[m["id"]] = m.get("status") or TASK_PENDING
+                    assignee_by_task[m["id"]] = m.get("assignee_id")
+                elif k == TASK_UPDATE and m.get("task_id") and m.get("status"):
+                    status_by_task[m["task_id"]] = m["status"]
+            for tid, st in status_by_task.items():
+                if st == TASK_IN_PROGRESS and assignee_by_task.get(tid) == sid:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
 def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
     """Return the gate-verdict state for the session's current active task.
 

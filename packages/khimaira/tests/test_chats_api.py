@@ -2678,3 +2678,45 @@ def test_auto_begin_fires_through_http(chats_api_client):
 
     # BEGIN must have fired synchronously inside send_message.
     assert chats_mod._is_task_begun(chat_id, task_id)
+
+
+def test_session_has_in_progress_assigned_task(chats_api_client):
+    """IN-AGENT-7 detection (session_has_in_progress_assigned_task): True ONLY when the
+    session holds an in_progress task assigned to it. False for no task, a pending
+    (assigned-but-not-started) task — jumping BEGIN does not license edits — and done.
+    """
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client,
+        chats_mod,
+        members=("bob",),
+        member_roles={"alice": "master", "bob": "agent"},
+    )
+    # no task at all → False (the self-dispatch case)
+    assert chats_mod.session_has_in_progress_assigned_task("bob") is False
+
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "do it",
+            "assignee_session_id": "bob",
+        },
+    )
+    tid = r.json()["id"]
+    # pending (assigned, BEGIN not signalled) → still False (jumping BEGIN ≠ licensed)
+    assert chats_mod.session_has_in_progress_assigned_task("bob") is False
+
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{tid}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+    # in_progress assigned to bob → True (legitimate work, no warn)
+    assert chats_mod.session_has_in_progress_assigned_task("bob") is True
+
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{tid}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
+    # done → False (no longer an active assignment)
+    assert chats_mod.session_has_in_progress_assigned_task("bob") is False
