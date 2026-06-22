@@ -72,10 +72,24 @@ def _cmd_start(args: argparse.Namespace) -> int:
 
     port = _port()
     if args.foreground:
-        # Useful for debugging — runs in this process, no fork.
+        # Runs in THIS process, no fork — this is how the systemd unit
+        # (Type=simple) and `monitor watch` launch the daemon. Write our own
+        # PID so `stop`/`restart`/`status` can find us: without it those
+        # commands silently no-op against a foreground daemon (#28 — the live
+        # systemd-launched daemon was uncontrollable + masked a stale-code
+        # instance for hours). Clean up on exit, but only if the file is still
+        # OURS (a concurrent start may have replaced it).
         from .server import serve
 
-        serve(port=port)
+        PID_FILE.write_text(str(os.getpid()))
+        try:
+            serve(port=port)
+        finally:
+            try:
+                if _read_pid() == os.getpid():
+                    PID_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
         return 0
 
     pid = daemonize_and_serve(port=port)
@@ -166,9 +180,46 @@ def _maybe_nudge_about_supervisor() -> None:
     )
 
 
+def _systemd_unit_active() -> bool:
+    """True iff the khimaira-monitor systemd user unit is currently active.
+
+    When it is, `stop`/`restart` MUST go through systemctl: the unit runs with
+    Restart=always, so SIGTERM-ing the process directly just makes systemd
+    respawn it (stop appears to fail, restart double-starts). Delegating to
+    systemctl is the only way to actually stop/cycle a supervised daemon (#28).
+    """
+    if sys.platform != "linux" or not shutil_which("systemctl"):
+        return False
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", "khimaira-monitor"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return r.stdout.strip() == "active"
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
 def _cmd_restart(args: argparse.Namespace) -> int:
-    """Stop the daemon (if running) then start. Tolerates no-PID-file."""
+    """Stop the daemon (if running) then start. Tolerates no-PID-file.
+
+    If the systemd unit is supervising the daemon, delegate to
+    `systemctl --user restart` — a manual stop+start would fight Restart=always.
+    """
     import time
+
+    if _systemd_unit_active():
+        import subprocess
+
+        print("khimaira monitor: restarting via systemd (unit active)…")
+        rc = subprocess.run(["systemctl", "--user", "restart", "khimaira-monitor"]).returncode
+        if rc == 0:
+            print("khimaira monitor: systemd restart requested")
+        return rc
 
     # Best-effort stop — don't bail if there's nothing running.
     try:
@@ -181,6 +232,12 @@ def _cmd_restart(args: argparse.Namespace) -> int:
 
 
 def _cmd_stop(args: argparse.Namespace) -> int:
+    if _systemd_unit_active():
+        import subprocess
+
+        print("khimaira monitor: stopping via systemd (unit active)…")
+        return subprocess.run(["systemctl", "--user", "stop", "khimaira-monitor"]).returncode
+
     pid = _read_pid()
     if pid is None:
         print("khimaira monitor: no PID file — not running")
@@ -594,12 +651,14 @@ After=network.target
 [Service]
 Type=simple
 ExecStart={exec_start}
-Restart=on-failure
+Restart=always
 RestartSec=5
-# Restart even on clean exits (rc=0) — khimaira daemon's normal exit
-# path is shutdown, so seeing rc=0 mid-day means something killed it.
-# Override to "on-failure" if you want the daemon to STAY stopped on
-# clean exits.
+# Restart=always (NOT on-failure): the `--foreground` serve path can return
+# rc=0 on a transient bind race at boot, and on-failure would then leave the
+# daemon dead all day — observed 2026-06-21, the unit sat inactive while a
+# manual instance served stale code (#28). `always` self-heals. An intentional
+# `systemctl --user stop` still stops it (systemd distinguishes a requested
+# stop from a process exit), so this doesn't trap the daemon "on".
 # Environment=KHIMAIRA_MONITOR_PORT=8740
 
 # Resource limits (optional; uncomment if you see OOM-related failures)
