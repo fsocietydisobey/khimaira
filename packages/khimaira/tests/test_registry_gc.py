@@ -140,3 +140,36 @@ def test_live_identities_includes_title_and_cmdline_name(gc_mod, monkeypatch):
     monkeypatch.setattr(rr, "_kitty", lambda *a: _json.dumps(ls))
     ids = gc._live_window_identities()
     assert "drifted-title" in ids and "muther-agent-3" in ids
+
+
+def test_decorated_title_yields_de_decorated_identity(gc_mod, monkeypatch):
+    """THE 2026-06-21 muther drop: kitty decorates the live window title with an
+    activity marker (✳ idle / ⠂ thinking / * bell). Plain .strip() leaves the
+    marker, so "✳ muther" != "muther" and the reaper false-deletes the LIVE
+    session — cascading a chat-membership leave. The reaper must add the
+    de-decorated identity so the marked window still proves "muther" alive."""
+    gc, _ = gc_mod
+    import json as _json
+    ls = [{"tabs": [{"windows": [{
+        "title": "✳ muther",
+        "foreground_processes": [{"cmdline": ["claude-chat", "-r", "muther"]}],
+    }]}]}]
+    from khimaira.monitor import roster_recovery as rr
+    monkeypatch.setattr(rr, "_kitty", lambda *a: _json.dumps(ls))
+    ids = gc._live_window_identities()
+    assert "muther" in ids, "de-decorated title must mark the session live"
+
+
+def test_decorated_window_session_not_reaped(gc_mod, monkeypatch):
+    """End-to-end: a live session whose only liveness proof is a decorated
+    window title ("⠂ muther") must NOT be reaped. Regression guard for the
+    cascade that dropped muther from her jeevy roster chat twice."""
+    gc, sess = gc_mod
+    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"muther"})  # de-decorated
+    deleted = []
+    monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-m", "muther", 99999)))
+    monkeypatch.setattr(sess, "delete_session",
+                        lambda sid, **k: deleted.append(sid) or {"deleted": True})
+    res = gc.reap_windowless_sessions()
+    assert res["reaped"] == 0
+    assert deleted == [], "decorated-title live session must survive the reaper"
