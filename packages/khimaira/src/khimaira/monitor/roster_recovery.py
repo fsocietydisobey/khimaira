@@ -1160,6 +1160,76 @@ def _session_has_unconsumed_chat(session_id: str) -> bool:
         return False
 
 
+# Audit instrument for #23 (idle-with-owed). Default on; KHIMAIRA_WAKE_DIAG=0 to mute.
+_WAKE_DIAG_ENABLED = os.environ.get("KHIMAIRA_WAKE_DIAG", "1") != "0"
+
+
+def _wake_skip_diagnostic(
+    session_id: str, role: str, window_id: int, signals: dict[str, bool]
+) -> None:
+    """Log LOUDLY when the wake path SKIPS an idle session that nonetheless has
+    chat work it never answered — the idle-with-owed false-negative we otherwise
+    can't catch (all wake signals clear, but the agent stopped mid-consume).
+
+    The discriminator the existing signals miss: inbound non-self messages that
+    postdate the session's OWN last chat post. `_session_has_unconsumed_chat` keys
+    on last_active (any action), so an agent that acts-without-answering looks
+    "consumed"; keying on its last OWN POST instead reveals work it never replied
+    to. This is DIAGNOSTIC ONLY (no behavior change) — it captures the exact live
+    state of the next real stall so the fix can be built audit-grade, not blind.
+
+    Low-noise by construction: fires only for a session idle past the wake floor
+    that has such unanswered inbound. A healthy agent that just delivered (its own
+    post is the newest) does NOT trip it. WARNING-level so it's visible at INFO.
+    """
+    if not _WAKE_DIAG_ENABLED:
+        return
+    try:
+        from khimaira.monitor import chats as chats_mod
+        from khimaira.monitor import sessions as sessions_mod
+
+        idle_s = float(sessions_mod.summary(session_id).get("last_active_age_s") or 0.0)
+        if idle_s < _IDLE_MIN_S:
+            return  # too fresh to be "stuck"
+
+        try:
+            rsid = chats_mod._resolve_or_uuid(session_id)
+        except Exception:
+            rsid = session_id
+
+        chat_dir = chats_mod._chat_dir()
+        if not chat_dir.exists():
+            return
+        owed: list[tuple[str, str, object]] = []
+        for chat_path in chat_dir.glob("chat-*.jsonl"):
+            try:
+                room = chats_mod.load_room(chat_path.stem)
+                member = room["members"].get(rsid)
+                if not member or member.get("state") != chats_mod.ACCEPTED:
+                    continue
+                msgs = [m for m in room.get("messages", []) if m.get("kind") == chats_mod.MSG]
+                own = [m for m in msgs if m.get("sender_id") == rsid]
+                last_own = _iso_to_epoch(own[-1].get("ts")) if own else 0.0
+                for m in msgs:
+                    sender = m.get("sender_id")
+                    if sender == rsid or sender == chats_mod.SYSTEM_SENDER_ID:
+                        continue
+                    if _iso_to_epoch(m.get("ts")) > last_own:
+                        owed.append((chat_path.stem, m.get("sender_name") or "", m.get("to")))
+            except Exception:
+                continue
+
+        if owed:
+            _log.warning(
+                "roster-recovery: WAKE-SKIP-DIAG window=%d role=%s session=%s idle=%.0fs "
+                "signals=%s — %d inbound chat msg(s) postdate its own last post "
+                "(idle-with-owed candidate; samples=%s)",
+                window_id, role, session_id[:8], idle_s, signals, len(owed), owed[:3],
+            )
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # HITL auto-answering helpers
 # ---------------------------------------------------------------------------
@@ -2014,6 +2084,22 @@ async def _process_window(win: dict[str, Any]) -> None:
             and not has_unread_inbox
             and not has_unconsumed_chat
         ):
+            # #23 audit instrument: before skipping, record whether this idle
+            # session actually has chat work it never answered (diagnostic only).
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                _wake_skip_diagnostic,
+                session_id,
+                role,
+                window_id,
+                {
+                    "obligations": bool(obligations),
+                    "pending_task": has_pending_task,
+                    "pending_invite": has_pending_invite,
+                    "unread_inbox": has_unread_inbox,
+                    "unconsumed_chat": has_unconsumed_chat,
+                },
+            )
             return
 
         rows = sessions_mod.list_sessions(use_cache=True)
