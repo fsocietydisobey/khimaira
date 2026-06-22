@@ -46,7 +46,33 @@ A fact appended to the store now is usable on the **next** `mnemosyne_ask` — n
 bake. The bake still runs as consolidation: facts that keep getting retrieved are
 the ones worth baking into weights (faster, generalizes, no retrieval needed).
 
-## Architecture (decision points — pick during build)
+## Decisions (LOCKED 2026-06-22, Joseph)
+
+The three open decisions are resolved. **Load-bearing fact:** the mnemosyne store +
+distiller live on the **laptop** (`~/dev/ai-lab/mnemosyne/data/`); only the oracle
+weights/vLLM are on the **Spark**. So retrieval happens **where the store is (laptop)**,
+and only the final augmented prompt crosses the LAN to the Spark oracle.
+
+1. **Shim location → laptop-side serve proxy.** A thin FastAPI service on the laptop
+   exposing the same `/v1/chat/completions` contract: retrieve locally → augment → forward
+   to the Spark oracle. `MNEMOSYNE_ORACLE_URL` / `MNEMOSYNE_JEEVY_URL` point at the proxy
+   (callers unchanged — centralized, every caller benefits). **Build order:** prototype the
+   retrieve+augment inside `mnemosyne_client.ask()` first to prove the lift on real
+   questions, THEN promote that logic into the standalone proxy.
+2. **Index → reuse Séance's Qdrant (laptop) + local embedder.** Séance already runs Qdrant
+   in the khimaira workspace on the laptop, co-located with the store — add a
+   `mnemosyne_<project>` collection rather than standing up a separate index. Embed with a
+   LOCAL model (Séance's existing embedder, or a sentence-transformer); NO external API.
+3. **Freshness → live upsert on `store.append`.** The store writer (distiller) and the
+   index are both laptop-local, so embedding + upserting each new pair at write time is
+   cheap and gives TRUE real-time memory (Joseph's "like a person" goal). The timer-sweep
+   fallback is unnecessary given co-location — keep it only as a reconcile/backfill safety.
+
+Rationale: co-locating store + index + proxy on the laptop makes real-time upsert a local
+operation (no cross-machine lag), keeps the whole retrieval path on the LAN, and limits the
+Spark round-trip to the one thing that MUST be there (the weights).
+
+## Architecture (implementation detail)
 
 **Where the retrieval shim lives** (recommend B):
 - **A — client-side** (`mnemosyne_client.ask()`): retrieve → prepend → POST to vLLM.
