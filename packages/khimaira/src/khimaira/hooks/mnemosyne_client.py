@@ -27,6 +27,17 @@ _ORACLES: dict[str, tuple[str, str]] = {
 }
 _DEFAULT_PROJECT = "khimaira"
 
+# Direct upstream oracles — client-side fallback when the RAG proxy is unreachable.
+# Post-flip, _ORACLE_BASE points at the laptop-side RAG proxy; if it's down (e.g. its
+# brief systemd-restart window), ask_oracle retries the REAL oracle here before
+# returning None — removing the proxy's SPOF window (oracle-realtime-rag #31). Stays
+# stdlib-only + fail-open. Set MNEMOSYNE_ORACLE_DIRECT / MNEMOSYNE_JEEVY_DIRECT to the
+# real oracle addresses (defaults assume spark ports forwarded to localhost).
+_ORACLE_DIRECT: dict[str, str] = {
+    "khimaira": os.environ.get("MNEMOSYNE_ORACLE_DIRECT", "http://127.0.0.1:18000"),
+    "jeevy": os.environ.get("MNEMOSYNE_JEEVY_DIRECT", "http://127.0.0.1:18001"),
+}
+
 _log = logging.getLogger(__name__)
 
 
@@ -162,25 +173,47 @@ def ask_oracle(
         },
         separators=(",", ":"),
     ).encode("utf-8")
-    try:
-        req = urllib.request.Request(
-            f"{base}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        answer = (
-            ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-        ).strip()
-        if not answer:
+    # Try the configured base (the RAG proxy, post-flip) first; on a TRANSPORT failure
+    # (proxy down / unreachable) fall back to the direct upstream oracle before giving
+    # up. A reached-but-empty/garbled response does NOT fall back — the oracle answered,
+    # it just had nothing usable (retrying direct would only duplicate the result).
+    targets = [base]
+    direct = _ORACLE_DIRECT.get(project)
+    if direct and direct != base:
+        targets.append(direct)
+
+    for i, target in enumerate(targets):
+        try:
+            req = urllib.request.Request(
+                f"{target}/v1/chat/completions",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            answer = (
+                ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            ).strip()
+            if not answer:
+                return None
+            return {
+                "answer": answer,
+                "model": data.get("model", model),
+                "usage": data.get("usage", {}),
+            }
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            if i + 1 < len(targets):
+                _log.warning(
+                    "mnemosyne oracle %s unreachable (%s) — falling back to direct upstream",
+                    target,
+                    exc,
+                )
+                continue
+            _log.warning("mnemosyne oracle ask failed (project=%r): %s", project, exc)
             return None
-        return {
-            "answer": answer,
-            "model": data.get("model", model),
-            "usage": data.get("usage", {}),
-        }
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        _log.warning("mnemosyne oracle ask failed (project=%r): %s", project, exc)
-        return None
+        except ValueError as exc:
+            _log.warning(
+                "mnemosyne oracle bad response (project=%r, target=%s): %s", project, target, exc
+            )
+            return None
