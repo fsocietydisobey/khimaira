@@ -57,12 +57,22 @@ and only the final augmented prompt crosses the LAN to the Spark oracle.
    exposing the same `/v1/chat/completions` contract: retrieve locally → augment → forward
    to the Spark oracle. `MNEMOSYNE_ORACLE_URL` / `MNEMOSYNE_JEEVY_URL` point at the proxy
    (callers unchanged — centralized, every caller benefits). **Build order:** prototype the
-   retrieve+augment inside `mnemosyne_client.ask()` first to prove the lift on real
-   questions, THEN promote that logic into the standalone proxy.
-2. **Index → reuse Séance's Qdrant (laptop) + local embedder.** Séance already runs Qdrant
-   in the khimaira workspace on the laptop, co-located with the store — add a
-   `mnemosyne_<project>` collection rather than standing up a separate index. Embed with a
-   LOCAL model (Séance's existing embedder, or a sentence-transformer); NO external API.
+   retrieve+augment first to prove the lift on real questions, THEN promote that logic into
+   the standalone proxy. NOTE (livyatan, 2026-06-22): `mnemosyne_client.py` is deliberately
+   stdlib-only ("must run in any subprocess") and retrieval needs Qdrant + an embedder (heavy
+   deps), so the retrieval logic lives in a SEPARATE module the client/harness imports — NOT
+   new deps inside `ask_oracle()`.
+2. **Index → reuse Séance's Qdrant INSTANCE (laptop), separate collection + OWN local embedder.**
+   Séance already runs Qdrant (embedded/on-disk) in the khimaira workspace on the laptop,
+   co-located with the store — add a `mnemosyne_<project>` collection rather than standing up a
+   separate index. **CORRECTION (livyatan, 2026-06-22): do NOT reuse Séance's *embedder* — it
+   is Google `gemini-embedding-001` via google-genai (EXTERNAL API, 3072-d), which violates
+   the hard LAN-privacy constraint.** Use a LOCAL laptop embedder instead: `bge-small-en-v1.5`
+   (384-d, CPU-fast; corpus is tiny — khimaira ~916 / jeevy ~1273 pairs), upgrade to
+   `bge-base-en-v1.5` (768-d) if validation shows weak recall. New collection has its own dim
+   (can't share Séance's 3072-d code-chunk collections — different vector space). Spark-served
+   embedder rejected: adds a per-query round-trip + GPU contention with the oracles, killing
+   the snappy-orientation use case.
 3. **Freshness → live upsert on `store.append`.** The store writer (distiller) and the
    index are both laptop-local, so embedding + upserting each new pair at write time is
    cheap and gives TRUE real-time memory (Joseph's "like a person" goal). The timer-sweep
