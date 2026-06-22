@@ -178,6 +178,50 @@ def _session_opt_out(session_id: str) -> bool:
 # kitty remote-control helpers
 # ---------------------------------------------------------------------------
 
+_RESOLVED_LISTEN: str | None = None  # cache of a discovered kitty control socket
+
+
+def _resolve_listen_socket() -> str | None:
+    """Find a live kitty control socket when ``KITTY_LISTEN_ON`` isn't in the env.
+
+    The daemon inherits ``KITTY_LISTEN_ON`` only when it is launched from INSIDE
+    a kitty window. Under systemd (`monitor install-service`) it has no TTY and
+    no inherited env, so ``kitty @`` falls back to opening /dev/tty and fails —
+    which silently kills ALL auto-wakes (the roster then stalls and the master
+    needs manual nudging; regression observed 2026-06-22 after the systemd
+    cutover). kitty's ``listen_on unix:/tmp/kitty`` config yields a per-instance
+    socket ``/tmp/kitty-<pid>``; discover + cache a live one and re-probe it on
+    failure. Glob overridable via ``KHIMAIRA_KITTY_SOCKET_GLOB``.
+    """
+    import glob
+
+    global _RESOLVED_LISTEN
+    # Re-validate a cached socket cheaply; clear it if the kitty instance is gone.
+    if _RESOLVED_LISTEN is not None:
+        sock_path = _RESOLVED_LISTEN.split("unix:", 1)[-1]
+        if os.path.exists(sock_path):
+            return _RESOLVED_LISTEN
+        _RESOLVED_LISTEN = None
+
+    pattern = os.environ.get("KHIMAIRA_KITTY_SOCKET_GLOB", "/tmp/kitty-*")
+    for sock in sorted(glob.glob(pattern)):
+        listen = f"unix:{sock}"
+        try:
+            r = subprocess.run(
+                ["kitty", "@", f"--to={listen}", "ls"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            if r.returncode == 0:
+                _RESOLVED_LISTEN = listen
+                _log.info("roster-recovery: discovered kitty control socket %s", listen)
+                return listen
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+    return None
+
+
 def _kitty(
     *args: str,
     input_text: str | None = None,
@@ -185,11 +229,12 @@ def _kitty(
 ) -> str | None:
     """Run ``kitty @ <args>``; return stdout or None on any failure.
 
-    When ``KITTY_LISTEN_ON`` is set (always the case under the daemon, which
-    runs without a controlling TTY), passes ``--to=<socket>`` so kitty uses
-    the IPC socket directly instead of trying to open /dev/tty.
+    Resolves the control socket so kitty uses the IPC socket directly instead of
+    trying to open /dev/tty: prefers an inherited ``KITTY_LISTEN_ON`` (daemon
+    launched inside kitty), else discovers a live ``/tmp/kitty-*`` socket (daemon
+    under systemd, no TTY/env — see ``_resolve_listen_socket``).
     """
-    listen = os.environ.get("KITTY_LISTEN_ON")
+    listen = os.environ.get("KITTY_LISTEN_ON") or _resolve_listen_socket()
     if listen:
         cmd = ["kitty", "@", f"--to={listen}", *args]
     else:

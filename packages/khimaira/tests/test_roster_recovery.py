@@ -43,6 +43,61 @@ SAMPLE_KITTY_LS = json.dumps([
 
 
 # ---------------------------------------------------------------------------
+# _resolve_listen_socket (headless kitty control-socket discovery)
+# ---------------------------------------------------------------------------
+
+class TestResolveListenSocket:
+    """Regression: the systemd daemon has no inherited KITTY_LISTEN_ON, so
+    `kitty @` fell back to /dev/tty and ALL auto-wakes died — the roster stalled
+    and the master needed manual nudging (2026-06-22 systemd-cutover regression).
+    `_kitty` must discover a live /tmp/kitty-* socket and pass --to."""
+
+    def setup_method(self):
+        rr._RESOLVED_LISTEN = None
+
+    def teardown_method(self):
+        rr._RESOLVED_LISTEN = None
+
+    def test_discovers_live_socket_via_glob(self, monkeypatch):
+        monkeypatch.delenv("KITTY_LISTEN_ON", raising=False)
+        import glob as _glob
+
+        monkeypatch.setattr(_glob, "glob", lambda p: ["/tmp/kitty-6285"])
+        monkeypatch.setattr(
+            rr.subprocess, "run",
+            lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr=""),
+        )
+        assert rr._resolve_listen_socket() == "unix:/tmp/kitty-6285"
+
+    def test_skips_dead_socket_tries_next(self, monkeypatch):
+        monkeypatch.delenv("KITTY_LISTEN_ON", raising=False)
+        import glob as _glob
+
+        monkeypatch.setattr(_glob, "glob", lambda p: ["/tmp/kitty-1", "/tmp/kitty-2"])
+
+        def fake_run(cmd, **k):
+            rc = 0 if "--to=unix:/tmp/kitty-2" in cmd else 1
+            return subprocess.CompletedProcess(cmd, rc, stdout="[]", stderr="dead")
+
+        monkeypatch.setattr(rr.subprocess, "run", fake_run)
+        assert rr._resolve_listen_socket() == "unix:/tmp/kitty-2"
+
+    def test_kitty_uses_discovered_socket_headless(self, monkeypatch):
+        monkeypatch.delenv("KITTY_LISTEN_ON", raising=False)
+        rr._RESOLVED_LISTEN = "unix:/tmp/kitty-6285"  # pre-cached
+        monkeypatch.setattr(rr.os.path, "exists", lambda p: True)
+        seen = {}
+
+        def fake_run(cmd, **k):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+        monkeypatch.setattr(rr.subprocess, "run", fake_run)
+        assert rr._kitty("ls") == "ok"
+        assert "--to=unix:/tmp/kitty-6285" in seen["cmd"]
+
+
+# ---------------------------------------------------------------------------
 # _discover_roster_windows
 # ---------------------------------------------------------------------------
 
