@@ -40,6 +40,16 @@ _TASK_STALL_S = float(os.environ.get("KHIMAIRA_GUARD7_TASK_STALL_S", str(10 * 60
 _INACTIVE_S = float(os.environ.get("KHIMAIRA_GUARD7_INACTIVE_S", str(15 * 60)))
 # Done task with an unposted verdict for this long → reviewer owes.
 _VERDICT_STALL_S = float(os.environ.get("KHIMAIRA_GUARD7_VERDICT_STALL_S", str(15 * 60)))
+# UPPER bound: a task done LONGER ago than this is abandoned, not "owed" — don't
+# resurrect ancient dead-roster tasks every sweep (the verdict obligation is only
+# live within a recency window; without this, every old done-without-verdict task in
+# every dead chat fires forever — a 43-task first-sweep burst in the live dry-run).
+_VERDICT_MAX_AGE_S = float(os.environ.get("KHIMAIRA_GUARD7_VERDICT_MAX_AGE_S", str(6 * 3600)))
+# Abandonment horizon for signals 1+2: a task open this long (since CREATED) is a stale
+# assignment no one will finish, not a live cogitate/dark — don't nag it (the 93h-old
+# "wake test" task is the case). Keyed on created_ts, not last_state_change, so an old
+# task re-touched once isn't judged "young".
+_ABANDON_AGE_S = float(os.environ.get("KHIMAIRA_GUARD7_ABANDON_AGE_S", str(24 * 3600)))
 # Per-(chat, task, signal) debounce so a persistent stall escalates once per cooldown.
 _DEBOUNCE_S = float(os.environ.get("KHIMAIRA_GUARD7_DEBOUNCE_S", str(30 * 60)))
 _DEBOUNCE_TTL_S = 2 * 3600.0  # fallback expiry so the table can't grow unbounded
@@ -85,6 +95,39 @@ def _assignee_idle_s(assignee_id: str | None) -> float | None:
         return float(age) if age is not None else None
     except Exception:
         return None
+
+
+def _chat_task_times(chat_id: str, cache: dict[str, dict[str, dict[str, str]]]) -> dict[str, dict[str, str]]:
+    """Per-task {created_ts, done_ts} for a chat (folded once, cached per sweep).
+
+    guard5's gate dict lacks these — we need created_ts for the abandonment horizon
+    (signals 1+2) and done_ts (when it entered done-awaiting-verdict) for signal-3's
+    recency, rather than last_state_change which any re-touch/partial-verdict advances.
+    Fail-open: read errors → empty (callers fall back to last_state_change).
+    """
+    if chat_id in cache:
+        return cache[chat_id]
+    times: dict[str, dict[str, str]] = {}
+    try:
+        from khimaira.monitor import chats as chats_mod
+
+        for line in chats_mod._read(chat_id):
+            kind = line.get("kind")
+            ts = line.get("ts", "")
+            if kind == chats_mod.TASK:
+                tid = line.get("id")
+                if tid:
+                    times[tid] = {"created_ts": ts, "done_ts": ""}
+            elif kind == chats_mod.TASK_UPDATE:
+                tid = line.get("task_id")
+                if tid and tid in times:
+                    ns = line.get("new_status") or line.get("status")
+                    if ns == "done":
+                        times[tid]["done_ts"] = ts
+    except Exception:
+        pass
+    cache[chat_id] = times
+    return times
 
 
 def _classify_signal(
@@ -221,6 +264,8 @@ async def _guard7_check_once() -> None:
 
     # committable lookups cached per chat this sweep (signal-3 dedup vs auto_dispatch).
     _committable_cache: dict[str, set[str]] = {}
+    # per-task created_ts/done_ts cached per chat this sweep (abandonment + done recency).
+    _times_cache: dict[str, dict[str, dict[str, str]]] = {}
 
     def _is_committable(chat_id: str, task_id: str) -> bool:
         if chat_id not in _committable_cache:
@@ -245,6 +290,12 @@ async def _guard7_check_once() -> None:
                 signal = _classify_signal(gate, now, idle)
                 if signal is None:
                     continue
+                created_ts = (
+                    _chat_task_times(chat_id, _times_cache).get(task_id, {}).get("created_ts")
+                )
+                created_age = _age_s(created_ts, now)
+                if created_age is not None and created_age > _ABANDON_AGE_S:
+                    continue  # open for days → abandoned assignment, not a live stall
                 if _debounced(chat_id, task_id, signal, now):
                     continue
                 # cogitate-then-drop → nudge the ASSIGNEE (it's the one turning).
@@ -253,6 +304,8 @@ async def _guard7_check_once() -> None:
                     target = gate.get("assignee_id")
                 else:
                     target = _resolve_target(gate, session_rows)
+                if not target:
+                    continue  # no one reachable to act → don't surface into a dead chat
                 await _surface(chat_id, target, _nudge_body(gate, signal))
                 _mark(chat_id, task_id, signal, now)
                 log.info(
@@ -264,16 +317,25 @@ async def _guard7_check_once() -> None:
                 # signal-3: done, no verdict activity for VERDICT_STALL, not committable
                 # (a reviewer slot is still empty). Reuse committable_gate_tasks so we
                 # don't dup auto_dispatch's commit path.
-                age = _age_s(
-                    gate.get("last_state_change_ts") or gate.get("last_event_ts"), now
+                done_ts = (
+                    _chat_task_times(chat_id, _times_cache).get(task_id, {}).get("done_ts")
                 )
+                age = _age_s(done_ts, now)
+                if age is None:  # no recorded done transition → fall back to last state change
+                    age = _age_s(
+                        gate.get("last_state_change_ts") or gate.get("last_event_ts"), now
+                    )
                 if age is None or age <= _VERDICT_STALL_S:
                     continue
+                if age > _VERDICT_MAX_AGE_S:
+                    continue  # done long ago = abandoned, not owed (no dead-roster resurrection)
                 if _is_committable(chat_id, task_id):
                     continue  # both verdicts in — master owns the commit, not Guard-7
                 if _debounced(chat_id, task_id, SIG_VERDICT, now):
                     continue
                 target = _resolve_target(gate, session_rows)
+                if not target:
+                    continue  # dead chat, no reachable reviewer/master → skip
                 await _surface(chat_id, target, _nudge_body(gate, SIG_VERDICT))
                 _mark(chat_id, task_id, SIG_VERDICT, now)
                 log.info(

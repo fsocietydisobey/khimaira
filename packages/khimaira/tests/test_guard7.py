@@ -81,13 +81,27 @@ def test_classify_none_when_untimeable():
 # ---------------------------------------------------------------------------
 
 
-def _wire(monkeypatch, gates, *, idle, wind_down=False, committable=None, target="master-1"):
+def _wire(
+    monkeypatch,
+    gates,
+    *,
+    idle,
+    wind_down=False,
+    committable=None,
+    target="master-1",
+    created_age=30 * 60,
+    done_age=20 * 60,
+):
     """Patch guard7's lazily-imported deps; return (notices, chat_posts) captured."""
     from khimaira.monitor import guard5, sessions, chats
 
     guard7._GUARD7_SEEN.clear()
     monkeypatch.setattr(guard7, "_ENABLED", True)
     monkeypatch.setattr(guard7.time, "time", lambda: NOW)
+
+    # per-task timeline (created_ts / done_ts) the abandonment + done-recency checks use
+    times = {"task-1": {"created_ts": _iso(created_age), "done_ts": _iso(done_age)}}
+    monkeypatch.setattr(guard7, "_chat_task_times", lambda cid, cache: times)
 
     monkeypatch.setattr(guard5, "_scan_blocking_gates", lambda: gates)
     monkeypatch.setattr(guard5, "is_wind_down", lambda: wind_down)
@@ -158,6 +172,39 @@ async def test_debounce_escalates_once_per_cooldown(monkeypatch):
     await guard7._guard7_check_once()
     await guard7._guard7_check_once()  # same stalled task, within cooldown
     assert len(notices) == 1  # second sweep debounced
+
+
+async def test_verdict_owed_skips_when_no_reachable_target(monkeypatch):
+    """Dead chat (no reachable reviewer/master) → no surface (the 43-burst fix)."""
+    g = _gate(status="done", task_age=20 * 60)
+    notices, posts = _wire(monkeypatch, [g], idle=60, committable=[], target=None)
+    await guard7._guard7_check_once()
+    assert notices == [] and posts == []
+
+
+async def test_verdict_owed_skips_when_abandoned_old(monkeypatch):
+    """done_ts LONGER ago than VERDICT_MAX_AGE → abandoned, not owed (no resurrection).
+    Keyed on done_ts: last_state_change is recent here, but done happened 10h ago."""
+    g = _gate(status="done", task_age=60)  # recent last_state_change (a re-touch)
+    notices, _ = _wire(
+        monkeypatch, [g], idle=60, committable=[], target="master-1", done_age=10 * 3600
+    )
+    await guard7._guard7_check_once()
+    assert notices == []
+
+
+async def test_cogitate_skips_when_task_abandoned(monkeypatch):
+    """in_progress task open for DAYS (created_ts old) → abandoned, not a live cogitate."""
+    notices, _ = _wire(monkeypatch, [_gate()], idle=60, created_age=93 * 3600)
+    await guard7._guard7_check_once()
+    assert notices == []
+
+
+async def test_dark_skips_when_no_reachable_target(monkeypatch):
+    """Dark assignee but nobody reachable to escalate to → don't post into the void."""
+    notices, posts = _wire(monkeypatch, [_gate()], idle=20 * 60, target=None)
+    await guard7._guard7_check_once()
+    assert notices == [] and posts == []
 
 
 async def test_never_uses_kitty_injection(monkeypatch):
