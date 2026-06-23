@@ -606,14 +606,20 @@ class TestInjectTextAndSubmit:
         r, _ = self._drive(monkeypatch, lambda inj: "x", send_fails=True)
         assert r is False
 
-    def test_uses_title_match_when_title_provided(self, monkeypatch):
+    def test_title_match_for_text_but_fresh_id_for_enter(self, monkeypatch):
+        # send-text uses the restart-stable anchored title-match, but the SUBMIT enter
+        # actuates by FRESH id: kitty decorates a live Claude title with a dynamic activity
+        # marker that FLICKERS during the nonce-poll; an anchored title-match enter then
+        # matches 0 windows and kitty send-key SILENTLY no-ops (rc=0), leaving the text
+        # unsubmitted at the prompt (2026-06-23 verifier-1/critic-1 bug). id is fresh this
+        # sweep + immune to title decoration.
         r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}", title="agent-3")
         assert r is True
         send_text = next(c for c in calls if c and c[0] == "send-text")
         send_enter = next(c for c in calls if c and c[0] == "send-key" and "enter" in c)
         assert r"--match=title:^agent\-3$" in send_text, "send-text must use anchored title-match"
-        assert r"--match=title:^agent\-3$" in send_enter, "send-key enter must use anchored title-match"
-        assert "--match=id:10" not in send_text, "send-text must NOT use id-match when title given"
+        assert "--match=id:10" in send_enter, "send-key enter must actuate by FRESH id"
+        assert "title:" not in str(send_enter), "enter must NOT title-match (decoration flicker no-ops)"
 
     def test_falls_back_to_id_when_title_matches_no_window(self, monkeypatch):
         """THE livyatan window-978 root cause (2026-06-20): the union path passes the
@@ -632,6 +638,44 @@ class TestInjectTextAndSubmit:
         r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}")
         assert r is True
         assert any("id:10" in str(c) for c in calls), "id-match must be used when no title given"
+
+    def _drive_submit_confirm(self, monkeypatch, clears_after_enters):
+        """Drive inject where the input stays at the ❯ prompt until the Nth enter, then
+        clears (submitted). Returns (result, enter_count)."""
+        monkeypatch.setattr(rr.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
+        state = {"inject": "", "enters": 0}
+
+        def fake_kitty(*args, **kw):
+            op = args[0] if args else ""
+            if op == "send-text":
+                state["inject"] = args[-1]
+            elif op == "send-key" and "enter" in args:
+                state["enters"] += 1
+            return ""
+
+        def fake_get_screen(_wid):
+            inj = state["inject"]
+            if state["enters"] < clears_after_enters:
+                return f"history line\n❯ {inj}"   # nonce still on the input line
+            return "✶ Working…\n❯ "               # input cleared → submitted
+
+        monkeypatch.setattr(rr, "_kitty", fake_kitty)
+        monkeypatch.setattr(rr, "_get_screen", fake_get_screen)
+        r = rr._inject_text_and_submit(window_id=10, text="hi", window_title="")
+        return r, state["enters"]
+
+    def test_enter_retries_until_submitted(self, monkeypatch):
+        # first enter doesn't take (text still at ❯); retry submits it.
+        r, enters = self._drive_submit_confirm(monkeypatch, clears_after_enters=2)
+        assert r is True
+        assert enters == 2, "must retry the enter when the text is still sitting at the prompt"
+
+    def test_enter_gives_up_after_retries_returns_false(self, monkeypatch):
+        # text never clears → honest False after 3 attempts (no false success).
+        r, enters = self._drive_submit_confirm(monkeypatch, clears_after_enters=99)
+        assert r is False
+        assert enters == 3, "must cap retries and report failure rather than a false success"
 
     def test_title_match_absent_title_fails_loudly(self, monkeypatch):
         """Title-match returning None (rc!=0 = window not found) → False, not silent."""

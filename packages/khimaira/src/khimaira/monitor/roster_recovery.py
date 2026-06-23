@@ -887,6 +887,24 @@ def _count_title_windows(window_title: str) -> int:
     return sum(len(t.get("windows", [])) for o in data for t in o.get("tabs", []))
 
 
+_PROMPT_NORM = re.compile(r"[\s>│▌❯|]+")
+
+
+def _input_line_contains(buffer: str, nonce: str) -> bool:
+    """True if ``nonce`` still sits on the current input (❯) line — i.e. NOT submitted.
+
+    After a successful submit the input box clears and the nonce survives only in
+    scrollback ABOVE the last ❯ prompt; scoping the check to text at/after the last
+    prompt line avoids a false "still sitting" from the submitted message's own echo
+    in history. No prompt visible (processing screen) → not sitting.
+    """
+    lines = buffer.splitlines()
+    last_prompt = max((i for i, ln in enumerate(lines) if "❯" in ln), default=-1)
+    if last_prompt < 0:
+        return False
+    return nonce in _PROMPT_NORM.sub("", "".join(lines[last_prompt:]))
+
+
 def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -> bool:
     """Inject ``text`` into a kitty window and submit with Enter.
 
@@ -1028,14 +1046,38 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
             )
         return False
 
-    # Step 5: submit
-    if _kitty("send-key", match_arg, "enter") is None:
-        _log.warning(
-            "roster-recovery: send-key enter failed for window %d (%s)", window_id, match_arg
+    # Step 5: submit — via the FRESH id, NOT the title. kitty decorates a live Claude
+    # window's title with a dynamic activity marker (e.g. "✳ Claude Code") that FLICKERS
+    # during the nonce-poll above; an anchored title-match enter then matches 0 windows
+    # and kitty's send-key SILENTLY no-ops (rc=0 → _kitty returns "" not None), so the
+    # old title-match enter reported success while the keystroke went NOWHERE and the text
+    # sat unsubmitted at the ❯ prompt (the 2026-06-23 verifier-1/critic-1 captures; repro'd
+    # audit-grade on a throwaway claude window). The window id is fresh THIS sweep and is
+    # immune to title decoration. Then CONFIRM the input actually cleared and RETRY the
+    # enter if it's still sitting (don't report a false success).
+    for attempt in range(3):
+        if _kitty("send-key", id_match, "enter") is None:
+            _log.warning(
+                "roster-recovery: send-key enter failed for window %d (id-match)", window_id
+            )
+            return False
+        for _ in range(6):  # up to ~0.9s for the submit to render
+            time.sleep(0.15)
+            buf = _get_screen(window_id)
+            if buf is not None and not _input_line_contains(buf, nonce):
+                return True  # input cleared → submitted
+        _log.info(
+            "roster-recovery: enter didn't submit window %d (text still at prompt) — "
+            "retry %d/3",
+            window_id,
+            attempt + 1,
         )
-        return False
-
-    return True
+    _log.warning(
+        "roster-recovery: window %d still unsubmitted after 3 enter retries — left at "
+        "prompt (next sweep will retry)",
+        window_id,
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
