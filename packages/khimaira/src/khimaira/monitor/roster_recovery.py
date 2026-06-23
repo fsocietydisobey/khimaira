@@ -1119,28 +1119,28 @@ def _session_has_unread_inbox(session_id: str) -> bool:
         return False
 
 
-def _session_has_unconsumed_chat(session_id: str) -> bool:
-    """Return True if an inbound chat message arrived AFTER the session's last action.
+def _session_has_directed_unanswered(session_id: str) -> bool:
+    """True if a DIRECTED chat message — `to=[me]`, or `@<my-name>` in the body —
+    is newer than this session's OWN last post in that chat (addressed + not
+    replied-to since).
 
-    Premise-correct peer-reply signal. An idle session keeps its SSE subscriber
-    alive, so the chat cursor (which advances on SSE DELIVERY, chats.py event
-    generator) can't distinguish "delivered" from "acted on" — it lags only if the
-    SSE physically disconnects. Instead compare each message's ts against the
-    session's last_active mtime (the last OBSERVABLE action): chat receipt writes
-    the CHAT dir (messages + cursors.jsonl), never the session dir, so last_active
-    is not polluted by delivery and the signal self-clears on the session's next turn.
-
-    Excludes self-sent + SYSTEM messages. Clock-skew safe: message ts (daemon ISO)
-    and last_active (filesystem mtime) are two clocks, so require ts > last_active +
-    _TS_SKEW_EPSILON_S. Fail-open: False on any read error.
+    The DIRECTED wake signal (#23). It replaces the prior `_session_has_unconsumed_chat`,
+    which fired on ANY peer message newer than `last_active` and so failed BOTH ways:
+      • over-wake: in a busy chat every undirected peer post tripped it, so the
+        idle-consult seats (architect/critic/analyst/verifier) got woken — and
+        injected into — on chatter they were never obligated to answer. That
+        plausibly aggravated mid-generation degeneration (the critic 'court' loop).
+      • false-negative: `last_active` advances on ANY action, so an agent that did
+        something unrelated after a real ask got the ask marked "consumed" and was
+        never woken for it (the muther/architect idle-with-owed stalls).
+    Keying on (a) DIRECTEDNESS and (b) the session's last OWN POST fixes both:
+    undirected chatter never wakes; a directed ask stays owed across unrelated
+    actions until the agent actually replies in that chat. Both ts use the daemon
+    ISO clock (same clock — no mtime skew, no epsilon needed). Excludes self + SYSTEM.
+    Fail-open: False on any read error.
     """
     try:
         from khimaira.monitor import chats as chats_mod
-        from khimaira.monitor import sessions as sessions_mod
-
-        summary = sessions_mod.summary(session_id)
-        last_active_epoch = time.time() - float(summary.get("last_active_age_s") or 0.0)
-        threshold = last_active_epoch + _TS_SKEW_EPSILON_S
 
         try:
             sid = chats_mod._resolve_or_uuid(session_id)
@@ -1156,13 +1156,23 @@ def _session_has_unconsumed_chat(session_id: str) -> bool:
                 member = room["members"].get(sid)
                 if not member or member.get("state") != chats_mod.ACCEPTED:
                     continue
-                for m in room.get("messages", []):
-                    if m.get("kind") != chats_mod.MSG:
-                        continue
+                my_name = (member.get("session_name") or "").strip()
+                msgs = [
+                    m for m in room.get("messages", []) if m.get("kind") == chats_mod.MSG
+                ]
+                own = [m for m in msgs if m.get("sender_id") == sid]
+                last_own = _iso_to_epoch(own[-1].get("ts")) if own else 0.0
+                for m in msgs:
                     sender = m.get("sender_id")
                     if sender == sid or sender == chats_mod.SYSTEM_SENDER_ID:
                         continue
-                    if _iso_to_epoch(m.get("ts")) > threshold:
+                    if _iso_to_epoch(m.get("ts")) <= last_own:
+                        continue  # the session has posted since this message
+                    to = m.get("to")
+                    directed = isinstance(to, list) and sid in to
+                    if not directed and my_name:
+                        directed = ("@" + my_name) in (m.get("body") or "")
+                    if directed:
                         return True
             except Exception:
                 continue
@@ -1182,12 +1192,12 @@ def _wake_skip_diagnostic(
     chat work it never answered — the idle-with-owed false-negative we otherwise
     can't catch (all wake signals clear, but the agent stopped mid-consume).
 
-    The discriminator the existing signals miss: inbound non-self messages that
-    postdate the session's OWN last chat post. `_session_has_unconsumed_chat` keys
-    on last_active (any action), so an agent that acts-without-answering looks
-    "consumed"; keying on its last OWN POST instead reveals work it never replied
-    to. This is DIAGNOSTIC ONLY (no behavior change) — it captures the exact live
-    state of the next real stall so the fix can be built audit-grade, not blind.
+    Now that the wake signal is `_session_has_directed_unanswered` (directed +
+    keyed on last OWN POST), this diagnostic catches the residual gap: inbound
+    non-self messages newer than the session's last own post that were NOT directed
+    (no `to=[me]`/@mention) — work the agent may still owe via an undirected ask the
+    directed signal deliberately ignores. DIAGNOSTIC ONLY (no behavior change) — it
+    surfaces whether undirected-but-owed is a real class worth widening the signal for.
 
     Low-noise by construction: fires only for a session idle past the wake floor
     that has such unanswered inbound. A healthy agent that just delivered (its own
@@ -2085,15 +2095,15 @@ async def _process_window(win: dict[str, Any]) -> None:
         has_unread_inbox = await asyncio.get_running_loop().run_in_executor(
             None, _session_has_unread_inbox, session_id
         )
-        has_unconsumed_chat = await asyncio.get_running_loop().run_in_executor(
-            None, _session_has_unconsumed_chat, session_id
+        has_directed_chat = await asyncio.get_running_loop().run_in_executor(
+            None, _session_has_directed_unanswered, session_id
         )
         if (
             not obligations
             and not has_pending_task
             and not has_pending_invite
             and not has_unread_inbox
-            and not has_unconsumed_chat
+            and not has_directed_chat
         ):
             # #23 audit instrument: before skipping, record whether this idle
             # session actually has chat work it never answered (diagnostic only).
@@ -2108,7 +2118,7 @@ async def _process_window(win: dict[str, Any]) -> None:
                     "pending_task": has_pending_task,
                     "pending_invite": has_pending_invite,
                     "unread_inbox": has_unread_inbox,
-                    "unconsumed_chat": has_unconsumed_chat,
+                    "directed_chat": has_directed_chat,
                 },
             )
             return

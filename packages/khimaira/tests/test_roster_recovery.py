@@ -918,19 +918,24 @@ class TestKittySocketInjection:
         )
         assert "ls" in cmd
 
-    def test_cmd_no_to_when_listen_on_unset(self):
-        """Without KITTY_LISTEN_ON, cmd falls back to bare `kitty @ ls`."""
+    def test_cmd_no_to_when_no_socket_anywhere(self):
+        """With neither KITTY_LISTEN_ON nor a discoverable /tmp/kitty-* socket,
+        cmd falls back to bare `kitty @ ls` (no --to). When a socket IS
+        discoverable, --to is added — that path is covered by
+        test_kitty_uses_discovered_socket_headless."""
         captured: list = []
         env_without = {k: v for k, v in os.environ.items() if k != "KITTY_LISTEN_ON"}
+        rr._RESOLVED_LISTEN = None  # clear discovery cache
         with (
             patch.dict(os.environ, env_without, clear=True),
+            patch.object(rr, "_resolve_listen_socket", return_value=None),
             patch("subprocess.run", side_effect=self._fake_run_ok(captured)),
         ):
             result = rr._kitty("ls")
         assert result == "[]"
         cmd = captured[0]
         assert not any(a.startswith("--to=") for a in cmd), (
-            f"--to= should NOT appear without KITTY_LISTEN_ON: {cmd}"
+            f"--to= should NOT appear when no socket is discoverable: {cmd}"
         )
 
     def test_daemon_path_uses_socket_not_tty(self):
