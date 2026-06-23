@@ -151,6 +151,17 @@ def _env_actuate_interface_allowed() -> bool:
     return os.environ.get("KHIMAIRA_ROSTER_ACTUATE_INTERFACE", "0") == "1"
 
 
+def _env_wake_inject_allowed() -> bool:
+    """Wake-INJECTION gate (default on). KHIMAIRA_ROSTER_WAKE_INJECT=0 keeps the
+    full watchdog (compaction auto-/compact, HITL auto-answer, rate-limit
+    escalation, the wake DECISION + WAKE-SKIP-DIAG) but stops the keystroke wake
+    injection. The crude wake signal fires on ANY undirected peer-chat message, so
+    in a busy roster it over-wakes review-gate seats — each wake a send-text into
+    the window, plausibly aggravating mid-generation degeneration (the jeevy critic
+    'court' repetition loop, 2026-06-23). Disable until waking is directed-only (#23)."""
+    return os.environ.get("KHIMAIRA_ROSTER_WAKE_INJECT", "1") == "1"
+
+
 def _env_auto_hitl_enabled() -> bool:
     """Return False if the HITL auto-answering kill-switch is set."""
     return os.environ.get("KHIMAIRA_AUTO_HITL", "1") != "0"
@@ -2156,6 +2167,17 @@ async def _process_window(win: dict[str, Any]) -> None:
             return
 
         wake_msg = "⏰ resume: call chat_my_chats + act on your inbox / pending work"
+        if not _env_wake_inject_allowed():
+            # Injection disabled: the wake DECISION ran (observable here) but no
+            # keystrokes are sent into the window. Cool down so this doesn't
+            # re-log every sweep. See _env_wake_inject_allowed (#23).
+            _DEBOUNCE[action_key] = time.time()
+            _log.info(
+                "roster-recovery: WOULD-WAKE window=%d role=%s session=%s "
+                "(injection disabled via KHIMAIRA_ROSTER_WAKE_INJECT=0)",
+                window_id, role, session_id[:8],
+            )
+            return
         submitted = await asyncio.get_running_loop().run_in_executor(
             None, _inject_text_and_submit, window_id, wake_msg, raw_name
         )
