@@ -484,6 +484,19 @@ class TestIsBusy:
         assert rr._is_busy("")
         assert rr._is_busy(None)  # type: ignore[arg-type]
 
+    def test_idle_hybrid_footer_not_busy(self):
+        """DEFECT B (jeevy master 2026-06-23): an auto-mode IDLE window renders a
+        hybrid footer with 'esc to interrupt' ALONGSIDE the idle-prompt hints.
+        That must NOT be flagged busy — else the idle agent never gets nudged."""
+        footer = "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents"
+        assert rr._is_busy(footer) is False
+
+    def test_real_generation_footer_is_busy(self):
+        """A genuinely-generating window shows 'esc to interrupt' with NO idle-prompt
+        hint (no shift+tab/← for agents) → busy, do not inject."""
+        gen = "✻ Tomfoolering… (8m 10s · ↓ 4.0k tokens)\n  esc to interrupt\n95% context used"
+        assert rr._is_busy(gen) is True
+
 
 # ---------------------------------------------------------------------------
 # _inject_text_and_submit — TOCTOU guard

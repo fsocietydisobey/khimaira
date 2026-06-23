@@ -670,12 +670,33 @@ def _compute_context_pct(session_id: str) -> int | None:
         return None
 
 
+# Idle-prompt hints — Claude Code renders these in the footer ONLY when waiting at
+# the prompt (not while generating). Their presence proves the window is idle even
+# if "esc to interrupt" also shows (CC renders a hybrid footer
+# "auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents" at an
+# auto-mode idle prompt). A genuinely-generating window shows the spinner line +
+# "esc to interrupt" but NONE of these hints.
+_IDLE_PROMPT_HINTS = ("shift+tab to cycle", "← for agents", "for shortcuts", "esc to undo")
+
+
 def _is_busy(text: str) -> bool:
-    """Return True if the window is actively working (unsafe to inject)."""
+    """Return True if the window is actively generating (unsafe to inject).
+
+    The "esc to interrupt" footer string is NOT a reliable busy signal on its own:
+    it also renders in the auto-mode IDLE footer alongside the idle-prompt hints,
+    so matching it bare false-flags an IDLE agent busy → it never gets nudged
+    (jeevy master DEFECT B 2026-06-23: agent-3 sat idle, un-nudged). Fix: treat
+    "esc to interrupt" as busy ONLY when no idle-prompt hint is present (a real
+    generation footer). Compaction is always busy. Conservative on empty/unknown.
+    """
     if not text:
         return True  # unknown → be conservative
     lower = text.lower()
-    return any(marker in lower for marker in _BUSY_MARKERS)
+    if any(m in lower for m in ("compacting…", "compacting...", "compacting ")):
+        return True
+    if "esc to interrupt" in lower:
+        return not any(hint in lower for hint in _IDLE_PROMPT_HINTS)
+    return False
 
 
 # ---------------------------------------------------------------------------
