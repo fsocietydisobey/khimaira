@@ -82,6 +82,98 @@ _FORWARD_RESP_HEADERS = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# Account failover — switch to a backup account on a sustained cap
+# ---------------------------------------------------------------------------
+# When the primary account hits a SUSTAINED limit — a 429/529 that survives ALL
+# AIMD retries (transient concurrency 429s resolve within retries, so a survivor
+# is a real weekly/usage cap or a severe sustained throttle) — swap the OAuth
+# bearer to a backup account's token and route there for a cooldown window, then
+# re-probe primary. FAIL-OPEN: any failover error degrades to original primary
+# behaviour (the proxy never gets worse than no-failover). Verified 2026-06-23:
+# the backup OAuth bearer authenticates + completes a real model call (HTTP 200)
+# through /v1/messages, so swapping just the Authorization header works.
+_FAILOVER_ENABLED = os.environ.get("KHIMAIRA_PROXY_FAILOVER", "1") == "1"
+_FAILOVER_COOLDOWN_S = float(os.environ.get("KHIMAIRA_PROXY_FAILOVER_COOLDOWN_S", "3600"))
+_FAILOVER_MAX_WINDOW_S = float(os.environ.get("KHIMAIRA_PROXY_FAILOVER_MAX_S", str(24 * 3600)))
+_BACKUP_CREDS_PATH = os.path.expanduser(
+    os.environ.get("KHIMAIRA_PROXY_BACKUP_CREDS", "~/.claude-backup/.credentials.json")
+)
+
+# Mutable failover state (single-process proxy → plain module globals are fine).
+_primary_capped_until: float = 0.0  # epoch; while now < this, route to the backup
+_backup_tok_cache: dict[str, object] = {"token": None, "mtime": 0.0}
+_failover_events: int = 0  # observability
+
+
+def _backup_bearer() -> str | None:
+    """Backup account OAuth access token, cached by file mtime. None if
+    unavailable → failover silently no-ops (primary behaviour unchanged)."""
+    try:
+        st = os.stat(_BACKUP_CREDS_PATH)
+        if (
+            _backup_tok_cache["token"] is None
+            or st.st_mtime != _backup_tok_cache["mtime"]
+        ):
+            with open(_BACKUP_CREDS_PATH) as f:
+                tok = json.load(f).get("claudeAiOauth", {}).get("accessToken")
+            _backup_tok_cache["token"] = tok
+            _backup_tok_cache["mtime"] = st.st_mtime
+        return _backup_tok_cache["token"]  # type: ignore[return-value]
+    except Exception:
+        return None
+
+
+def _with_backup_auth(headers: dict[str, str]) -> dict[str, str] | None:
+    """Copy of ``headers`` with the Authorization bearer replaced by the backup
+    account's token. None if no backup token is available."""
+    tok = _backup_bearer()
+    if not tok:
+        return None
+    out = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+    out["authorization"] = f"Bearer {tok}"
+    return out
+
+
+def _on_backup_already(headers: dict[str, str]) -> bool:
+    """True if ``headers`` already carry the backup token (avoid re-failing-over
+    when a request was proactively routed to the backup and STILL 429s — that
+    means the backup is also capped)."""
+    tok = _backup_bearer()
+    if not tok:
+        return False
+    auth = ""
+    for k, v in headers.items():
+        if k.lower() == "authorization":
+            auth = v
+            break
+    return auth == f"Bearer {tok}"
+
+
+def _in_failover_window() -> bool:
+    return _FAILOVER_ENABLED and time.time() < _primary_capped_until
+
+
+def _enter_failover(
+    status: int, retry_after: str | None, session_id: str | None
+) -> None:
+    """Primary hit a sustained cap → route to the backup for a cooldown window."""
+    global _primary_capped_until, _failover_events
+    cooldown = _FAILOVER_COOLDOWN_S
+    if retry_after:
+        try:
+            cooldown = max(_FAILOVER_COOLDOWN_S, min(_FAILOVER_MAX_WINDOW_S, float(retry_after)))
+        except ValueError:
+            pass
+    _primary_capped_until = time.time() + cooldown
+    _failover_events += 1
+    logger.warning(
+        "proxy: PRIMARY CAPPED (sustained %s, session=%s) → FAILOVER to backup "
+        "account for %.0fs (retry-after=%s, total events=%d)",
+        status, session_id or "?", cooldown, retry_after, _failover_events,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Concurrency controller (AIMD)
 # ---------------------------------------------------------------------------
 
@@ -291,6 +383,22 @@ async def _upstream_with_retry(
         if resp.status_code == 429 or resp.status_code == 529:
             await _controller.on_429(session_id)
             if attempt >= _MAX_RETRIES:
+                # Sustained 429/529 (survived all retries) = real cap / severe
+                # throttle, not a transient concurrency blip. If we're NOT already
+                # on the backup, fail over: open the cap window + retry this
+                # request once on the backup account. Fail-open on any error.
+                if _FAILOVER_ENABLED and not _on_backup_already(headers):
+                    backup_headers = _with_backup_auth(headers)
+                    if backup_headers is not None:
+                        _enter_failover(
+                            resp.status_code, resp.headers.get("retry-after"), session_id
+                        )
+                        try:
+                            return await _direct_forward_bytes(
+                                method, path, backup_headers, body
+                            )
+                        except Exception as exc:
+                            logger.error("proxy: backup retry failed: %s", exc)
                 return resp  # surface after max retries exhausted
 
             retry_after_raw = resp.headers.get("retry-after")
@@ -437,30 +545,43 @@ async def _throttled_stream(
                     async with _client.stream(
                         "POST", path, headers=headers, content=body
                     ) as resp:
-                        if resp.status_code in (429, 529) and attempt < _MAX_RETRIES:
-                            # 429 on a stream: drain nothing, retry with backoff
-                            await _controller.on_429(session_id)
-                            retry_after_raw = resp.headers.get("retry-after")
-                            if retry_after_raw:
-                                try:
-                                    delay = min(_RETRY_AFTER_CAP_S, float(retry_after_raw))
-                                except ValueError:
+                        if resp.status_code in (429, 529):
+                            if attempt < _MAX_RETRIES:
+                                # 429 on a stream: drain nothing, retry with backoff
+                                await _controller.on_429(session_id)
+                                retry_after_raw = resp.headers.get("retry-after")
+                                if retry_after_raw:
+                                    try:
+                                        delay = min(_RETRY_AFTER_CAP_S, float(retry_after_raw))
+                                    except ValueError:
+                                        delay = _retry_jitter(attempt)
+                                else:
                                     delay = _retry_jitter(attempt)
-                            else:
-                                delay = _retry_jitter(attempt)
 
-                            logger.info(
-                                "proxy: stream 429 attempt %d/%d; waiting %.1fs",
-                                attempt + 1,
-                                _MAX_RETRIES,
-                                delay,
-                            )
-                            slot_released = True
-                            await _controller.release()
-                            await asyncio.sleep(delay)
-                            await _controller.acquire()
-                            slot_released = False
-                            continue
+                                logger.info(
+                                    "proxy: stream 429 attempt %d/%d; waiting %.1fs",
+                                    attempt + 1,
+                                    _MAX_RETRIES,
+                                    delay,
+                                )
+                                slot_released = True
+                                await _controller.release()
+                                await asyncio.sleep(delay)
+                                await _controller.acquire()
+                                slot_released = False
+                                continue
+                            elif _FAILOVER_ENABLED and not _on_backup_already(headers):
+                                # Sustained stream cap: open the failover window so
+                                # SUBSEQUENT requests proactively route to the backup
+                                # account. We don't retry this stream inline (keep the
+                                # generator's slot logic simple) — CC's next call (it
+                                # polls count_tokens + re-sends) lands on the backup.
+                                await _controller.on_429(session_id)
+                                _enter_failover(
+                                    resp.status_code,
+                                    resp.headers.get("retry-after"),
+                                    session_id,
+                                )
 
                         async for chunk in resp.aiter_bytes():
                             yield chunk
@@ -503,6 +624,14 @@ async def _handle_proxy(request: Request, method: str, path: str) -> Response:
     headers = _extract_forward_headers(request)
     is_stream = method == "POST" and _wants_stream(body)
 
+    # Account failover: while primary is in a cap window, route to the backup
+    # account by swapping the Authorization bearer. Fail-open: if no backup token,
+    # _with_backup_auth returns None and we keep primary headers untouched.
+    if _in_failover_window():
+        swapped = _with_backup_auth(headers)
+        if swapped is not None:
+            headers = swapped
+
     try:
         if is_stream:
             return await _throttled_stream(path, headers, body, session_id)
@@ -541,6 +670,13 @@ async def health() -> dict:
     return {
         "status": "ok",
         "upstream": _ANTHROPIC_API_BASE,
+        "failover": {
+            "enabled": _FAILOVER_ENABLED,
+            "active": _in_failover_window(),
+            "capped_until": round(_primary_capped_until, 1),
+            "events": _failover_events,
+            "backup_token_present": _backup_bearer() is not None,
+        },
         **(ctrl.metrics() if ctrl else {}),
     }
 

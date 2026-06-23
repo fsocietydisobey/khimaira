@@ -702,3 +702,91 @@ async def test_load_32_fault_injection_never_crash():
     await asyncio.gather(*[_one_request(i) for i in range(32)])
     # All 32 requests should have degraded to pass-through (FLAG-1)
     assert passthrough_count == 32
+
+
+# ---------------------------------------------------------------------------
+# Account failover — switch to a backup account on a sustained cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failover_to_backup_on_sustained_429():
+    """A 429 that survives all retries on the primary token → swap to the backup
+    account's token, retry once, return its 200. Window is opened."""
+    import khimaira.proxy.server as srv
+
+    controller = srv._ConcurrencyController(10)
+
+    async def _fake_upstream(method, path, *, headers, content, **kw):
+        auth = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
+        if auth == "Bearer BK":
+            return _make_response(200, b'{"ok":true}')
+        return _make_response(429, b"weekly limit", {"retry-after": "120"})
+
+    srv._primary_capped_until = 0.0
+    srv._failover_events = 0
+
+    async def _noop_sleep(d):
+        pass
+
+    with patch.object(srv, "_controller", controller), \
+         patch.object(srv, "_client", AsyncMock(request=_fake_upstream)), \
+         patch.object(srv, "_backup_bearer", lambda: "BK"), \
+         patch.object(srv, "_FAILOVER_ENABLED", True), \
+         patch.object(srv, "_MAX_RETRIES", 1), \
+         patch("asyncio.sleep", side_effect=_noop_sleep):
+        headers = {"authorization": "Bearer PRIMARY", "content-type": "application/json"}
+        result = await srv._upstream_with_retry("POST", "/v1/messages", headers, b"{}", "s1")
+        # assert INSIDE the patch scope: _FAILOVER_ENABLED still True, and the
+        # global _primary_capped_until that _enter_failover set isn't restored yet.
+        assert result.status_code == 200  # failed over to backup
+        assert srv._in_failover_window() is True  # cap window opened
+        assert srv._failover_events == 1
+
+    srv._primary_capped_until = 0.0  # don't leak window state to other tests
+
+
+@pytest.mark.asyncio
+async def test_no_failover_without_backup_token():
+    """No backup token → failover no-ops, the primary 429 surfaces (fail-open)."""
+    import khimaira.proxy.server as srv
+
+    controller = srv._ConcurrencyController(10)
+
+    async def _fake_upstream(method, path, *, headers, content, **kw):
+        return _make_response(429, b"limit", {"retry-after": "10"})
+
+    with patch.object(srv, "_controller", controller), \
+         patch.object(srv, "_client", AsyncMock(request=_fake_upstream)), \
+         patch.object(srv, "_backup_bearer", lambda: None), \
+         patch.object(srv, "_FAILOVER_ENABLED", True), \
+         patch.object(srv, "_primary_capped_until", 0.0), \
+         patch.object(srv, "_MAX_RETRIES", 1), \
+         patch("asyncio.sleep", side_effect=lambda d: asyncio.sleep(0)):
+        result = await srv._upstream_with_retry("POST", "/v1/messages", {}, b"{}", "s1")
+
+    assert result.status_code == 429  # no backup → surfaces, no worse than before
+
+
+def test_with_backup_auth_swaps_only_authorization():
+    """_with_backup_auth replaces ONLY the Authorization header, keeps the rest."""
+    import khimaira.proxy.server as srv
+
+    with patch.object(srv, "_backup_bearer", lambda: "BK"):
+        out = srv._with_backup_auth(
+            {"authorization": "Bearer PRIMARY", "anthropic-version": "2023-06-01"}
+        )
+    assert out["authorization"] == "Bearer BK"
+    assert out["anthropic-version"] == "2023-06-01"
+    # and None when no backup
+    with patch.object(srv, "_backup_bearer", lambda: None):
+        assert srv._with_backup_auth({"authorization": "x"}) is None
+
+
+def test_on_backup_already_detects_backup_headers():
+    """A 429 while already on the backup must NOT re-trigger failover."""
+    import khimaira.proxy.server as srv
+
+    with patch.object(srv, "_backup_bearer", lambda: "BK"):
+        assert srv._on_backup_already({"authorization": "Bearer BK"}) is True
+        assert srv._on_backup_already({"authorization": "Bearer PRIMARY"}) is False
