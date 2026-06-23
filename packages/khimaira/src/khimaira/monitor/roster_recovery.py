@@ -2282,6 +2282,15 @@ async def watcher_loop() -> None:
             await check_once()
         except Exception as exc:
             _log.warning("roster-recovery: sweep error: %s", exc)
+        # Guard-7 (#32): task-delivery watchdog rides THIS proven sweep (not its own
+        # asyncio.sleep loop — #18 freeze risk). Fail-open: its own errors never break
+        # the sweep. New-file (guard7.py); this is the only wiring touch.
+        try:
+            from khimaira.monitor import guard7 as _g7
+
+            await _g7._guard7_check_once()
+        except Exception as exc:
+            _log.warning("roster-recovery: guard7 sweep error: %s", exc)
         # #18 backstop (gated, opt-in): auto_dispatch's own sleep-loop can freeze
         # on the live daemon (uvloop timer never fires; load/SSE-churn ruled out
         # as the cause). THIS loop demonstrably fires on the same daemon, so drive
