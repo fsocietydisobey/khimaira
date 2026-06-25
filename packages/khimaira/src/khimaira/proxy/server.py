@@ -93,6 +93,10 @@ _FORWARD_RESP_HEADERS = frozenset(
 # the backup OAuth bearer authenticates + completes a real model call (HTTP 200)
 # through /v1/messages, so swapping just the Authorization header works.
 _FAILOVER_ENABLED = os.environ.get("KHIMAIRA_PROXY_FAILOVER", "1") == "1"
+# Manual kill-switch: when set, route the WHOLE roster to the backup account
+# unconditionally (no cap detection needed). Flip on to proactively switch before
+# the primary's weekly cap; flip off (and restart) when the primary resets.
+_FORCE_BACKUP = os.environ.get("KHIMAIRA_PROXY_FORCE_BACKUP", "0") == "1"
 _FAILOVER_COOLDOWN_S = float(os.environ.get("KHIMAIRA_PROXY_FAILOVER_COOLDOWN_S", "3600"))
 _FAILOVER_MAX_WINDOW_S = float(os.environ.get("KHIMAIRA_PROXY_FAILOVER_MAX_S", str(24 * 3600)))
 _BACKUP_CREDS_PATH = os.path.expanduser(
@@ -150,6 +154,9 @@ def _on_backup_already(headers: dict[str, str]) -> bool:
 
 
 def _in_failover_window() -> bool:
+    # Force flag short-circuits cap detection — a deliberate manual switch to backup.
+    if _FORCE_BACKUP and _backup_bearer() is not None:
+        return True
     return _FAILOVER_ENABLED and time.time() < _primary_capped_until
 
 
@@ -672,6 +679,7 @@ async def health() -> dict:
         "upstream": _ANTHROPIC_API_BASE,
         "failover": {
             "enabled": _FAILOVER_ENABLED,
+            "forced": _FORCE_BACKUP,
             "active": _in_failover_window(),
             "capped_until": round(_primary_capped_until, 1),
             "events": _failover_events,
