@@ -837,6 +837,19 @@ def build_router():
             except Exception:
                 pass  # fail-open: missing key → condition returns False
 
+        # Lazy enrichment: has_in_progress_assignment (IN-AGENT-7, edit tools only).
+        # True if THIS session holds a task assigned to it in status in_progress. An
+        # agent editing files with no active assignment = self-dispatch / BEGIN-gate
+        # jump (jeevy-agent-2 2026-06-21). The rule lives in agent.yaml, so only
+        # agent-role sessions evaluate IN-AGENT-7 — master/lead edits are unaffected.
+        if req.tool_name in _EDIT_TOOLS:
+            try:
+                conditions_payload["has_in_progress_assignment"] = (
+                    chats.session_has_in_progress_assigned_task(req.session_id)
+                )
+            except Exception:
+                pass  # fail-open: missing key → condition returns False (no warn)
+
         # Lazy enrichment: gate_verdicts (B3 Slice B)
         # Only computed for (a) Bash+git-commit and (b) chat_task_update→approved.
         # get_gate_verdicts returns: None (no active task) | "absent" | "error" | dict.

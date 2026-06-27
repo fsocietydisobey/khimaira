@@ -27,6 +27,17 @@ _ORACLES: dict[str, tuple[str, str]] = {
 }
 _DEFAULT_PROJECT = "khimaira"
 
+# Direct upstream oracles — client-side fallback when the RAG proxy is unreachable.
+# Post-flip, _ORACLE_BASE points at the laptop-side RAG proxy; if it's down (e.g. its
+# brief systemd-restart window), ask_oracle retries the REAL oracle here before
+# returning None — removing the proxy's SPOF window (oracle-realtime-rag #31). Stays
+# stdlib-only + fail-open. Set MNEMOSYNE_ORACLE_DIRECT / MNEMOSYNE_JEEVY_DIRECT to the
+# real oracle addresses (defaults assume spark ports forwarded to localhost).
+_ORACLE_DIRECT: dict[str, str] = {
+    "khimaira": os.environ.get("MNEMOSYNE_ORACLE_DIRECT", "http://127.0.0.1:18000"),
+    "jeevy": os.environ.get("MNEMOSYNE_JEEVY_DIRECT", "http://127.0.0.1:18001"),
+}
+
 _log = logging.getLogger(__name__)
 
 
@@ -35,19 +46,20 @@ def distill(
     transcript: str,
     session_slug: str,
     *,
-    timeout: float = 30.0,
+    timeout: float = 240.0,
 ) -> dict | None:
     """POST /distill; return parsed response dict or None on any failure.
 
     Fail-open: URLError, OSError, TimeoutError → None (never raises).
 
-    Timeout is 30s, not 2s: distillation runs an LLM pass over the full
-    transcript server-side. A 50-entry transcript already takes ~2.3s; real
-    session transcripts are 100× larger. A 2s timeout silently failed every
-    real distill — the OSError was caught and reported as None ("unreachable")
-    while the daemon was perfectly healthy. The failure path now logs a
-    warning so a future divergence is audible in the daemon log instead of
-    silently swallowed.
+    Timeout is 240s: distillation runs an LLM pass over the full transcript
+    server-side. Post-truncation-fix the window is ~600k chars (~150k tok), so a
+    Haiku distill runs ~20-90s — the old 30s cap silently None'd EVERY large
+    transcript (backfill, the Stop hook, AND the weekly active-distill all send
+    600k windows). Downstream is uncapped below this: the anthropic SDK default is
+    600s and uvicorn sets no request-duration timeout, so 240s is the binding cap
+    with safe headroom. The failure path logs a warning so a future divergence is
+    audible instead of silently swallowed.
     """
     payload = json.dumps(
         {"domain": domain, "transcript": transcript, "session_slug": session_slug},
@@ -119,6 +131,7 @@ def ask_oracle(
     project: str = _DEFAULT_PROJECT,
     max_tokens: int = 256,
     temperature: float = 0.3,
+    repetition_penalty: float = 1.3,
     timeout: float = 60.0,
 ) -> dict | None:
     """Ask a local codebase-oracle MODEL (vLLM) a question.
@@ -151,28 +164,56 @@ def ask_oracle(
             "messages": [{"role": "user", "content": question}],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            # repetition_penalty (vLLM-native sampling param, accepted on the
+            # OpenAI-compatible endpoint) breaks the small-7B degeneration into
+            # repetition loops at ~200-256 tokens (2026-06-20 re-bake validation
+            # artifact — grounding was fine, the output tail degenerated). 1.3 is
+            # firm enough to stop the loop without harming a normal answer.
+            "repetition_penalty": repetition_penalty,
         },
         separators=(",", ":"),
     ).encode("utf-8")
-    try:
-        req = urllib.request.Request(
-            f"{base}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        answer = (
-            ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-        ).strip()
-        if not answer:
+    # Try the configured base (the RAG proxy, post-flip) first; on a TRANSPORT failure
+    # (proxy down / unreachable) fall back to the direct upstream oracle before giving
+    # up. A reached-but-empty/garbled response does NOT fall back — the oracle answered,
+    # it just had nothing usable (retrying direct would only duplicate the result).
+    targets = [base]
+    direct = _ORACLE_DIRECT.get(project)
+    if direct and direct != base:
+        targets.append(direct)
+
+    for i, target in enumerate(targets):
+        try:
+            req = urllib.request.Request(
+                f"{target}/v1/chat/completions",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            answer = (
+                ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            ).strip()
+            if not answer:
+                return None
+            return {
+                "answer": answer,
+                "model": data.get("model", model),
+                "usage": data.get("usage", {}),
+            }
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            if i + 1 < len(targets):
+                _log.warning(
+                    "mnemosyne oracle %s unreachable (%s) — falling back to direct upstream",
+                    target,
+                    exc,
+                )
+                continue
+            _log.warning("mnemosyne oracle ask failed (project=%r): %s", project, exc)
             return None
-        return {
-            "answer": answer,
-            "model": data.get("model", model),
-            "usage": data.get("usage", {}),
-        }
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        _log.warning("mnemosyne oracle ask failed (project=%r): %s", project, exc)
-        return None
+        except ValueError as exc:
+            _log.warning(
+                "mnemosyne oracle bad response (project=%r, target=%s): %s", project, target, exc
+            )
+            return None

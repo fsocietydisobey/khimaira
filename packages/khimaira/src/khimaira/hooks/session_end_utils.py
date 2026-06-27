@@ -14,9 +14,22 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
 
 _DOMAINS = ("backend", "frontend", "data", "devops")
+
+# Distillation window. The distiller backend is Haiku (200k-token context), so a
+# ~150k-token (~600k-char) CONTIGUOUS slice fits with headroom for the system prompt +
+# output — 12x the old 50k cap (~0.3% of a 13-19MB master transcript). Over-budget uses
+# first-half + last-half truncation (_truncate).
+#
+# A decision-dense whole-session SELECTION was tried + REVERTED (2026-06-20): the
+# reordered, gap-marked, chat-shaped fragments made Haiku CONTINUE the roster chat
+# instead of distilling it → 0 pairs (even with a forced-JSON prompt), while contiguous
+# 600k distills cleanly (~32 pairs/master). True whole-session coverage needs a
+# chunk-and-distill v2, not a selection format the distiller can't read. NOTE: 600k
+# assumes the Haiku backend; a flip to the 4096-ctx local oracle needs a 32k re-serve
+# first (see mnemosyne/docs/FOLLOWUP-oracle-as-distiller.md).
+_DEFAULT_MAX_CHARS = 600_000
 
 _PROJECTS_ROOT = (
     Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
@@ -124,15 +137,17 @@ def detect_domain(session_name_or_transcript: str) -> str:
 
 def extract_transcript(
     session_id: str,
-    max_chars: int = 50_000,
-    transcript_path: Optional[str] = None,
-) -> Optional[str]:
-    """Fetch session transcript text, truncated to max_chars.
+    max_chars: int = _DEFAULT_MAX_CHARS,
+    transcript_path: str | None = None,
+) -> str | None:
+    """Fetch session transcript text, capped to max_chars.
 
     If transcript_path is given (from Stop hook payload), read it directly.
     Otherwise, search ~/.claude/projects/ subdirectories for {session_id}.jsonl.
 
-    Truncation: keeps the first half + last half, with "...[truncated]..." separator.
+    Over-budget handling: first-half + last-half truncation over the ~600k window
+    (contiguous, so the distiller sees coherent narrative). See _read_jsonl + the
+    _DEFAULT_MAX_CHARS note for why a decision-dense selection was reverted.
 
     Returns None if the transcript is unavailable or empty.
     """
@@ -154,7 +169,7 @@ def extract_transcript(
     return None
 
 
-def _read_jsonl(path: Path, max_chars: int) -> Optional[str]:
+def _read_jsonl(path: Path, max_chars: int) -> str | None:
     """Parse a Claude Code session JSONL and extract readable text content."""
     parts: list[str] = []
     try:
@@ -188,6 +203,9 @@ def _read_jsonl(path: Path, max_chars: int) -> Optional[str]:
         return None
 
     full = "\n".join(parts)
+    # Over budget → first-half + last-half (contiguous). A decision-dense whole-session
+    # selection was tried + reverted — see the _DEFAULT_MAX_CHARS note (it broke the
+    # distiller: chat-shaped fragments → Haiku continued the chat → 0 pairs).
     return _truncate(full, max_chars)
 
 

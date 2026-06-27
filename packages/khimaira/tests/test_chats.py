@@ -704,9 +704,20 @@ def test_send_message_no_to_preserves_broadcast(isolated_chats):
 
 
 # ---------------------------------------------------------------------------
-# Fix C (muther ISSUE 1 Path C, 2026-06-18) — an ADDRESSED-but-undirected msg to
-# an SSE-dead idle-consult seat gets a durable notice (wake stays suppressed);
-# unaddressed chatter stays notice-free so a busy room can't spam an idle seat.
+# Consult-role wake-filter (muther ISSUE 1 Path C, 2026-06-18 + issue #29
+# sibling, 2026-06-27 khimaira-void).
+#
+# Contract (author-confirmed by Joseph 2026-06-27): the ORIGINAL roster design
+# was broadcast-to-all + @mention with universal real-time delivery. A later
+# consult-suppression optimization (don't wake every consult seat on every
+# broadcast) regressed it by IGNORING the @. Restored behavior:
+#   • @mention (by seat-name or role) to a consult seat WITH a live subscriber
+#     → LIVE real-time push (original contract restored).
+#   • @mention to a consult seat with NO subscriber → durable notice backstop.
+#   • weaker addressing (bare name / role:) → notice backstop, NOT a live push.
+#   • unaddressed chatter → fully suppressed (no busy-room spam).
+# This was the JEEVY-605 22-min stall: an @-addressed architect, SSE-subscribed
+# yet idle, got neither the live push nor a notice.
 # ---------------------------------------------------------------------------
 
 
@@ -726,15 +737,84 @@ def _dead_critic_room(c, sessions_mod):
     return chat_id
 
 
+def _subscribe(c, session_id):
+    """Register a live-but-idle SSE subscriber queue for a member; return it."""
+    import asyncio as _asyncio
+
+    q: _asyncio.Queue = _asyncio.Queue()
+    c._subscribers.setdefault(c._slot_subscriber_key(session_id), set()).add(q)
+    return q
+
+
+def _queue_bodies(q):
+    """Drain a subscriber queue → list of msg bodies pushed to it."""
+    bodies = []
+    while not q.empty():
+        rec = q.get_nowait()
+        if rec.get("kind") == "msg":
+            bodies.append(rec.get("body"))
+    return bodies
+
+
+def test_at_mention_consult_subscribed_delivers_live(isolated_chats):
+    """Restored @-contract (khimaira-void, issue #29 sibling, 2026-06-27): an
+    UNDIRECTED broadcast that @mentions a consult seat WITH a live (idle) SSE
+    subscriber delivers a real-time PUSH — bypassing the consult-suppression for
+    the mentioned member only. This is the direct fix for the JEEVY-605 stall."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _dead_critic_room(c, sessions_mod)
+    q = _subscribe(c, "critic-1-uuid")
+    try:
+        c.send_message(chat_id, "alice-uuid", "@critic-1 please review the gate verdict")
+        assert "@critic-1 please review the gate verdict" in _queue_bodies(q), (
+            "an @mention to a subscribed consult seat must be pushed LIVE"
+        )
+    finally:
+        c._subscribers.pop(c._slot_subscriber_key("critic-1-uuid"), None)
+
+
+def test_at_mention_consult_dead_sse_posts_notice(isolated_chats):
+    """@mention to a consult seat with NO live subscriber → durable notice
+    backstop (survives to the agent's next turn)."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _dead_critic_room(c, sessions_mod)
+    c.send_message(chat_id, "alice-uuid", "@critic-1 please review the gate verdict")
+    notes = sessions_mod.pending_notes("critic-1-uuid", mark_read=False)
+    assert any("addressed in an undirected" in (n.get("text") or "") for n in notes)
+
+
+def test_bare_name_consult_subscribed_suppressed_not_live(isolated_chats):
+    """Non-@ addressing (bare seat name) stays SUPPRESSED even when subscribed —
+    the efficiency win is preserved; only the @ form restores live delivery. The
+    seat still gets the notice backstop, but NOT a live push."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _dead_critic_room(c, sessions_mod)
+    q = _subscribe(c, "critic-1-uuid")
+    try:
+        c.send_message(chat_id, "alice-uuid", "critic-1 please review the gate verdict")
+        assert _queue_bodies(q) == [], "bare-name (no @) must NOT push live"
+        notes = sessions_mod.pending_notes("critic-1-uuid", mark_read=False)
+        assert any("addressed in an undirected" in (n.get("text") or "") for n in notes)
+    finally:
+        c._subscribers.pop(c._slot_subscriber_key("critic-1-uuid"), None)
+
+
 def test_suppressed_undirected_addressed_consult_posts_notice(isolated_chats):
-    """Undirected msg that NAMES the idle critic seat → durable notice survives."""
+    """Undirected msg that NAMES the idle critic seat (no @, dead SSE) → durable
+    notice survives."""
     from khimaira.monitor import sessions as sessions_mod
 
     c = isolated_chats
     chat_id = _dead_critic_room(c, sessions_mod)
     c.send_message(chat_id, "alice-uuid", "critic-1 please review the gate verdict")
     notes = sessions_mod.pending_notes("critic-1-uuid", mark_read=False)
-    assert any("SSE not connected" in (n.get("text") or "") for n in notes)
+    assert any("addressed in an undirected" in (n.get("text") or "") for n in notes)
 
 
 def test_suppressed_undirected_unaddressed_chatter_no_notice(isolated_chats):
@@ -745,7 +825,7 @@ def test_suppressed_undirected_unaddressed_chatter_no_notice(isolated_chats):
     chat_id = _dead_critic_room(c, sessions_mod)
     c.send_message(chat_id, "alice-uuid", "agent-2 shipped slice-E, nice work")
     notes = sessions_mod.pending_notes("critic-1-uuid", mark_read=False)
-    assert not any("SSE not connected" in (n.get("text") or "") for n in notes)
+    assert not any("addressed in an undirected" in (n.get("text") or "") for n in notes)
 
 
 def test_directed_to_dead_critic_single_notice_unchanged(isolated_chats):

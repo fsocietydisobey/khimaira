@@ -2395,6 +2395,72 @@ def test_gate_bypass_prevented_on_satisfied_prior_round(chats_api_client):
     ), f"Expected gate ABSENT for round-2 (stale verdicts must be invalidated), got {verdicts_r2}"
 
 
+def test_gate_satisfied_when_verdicts_precede_auto_advance_done(chats_api_client):
+    """IN-MASTER-9 false-block regression (audit 2026-06-21, muther task 625).
+
+    When critic APPROVE + verifier SHIP arrive BEFORE the task transitions to done
+    — e.g. the daemon's gate-auto-advance writes the done FROM those very verdicts —
+    the master approve gate must STILL see them satisfied. The old round filter keyed
+    on the last DONE transition, so the gate-completing verdicts (now earlier than the
+    auto-advance done) were wrongly treated as 'prior round' → 'absent' → IN-MASTER-9
+    blocked master's →approved. The fix keys the round on REOPEN (done→active), not
+    on last-done; a done-transition is the gate closing, not a new round. This test
+    FAILS on the old last-done filter and PASSES on the reopen-based one.
+    """
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client,
+        chats_mod,
+        members=("bob", "carol"),
+        member_roles={"alice": "master", "bob": "agent", "carol": "critic"},
+    )
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "Do the thing",
+            "assignee_session_id": "bob",
+            "gate_required": True,
+        },
+    )
+    work_task_id = r.json()["id"]
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+
+    # Verdicts arrive while still in_progress (critic approve + verifier ship).
+    chats_mod.record_gate_verdict(chat_id, "carol", work_task_id, "approve")
+    chats_mod._append(
+        chat_id,
+        {
+            "kind": chats_mod.TASK_VERDICT,
+            "event_id": chats_mod._new_event_id(),
+            "ts": chats_mod._now_iso(),
+            "chat_id": chat_id,
+            "task_id": work_task_id,
+            "verdict": "ship",
+            "by_session_id": "alice",  # not a real verifier — test only
+            "by_name": "alice",
+        },
+    )
+
+    # THEN the task transitions to done AFTER the verdicts — the gate-auto-advance
+    # shape that poisoned the old last-done filter (no reopen follows).
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
+
+    # The approve gate must STILL be satisfied (NOT 'absent').
+    verdicts = chats_mod.get_gate_verdicts_by_task("alice", work_task_id)
+    assert isinstance(
+        verdicts, dict
+    ), f"expected satisfied dict (verdicts precede the done), got {verdicts!r}"
+    assert verdicts["critic_approved"] is True
+    assert verdicts["verifier_shipped"] is True
+
+
 def test_auto_create_review_tasks_fresh_on_re_done_after_closed(chats_api_client):
     """After prior review-tasks are closed, re-done creates fresh obligations."""
     client, chats_mod = chats_api_client
@@ -2612,3 +2678,45 @@ def test_auto_begin_fires_through_http(chats_api_client):
 
     # BEGIN must have fired synchronously inside send_message.
     assert chats_mod._is_task_begun(chat_id, task_id)
+
+
+def test_session_has_in_progress_assigned_task(chats_api_client):
+    """IN-AGENT-7 detection (session_has_in_progress_assigned_task): True ONLY when the
+    session holds an in_progress task assigned to it. False for no task, a pending
+    (assigned-but-not-started) task — jumping BEGIN does not license edits — and done.
+    """
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client,
+        chats_mod,
+        members=("bob",),
+        member_roles={"alice": "master", "bob": "agent"},
+    )
+    # no task at all → False (the self-dispatch case)
+    assert chats_mod.session_has_in_progress_assigned_task("bob") is False
+
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "do it",
+            "assignee_session_id": "bob",
+        },
+    )
+    tid = r.json()["id"]
+    # pending (assigned, BEGIN not signalled) → still False (jumping BEGIN ≠ licensed)
+    assert chats_mod.session_has_in_progress_assigned_task("bob") is False
+
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{tid}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+    # in_progress assigned to bob → True (legitimate work, no warn)
+    assert chats_mod.session_has_in_progress_assigned_task("bob") is True
+
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{tid}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
+    # done → False (no longer an active assignment)
+    assert chats_mod.session_has_in_progress_assigned_task("bob") is False

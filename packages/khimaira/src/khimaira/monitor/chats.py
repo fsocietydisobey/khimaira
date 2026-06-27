@@ -2233,6 +2233,81 @@ _GATE_ABSENT = "absent"
 _GATE_ERROR = "error"
 
 
+def _last_round_reset_ts(room: dict[str, Any], task_id: str) -> str:
+    """Timestamp of the most recent transition that REOPENS a task for a fresh
+    review round (done → any non-terminal status: pending / in_progress /
+    changes_requested = sent back for rework). Verdicts recorded BEFORE this are
+    stale prior-round verdicts that must not satisfy the current gate; verdicts
+    AFTER it (or all of them, if never reopened) are current.
+
+    Keys on the REOPEN, deliberately NOT on the last done-transition. A
+    done-transition is the gate CLOSING — including the daemon's gate-auto-advance
+    (`_maybe_auto_advance_gate_complete`) and a manual master →done — not a new
+    round; `done → approved` is the gate SUCCEEDING, also not a reopen. Keying on
+    last-done wrongly invalidated the very critic+verifier verdicts that TRIGGERED
+    an auto-advance→done: master's subsequent →approved then saw zero verdicts and
+    IN-MASTER-9 false-blocked it (audit 2026-06-21, muther task 625; the identical
+    task 623 succeeded only because no auto-advance had fired yet).
+    """
+    transitions: list[tuple[str, str]] = []
+    for m in room.get("messages", []):
+        k = m.get("kind")
+        if k == TASK and m.get("id") == task_id:
+            transitions.append((m.get("ts", ""), m.get("status") or TASK_PENDING))
+        elif k == TASK_UPDATE and m.get("task_id") == task_id:
+            st = m.get("status") or m.get("new_status")
+            if st:
+                transitions.append((m.get("ts", ""), st))
+    transitions.sort(key=lambda t: t[0])
+    last_reset = ""
+    prev: str | None = None
+    for ts, st in transitions:
+        # A reopen = leaving DONE for any non-terminal status. NOT done→done (no-op)
+        # and NOT done→approved (gate success). Anything else (pending/in_progress/
+        # changes_requested) is rework → resets the verdict round.
+        if prev == TASK_DONE and st not in (TASK_DONE, TASK_APPROVED):
+            last_reset = max(last_reset, ts)
+        prev = st
+    return last_reset
+
+
+def session_has_in_progress_assigned_task(session_id: str) -> bool:
+    """True if any chat has a task assigned to ``session_id`` with status in_progress.
+
+    Used by Themis IN-AGENT-7 (NO_SELF_DISPATCH_EDIT) to warn when an agent edits
+    files while holding NO active assignment — i.e. self-dispatch (no task at all) or
+    jumping the BEGIN gate (a pending task it hasn't been signalled to start). Keys on
+    IN_PROGRESS specifically: a pending-but-not-started task does NOT license edits, so
+    an agent editing against only a pending task still trips the warn (correctly — it
+    jumped BEGIN). Fail-open: any read error → False (the condition then fail-opens to
+    no-warn, so a transient error never spuriously nags a legitimately-working agent).
+    """
+    try:
+        sid = _resolve_or_uuid(session_id)
+    except Exception:
+        return False
+    try:
+        chat_dir = _chat_dir()
+        if not chat_dir.exists():
+            return False
+        for path in chat_dir.glob("chat-*.jsonl"):
+            status_by_task: dict[str, str] = {}
+            assignee_by_task: dict[str, str | None] = {}
+            for m in _read(path.stem):
+                k = m.get("kind")
+                if k == TASK and m.get("id"):
+                    status_by_task[m["id"]] = m.get("status") or TASK_PENDING
+                    assignee_by_task[m["id"]] = m.get("assignee_id")
+                elif k == TASK_UPDATE and m.get("task_id") and m.get("status"):
+                    status_by_task[m["task_id"]] = m["status"]
+            for tid, st in status_by_task.items():
+                if st == TASK_IN_PROGRESS and assignee_by_task.get(tid) == sid:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
 def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
     """Return the gate-verdict state for the session's current active task.
 
@@ -2312,16 +2387,10 @@ def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
         except Exception:
             return _GATE_ERROR
 
-        # Find the most recent 'done' transition timestamp for this task.
-        last_done_ts: str = ""
-        for msg in room.get("messages", []):
-            kind = msg.get("kind")
-            if kind == TASK and msg.get("id") == task_id:
-                if msg.get("status") == TASK_DONE:
-                    last_done_ts = max(last_done_ts, msg.get("ts", ""))
-            elif kind == TASK_UPDATE and msg.get("task_id") == task_id:
-                if (msg.get("status") or msg.get("new_status")) == TASK_DONE:
-                    last_done_ts = max(last_done_ts, msg.get("ts", ""))
+        # Invalidate stale prior-round verdicts: the round resets on a REOPEN
+        # (done→pending/in_progress), NOT on the last done-transition — last-done is
+        # poisoned by the daemon's gate-auto-advance. See _last_round_reset_ts.
+        last_reset_ts = _last_round_reset_ts(room, task_id)
 
         critic_verdict: str | None = None
         verifier_verdict: str | None = None
@@ -2330,8 +2399,8 @@ def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
                 continue
             if msg.get("task_id") != task_id:
                 continue
-            # Skip verdicts from prior rounds (before the current done transition).
-            if last_done_ts and msg.get("ts", "") < last_done_ts:
+            # Skip verdicts from a prior review round (before the last reopen).
+            if last_reset_ts and msg.get("ts", "") < last_reset_ts:
                 continue
             v = msg.get("verdict")
             if v in ("approve", "changes"):
@@ -2385,21 +2454,14 @@ def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] |
             member = room["members"].get(sid)
             if not member or member["state"] != ACCEPTED:
                 continue
-            # Find the most recent 'done' transition timestamp (Guard-5 Part A: invalidation).
-            last_done_ts_by: str = ""
-            for msg in room.get("messages", []):
-                kind = msg.get("kind")
-                if (
-                    kind == TASK
-                    and msg.get("id") == task_id
-                    and msg.get("status") == TASK_DONE
-                ):
-                    last_done_ts_by = max(last_done_ts_by, msg.get("ts", ""))
-                elif kind == TASK_UPDATE and msg.get("task_id") == task_id:
-                    if (msg.get("status") or msg.get("new_status")) == TASK_DONE:
-                        last_done_ts_by = max(last_done_ts_by, msg.get("ts", ""))
+            # Invalidate stale prior-round verdicts on a REOPEN (done→active), NOT on
+            # the last done-transition (Guard-5 Part A). last-done is poisoned by the
+            # daemon's gate-auto-advance, which writes a done FROM these very verdicts
+            # → they'd be wrongly treated as prior-round → IN-MASTER-9 false-blocks
+            # master's →approved (audit 2026-06-21, task 625). See _last_round_reset_ts.
+            last_reset_ts = _last_round_reset_ts(room, task_id)
 
-            # Scan verdicts from the current done round only.
+            # Scan verdicts from the current review round only.
             critic_verdict: str | None = None
             verifier_verdict: str | None = None
             for msg in room.get("messages", []):
@@ -2407,8 +2469,8 @@ def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] |
                     continue
                 if msg.get("task_id") != task_id:
                     continue
-                if last_done_ts_by and msg.get("ts", "") < last_done_ts_by:
-                    continue  # prior-round verdict — skip
+                if last_reset_ts and msg.get("ts", "") < last_reset_ts:
+                    continue  # prior review round — skip
                 v = msg.get("verdict")
                 if v in ("approve", "changes"):
                     critic_verdict = v
@@ -4279,38 +4341,64 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
             and record.get("kind") == MSG
             and member_roles.get(sid) in IDLE_CONSULT_ROLES
         ):
-            # Wake suppressed (idle-consult role + undirected). BUT if the sender
-            # clearly ADDRESSED this member (named its seat, or @role / role:) yet
-            # forgot to direct the msg, a dead-SSE target silently loses it: the
-            # next-turn catch-up can't run until a wake forces a turn, and wake
-            # latency can exceed the catch-up window (muther ISSUE 1 Path C,
-            # 2026-06-18 — gate consult "reached NEITHER critic-1 nor verifier-1").
-            # For that addressed-but-undirected + SSE-dead case ONLY, drop the same
-            # durable inbox notice directed msgs get. Unaddressed chatter stays
-            # suppressed + notice-free so a busy room never spams an idle consult seat.
+            # Consult-role wake-filter. Undirected broadcasts don't wake idle-by-
+            # default consult seats (they'd react to every broadcast — the cost
+            # leak the suppression was added to fix). BUT an explicit @mention is
+            # the sender saying "you specifically": it must be honored.
+            #
+            # RESTORED ORIGINAL CONTRACT (author-confirmed by Joseph, 2026-06-27,
+            # issue #29 sibling): the original roster design was broadcast-to-all +
+            # @mention with UNIVERSAL real-time delivery — you @ a seat and it reads
+            # it live. The consult-suppression optimization (correct in instinct:
+            # don't wake every consult seat on every broadcast) severed that by
+            # IGNORING the @. That omission is the regression — it caused the
+            # JEEVY-605 stall (an @-addressed architect that was SSE-subscribed yet
+            # idle got neither the live push nor a notice, so it sat 22 min).
+            #
+            # Fix: an @mention (by seat-name or role) restores live delivery to the
+            # MENTIONED member only — fall through to the normal push below. Non-
+            # mentioned consult seats stay suppressed (efficiency preserved). For an
+            # @-mentioned seat with NO live subscriber, drop a durable notice as the
+            # backstop so it survives to the agent's next turn. Weaker addressing
+            # (bare name / role:) also gets the notice backstop but NOT a live push;
+            # unaddressed chatter stays fully suppressed (no busy-room spam).
             _c_role = (member_roles.get(sid) or "").lower()
             _c_name = ((member or {}).get("session_name") or "").lower()
             _c_body = (record.get("body") or "").lower()
-            _addressed = (bool(_c_name) and _c_name in _c_body) or any(
-                tok and tok in _c_body
-                for tok in (f"@{_c_role}", f"{_c_role}:", f"{_c_role}-")
+            _at_mentioned = any(
+                tok and tok in _c_body for tok in (f"@{_c_name}", f"@{_c_role}")
             )
-            if _addressed and not (_subscribers.get(_slot_subscriber_key(sid)) or _subscribers.get(sid)):
-                try:
-                    sessions_mod.post_notice(
-                        target_session_id=sid,
-                        text=(
-                            f"📨 You were addressed in an undirected chat message in "
-                            f"{chat_id} from "
-                            f"{record.get('sender_name') or record.get('sender_id')} "
-                            f"while idle (SSE not connected). "
-                            f"Call chat_history(chat_id='{chat_id}') to read it."
-                        ),
-                        from_session_id="khimaira-daemon",
+            _has_sub = bool(
+                _subscribers.get(_slot_subscriber_key(sid)) or _subscribers.get(sid)
+            )
+            if _at_mentioned and _has_sub:
+                pass  # restored @-contract: fall through to live real-time delivery
+            else:
+                _addressed = (
+                    _at_mentioned
+                    or (bool(_c_name) and _c_name in _c_body)
+                    or any(
+                        tok and tok in _c_body
+                        for tok in (f"{_c_role}:", f"{_c_role}-")
                     )
-                except Exception:
-                    pass
-            continue  # idle consult role + undirected msg → suppress wake
+                )
+                if _addressed:
+                    try:
+                        sessions_mod.post_notice(
+                            target_session_id=sid,
+                            text=(
+                                f"📨 You were addressed in an undirected chat message "
+                                f"in {chat_id} from "
+                                f"{record.get('sender_name') or record.get('sender_id')} "
+                                f"that was not delivered in real time (consult-role "
+                                f"wake-suppression). "
+                                f"Call chat_history(chat_id='{chat_id}') to read it."
+                            ),
+                            from_session_id="khimaira-daemon",
+                        )
+                    except Exception:
+                        pass
+                continue  # not an @-mentioned live seat → suppress wake
         # Part F: resolve member sid → slot key so delivery follows the live
         # session across transfer/reattach. Slot-keyed subscriber receives the
         # event even when its membership entry is keyed to the prior sid.

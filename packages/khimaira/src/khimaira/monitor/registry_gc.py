@@ -94,6 +94,18 @@ def _live_window_identities() -> set[str] | None:
                 t = (win.get("title") or "").strip()
                 if t:
                     names.add(t)
+                    # Kitty decorates window titles with activity/bell markers
+                    # (✳ idle, ⠂ thinking, * bell, etc.) that break exact
+                    # name-match. Add the de-decorated form too, so a live
+                    # "✳ muther" window still proves the "muther" session is
+                    # alive. Without this, the reaper false-deletes the session
+                    # AND cascades a chat-membership leave (delete_session marks
+                    # the reaped session LEFT in every chat) — muther was dropped
+                    # from her jeevy roster chat twice on 2026-06-21 this way.
+                    # Mirrors roster_recovery's title-match normalizer.
+                    cleaned = t.lstrip("✳🔔★*•⠂ ").strip()
+                    if cleaned and cleaned != t:
+                        names.add(cleaned)
                 for proc in win.get("foreground_processes", []):
                     nm = _name_from_cmdline(proc.get("cmdline") or [])
                     if nm:

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import json
+import os
+import time
 
 from khimaira.tools import distill_active_sessions as das
-
 
 # --- pure helpers ----------------------------------------------------------
 
@@ -109,8 +110,207 @@ def test_untracked_transcript_skipped(tmp_path, monkeypatch):
     monkeypatch.setattr(das, "_CLAUDE_PROJECTS", tmp_path)
     monkeypatch.setattr(das._sessions, "list_sessions", lambda **k: [])
     s = das.distill_active_sessions(
-        project_root="/home/_3ntropy/dev/khimaira", project="khimaira",
-        settle_min=30.0, recent_days=8.0, max_chars=50_000, dry_run=True, verbose=False,
+        project_root="/home/_3ntropy/dev/khimaira",
+        project="khimaira",
+        settle_min=30.0,
+        recent_days=8.0,
+        max_chars=50_000,
+        dry_run=True,
+        verbose=False,
     )
     assert s["distilled"] == []
     assert s["skipped"]["untracked"] == 1
+
+
+# --- backfill: name recovery from transcript --------------------------------
+
+
+def _write_transcript(proj_dir, sid, *, set_name=None, names=None, mtime_age_s=100 * 86400):
+    """Write a synthetic transcript JSONL and set its mtime to now - mtime_age_s.
+
+    `set_name`: emit one session_set_name tool_use with this name.
+    `names`: emit several session_set_name tool_uses in order (last should win).
+    """
+    lines = [
+        json.dumps(
+            {"type": "user", "message": {"content": [{"type": "text", "text": "do the thing"}]}}
+        )
+    ]
+    for nm in names or ([set_name] if set_name else []):
+        lines.append(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "mcp__khimaira__session_set_name",
+                                "input": {"session_id": sid, "name": nm},
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+    # a decoy Skill invocation named like a skill — must NOT be mistaken for a name
+    lines.append(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Skill",
+                            "input": {"name": "khimaira-bootstrap-roster"},
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    path = proj_dir / f"{sid}.jsonl"
+    path.write_text("\n".join(lines) + "\n")
+    t = time.time() - mtime_age_s
+    os.utime(path, (t, t))
+    return path
+
+
+def test_name_from_transcript_finds_last_session_set_name(tmp_path):
+    proj = tmp_path / "p"
+    proj.mkdir()
+    p = _write_transcript(proj, "sid1", names=["scratch", "khimaira-0"])
+    assert das._name_from_transcript(p) == "khimaira-0"  # last self-naming wins
+
+
+def test_name_from_transcript_none_when_absent_not_skill_conflation(tmp_path):
+    proj = tmp_path / "p"
+    proj.mkdir()
+    # no session_set_name — only a Skill(name=...) decoy is present
+    p = _write_transcript(proj, "sid2", set_name=None)
+    assert das._name_from_transcript(p) is None
+
+
+# --- backfill: selection + ledger -------------------------------------------
+
+
+def _run_backfill(
+    tmp_path,
+    monkeypatch,
+    *,
+    tracked=None,
+    confirm=False,
+    backfill_since="",
+    max_sessions=0,
+    ledger=None,
+):
+    """Drive backfill against tmp_path's project dir. `tracked` = live session rows."""
+    proj_dir = tmp_path / "-home--3ntropy-dev-khimaira"
+    if not proj_dir.exists():
+        proj_dir.mkdir(parents=True)
+    monkeypatch.setattr(das, "_CLAUDE_PROJECTS", tmp_path)
+    monkeypatch.setattr(das._sessions, "list_sessions", lambda **k: tracked or [])
+    monkeypatch.setattr(das, "extract_transcript", lambda sid, **k: "transcript body")
+    return das.distill_active_sessions(
+        project_root="/home/_3ntropy/dev/khimaira",
+        project="khimaira",
+        settle_min=30.0,
+        recent_days=8.0,
+        max_chars=50_000,
+        dry_run=False,
+        verbose=False,
+        backfill=True,
+        backfill_since=backfill_since,
+        max_sessions=max_sessions,
+        confirm=confirm,
+        ledger_path=ledger or (tmp_path / "ledger.json"),
+    ), proj_dir
+
+
+def test_backfill_distills_untracked_via_transcript_name(tmp_path, monkeypatch):
+    s, proj = _run_backfill(tmp_path, monkeypatch)
+    _write_transcript(proj, "ghost1", set_name="khimaira-0")  # untracked, names itself
+    s, _ = _run_backfill(tmp_path, monkeypatch)  # re-run now that the file exists
+    assert [d["domain"] for d in s["distilled"]] == ["khimaira:orchestration"]
+    assert s["dry_run"] is True  # no --confirm → dry-run default
+
+
+def test_backfill_skips_untracked_with_no_name(tmp_path, monkeypatch):
+    s, proj = _run_backfill(tmp_path, monkeypatch)
+    _write_transcript(proj, "ghost2", set_name=None)  # no session_set_name
+    s, _ = _run_backfill(tmp_path, monkeypatch)
+    assert s["distilled"] == []
+    assert s["skipped"]["no_name"] == 1
+
+
+def test_backfill_processes_stale_session_active_path_skips(tmp_path, monkeypatch):
+    # A session in the registry but 100 days idle: active path = stale-skip; backfill picks it up.
+    proj = tmp_path / "-home--3ntropy-dev-khimaira"
+    proj.mkdir(parents=True)
+    _write_transcript(proj, "old1", set_name="backend-lead-1")
+    tracked = [{"session_id": "old1", "name": "backend-lead-1", "last_active_age_s": 100 * 86400}]
+    s, _ = _run_backfill(tmp_path, monkeypatch, tracked=tracked)
+    assert [d["domain"] for d in s["distilled"]] == ["khimaira:backend"]
+
+
+def test_backfill_ledger_idempotent_across_runs(tmp_path, monkeypatch):
+    proj = tmp_path / "-home--3ntropy-dev-khimaira"
+    proj.mkdir(parents=True)
+    _write_transcript(proj, "g3", set_name="khimaira-0")
+    calls = []
+    monkeypatch.setattr(
+        das, "_mnemosyne_distill", lambda *a, **k: calls.append(a) or {"pairs_extracted": 4}
+    )
+    ledger = tmp_path / "ledger.json"
+    s1, _ = _run_backfill(tmp_path, monkeypatch, confirm=True, ledger=ledger)
+    assert len(s1["distilled"]) == 1 and len(calls) == 1
+    assert ledger.exists()  # persisted
+    s2, _ = _run_backfill(tmp_path, monkeypatch, confirm=True, ledger=ledger)
+    assert s2["distilled"] == [] and s2["skipped"]["already_done"] == 1
+    assert len(calls) == 1  # NOT re-distilled — ledger guarded
+
+
+def test_backfill_dry_run_default_does_not_write(tmp_path, monkeypatch):
+    proj = tmp_path / "-home--3ntropy-dev-khimaira"
+    proj.mkdir(parents=True)
+    _write_transcript(proj, "g4", set_name="khimaira-0")
+    calls = []
+    monkeypatch.setattr(
+        das, "_mnemosyne_distill", lambda *a, **k: calls.append(a) or {"pairs_extracted": 1}
+    )
+    ledger = tmp_path / "ledger.json"
+    s, _ = _run_backfill(tmp_path, monkeypatch, confirm=False, ledger=ledger)
+    assert len(s["distilled"]) == 1  # listed
+    assert calls == []  # but distill NOT called
+    assert not ledger.exists()  # and nothing ledgered
+
+
+def test_backfill_since_excludes_older(tmp_path, monkeypatch):
+    proj = tmp_path / "-home--3ntropy-dev-khimaira"
+    proj.mkdir(parents=True)
+    _write_transcript(proj, "g5", set_name="khimaira-0", mtime_age_s=100 * 86400)
+    # since = far in the future relative to the 100-day-old file → excluded
+    s, _ = _run_backfill(tmp_path, monkeypatch, backfill_since="2099-01-01")
+    assert s["distilled"] == []
+    assert s["skipped"]["too_old"] == 1
+
+
+def test_backfill_max_sessions_caps(tmp_path, monkeypatch):
+    proj = tmp_path / "-home--3ntropy-dev-khimaira"
+    proj.mkdir(parents=True)
+    for n in ("a", "b", "c"):
+        _write_transcript(proj, f"cap{n}", set_name="khimaira-0")
+    s, _ = _run_backfill(tmp_path, monkeypatch, max_sessions=1)
+    assert len(s["distilled"]) == 1
+    assert s["skipped"]["capped"] == 2
+
+
+def test_backfill_live_guard_skips_recent_mtime(tmp_path, monkeypatch):
+    proj = tmp_path / "-home--3ntropy-dev-khimaira"
+    proj.mkdir(parents=True)
+    # touched 60s ago < 30min settle → possibly mid-flight → skip
+    _write_transcript(proj, "live1", set_name="khimaira-0", mtime_age_s=60)
+    s, _ = _run_backfill(tmp_path, monkeypatch)
+    assert s["distilled"] == []
+    assert s["skipped"]["mid_flight"] == 1

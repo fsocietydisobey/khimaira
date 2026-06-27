@@ -110,3 +110,27 @@ invariants:
 
       No active task (ad-hoc commit)? → allowed without verdicts.
       Daemon unreachable? → hook fail-opens at the network layer (D7 / #61 axis-A).
+
+  - id: IN-AGENT-7
+    name: NO_SELF_DISPATCH_EDIT
+    severity: warn
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+      - tool: NotebookEdit
+    conditions:
+      - check: agent_edit_without_assigned_task
+    message: |
+      ⚠️ Themis IN-AGENT-7 (NO_SELF_DISPATCH_EDIT): you are editing files but hold NO
+      in_progress task assigned to you. This is self-dispatch / jumping the BEGIN gate —
+      an eager agent treating visible-needed-work as a cue to act before master assigns
+      + signals start (jeevy-agent-2, 2026-06-21).
+
+      The flow is: master assigns → BEGIN signal → you build → gate (critic + verifier)
+      → master commits. If you see work that needs doing, PROPOSE it in the roster chat
+      and WAIT for master to create + assign the task — do not edit first.
+
+      Autonomous initiative is wanted; UNGATED initiative is not. Severity is warn
+      (heuristic — a legitimate edge may lack an in_progress task, e.g. a scratch file
+      outside the task surface); master captures good unsolicited work into a gated task.

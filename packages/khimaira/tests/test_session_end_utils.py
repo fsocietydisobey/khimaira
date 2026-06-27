@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from khimaira.hooks.session_end_utils import (
     detect_domain,
     detect_project,
@@ -218,6 +217,7 @@ def test_extract_transcript_returns_none_for_unknown_session(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     # Reload so _PROJECTS_ROOT picks up the new env var
     import importlib
+
     import khimaira.hooks.session_end_utils as mod
 
     importlib.reload(mod)
@@ -296,3 +296,34 @@ def test_extract_transcript_returns_none_for_nonexistent_path(tmp_path: Path):
         "any-id", transcript_path=str(tmp_path / "missing.jsonl")
     )
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# contiguous 600k window over-budget handling (task 4: bigger window, first/last-half)
+# ---------------------------------------------------------------------------
+# A decision-dense whole-session SELECTION was tried + reverted — chat-shaped fragments
+# made the distiller continue the chat instead of distilling (0 pairs). The shipped
+# behavior is a bigger CONTIGUOUS window with first-half+last-half truncation.
+
+
+def test_over_budget_uses_contiguous_first_last_half(tmp_path: Path):
+    """Over-budget → first-half + last-half contiguous slice (the …[truncated]… marker),
+    NOT a reordered/gap-marked selection (which broke the distiller)."""
+    jsonl = tmp_path / "s.jsonl"
+    body = "x" * 2000
+    _write_jsonl(jsonl, [{"role": "assistant", "content": body}])
+    result = extract_transcript("id", max_chars=200, transcript_path=str(jsonl))
+    assert result is not None
+    assert "...[truncated]..." in result          # contiguous first/last-half path
+    assert "…[gap]…" not in result                # no decision-dense gap markers
+    assert len(result) <= 200 + len("\n...[truncated]...\n")
+
+
+def test_under_budget_returned_whole(tmp_path: Path):
+    """Under the window → full transcript, no truncation."""
+    jsonl = tmp_path / "s.jsonl"
+    _write_jsonl(jsonl, [{"role": "assistant", "content": "a coherent narrative block"}])
+    result = extract_transcript("id", max_chars=600_000, transcript_path=str(jsonl))
+    assert result is not None
+    assert "coherent narrative" in result
+    assert "...[truncated]..." not in result

@@ -1,20 +1,21 @@
-"""Tests for the Path-2 idle-wake signals: unread-inbox + unconsumed-chat.
+"""Tests for the idle-wake OR-gate signals: unread-inbox + directed-unanswered.
 
 CONTEXT: roster_recovery._process_window wakes an idle session only if its OR-gate
-trips. Path 1 added owed-verdict obligations; Path 2 adds two more OR-gate signals so
-an idle session (incl. the master) is woken when a peer pinged it:
+trips. Path 1 added owed-verdict obligations; the OR-gate also includes:
 
-  A) _session_has_unread_inbox  — notices / handoffs piling up unread (session_post_notice)
-  B) _session_has_unconsumed_chat — an inbound chat message newer than the session's
-     last observable action (the peer-reply case). NOT the chat cursor: the cursor
-     advances on SSE DELIVERY, which continues while an idle session is turn-gated, so
-     cursor-lag is ~0 exactly when we need to wake. We compare message ts against
-     last_active (session-dir mtime), which delivery does not pollute.
+  A) _session_has_unread_inbox       — notices / handoffs piling up unread.
+  B) _session_has_directed_unanswered — a DIRECTED chat message (to=[me] or
+     @<my-name>) newer than the session's OWN last post in that chat. This is the
+     #23 directed-wake signal: it REPLACED the prior _session_has_unconsumed_chat,
+     which fired on ANY peer message newer than last_active and so (1) over-woke
+     idle-consult seats on undirected chatter and (2) false-cleared the moment the
+     agent took any unrelated action (last_active is global). Directedness + last
+     OWN POST fixes both.
 
-STORM-SAFETY ACCEPTANCE (the master's hard constraint): both signals must read ZERO on a
-quiet/healthy roster. The fire tests prove they trip when they should; the quiet tests
-prove they stay silent. The clock-skew guard (_TS_SKEW_EPSILON_S) is exercised so a
-borderline-equal ts/mtime can't false-fire.
+STORM-SAFETY ACCEPTANCE (the master's hard constraint): the signal MUST read ZERO on
+undirected peer chatter (the over-wake fix) and on a directed ask the session has
+already replied to. The fire tests prove it trips on a real directed ask; the quiet
+tests prove it stays silent otherwise.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from khimaira.monitor import chats
 from khimaira.monitor import roster_recovery as rr
 from khimaira.monitor import sessions as sessions_mod
 
-MEMBER_SID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"  # session under test
+MEMBER_SID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"  # session under test (name "void")
 PEER_SID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"  # the one who pinged
 CHAT_ID = "chat-cafebabe0001"
 
@@ -60,14 +61,21 @@ def _write_chat(messages: list[dict], member_state: str = "accepted") -> None:
     )
 
 
-def _msg(sender_id: str, ts_epoch: float, event_id: str) -> dict:
+def _msg(
+    sender_id: str,
+    ts_epoch: float,
+    event_id: str,
+    to: list[str] | None = None,
+    body: str = "ping",
+) -> dict:
     from datetime import datetime, timezone
 
     return {
         "kind": chats.MSG,
         "chat_id": CHAT_ID,
         "sender_id": sender_id,
-        "body": "ping",
+        "body": body,
+        "to": to,
         "ts": datetime.fromtimestamp(ts_epoch, tz=timezone.utc).isoformat(),
         "event_id": event_id,
     }
@@ -77,89 +85,94 @@ def _msg(sender_id: str, ts_epoch: float, event_id: str) -> dict:
 
 
 def test_unread_inbox_fires(isolated_state):
-    sessions_mod.set_status(MEMBER_SID, "idle")  # register the session
-    sessions_mod.post_notice(
-        MEMBER_SID, "peer left you a note", fire_desktop_notify=False
-    )
-
+    sessions_mod.set_status(MEMBER_SID, "idle")
+    sessions_mod.post_notice(MEMBER_SID, "peer left you a note", fire_desktop_notify=False)
     assert rr._session_has_unread_inbox(MEMBER_SID) is True
 
 
 def test_drained_inbox_stays_quiet(isolated_state):
-    sessions_mod.set_status(MEMBER_SID, "idle")  # register the session
+    sessions_mod.set_status(MEMBER_SID, "idle")
     sessions_mod.post_notice(MEMBER_SID, "note", fire_desktop_notify=False)
-    sessions_mod.pending_notes(
-        MEMBER_SID, mark_read=True
-    )  # drain it (the active-turn path)
-
+    sessions_mod.pending_notes(MEMBER_SID, mark_read=True)
     assert rr._session_has_unread_inbox(MEMBER_SID) is False
 
 
 def test_no_inbox_stays_quiet(isolated_state):
-    sessions_mod.set_status(MEMBER_SID, "idle")  # session exists, empty inbox
-
+    sessions_mod.set_status(MEMBER_SID, "idle")
     assert rr._session_has_unread_inbox(MEMBER_SID) is False
 
 
-# --- Signal B: unconsumed chat (ts > last_active) --------------------------
+# --- Signal B: directed-unanswered (the #23 directed wake) -----------------
 
 
-def test_unconsumed_chat_fires_for_newer_peer_message(isolated_state):
-    """A peer message AFTER the session's last action → wake."""
+def test_directed_to_me_fires(isolated_state):
+    """A to=[me] message newer than my last post → wake."""
     sessions_mod.set_status(MEMBER_SID, "idle")
     now = time.time()
-    _pin_last_active(MEMBER_SID, now - 3600)  # last acted an hour ago
-    _write_chat([_msg(PEER_SID, now, "evt-msg-0001")])  # peer pinged just now
-
-    assert rr._session_has_unconsumed_chat(MEMBER_SID) is True
+    _write_chat([_msg(PEER_SID, now, "evt-1", to=[MEMBER_SID])])
+    assert rr._session_has_directed_unanswered(MEMBER_SID) is True
 
 
-def test_old_message_before_last_action_stays_quiet(isolated_state):
-    """A peer message the session already acted past → no wake (self-clearing)."""
+def test_at_mention_fires(isolated_state):
+    """An @<my-name> mention newer than my last post → wake."""
     sessions_mod.set_status(MEMBER_SID, "idle")
     now = time.time()
-    _write_chat([_msg(PEER_SID, now - 3600, "evt-msg-0001")])  # message an hour ago
-    _pin_last_active(MEMBER_SID, now)  # session acted just now → past msg consumed
-
-    assert rr._session_has_unconsumed_chat(MEMBER_SID) is False
+    _write_chat([_msg(PEER_SID, now, "evt-1", body="hey @void can you look")])
+    assert rr._session_has_directed_unanswered(MEMBER_SID) is True
 
 
-def test_self_sent_message_stays_quiet(isolated_state):
-    """The session's own message must not wake it."""
+def test_undirected_peer_chatter_stays_quiet(isolated_state):
+    """THE over-wake fix: an undirected peer message (no to, no @mention) must NOT
+    wake an idle-consult seat, even though it's newer than the session's last post."""
     sessions_mod.set_status(MEMBER_SID, "idle")
     now = time.time()
-    _pin_last_active(MEMBER_SID, now - 3600)
-    _write_chat([_msg(MEMBER_SID, now, "evt-msg-0001")])  # self-sent
-
-    assert rr._session_has_unconsumed_chat(MEMBER_SID) is False
+    _write_chat([_msg(PEER_SID, now, "evt-1", body="status update for the room")])
+    assert rr._session_has_directed_unanswered(MEMBER_SID) is False
 
 
-def test_system_message_stays_quiet(isolated_state):
-    """A SYSTEM-emitted message (role directives etc.) must not wake."""
+def test_directed_but_answered_since_stays_quiet(isolated_state):
+    """A directed ask the session has POSTED since → answered → no wake."""
     sessions_mod.set_status(MEMBER_SID, "idle")
     now = time.time()
-    _pin_last_active(MEMBER_SID, now - 3600)
-    _write_chat([_msg(chats.SYSTEM_SENDER_ID, now, "evt-msg-0001")])
+    _write_chat(
+        [
+            _msg(PEER_SID, now - 100, "evt-1", to=[MEMBER_SID]),  # directed ask
+            _msg(MEMBER_SID, now - 50, "evt-2", body="on it"),  # my reply after
+        ]
+    )
+    assert rr._session_has_directed_unanswered(MEMBER_SID) is False
 
-    assert rr._session_has_unconsumed_chat(MEMBER_SID) is False
+
+def test_directed_unanswered_survives_unrelated_action(isolated_state):
+    """The false-negative fix: a directed ask stays owed even after the session
+    takes an UNRELATED action (last_active advances) as long as it hasn't replied
+    in chat. The old signal cleared on any action; this keys on last own POST."""
+    sessions_mod.set_status(MEMBER_SID, "idle")
+    now = time.time()
+    _write_chat([_msg(PEER_SID, now - 100, "evt-1", to=[MEMBER_SID])])  # directed, no reply
+    _pin_last_active(MEMBER_SID, now)  # did something unrelated just now
+    assert rr._session_has_directed_unanswered(MEMBER_SID) is True
+
+
+def test_self_directed_stays_quiet(isolated_state):
+    """The session's own message must not wake it (even if to=[self])."""
+    sessions_mod.set_status(MEMBER_SID, "idle")
+    now = time.time()
+    _write_chat([_msg(MEMBER_SID, now, "evt-1", to=[MEMBER_SID])])
+    assert rr._session_has_directed_unanswered(MEMBER_SID) is False
+
+
+def test_system_directed_stays_quiet(isolated_state):
+    """A SYSTEM-emitted directed message must not wake."""
+    sessions_mod.set_status(MEMBER_SID, "idle")
+    now = time.time()
+    _write_chat([_msg(chats.SYSTEM_SENDER_ID, now, "evt-1", to=[MEMBER_SID])])
+    assert rr._session_has_directed_unanswered(MEMBER_SID) is False
 
 
 def test_non_member_stays_quiet(isolated_state):
-    """A newer peer message in a chat the session isn't an accepted member of → no wake."""
+    """A directed message in a chat the session isn't an accepted member of → no wake."""
     sessions_mod.set_status(MEMBER_SID, "idle")
     now = time.time()
-    _pin_last_active(MEMBER_SID, now - 3600)
-    _write_chat([_msg(PEER_SID, now, "evt-msg-0001")], member_state="pending")
-
-    assert rr._session_has_unconsumed_chat(MEMBER_SID) is False
-
-
-def test_clock_skew_epsilon_blocks_borderline(isolated_state):
-    """A message within _TS_SKEW_EPSILON_S of last_active must NOT fire (skew guard)."""
-    sessions_mod.set_status(MEMBER_SID, "idle")
-    now = time.time()
-    _pin_last_active(MEMBER_SID, now)
-    # message 1s newer than last_active, inside the 2s epsilon → no fire
-    _write_chat([_msg(PEER_SID, now + 1.0, "evt-msg-0001")])
-
-    assert rr._session_has_unconsumed_chat(MEMBER_SID) is False
+    _write_chat([_msg(PEER_SID, now, "evt-1", to=[MEMBER_SID])], member_state="pending")
+    assert rr._session_has_directed_unanswered(MEMBER_SID) is False

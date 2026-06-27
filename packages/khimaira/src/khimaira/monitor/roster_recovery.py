@@ -151,6 +151,17 @@ def _env_actuate_interface_allowed() -> bool:
     return os.environ.get("KHIMAIRA_ROSTER_ACTUATE_INTERFACE", "0") == "1"
 
 
+def _env_wake_inject_allowed() -> bool:
+    """Wake-INJECTION gate (default on). KHIMAIRA_ROSTER_WAKE_INJECT=0 keeps the
+    full watchdog (compaction auto-/compact, HITL auto-answer, rate-limit
+    escalation, the wake DECISION + WAKE-SKIP-DIAG) but stops the keystroke wake
+    injection. The crude wake signal fires on ANY undirected peer-chat message, so
+    in a busy roster it over-wakes review-gate seats — each wake a send-text into
+    the window, plausibly aggravating mid-generation degeneration (the jeevy critic
+    'court' repetition loop, 2026-06-23). Disable until waking is directed-only (#23)."""
+    return os.environ.get("KHIMAIRA_ROSTER_WAKE_INJECT", "1") == "1"
+
+
 def _env_auto_hitl_enabled() -> bool:
     """Return False if the HITL auto-answering kill-switch is set."""
     return os.environ.get("KHIMAIRA_AUTO_HITL", "1") != "0"
@@ -178,6 +189,50 @@ def _session_opt_out(session_id: str) -> bool:
 # kitty remote-control helpers
 # ---------------------------------------------------------------------------
 
+_RESOLVED_LISTEN: str | None = None  # cache of a discovered kitty control socket
+
+
+def _resolve_listen_socket() -> str | None:
+    """Find a live kitty control socket when ``KITTY_LISTEN_ON`` isn't in the env.
+
+    The daemon inherits ``KITTY_LISTEN_ON`` only when it is launched from INSIDE
+    a kitty window. Under systemd (`monitor install-service`) it has no TTY and
+    no inherited env, so ``kitty @`` falls back to opening /dev/tty and fails —
+    which silently kills ALL auto-wakes (the roster then stalls and the master
+    needs manual nudging; regression observed 2026-06-22 after the systemd
+    cutover). kitty's ``listen_on unix:/tmp/kitty`` config yields a per-instance
+    socket ``/tmp/kitty-<pid>``; discover + cache a live one and re-probe it on
+    failure. Glob overridable via ``KHIMAIRA_KITTY_SOCKET_GLOB``.
+    """
+    import glob
+
+    global _RESOLVED_LISTEN
+    # Re-validate a cached socket cheaply; clear it if the kitty instance is gone.
+    if _RESOLVED_LISTEN is not None:
+        sock_path = _RESOLVED_LISTEN.split("unix:", 1)[-1]
+        if os.path.exists(sock_path):
+            return _RESOLVED_LISTEN
+        _RESOLVED_LISTEN = None
+
+    pattern = os.environ.get("KHIMAIRA_KITTY_SOCKET_GLOB", "/tmp/kitty-*")
+    for sock in sorted(glob.glob(pattern)):
+        listen = f"unix:{sock}"
+        try:
+            r = subprocess.run(
+                ["kitty", "@", f"--to={listen}", "ls"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            if r.returncode == 0:
+                _RESOLVED_LISTEN = listen
+                _log.info("roster-recovery: discovered kitty control socket %s", listen)
+                return listen
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+    return None
+
+
 def _kitty(
     *args: str,
     input_text: str | None = None,
@@ -185,11 +240,12 @@ def _kitty(
 ) -> str | None:
     """Run ``kitty @ <args>``; return stdout or None on any failure.
 
-    When ``KITTY_LISTEN_ON`` is set (always the case under the daemon, which
-    runs without a controlling TTY), passes ``--to=<socket>`` so kitty uses
-    the IPC socket directly instead of trying to open /dev/tty.
+    Resolves the control socket so kitty uses the IPC socket directly instead of
+    trying to open /dev/tty: prefers an inherited ``KITTY_LISTEN_ON`` (daemon
+    launched inside kitty), else discovers a live ``/tmp/kitty-*`` socket (daemon
+    under systemd, no TTY/env — see ``_resolve_listen_socket``).
     """
-    listen = os.environ.get("KITTY_LISTEN_ON")
+    listen = os.environ.get("KITTY_LISTEN_ON") or _resolve_listen_socket()
     if listen:
         cmd = ["kitty", "@", f"--to={listen}", *args]
     else:
@@ -409,6 +465,132 @@ def _window_for_session_name(name: str) -> dict[str, Any] | None:
     return None
 
 
+def _roster_role_map() -> dict[str, Any]:
+    """session_id → role across all active chat rooms (member_roles).
+
+    The reverse of ``_resolve_session_for_role``: a forward sid→role lookup so a
+    registered window can be synthesized with the role its session holds. Last
+    writer wins on the rare cross-chat collision (a session in two rooms).
+    """
+    out: dict[str, Any] = {}
+    try:
+        from khimaira.monitor import chats as chats_mod
+
+        chat_dir = chats_mod._chat_dir()
+        if not chat_dir.exists():
+            return out
+        for chat_path in chat_dir.glob("chat-*.jsonl"):
+            try:
+                room = chats_mod.load_room(chat_path.stem)
+                member_roles: dict[str, str] = room["meta"].get("member_roles") or {}
+                for sid, r in member_roles.items():
+                    if r:
+                        out[sid] = r
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _union_registered_windows(
+    windows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add identity-registered windows the title-discovery pass missed.
+
+    For each roster member that registered a window_id (POST /sessions/{id}/window)
+    whose window is LIVE in kitty but was NOT found by title (non-role-shaped title),
+    synthesize a ``win`` dict so the wake reaches it by IDENTITY. This finishes task
+    #16 for the wake path: title-discovery drops any window whose title doesn't
+    resolve to a role, so a legitimately-roled member named e.g. "livyatan" was
+    silently unwakeable.
+
+    ADDITIVE: title-discovered windows are untouched; only previously-invisible
+    registered windows are appended (deduped by window_id) — so the live watchdog's
+    behavior on every currently-wakeable window is unchanged.
+
+    Two hard guards (kitty window_ids renumber on restart, so a registered wid can go
+    stale or be reused):
+      * LIVENESS — only synthesize for a wid that is present in this sweep's
+        ``kitty @ ls``; a stale wid must never be woken.
+      * is_focused — carried from that same ls pass so the human-presence /
+        human-interface guards in ``_process_window`` apply to registered windows
+        identically (never inject into Joseph's focused window).
+    """
+    try:
+        from khimaira.monitor import sessions as _sess_mod
+    except Exception:
+        return windows
+
+    roster_ids = _get_roster_member_ids()
+    if not roster_ids:
+        return windows  # fail-open: no canonical roster → don't synthesize
+
+    discovered_wids = {w.get("window_id") for w in windows}
+
+    # One kitty-ls pass → live window_id → window json (for is_focused). A registered
+    # wid absent here is stale (window closed / kitty renumbered) and is skipped.
+    live: dict[int, dict[str, Any]] = {}
+    raw = _kitty("ls")
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            data = []
+        for os_win in data:
+            for tab in os_win.get("tabs", []):
+                for w in tab.get("windows", []):
+                    wid = w.get("id")
+                    if wid is not None:
+                        live[wid] = w
+
+    role_by_sid = _roster_role_map()
+    name_by_sid: dict[str, str] = {}
+    try:
+        for row in _sess_mod.list_sessions(use_cache=True):
+            sid = row.get("session_id")
+            nm = row.get("name")
+            if sid and nm:
+                name_by_sid[sid] = nm
+    except Exception:
+        pass
+
+    added = 0
+    for sid in roster_ids:
+        wid = _sess_mod.get_session_window(sid)
+        if wid is None:
+            continue
+        if wid in discovered_wids:
+            continue  # already found by title — dedup, no double-wake
+        live_win = live.get(wid)
+        if live_win is None:
+            _log.debug(
+                "roster-recovery: registered window %s for %s is stale (not live) — skip",
+                wid, sid[:8],
+            )
+            continue  # LIVENESS gate: stale / renumbered wid
+        role = role_by_sid.get(sid)
+        if not role:
+            continue  # not a roled member → nothing to wake it as
+        windows.append({
+            "window_id": wid,
+            "role": role,
+            "raw_name": name_by_sid.get(sid) or sid,
+            "session_id": sid,            # carried → _process_window resolves directly
+            "cmdline": "",
+            "is_focused": bool(live_win.get("is_focused")),
+            "registered": True,
+        })
+        discovered_wids.add(wid)
+        added += 1
+    if added:
+        _log.info(
+            "roster-recovery: union added %d identity-registered window(s) the title "
+            "pass missed", added,
+        )
+    return windows
+
+
 def _get_screen(window_id: int) -> str | None:
     """Read current screen text for a kitty window."""
     return _kitty("get-text", f"--match=id:{window_id}")
@@ -488,12 +670,33 @@ def _compute_context_pct(session_id: str) -> int | None:
         return None
 
 
+# Idle-prompt hints — Claude Code renders these in the footer ONLY when waiting at
+# the prompt (not while generating). Their presence proves the window is idle even
+# if "esc to interrupt" also shows (CC renders a hybrid footer
+# "auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents" at an
+# auto-mode idle prompt). A genuinely-generating window shows the spinner line +
+# "esc to interrupt" but NONE of these hints.
+_IDLE_PROMPT_HINTS = ("shift+tab to cycle", "← for agents", "for shortcuts", "esc to undo")
+
+
 def _is_busy(text: str) -> bool:
-    """Return True if the window is actively working (unsafe to inject)."""
+    """Return True if the window is actively generating (unsafe to inject).
+
+    The "esc to interrupt" footer string is NOT a reliable busy signal on its own:
+    it also renders in the auto-mode IDLE footer alongside the idle-prompt hints,
+    so matching it bare false-flags an IDLE agent busy → it never gets nudged
+    (jeevy master DEFECT B 2026-06-23: agent-3 sat idle, un-nudged). Fix: treat
+    "esc to interrupt" as busy ONLY when no idle-prompt hint is present (a real
+    generation footer). Compaction is always busy. Conservative on empty/unknown.
+    """
     if not text:
         return True  # unknown → be conservative
     lower = text.lower()
-    return any(marker in lower for marker in _BUSY_MARKERS)
+    if any(m in lower for m in ("compacting…", "compacting...", "compacting ")):
+        return True
+    if "esc to interrupt" in lower:
+        return not any(hint in lower for hint in _IDLE_PROMPT_HINTS)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +887,24 @@ def _count_title_windows(window_title: str) -> int:
     return sum(len(t.get("windows", [])) for o in data for t in o.get("tabs", []))
 
 
+_PROMPT_NORM = re.compile(r"[\s>│▌❯|]+")
+
+
+def _input_line_contains(buffer: str, nonce: str) -> bool:
+    """True if ``nonce`` still sits on the current input (❯) line — i.e. NOT submitted.
+
+    After a successful submit the input box clears and the nonce survives only in
+    scrollback ABOVE the last ❯ prompt; scoping the check to text at/after the last
+    prompt line avoids a false "still sitting" from the submitted message's own echo
+    in history. No prompt visible (processing screen) → not sitting.
+    """
+    lines = buffer.splitlines()
+    last_prompt = max((i for i, ln in enumerate(lines) if "❯" in ln), default=-1)
+    if last_prompt < 0:
+        return False
+    return nonce in _PROMPT_NORM.sub("", "".join(lines[last_prompt:]))
+
+
 def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -> bool:
     """Inject ``text`` into a kitty window and submit with Enter.
 
@@ -697,10 +918,12 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     Steps:
     1. Clear any pre-existing input with Ctrl-U (line-kill) so stale nudge text
        from a prior aborted cycle doesn't pollute the TOCTOU check.
-    2. Send the text (does NOT submit yet).
-    3. Wait briefly for the terminal to echo it.
-    4. Re-read the buffer via id (precise) — verify it ends with ONLY our text
-       (TOCTOU guard). Abort + clear (Ctrl-C) if changed.
+    2. Send the text + a unique nonce (does NOT submit yet).
+    3. POLL the buffer (up to ~1.8s) until the nonce echoes — accommodates slow
+       re-render on saturated high-context windows where a single fixed-delay read
+       would race the render and false-abort.
+    4. Verify the nonce is present (TOCTOU guard). Abort + clear (Ctrl-C) if it
+       never appears within the poll ceiling.
     5. Submit with Enter.
 
     Returns True if submitted, False if aborted.
@@ -709,6 +932,22 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     # title hits BOTH windows (garbling the live agent). If >1 window shares this
     # title, self-heal once (reap the stale duplicate) then re-check; if STILL
     # ambiguous, ABORT loud rather than inject into the wrong/both windows.
+    # Resolve the actuation match-arg. Prefer title-match (stable across restarts —
+    # window ids renumber, role titles don't), but kitty decorates LIVE window titles
+    # with dynamic activity markers (e.g. "✳ livyatan", a bell glyph, a thinking-state
+    # symbol) that an anchored ^name$ title-match cannot match. When that happens the
+    # title-match SILENTLY no-ops (rc=0, keystrokes go nowhere) and every wake aborts on
+    # the nonce check — the livyatan window-978 failure (2026-06-20): the union path
+    # passed the clean session name "livyatan" while the real kitty title was
+    # "✳ livyatan". The marker can also FLICKER on/off between discovery and inject for
+    # role-named windows. So branch on how many live windows the title actually matches:
+    #   n==1 → title-match (precise + restart-stable; the normal case)
+    #   n==0 → the (possibly decoration-prefixed/flickering) title matches no live
+    #          window; fall back to the id we resolved THIS sweep (fresh, not stale). If
+    #          the id is ALSO dead, the nonce TOCTOU catches it — safe either way.
+    #   n>1  → ambiguous duplicate title; reap the stale twin, re-check, abort if still
+    #          ambiguous rather than inject into the wrong/both windows.
+    use_title = False
     if window_title:
         n = _count_title_windows(window_title)
         if n > 1:
@@ -721,9 +960,16 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
                 window_title, n,
             )
             return False
+        use_title = n == 1
+        if n == 0:
+            _log.info(
+                "roster-recovery: title %r matches no live window (kitty title "
+                "decoration / marker flicker?) — falling back to id-match window %d",
+                window_title, window_id,
+            )
 
     match_arg = (
-        _title_match_arg(window_title) if window_title else f"--match=id:{window_id}"
+        _title_match_arg(window_title) if use_title else f"--match=id:{window_id}"
     )
     id_match = f"--match=id:{window_id}"
 
@@ -734,64 +980,104 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     _kitty("send-key", id_match, "ctrl+u")
     time.sleep(0.05)
 
-    # Step 2: send text
-    if _kitty("send-text", match_arg, "--", text) is None:
+    # Step 2: send text WITH a unique verification nonce appended. The nonce makes the
+    # TOCTOU check robust to a SATURATED window — a long-running, high-context session
+    # showing the task panel + "/clear to save Nk tokens" footer (the COMMON state for
+    # exactly the long-lived sessions that idle and need waking). In that layout the
+    # input line (carrying the wrapped wake text) is pushed far ABOVE the last screen
+    # lines, so scanning only the last 15 lines for the static wake text misses it and
+    # aborts — the real cause of the 520k-token-window wake failure (2026-06-20). The
+    # nonce appears ONLY in the just-injected input (a prior wake used a DIFFERENT
+    # nonce, and submitted wakes in scrollback carry old nonces), so we can scan the
+    # WHOLE buffer for it with no stale false-positive. Cost: a small "(sync wkNNNNN)"
+    # marker rides along in the submitted prompt — the agent ignores it.
+    nonce = f"wk{int(time.time()) % 100000:05d}"
+    inject = f"{text}  (sync {nonce})"
+    if _kitty("send-text", match_arg, "--", inject) is None:
         _log.warning(
             "roster-recovery: send-text failed for window %d (%s)", window_id, match_arg
         )
         return False
 
-    # Step 3: brief pause for echo
-    time.sleep(0.15)
-
-    # Step 4: TOCTOU — re-read and verify
-    buffer = _get_screen(window_id)
-    if buffer is None:
-        # Can't verify — abort safely
-        _kitty("send-key", id_match, "ctrl+c")
-        _log.warning(
-            "roster-recovery: TOCTOU verify read failed for window %d — aborted",
-            window_id,
-        )
-        return False
-
-    lines = [line.rstrip() for line in buffer.splitlines() if line.strip()]
-    expected = text.rstrip()
-    # TOCTOU verify: confirm our injected text actually landed in the window's input.
-    # It is NOT reliably the LAST screen line, and it is NOT reliably a SINGLE line:
-    #   - Claude Code renders chrome BELOW the input (the "⏵⏵ auto mode on" footer, a
-    #     "N% until auto-compact" / "new task? /clear" hint, a slash-command menu when
-    #     the text starts with "/"), and
-    #   - a long wake message WRAPS across several terminal lines.
-    # The old "last line == text" check aborted on every auto-accept-mode window AND
-    # on every wrapped message — muther agents were never woken, /compact never landed
-    # (2026-06-18). So normalize the recent buffer (drop whitespace + prompt-box glyphs,
-    # which reconstructs wrapped text) and substring-check for our normalized text.
-    # The raced-user-typing concern the old exact-match guarded against is already
-    # covered upstream: we never inject into a busy/focused/human-interface window, so
-    # an idle agent window has no human typing into it during the 150ms verify window.
+    # Step 3+4: TOCTOU — POLL the buffer until the nonce echoes, up to a bound.
+    # A single fixed sleep+read fails on SATURATED windows (the 520k-token, task-panel
+    # sessions that are exactly the ones idling and needing a wake): at high context the
+    # Claude Code TUI re-renders slowly, so the injected nonce hasn't been painted into
+    # the screen buffer within 0.15s — the single read captures the PRE-inject screen,
+    # finds no nonce, and aborts. The send-text DID land (manual nudges to the same
+    # window succeed); only the readback raced the render. Polling accommodates both
+    # regimes: a fast normal window passes on iteration 1 (~0.1s); a slow high-context
+    # window gets up to ~1.8s for the echo to appear. (2026-06-20 — the real fix for the
+    # livyatan window-978 wake failures that the nonce/whole-buffer change alone didn't
+    # close, because the bug was a render-vs-readback TIMING race, not a scan-scope miss.)
     _NORM_STRIP = re.compile(r"[\s>│▌❯|]+")
-    buffer_norm = _NORM_STRIP.sub("", " ".join(lines[-15:]))
-    expected_norm = _NORM_STRIP.sub("", expected)
-    if not expected_norm or expected_norm not in buffer_norm:
-        # Our text isn't in the input buffer — the inject didn't land. Abort safely.
+    buffer: str | None = None
+    last_read_failed = False
+    for _ in range(12):  # 12 × 0.15s ≈ 1.8s ceiling
+        time.sleep(0.15)
+        buffer = _get_screen(window_id)
+        if buffer is None:
+            last_read_failed = True
+            continue
+        last_read_failed = False
+        # Scan the WHOLE captured buffer (whitespace + prompt-box glyphs stripped, so a
+        # wrapped inject reconstructs) for the unique nonce. Whole-buffer (not
+        # last-15-lines) is what makes this robust to the saturated/task-panel layout;
+        # the nonce is what makes whole-buffer scanning SAFE — only the current inject
+        # carries it, so no stale submitted-wake in scrollback can false-positive.
+        if nonce in _NORM_STRIP.sub("", buffer):
+            break
+    else:
+        # Nonce never echoed within the poll ceiling — abort safely.
         _kitty("send-key", id_match, "ctrl+c")
-        _log.warning(
-            "roster-recovery: TOCTOU mismatch on window %d — injected text not found "
-            "in buffer (last line %r), aborted",
+        if last_read_failed or buffer is None:
+            _log.warning(
+                "roster-recovery: TOCTOU verify read failed for window %d — aborted",
+                window_id,
+            )
+        else:
+            lines = [ln.rstrip() for ln in buffer.splitlines() if ln.strip()]
+            _log.warning(
+                "roster-recovery: TOCTOU mismatch on window %d — nonce %s not found in "
+                "buffer after poll (last line %r), aborted",
+                window_id,
+                nonce,
+                lines[-1] if lines else "",
+            )
+        return False
+
+    # Step 5: submit — via the FRESH id, NOT the title. kitty decorates a live Claude
+    # window's title with a dynamic activity marker (e.g. "✳ Claude Code") that FLICKERS
+    # during the nonce-poll above; an anchored title-match enter then matches 0 windows
+    # and kitty's send-key SILENTLY no-ops (rc=0 → _kitty returns "" not None), so the
+    # old title-match enter reported success while the keystroke went NOWHERE and the text
+    # sat unsubmitted at the ❯ prompt (the 2026-06-23 verifier-1/critic-1 captures; repro'd
+    # audit-grade on a throwaway claude window). The window id is fresh THIS sweep and is
+    # immune to title decoration. Then CONFIRM the input actually cleared and RETRY the
+    # enter if it's still sitting (don't report a false success).
+    for attempt in range(3):
+        if _kitty("send-key", id_match, "enter") is None:
+            _log.warning(
+                "roster-recovery: send-key enter failed for window %d (id-match)", window_id
+            )
+            return False
+        for _ in range(6):  # up to ~0.9s for the submit to render
+            time.sleep(0.15)
+            buf = _get_screen(window_id)
+            if buf is not None and not _input_line_contains(buf, nonce):
+                return True  # input cleared → submitted
+        _log.info(
+            "roster-recovery: enter didn't submit window %d (text still at prompt) — "
+            "retry %d/3",
             window_id,
-            lines[-1] if lines else "",
+            attempt + 1,
         )
-        return False
-
-    # Step 5: submit
-    if _kitty("send-key", match_arg, "enter") is None:
-        _log.warning(
-            "roster-recovery: send-key enter failed for window %d (%s)", window_id, match_arg
-        )
-        return False
-
-    return True
+    _log.warning(
+        "roster-recovery: window %d still unsubmitted after 3 enter retries — left at "
+        "prompt (next sweep will retry)",
+        window_id,
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -896,28 +1182,28 @@ def _session_has_unread_inbox(session_id: str) -> bool:
         return False
 
 
-def _session_has_unconsumed_chat(session_id: str) -> bool:
-    """Return True if an inbound chat message arrived AFTER the session's last action.
+def _session_has_directed_unanswered(session_id: str) -> bool:
+    """True if a DIRECTED chat message — `to=[me]`, or `@<my-name>` in the body —
+    is newer than this session's OWN last post in that chat (addressed + not
+    replied-to since).
 
-    Premise-correct peer-reply signal. An idle session keeps its SSE subscriber
-    alive, so the chat cursor (which advances on SSE DELIVERY, chats.py event
-    generator) can't distinguish "delivered" from "acted on" — it lags only if the
-    SSE physically disconnects. Instead compare each message's ts against the
-    session's last_active mtime (the last OBSERVABLE action): chat receipt writes
-    the CHAT dir (messages + cursors.jsonl), never the session dir, so last_active
-    is not polluted by delivery and the signal self-clears on the session's next turn.
-
-    Excludes self-sent + SYSTEM messages. Clock-skew safe: message ts (daemon ISO)
-    and last_active (filesystem mtime) are two clocks, so require ts > last_active +
-    _TS_SKEW_EPSILON_S. Fail-open: False on any read error.
+    The DIRECTED wake signal (#23). It replaces the prior `_session_has_unconsumed_chat`,
+    which fired on ANY peer message newer than `last_active` and so failed BOTH ways:
+      • over-wake: in a busy chat every undirected peer post tripped it, so the
+        idle-consult seats (architect/critic/analyst/verifier) got woken — and
+        injected into — on chatter they were never obligated to answer. That
+        plausibly aggravated mid-generation degeneration (the critic 'court' loop).
+      • false-negative: `last_active` advances on ANY action, so an agent that did
+        something unrelated after a real ask got the ask marked "consumed" and was
+        never woken for it (the muther/architect idle-with-owed stalls).
+    Keying on (a) DIRECTEDNESS and (b) the session's last OWN POST fixes both:
+    undirected chatter never wakes; a directed ask stays owed across unrelated
+    actions until the agent actually replies in that chat. Both ts use the daemon
+    ISO clock (same clock — no mtime skew, no epsilon needed). Excludes self + SYSTEM.
+    Fail-open: False on any read error.
     """
     try:
         from khimaira.monitor import chats as chats_mod
-        from khimaira.monitor import sessions as sessions_mod
-
-        summary = sessions_mod.summary(session_id)
-        last_active_epoch = time.time() - float(summary.get("last_active_age_s") or 0.0)
-        threshold = last_active_epoch + _TS_SKEW_EPSILON_S
 
         try:
             sid = chats_mod._resolve_or_uuid(session_id)
@@ -933,19 +1219,99 @@ def _session_has_unconsumed_chat(session_id: str) -> bool:
                 member = room["members"].get(sid)
                 if not member or member.get("state") != chats_mod.ACCEPTED:
                     continue
-                for m in room.get("messages", []):
-                    if m.get("kind") != chats_mod.MSG:
-                        continue
+                my_name = (member.get("session_name") or "").strip()
+                msgs = [
+                    m for m in room.get("messages", []) if m.get("kind") == chats_mod.MSG
+                ]
+                own = [m for m in msgs if m.get("sender_id") == sid]
+                last_own = _iso_to_epoch(own[-1].get("ts")) if own else 0.0
+                for m in msgs:
                     sender = m.get("sender_id")
                     if sender == sid or sender == chats_mod.SYSTEM_SENDER_ID:
                         continue
-                    if _iso_to_epoch(m.get("ts")) > threshold:
+                    if _iso_to_epoch(m.get("ts")) <= last_own:
+                        continue  # the session has posted since this message
+                    to = m.get("to")
+                    directed = isinstance(to, list) and sid in to
+                    if not directed and my_name:
+                        directed = ("@" + my_name) in (m.get("body") or "")
+                    if directed:
                         return True
             except Exception:
                 continue
         return False
     except Exception:
         return False
+
+
+# Audit instrument for #23 (idle-with-owed). Default on; KHIMAIRA_WAKE_DIAG=0 to mute.
+_WAKE_DIAG_ENABLED = os.environ.get("KHIMAIRA_WAKE_DIAG", "1") != "0"
+
+
+def _wake_skip_diagnostic(
+    session_id: str, role: str, window_id: int, signals: dict[str, bool]
+) -> None:
+    """Log LOUDLY when the wake path SKIPS an idle session that nonetheless has
+    chat work it never answered — the idle-with-owed false-negative we otherwise
+    can't catch (all wake signals clear, but the agent stopped mid-consume).
+
+    Now that the wake signal is `_session_has_directed_unanswered` (directed +
+    keyed on last OWN POST), this diagnostic catches the residual gap: inbound
+    non-self messages newer than the session's last own post that were NOT directed
+    (no `to=[me]`/@mention) — work the agent may still owe via an undirected ask the
+    directed signal deliberately ignores. DIAGNOSTIC ONLY (no behavior change) — it
+    surfaces whether undirected-but-owed is a real class worth widening the signal for.
+
+    Low-noise by construction: fires only for a session idle past the wake floor
+    that has such unanswered inbound. A healthy agent that just delivered (its own
+    post is the newest) does NOT trip it. WARNING-level so it's visible at INFO.
+    """
+    if not _WAKE_DIAG_ENABLED:
+        return
+    try:
+        from khimaira.monitor import chats as chats_mod
+        from khimaira.monitor import sessions as sessions_mod
+
+        idle_s = float(sessions_mod.summary(session_id).get("last_active_age_s") or 0.0)
+        if idle_s < _IDLE_MIN_S:
+            return  # too fresh to be "stuck"
+
+        try:
+            rsid = chats_mod._resolve_or_uuid(session_id)
+        except Exception:
+            rsid = session_id
+
+        chat_dir = chats_mod._chat_dir()
+        if not chat_dir.exists():
+            return
+        owed: list[tuple[str, str, object]] = []
+        for chat_path in chat_dir.glob("chat-*.jsonl"):
+            try:
+                room = chats_mod.load_room(chat_path.stem)
+                member = room["members"].get(rsid)
+                if not member or member.get("state") != chats_mod.ACCEPTED:
+                    continue
+                msgs = [m for m in room.get("messages", []) if m.get("kind") == chats_mod.MSG]
+                own = [m for m in msgs if m.get("sender_id") == rsid]
+                last_own = _iso_to_epoch(own[-1].get("ts")) if own else 0.0
+                for m in msgs:
+                    sender = m.get("sender_id")
+                    if sender == rsid or sender == chats_mod.SYSTEM_SENDER_ID:
+                        continue
+                    if _iso_to_epoch(m.get("ts")) > last_own:
+                        owed.append((chat_path.stem, m.get("sender_name") or "", m.get("to")))
+            except Exception:
+                continue
+
+        if owed:
+            _log.warning(
+                "roster-recovery: WAKE-SKIP-DIAG window=%d role=%s session=%s idle=%.0fs "
+                "signals=%s — %d inbound chat msg(s) postdate its own last post "
+                "(idle-with-owed candidate; samples=%s)",
+                window_id, role, session_id[:8], idle_s, signals, len(owed), owed[:3],
+            )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1566,8 +1932,12 @@ async def _process_window(win: dict[str, Any]) -> None:
     # from ever firing: with 11 sessions all role='agent', _resolve_session_for_role
     # always returned None. The window title is unique — resolve_active_session
     # resolves it to the most-recently-active UUID.
-    session_id: str | None = None
-    if raw_name:
+    # Identity-registered windows (from _union_registered_windows) carry their sid
+    # directly — skip the fragile name→uuid resolution for them. Title-discovered
+    # windows lack the key (win.get → None), so they fall through to the existing
+    # name/role resolution UNCHANGED (additive).
+    session_id: str | None = win.get("session_id")
+    if not session_id and raw_name:
         session_id = await asyncio.get_running_loop().run_in_executor(
             None, _resolve_session_by_name, raw_name
         )
@@ -1788,16 +2158,32 @@ async def _process_window(win: dict[str, Any]) -> None:
         has_unread_inbox = await asyncio.get_running_loop().run_in_executor(
             None, _session_has_unread_inbox, session_id
         )
-        has_unconsumed_chat = await asyncio.get_running_loop().run_in_executor(
-            None, _session_has_unconsumed_chat, session_id
+        has_directed_chat = await asyncio.get_running_loop().run_in_executor(
+            None, _session_has_directed_unanswered, session_id
         )
         if (
             not obligations
             and not has_pending_task
             and not has_pending_invite
             and not has_unread_inbox
-            and not has_unconsumed_chat
+            and not has_directed_chat
         ):
+            # #23 audit instrument: before skipping, record whether this idle
+            # session actually has chat work it never answered (diagnostic only).
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                _wake_skip_diagnostic,
+                session_id,
+                role,
+                window_id,
+                {
+                    "obligations": bool(obligations),
+                    "pending_task": has_pending_task,
+                    "pending_invite": has_pending_invite,
+                    "unread_inbox": has_unread_inbox,
+                    "directed_chat": has_directed_chat,
+                },
+            )
             return
 
         rows = sessions_mod.list_sessions(use_cache=True)
@@ -1854,6 +2240,17 @@ async def _process_window(win: dict[str, Any]) -> None:
             return
 
         wake_msg = "⏰ resume: call chat_my_chats + act on your inbox / pending work"
+        if not _env_wake_inject_allowed():
+            # Injection disabled: the wake DECISION ran (observable here) but no
+            # keystrokes are sent into the window. Cool down so this doesn't
+            # re-log every sweep. See _env_wake_inject_allowed (#23).
+            _DEBOUNCE[action_key] = time.time()
+            _log.info(
+                "roster-recovery: WOULD-WAKE window=%d role=%s session=%s "
+                "(injection disabled via KHIMAIRA_ROSTER_WAKE_INJECT=0)",
+                window_id, role, session_id[:8],
+            )
+            return
         submitted = await asyncio.get_running_loop().run_in_executor(
             None, _inject_text_and_submit, window_id, wake_msg, raw_name
         )
@@ -1898,6 +2295,9 @@ async def check_once() -> None:
     # sweep (and every external nudge/busy-read) resolves to exactly one window.
     await loop.run_in_executor(None, _reap_duplicate_windows)
     windows = await loop.run_in_executor(None, _discover_roster_windows)
+    # ADDITIVE: union in identity-registered windows the title pass missed (non-role-
+    # shaped titles). Title-discovered windows above are untouched.
+    windows = await loop.run_in_executor(None, _union_registered_windows, windows)
     for win in windows:
         try:
             await _process_window(win)
@@ -1924,6 +2324,15 @@ async def watcher_loop() -> None:
             await check_once()
         except Exception as exc:
             _log.warning("roster-recovery: sweep error: %s", exc)
+        # Guard-7 (#32): task-delivery watchdog rides THIS proven sweep (not its own
+        # asyncio.sleep loop — #18 freeze risk). Fail-open: its own errors never break
+        # the sweep. New-file (guard7.py); this is the only wiring touch.
+        try:
+            from khimaira.monitor import guard7 as _g7
+
+            await _g7._guard7_check_once()
+        except Exception as exc:
+            _log.warning("roster-recovery: guard7 sweep error: %s", exc)
         # #18 backstop (gated, opt-in): auto_dispatch's own sleep-loop can freeze
         # on the live daemon (uvloop timer never fires; load/SSE-churn ruled out
         # as the cause). THIS loop demonstrably fires on the same daemon, so drive

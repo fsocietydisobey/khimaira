@@ -43,6 +43,61 @@ SAMPLE_KITTY_LS = json.dumps([
 
 
 # ---------------------------------------------------------------------------
+# _resolve_listen_socket (headless kitty control-socket discovery)
+# ---------------------------------------------------------------------------
+
+class TestResolveListenSocket:
+    """Regression: the systemd daemon has no inherited KITTY_LISTEN_ON, so
+    `kitty @` fell back to /dev/tty and ALL auto-wakes died — the roster stalled
+    and the master needed manual nudging (2026-06-22 systemd-cutover regression).
+    `_kitty` must discover a live /tmp/kitty-* socket and pass --to."""
+
+    def setup_method(self):
+        rr._RESOLVED_LISTEN = None
+
+    def teardown_method(self):
+        rr._RESOLVED_LISTEN = None
+
+    def test_discovers_live_socket_via_glob(self, monkeypatch):
+        monkeypatch.delenv("KITTY_LISTEN_ON", raising=False)
+        import glob as _glob
+
+        monkeypatch.setattr(_glob, "glob", lambda p: ["/tmp/kitty-6285"])
+        monkeypatch.setattr(
+            rr.subprocess, "run",
+            lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr=""),
+        )
+        assert rr._resolve_listen_socket() == "unix:/tmp/kitty-6285"
+
+    def test_skips_dead_socket_tries_next(self, monkeypatch):
+        monkeypatch.delenv("KITTY_LISTEN_ON", raising=False)
+        import glob as _glob
+
+        monkeypatch.setattr(_glob, "glob", lambda p: ["/tmp/kitty-1", "/tmp/kitty-2"])
+
+        def fake_run(cmd, **k):
+            rc = 0 if "--to=unix:/tmp/kitty-2" in cmd else 1
+            return subprocess.CompletedProcess(cmd, rc, stdout="[]", stderr="dead")
+
+        monkeypatch.setattr(rr.subprocess, "run", fake_run)
+        assert rr._resolve_listen_socket() == "unix:/tmp/kitty-2"
+
+    def test_kitty_uses_discovered_socket_headless(self, monkeypatch):
+        monkeypatch.delenv("KITTY_LISTEN_ON", raising=False)
+        rr._RESOLVED_LISTEN = "unix:/tmp/kitty-6285"  # pre-cached
+        monkeypatch.setattr(rr.os.path, "exists", lambda p: True)
+        seen = {}
+
+        def fake_run(cmd, **k):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+        monkeypatch.setattr(rr.subprocess, "run", fake_run)
+        assert rr._kitty("ls") == "ok"
+        assert "--to=unix:/tmp/kitty-6285" in seen["cmd"]
+
+
+# ---------------------------------------------------------------------------
 # _discover_roster_windows
 # ---------------------------------------------------------------------------
 
@@ -128,6 +183,105 @@ class TestDiscoverRosterWindows:
         assert by_id.get(41) == "verifier"
         assert by_id.get(42) == "tracker"
         assert by_id.get(43) == "agent"
+
+
+def _kitty_ls(*win_specs):
+    """Build a kitty @ ls JSON with the given (id, is_focused) windows."""
+    return json.dumps([{"tabs": [{"windows": [
+        {"id": wid, "is_focused": foc} for (wid, foc) in win_specs
+    ]}]}])
+
+
+class TestUnionRegisteredWindows:
+    """wake-by-session-id: identity-registered windows the title pass missed.
+
+    The catching-tests for the corpus seam wake-targets-window-by-title-not-session-
+    identity — a roled member whose window TITLE isn't role-shaped (e.g. "livyatan")
+    was silently unwakeable.
+    """
+
+    SID = "livyatan-sid-0000"
+
+    def test_wake_by_registered_window_id(self):
+        """A non-role-titled member with a LIVE registered window + role is unioned in."""
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((99, False))),
+            patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window",
+                  side_effect=lambda s: 99 if s == self.SID else None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": self.SID, "name": "livyatan"}]),
+        ):
+            out = rr._union_registered_windows([])  # title pass found nothing
+        assert len(out) == 1
+        w = out[0]
+        assert w["window_id"] == 99
+        assert w["role"] == "agent"
+        assert w["session_id"] == self.SID  # carried → _process_window resolves directly
+        assert w["registered"] is True
+        assert w["is_focused"] is False
+
+    def test_title_discovery_still_primary(self):
+        """A title-discovered window with NO registration is untouched (no regression)."""
+        title_win = {"window_id": 10, "role": "agent", "raw_name": "agent-1", "is_focused": False}
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({"agent-1-sid"})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((10, False))),
+            patch.object(rr, "_roster_role_map", return_value={"agent-1-sid": "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window", side_effect=lambda s: None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": "agent-1-sid", "name": "agent-1"}]),
+        ):
+            out = rr._union_registered_windows([dict(title_win)])
+        assert len(out) == 1
+        assert out[0]["window_id"] == 10
+        assert "registered" not in out[0]  # the live title path is untouched
+
+    def test_dedup_title_and_registered(self):
+        """A window BOTH title-discovered AND registered appears once (no double-wake)."""
+        title_win = {"window_id": 10, "role": "agent", "raw_name": "agent-1", "is_focused": False}
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((10, False))),
+            patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window",
+                  side_effect=lambda s: 10 if s == self.SID else None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": self.SID, "name": "livyatan"}]),
+        ):
+            out = rr._union_registered_windows([dict(title_win)])
+        assert [w["window_id"] for w in out] == [10]  # exactly once
+
+    def test_stale_registered_window_skipped(self):
+        """LIVENESS gate: a registered wid NOT live in kitty is never synthesized
+        (window_ids renumber on kitty restart → stale wid must not be woken)."""
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((10, False))),  # 77 not live
+            patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window",
+                  side_effect=lambda s: 77 if s == self.SID else None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": self.SID, "name": "livyatan"}]),
+        ):
+            out = rr._union_registered_windows([])
+        assert out == []  # stale wid dropped
+
+    def test_registered_window_carries_is_focused(self):
+        """is_focused carried from kitty-ls so the human-presence guard applies to
+        identity-discovered windows identically (never inject into a focused window)."""
+        with (
+            patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
+            patch.object(rr, "_kitty", return_value=_kitty_ls((99, True))),  # user focused
+            patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
+            patch("khimaira.monitor.sessions.get_session_window",
+                  side_effect=lambda s: 99 if s == self.SID else None),
+            patch("khimaira.monitor.sessions.list_sessions",
+                  return_value=[{"session_id": self.SID, "name": "livyatan"}]),
+        ):
+            out = rr._union_registered_windows([])
+        assert out[0]["is_focused"] is True
 
 
 class TestDiscoverRosterWindowsScoping:
@@ -330,6 +484,19 @@ class TestIsBusy:
         assert rr._is_busy("")
         assert rr._is_busy(None)  # type: ignore[arg-type]
 
+    def test_idle_hybrid_footer_not_busy(self):
+        """DEFECT B (jeevy master 2026-06-23): an auto-mode IDLE window renders a
+        hybrid footer with 'esc to interrupt' ALONGSIDE the idle-prompt hints.
+        That must NOT be flagged busy — else the idle agent never gets nudged."""
+        footer = "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents"
+        assert rr._is_busy(footer) is False
+
+    def test_real_generation_footer_is_busy(self):
+        """A genuinely-generating window shows 'esc to interrupt' with NO idle-prompt
+        hint (no shift+tab/← for agents) → busy, do not inject."""
+        gen = "✻ Tomfoolering… (8m 10s · ↓ 4.0k tokens)\n  esc to interrupt\n95% context used"
+        assert rr._is_busy(gen) is True
+
 
 # ---------------------------------------------------------------------------
 # _inject_text_and_submit — TOCTOU guard
@@ -343,103 +510,178 @@ class TestInjectTextAndSubmit:
         # and doesn't consume the fixed _kitty side_effect sequences.
         monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
 
-    def _make_screen(self, text: str) -> str:
-        return f"previous lines\n{text}"
+    def _drive(self, monkeypatch, screen_tmpl, *, send_fails=False, read_fails=False,
+               text="/compact", title=""):
+        """Stateful mock: capture the send-text inject (incl. the runtime verification
+        nonce) and ECHO it into the get-text screen via screen_tmpl(inject) — mirrors
+        reality, where the window renders what was typed. Returns (result, kitty_calls)."""
+        monkeypatch.setattr(rr.time, "sleep", lambda _s: None)  # skip real poll waits
+        state = {"inject": None}
+        kitty_calls = []
 
-    def test_submits_when_buffer_matches(self):
-        screen_after_inject = self._make_screen("/compact")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = [
-                "",                           # send-key ctrl+u (clear stale input)
-                "",                           # send-text → success
-                screen_after_inject,          # get-text (TOCTOU verify)
-                "",                           # send-key enter → success
-            ]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is True
+        def fake_kitty(*args, **kw):
+            kitty_calls.append(args)
+            op = args[0] if args else ""
+            if op == "send-text":
+                if send_fails:
+                    return None
+                state["inject"] = args[-1]  # the injected text incl. "(sync wkNNNNN)"
+                return ""
+            return ""  # ctrl+u, send-key enter, ctrl+c
 
-    def test_submits_with_chrome_after_our_text(self):
-        """Chrome rendered AFTER our text (footer/menu/hint) no longer aborts — the
-        TOCTOU check verifies our text LANDED, not that the buffer is pristine. The
-        old exact-match aborted on every auto-mode/slash-menu window (2026-06-18); the
-        raced-user-input concern moved upstream to the busy/focus/human-interface
-        guards + the Ctrl-U pre-clear, which keep a human's keystrokes out of the
-        windows we inject into."""
-        screen = self._make_screen("/compact\n  ⏵⏵ auto mode on (shift+tab to cycle)")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", "", screen, ""]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is True
+        def fake_get_screen(_wid):
+            return None if read_fails else screen_tmpl(state["inject"] or "")
 
-    def test_submits_with_prompt_chrome_before_our_text(self):
-        """Prompt chrome BEFORE our text (the "> " prompt, box glyphs) still submits —
-        normalization strips prompt glyphs so the input line reconstructs."""
-        screen = self._make_screen("> /compact")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", "", screen, ""]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is True
+        monkeypatch.setattr(rr, "_kitty", fake_kitty)
+        monkeypatch.setattr(rr, "_get_screen", fake_get_screen)
+        result = rr._inject_text_and_submit(window_id=10, text=text, window_title=title)
+        return result, kitty_calls
 
-    def test_aborts_when_get_text_fails(self):
-        """Can't verify buffer — abort conservatively."""
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = [
-                "",    # send-key ctrl+u (clear)
-                "",    # send-text
-                None,  # get-text fails
-                "",    # ctrl+c
-            ]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is False
+    def test_submits_when_inject_lands(self, monkeypatch):
+        r, _ = self._drive(monkeypatch, lambda inj: f"previous lines\n{inj}")
+        assert r is True
 
-    def test_aborts_when_send_text_fails(self):
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = [
-                "",    # send-key ctrl+u (clear)
-                None,  # send-text fails
-            ]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is False
+    def test_submits_on_SATURATED_window(self, monkeypatch):
+        """THE 520k-token case (2026-06-20): a high-context session shows a big task
+        panel + "/clear to save Nk tokens" footer, pushing the input (w/ inject) FAR
+        above the last screen lines. The old last-15-lines scan missed it → wake never
+        landed. The unique-nonce + WHOLE-buffer scan finds it regardless of layout."""
+        def tmpl(inj):
+            panel = "\n".join(f"  ▸ task row {i}" for i in range(25))
+            footer = ("  ⏵⏵ auto mode on (shift+tab to cycle) · ctrl+t to hide tasks · "
+                      "← for agents                   new task? /clear to save 520.8k tokens")
+            return f"> {inj}\n{panel}\n{footer}"
+        r, _ = self._drive(monkeypatch, tmpl, text="⏰ resume: call chat_my_chats + act")
+        assert r is True
 
-    def test_uses_title_match_when_title_provided(self):
-        """When window_title is given, send-text and send-key enter use title-match.
-        ctrl+u (step 1) and TOCTOU get-text (step 3) always use id-match for safety."""
-        screen_after_inject = self._make_screen("/compact")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", "", screen_after_inject, ""]
-            result = rr._inject_text_and_submit(
-                window_id=10, text="/compact", window_title="agent-3"
-            )
-        assert result is True
-        # Index 0: ctrl+u (id-match); index 1: send-text (title-match);
-        # index 2: get-text TOCTOU (id-match); index 3: send-key enter (title-match).
-        # Inspect actual arg tuples (not str(call) — repr doubles backslashes).
-        send_text_args = mock_kitty.call_args_list[1].args
-        send_key_args = mock_kitty.call_args_list[3].args
-        # Anchored exact-match (2026-06-07 cross-roster-nudge fix): kitty title:
-        # is an unanchored regex, so the match must be ^<escaped-title>$.
-        assert r"--match=title:^agent\-3$" in send_text_args, "send-text must use anchored title-match"
-        assert r"--match=title:^agent\-3$" in send_key_args, "send-key must use anchored title-match"
-        assert "--match=id:10" not in send_text_args, "send-text must NOT use id-match when title given"
-        assert "--match=id:10" not in send_key_args, "send-key must NOT use id-match when title given"
+    def test_submits_with_chrome_after_our_text(self, monkeypatch):
+        r, _ = self._drive(
+            monkeypatch,
+            lambda inj: f"> {inj}\n  ⏵⏵ auto mode on (shift+tab to cycle)",
+        )
+        assert r is True
 
-    def test_uses_id_match_when_title_empty(self):
-        """Without window_title, falls back to id-match (backward compat)."""
-        screen_after_inject = self._make_screen("/compact")
-        with patch.object(rr, "_kitty") as mock_kitty:
-            mock_kitty.side_effect = ["", "", screen_after_inject, ""]
-            result = rr._inject_text_and_submit(window_id=10, text="/compact")
-        assert result is True
-        calls = [str(c) for c in mock_kitty.call_args_list]
-        assert any("id:10" in c for c in calls), "id-match must be used when no title given"
+    def test_submits_when_nonce_echoes_late(self, monkeypatch):
+        """THE livyatan window-978 case (2026-06-20): at 520k tokens the Claude Code TUI
+        re-renders slowly, so the injected nonce isn't painted into the screen buffer on
+        the FIRST read — a single fixed-delay readback raced the render and false-aborted.
+        The poll re-reads until the echo appears. Here the first 4 reads show the
+        pre-inject screen (no nonce); the 5th echoes it. Must still submit."""
+        monkeypatch.setattr(rr.time, "sleep", lambda _s: None)  # don't actually wait ~1.8s
+        state = {"inject": None, "reads": 0}
+        calls = []
 
-    def test_title_match_absent_title_fails_loudly(self):
+        def fake_kitty(*args, **kw):
+            calls.append(args)
+            if args and args[0] == "send-text":
+                state["inject"] = args[-1]
+                return ""
+            return ""
+
+        def fake_get_screen(_wid):
+            state["reads"] += 1
+            if state["reads"] < 5:
+                return "  ⏵⏵ auto mode on (shift+tab to cycle) · ctrl+t to hide tasks"
+            return f"> {state['inject']}\n  ⏵⏵ auto mode on"
+
+        monkeypatch.setattr(rr, "_kitty", fake_kitty)
+        monkeypatch.setattr(rr, "_get_screen", fake_get_screen)
+        r = rr._inject_text_and_submit(window_id=978, text="⏰ resume", window_title="")
+        assert r is True, "late echo within the poll ceiling must still submit"
+        assert any(c and c[0] == "send-key" and "enter" in c for c in calls), "must press enter"
+
+    def test_aborts_when_inject_absent(self, monkeypatch):
+        """Inject didn't land (window unresponsive) → nonce absent → abort safely."""
+        r, _ = self._drive(
+            monkeypatch,
+            lambda inj: "previous\n  ⏵⏵ auto mode on\n  3% until auto-compact",
+        )
+        assert r is False
+
+    def test_aborts_when_get_text_fails(self, monkeypatch):
+        r, _ = self._drive(monkeypatch, lambda inj: "x", read_fails=True)
+        assert r is False
+
+    def test_aborts_when_send_text_fails(self, monkeypatch):
+        r, _ = self._drive(monkeypatch, lambda inj: "x", send_fails=True)
+        assert r is False
+
+    def test_title_match_for_text_but_fresh_id_for_enter(self, monkeypatch):
+        # send-text uses the restart-stable anchored title-match, but the SUBMIT enter
+        # actuates by FRESH id: kitty decorates a live Claude title with a dynamic activity
+        # marker that FLICKERS during the nonce-poll; an anchored title-match enter then
+        # matches 0 windows and kitty send-key SILENTLY no-ops (rc=0), leaving the text
+        # unsubmitted at the prompt (2026-06-23 verifier-1/critic-1 bug). id is fresh this
+        # sweep + immune to title decoration.
+        r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}", title="agent-3")
+        assert r is True
+        send_text = next(c for c in calls if c and c[0] == "send-text")
+        send_enter = next(c for c in calls if c and c[0] == "send-key" and "enter" in c)
+        assert r"--match=title:^agent\-3$" in send_text, "send-text must use anchored title-match"
+        assert "--match=id:10" in send_enter, "send-key enter must actuate by FRESH id"
+        assert "title:" not in str(send_enter), "enter must NOT title-match (decoration flicker no-ops)"
+
+    def test_falls_back_to_id_when_title_matches_no_window(self, monkeypatch):
+        """THE livyatan window-978 root cause (2026-06-20): the union path passes the
+        clean session name 'livyatan' as window_title, but kitty's real title is
+        '✳ livyatan' (dynamic activity marker), so the anchored ^livyatan$ title-match
+        finds ZERO windows and send-text silently no-ops (rc=0) → every wake aborts.
+        With a known window_id, fall back to id-match so the inject actually lands."""
+        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 0)  # decorated title misses
+        r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}", title="livyatan")
+        assert r is True, "must fall back to id-match and submit when title matches no window"
+        send_text = next(c for c in calls if c and c[0] == "send-text")
+        assert "--match=id:10" in str(send_text), "send-text must use id-match on title no-match"
+        assert "title:" not in str(send_text), "must NOT use the (non-matching) title-match"
+
+    def test_uses_id_match_when_title_empty(self, monkeypatch):
+        r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}")
+        assert r is True
+        assert any("id:10" in str(c) for c in calls), "id-match must be used when no title given"
+
+    def _drive_submit_confirm(self, monkeypatch, clears_after_enters):
+        """Drive inject where the input stays at the ❯ prompt until the Nth enter, then
+        clears (submitted). Returns (result, enter_count)."""
+        monkeypatch.setattr(rr.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
+        state = {"inject": "", "enters": 0}
+
+        def fake_kitty(*args, **kw):
+            op = args[0] if args else ""
+            if op == "send-text":
+                state["inject"] = args[-1]
+            elif op == "send-key" and "enter" in args:
+                state["enters"] += 1
+            return ""
+
+        def fake_get_screen(_wid):
+            inj = state["inject"]
+            if state["enters"] < clears_after_enters:
+                return f"history line\n❯ {inj}"   # nonce still on the input line
+            return "✶ Working…\n❯ "               # input cleared → submitted
+
+        monkeypatch.setattr(rr, "_kitty", fake_kitty)
+        monkeypatch.setattr(rr, "_get_screen", fake_get_screen)
+        r = rr._inject_text_and_submit(window_id=10, text="hi", window_title="")
+        return r, state["enters"]
+
+    def test_enter_retries_until_submitted(self, monkeypatch):
+        # first enter doesn't take (text still at ❯); retry submits it.
+        r, enters = self._drive_submit_confirm(monkeypatch, clears_after_enters=2)
+        assert r is True
+        assert enters == 2, "must retry the enter when the text is still sitting at the prompt"
+
+    def test_enter_gives_up_after_retries_returns_false(self, monkeypatch):
+        # text never clears → honest False after 3 attempts (no false success).
+        r, enters = self._drive_submit_confirm(monkeypatch, clears_after_enters=99)
+        assert r is False
+        assert enters == 3, "must cap retries and report failure rather than a false success"
+
+    def test_title_match_absent_title_fails_loudly(self, monkeypatch):
         """Title-match returning None (rc!=0 = window not found) → False, not silent."""
-        # kitty @ send-text --match=title:<absent> → rc != 0 → _kitty returns None
-        with patch.object(rr, "_kitty", return_value=None):
-            result = rr._inject_text_and_submit(
-                window_id=99, text="wake", window_title="dead-agent"
-            )
+        monkeypatch.setattr(rr, "_kitty", lambda *a, **k: None)
+        monkeypatch.setattr(rr, "_get_screen", lambda _wid: None)
+        result = rr._inject_text_and_submit(window_id=99, text="wake", window_title="dead-agent")
         assert result is False
 
 
@@ -733,19 +975,24 @@ class TestKittySocketInjection:
         )
         assert "ls" in cmd
 
-    def test_cmd_no_to_when_listen_on_unset(self):
-        """Without KITTY_LISTEN_ON, cmd falls back to bare `kitty @ ls`."""
+    def test_cmd_no_to_when_no_socket_anywhere(self):
+        """With neither KITTY_LISTEN_ON nor a discoverable /tmp/kitty-* socket,
+        cmd falls back to bare `kitty @ ls` (no --to). When a socket IS
+        discoverable, --to is added — that path is covered by
+        test_kitty_uses_discovered_socket_headless."""
         captured: list = []
         env_without = {k: v for k, v in os.environ.items() if k != "KITTY_LISTEN_ON"}
+        rr._RESOLVED_LISTEN = None  # clear discovery cache
         with (
             patch.dict(os.environ, env_without, clear=True),
+            patch.object(rr, "_resolve_listen_socket", return_value=None),
             patch("subprocess.run", side_effect=self._fake_run_ok(captured)),
         ):
             result = rr._kitty("ls")
         assert result == "[]"
         cmd = captured[0]
         assert not any(a.startswith("--to=") for a in cmd), (
-            f"--to= should NOT appear without KITTY_LISTEN_ON: {cmd}"
+            f"--to= should NOT appear when no socket is discoverable: {cmd}"
         )
 
     def test_daemon_path_uses_socket_not_tty(self):
@@ -1681,53 +1928,7 @@ class TestTitleMatchExact:
         assert not _re.search(pattern, "agent-11"), "must NOT match agent-11 (substring)"
 
 
-class TestInjectTOCTOUInputLine:
-    """TOCTOU verify must find our text on the INPUT line even when chrome renders
-    BELOW it (auto-mode footer, slash-command menu) — the muther wake/compact aborts
-    2026-06-18 — while still rejecting a raced user-typed prefix."""
-
-    def _run(self, monkeypatch, buffer: str, text: str):
-        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
-        monkeypatch.setattr(rr, "_get_screen", lambda wid: buffer)
-        monkeypatch.setattr(rr, "time", rr.time)  # keep real time; sleeps are tiny
-        calls: list[tuple] = []
-
-        def fake_kitty(*args, **kw):
-            calls.append(args)
-            return ""  # non-None = success for send-key/send-text
-
-        monkeypatch.setattr(rr, "_kitty", fake_kitty)
-        result = rr._inject_text_and_submit(900, text, "agent-1")
-        pressed_enter = any("enter" in a for a in calls)
-        return result, pressed_enter
-
-    def test_auto_mode_footer_below_input_submits(self, monkeypatch):
-        buf = "> ⏰ resume now please\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
-        result, enter = self._run(monkeypatch, buf, "⏰ resume now please")
-        assert result is True and enter
-
-    def test_slash_command_menu_below_input_submits(self, monkeypatch):
-        buf = "> /compact\n  workflows\n  /config\n  /clear\n"
-        result, enter = self._run(monkeypatch, buf, "/compact")
-        assert result is True and enter
-
-    def test_wrapped_long_message_submits(self, monkeypatch):
-        # A long wake message WRAPS across terminal lines (the real failure: no single
-        # line equals/ends-with the full text). Normalize+reconstruct must still match.
-        buf = (
-            "> ⏰ resume: call chat_my_chats + act on\n"
-            "your inbox / pending work\n"
-            "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
-        )
-        result, enter = self._run(
-            monkeypatch,
-            buf,
-            "⏰ resume: call chat_my_chats + act on your inbox / pending work",
-        )
-        assert result is True and enter
-
-    def test_text_absent_aborts(self, monkeypatch):
-        # Inject didn't land — buffer has only chrome, none of our text → abort safely.
-        buf = "  ⏵⏵ auto mode on (shift+tab to cycle)\n  3% until auto-compact\n"
-        result, enter = self._run(monkeypatch, buf, "/compact")
-        assert result is False and not enter
+# (TOCTOU input-line cases — auto-mode footer, slash-menu, wrapped, absent — are now
+# covered by TestInjectTextAndSubmit's nonce-echo tests, incl. the SATURATED-window
+# case. The old fixed-buffer class was removed when the verify moved to nonce-based
+# whole-buffer scanning 2026-06-20.)

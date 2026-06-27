@@ -1067,6 +1067,20 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    # Register window_id UNCONDITIONALLY (NOT slot-gated) so roster_recovery can wake
+    # this session by IDENTITY even when its window title isn't role-shaped (standalone
+    # / oddly-named sessions, which the title-discovery path silently drops). Separate
+    # from the slot POST above so a session WITHOUT a roster slot still registers.
+    # Best-effort, fire-and-forget; never blocks boot.
+    if _kitty_wid:
+        try:
+            _http_post_json(
+                f"/api/sessions/{session_id}/window",
+                {"window_id": int(_kitty_wid)},
+            )
+        except Exception:
+            pass
+
     # Roster auto-accept (closes the last-launched-session pending tail, 2026-06-06).
     # A worker pre-registers its MASTER in its auto-accept allowlist at boot — BEFORE the
     # master bootstraps the roster chat. Then chats.create_room's existing auto-accept
