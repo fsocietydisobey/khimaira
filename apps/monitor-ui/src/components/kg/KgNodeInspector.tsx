@@ -16,9 +16,9 @@ import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { typeColor, typeColorAlpha } from "./graphStyle";
 import {
+  GRAPH_URL,
   MOCK_MODE,
   MOCK_NODE_DETAIL,
-  NODE_URL,
   type GraphEdge,
   type GraphFact,
   type GraphNodeDetail,
@@ -29,6 +29,10 @@ import {
 // ---------------------------------------------------------------------------
 
 interface KgNodeInspectorProps {
+  /** Khimaira-attached project (route :name) — daemon proxies to its KG adapter. */
+  project: string | undefined;
+  /** Graph scope (e.g. "shop:10") — forwarded to the node-detail endpoint. */
+  scope: string;
   nodeId: string;
   type: string;
   label: string;
@@ -37,6 +41,8 @@ interface KgNodeInspectorProps {
 }
 
 export function KgNodeInspector({
+  project,
+  scope,
   nodeId,
   type,
   label,
@@ -49,7 +55,9 @@ export function KgNodeInspector({
       <div className="flex items-start justify-between border-b border-border px-3 py-2 gap-2">
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">graph node</p>
+            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              graph node
+            </p>
             <span
               className="inline-flex items-center rounded-md border px-1.5 py-0 text-[10px] font-medium"
               style={{
@@ -76,7 +84,7 @@ export function KgNodeInspector({
 
       {/* Body */}
       <div className="flex-1 overflow-auto p-3 space-y-3">
-        <FactsPanel nodeId={nodeId} />
+        <FactsPanel project={project} scope={scope} nodeId={nodeId} />
       </div>
     </div>
   );
@@ -92,7 +100,15 @@ type LoadState =
   | { status: "error"; message: string }
   | { status: "ok"; detail: GraphNodeDetail };
 
-function FactsPanel({ nodeId }: { nodeId: string }) {
+function FactsPanel({
+  project,
+  scope,
+  nodeId,
+}: {
+  project: string | undefined;
+  scope: string;
+  nodeId: string;
+}) {
   const [state, setState] = useState<LoadState>({ status: "idle" });
 
   useEffect(() => {
@@ -110,23 +126,24 @@ function FactsPanel({ nodeId }: { nodeId: string }) {
       };
     }
 
-    // P3 wiring: same-origin daemon node-detail endpoint.
-    const url = `${NODE_URL}/${encodeURIComponent(nodeId)}`;
+    if (!project) {
+      setState({ status: "error", message: "no project in route" });
+      return;
+    }
+
+    // Same-origin daemon node-detail proxy (vite /api → daemon → KG adapter):
+    //   /api/graph/<project>/node/<uuid>?scope=<scope>
+    const url =
+      `${GRAPH_URL}/${encodeURIComponent(project)}/node/${encodeURIComponent(nodeId)}` +
+      `?scope=${encodeURIComponent(scope)}`;
     fetch(url)
       .then((r) => {
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-        // The node-detail endpoint isn't wired yet — an unmatched /api path
-        // falls through to the SPA's index.html. Detect that (content-type is
-        // text/html, not JSON) and degrade gracefully instead of JSON-parsing
-        // an HTML document.
-        const ct = r.headers.get("content-type") ?? "";
-        if (!ct.includes("application/json")) {
-          throw new Error("node-detail endpoint not wired yet (topology-only)");
-        }
         return r.json();
       })
       .then((json) => {
-        if (!cancelled) setState({ status: "ok", detail: json.data as GraphNodeDetail });
+        if (!cancelled)
+          setState({ status: "ok", detail: json.data as GraphNodeDetail });
       })
       .catch((err: unknown) => {
         if (!cancelled) setState({ status: "error", message: String(err) });
@@ -135,17 +152,15 @@ function FactsPanel({ nodeId }: { nodeId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [nodeId]);
+  }, [project, scope, nodeId]);
 
   if (state.status === "idle" || state.status === "loading") {
     return <p className="text-xs text-muted-foreground">loading facts…</p>;
   }
   if (state.status === "error") {
-    // The node-detail (facts/observations) endpoint isn't wired yet — show a
-    // calm note rather than a red error. The node header above still renders.
     return (
-      <p className="text-xs text-muted-foreground italic">
-        Node facts aren't available yet — the node-detail endpoint isn't wired.
+      <p className="text-xs text-destructive">
+        Failed to load facts: {state.message}
       </p>
     );
   }
@@ -168,7 +183,9 @@ function FactsPanel({ nodeId }: { nodeId: string }) {
           </div>
         </section>
       ) : (
-        <p className="text-[11px] text-muted-foreground italic">No current facts.</p>
+        <p className="text-[11px] text-muted-foreground italic">
+          No current facts.
+        </p>
       )}
 
       {historical.length > 0 ? (
@@ -191,7 +208,13 @@ function FactsPanel({ nodeId }: { nodeId: string }) {
   );
 }
 
-function FactRow({ fact, dimmed = false }: { fact: GraphFact; dimmed?: boolean }) {
+function FactRow({
+  fact,
+  dimmed = false,
+}: {
+  fact: GraphFact;
+  dimmed?: boolean;
+}) {
   const metaEntries = fact.meta ? Object.entries(fact.meta) : [];
   return (
     <div
@@ -205,7 +228,11 @@ function FactRow({ fact, dimmed = false }: { fact: GraphFact; dimmed?: boolean }
         {metaEntries.length > 0 ? (
           <div className="flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
             {metaEntries.map(([k, v]) => (
-              <Badge key={k} variant="outline" className="text-[10px] py-0 px-1">
+              <Badge
+                key={k}
+                variant="outline"
+                className="text-[10px] py-0 px-1"
+              >
                 {k}:{String(v)}
               </Badge>
             ))}
@@ -213,7 +240,11 @@ function FactRow({ fact, dimmed = false }: { fact: GraphFact; dimmed?: boolean }
         ) : null}
       </div>
       <p className="font-mono text-muted-foreground mt-0.5 break-all">
-        {fact.value === null ? <span className="italic">null</span> : String(fact.value)}
+        {fact.value === null ? (
+          <span className="italic">null</span>
+        ) : (
+          String(fact.value)
+        )}
       </p>
     </div>
   );
@@ -245,11 +276,20 @@ function EdgeList({
   );
 }
 
-function EdgeRow({ edge, direction }: { edge: GraphEdge; direction: "→" | "←" }) {
+function EdgeRow({
+  edge,
+  direction,
+}: {
+  edge: GraphEdge;
+  direction: "→" | "←";
+}) {
   return (
     <div className="flex items-center gap-2 text-[11px]">
       <span className="text-muted-foreground font-mono">{direction}</span>
-      <span className="font-mono font-medium" style={{ color: typeColor(edge.type) }}>
+      <span
+        className="font-mono font-medium"
+        style={{ color: typeColor(edge.type) }}
+      >
         {edge.type}
       </span>
       {edge.weight !== undefined ? (

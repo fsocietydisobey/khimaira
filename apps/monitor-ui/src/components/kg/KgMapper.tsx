@@ -471,6 +471,8 @@ export function KgMapper() {
         {selectedNode ? (
           <div className="w-96 shrink-0">
             <KgNodeInspector
+              project={project}
+              scope={scope}
               nodeId={selectedNode.nodeId}
               type={selectedNode.type}
               label={selectedNode.label}

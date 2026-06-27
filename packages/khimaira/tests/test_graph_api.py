@@ -277,3 +277,66 @@ def test_set_kg_adapter_with_auth_header_roundtrip(isolated_registry):
         "token_env": "TOK",
         "auth_header": "X-Internal-Key",
     }
+
+
+# ---------------------------------------------------------------------------
+# Node-detail proxy: GET /api/graph/<project>/node/<id>
+# ---------------------------------------------------------------------------
+
+_NODE_DETAIL = {
+    "data": {
+        "id": "uuid-1",
+        "type": "task",
+        "label": "Cut sheet",
+        "currentFacts": [{"label": "status", "value": "open"}],
+        "historyFacts": [],
+        "edgesFrom": [],
+        "edgesTo": [],
+    }
+}
+
+
+def test_node_url_derivation():
+    from khimaira.monitor.api.graph import _node_url
+
+    assert _node_url("http://j/internal/kg/graph", "u1") == "http://j/internal/kg/node/u1"
+    assert _node_url("http://j/internal/kg/", "u1") == "http://j/internal/kg/node/u1"
+    assert _node_url("http://j/kg", "u1") == "http://j/kg/node/u1"
+
+
+def test_graph_node_happy_proxies_to_node_subpath(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_NODE_DETAIL)),
+    )
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal/node/uuid-1", params={"scope": "shop:10"}
+    )
+    assert r.status_code == 200
+    assert r.json() == _NODE_DETAIL
+    # Proxied to the derived node sub-path, scope forwarded.
+    assert _FakeClient.last_url == "http://x/internal/kg/node/uuid-1"
+    assert _FakeClient.last_params == {"scope": "shop:10"}
+
+
+def test_graph_node_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/node/uuid-1")
+    assert r.status_code == 404
+
+
+def test_graph_node_502_adapter_unreachable(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, raise_exc=httpx.ConnectError("boom")),
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/node/uuid-1")
+    assert r.status_code == 502

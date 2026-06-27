@@ -60,12 +60,24 @@ def _resolve_token(token_env: str) -> str | None:
     return os.environ.get(token_env) or None
 
 
+def _node_url(graph_url: str, node_id: str) -> str:
+    """Derive the adapter's node sub-path from its configured graph URL.
+
+    The kg_adapter `url` is the graph endpoint (e.g. `.../internal/kg/graph`); the
+    node endpoint is its sibling (`.../internal/kg/node/<id>`). Strip a trailing
+    `/graph` to get the base, then append `/node/<id>`. Keeps the daemon
+    code-agnostic — it doesn't hard-code the adapter's route layout beyond the
+    `/graph` ↔ `/node` sibling convention.
+    """
+    base = graph_url[:-6] if graph_url.endswith("/graph") else graph_url.rstrip("/")
+    return f"{base}/node/{node_id}"
+
+
 def build_router():
     fastapi = require("fastapi")
     router = fastapi.APIRouter()
 
-    @router.get("/graph/{project}")
-    async def get_graph(project: str, scope: str = "") -> dict[str, Any]:
+    def _adapter_or_404(project: str) -> dict[str, Any]:
         adapter = get_kg_adapter(project)
         if not adapter or not adapter.get("url"):
             raise fastapi.HTTPException(
@@ -74,7 +86,9 @@ def build_router():
                 f"(set a kg_adapter block in attached.json via "
                 f"registry.set_kg_adapter)",
             )
+        return adapter
 
+    def _auth_headers(adapter: dict[str, Any]) -> dict[str, str]:
         headers: dict[str, str] = {}
         token_env = adapter.get("token_env")
         if token_env:
@@ -95,11 +109,21 @@ def build_router():
                 headers["Authorization"] = f"Bearer {token}"
             else:
                 headers[auth_header] = token
+        return headers
 
+    async def _proxy_get(
+        project: str, adapter: dict[str, Any], url: str, scope: str
+    ) -> dict[str, Any]:
+        """Proxy a GET to the adapter URL with auth + scope; return its JSON.
+
+        Shared by the graph + node routes so both fail loud identically
+        (502 unreachable / error-status / non-JSON).
+        """
+        headers = _auth_headers(adapter)
         params = {"scope": scope} if scope else {}
         try:
             async with httpx.AsyncClient(timeout=_ADAPTER_TIMEOUT) as client:
-                resp = await client.get(adapter["url"], params=params, headers=headers)
+                resp = await client.get(url, params=params, headers=headers)
         except httpx.HTTPError as exc:
             raise fastapi.HTTPException(
                 502,
@@ -121,5 +145,24 @@ def build_router():
                 502,
                 f"KG adapter for project {project!r} returned non-JSON: {exc}",
             ) from exc
+
+    @router.get("/graph/{project}")
+    async def get_graph(project: str, scope: str = "") -> dict[str, Any]:
+        adapter = _adapter_or_404(project)
+        return await _proxy_get(project, adapter, adapter["url"], scope)
+
+    @router.get("/graph/{project}/node/{node_id}")
+    async def get_graph_node(
+        project: str, node_id: str, scope: str = ""
+    ) -> dict[str, Any]:
+        """Proxy a single node's detail (facts + edges) to the project's adapter.
+
+        The opaque `node_id` (graph-contract id) is passed through verbatim — the
+        daemon never interprets it; only the adapter resolves it to a node.
+        """
+        adapter = _adapter_or_404(project)
+        return await _proxy_get(
+            project, adapter, _node_url(adapter["url"], node_id), scope
+        )
 
     return router
