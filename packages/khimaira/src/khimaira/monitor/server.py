@@ -99,6 +99,7 @@ def build_app():
     from .api import themis as themis_api
     from .api import oracle as oracle_api
     from .api import frontend_components as fc_api
+    from .api import graph as graph_api
     from .api import heartbeats as heartbeats_api
     from .api import mcp_calls as mcp_calls_api
     from .api import processes as processes_api
@@ -130,6 +131,7 @@ def build_app():
     app.include_router(chats_api.build_router(), prefix="/api")
     app.include_router(themis_api.build_router(), prefix="/api")
     app.include_router(oracle_api.build_router(), prefix="/api")
+    app.include_router(graph_api.build_router(), prefix="/api")
 
     # SSE delivery cursor persistence — load cursors from disk at startup
     # so reconnecting subscribers resume from their last yielded position.

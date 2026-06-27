@@ -11,11 +11,21 @@ Schema:
           "project_path": "/abs/path/to/jeevy_portal",
           "venv_path": "/abs/path/to/jeevy_portal/.venv",
           "attached_at": "2026-05-09T22:00:00Z",
-          "label": "jeevy_portal"   // optional human-readable
+          "label": "jeevy_portal",   // optional human-readable
+          "kg_adapter": {            // optional — per-project KG graph adapter
+            "url": "http://127.0.0.1:8001/internal/kg/graph",
+            "token_env": "JEEVY_KG_ADAPTER_TOKEN"  // env-var NAME, never the secret
+          }
         },
         ...
       ]
     }
+
+The `kg_adapter` block opts a project into the generic graph viewer
+(GET /api/graph/<project>). The daemon proxies to `url` with a Bearer
+resolved from the env var named by `token_env` — the secret itself is
+NEVER stored at rest in this file (security rule: load_dotenv +
+env-var name only).
 """
 
 from __future__ import annotations
@@ -72,11 +82,19 @@ def list_attached() -> list[dict]:
 
 
 def record_attach(project_path: Path, venv_path: Path, label: str = "") -> dict:
-    """Add or update a project entry. Idempotent on (project_path, venv_path)."""
+    """Add or update a project entry. Idempotent on (project_path, venv_path).
+
+    Preserves an existing `kg_adapter` block across re-attach so a manually
+    configured adapter survives `khimaira detach`/`attach` cycles.
+    """
     data = _load()
     projects: list = data.setdefault("projects", [])
     target = str(project_path.resolve())
     venv_str = str(venv_path.resolve())
+
+    # Preserve a prior kg_adapter (set out-of-band) when re-attaching.
+    prior = next((p for p in projects if p.get("project_path") == target), None)
+    prior_adapter = prior.get("kg_adapter") if prior else None
 
     # Replace any prior entry for this project
     projects = [p for p in projects if p.get("project_path") != target]
@@ -86,11 +104,69 @@ def record_attach(project_path: Path, venv_path: Path, label: str = "") -> dict:
         "attached_at": _now_iso(),
         "label": label or project_path.name,
     }
+    if prior_adapter:
+        entry["kg_adapter"] = prior_adapter
     projects.insert(0, entry)
     data["projects"] = projects
     data["version"] = _VERSION
     _save(data)
     return entry
+
+
+def set_kg_adapter(
+    name_or_path: str, url: str, token_env: str = "", auth_header: str = ""
+) -> bool:
+    """Attach a `kg_adapter` block to an existing project entry.
+
+    `name_or_path` matches against `label`, the project-path basename, or the
+    full resolved project path. Returns True if a matching entry was updated.
+    The `token_env` is the NAME of the env var holding the token — the secret
+    itself is never written here. `auth_header` overrides the request header the
+    daemon sends the token under (default `Authorization` as `Bearer <token>`;
+    e.g. set `X-Internal-Key` for a project whose service-auth expects the raw
+    token under a custom header).
+    """
+    data = _load()
+    projects = data.get("projects") or []
+    matched = False
+    for p in projects:
+        if _matches_project(p, name_or_path):
+            adapter: dict[str, str] = {"url": url}
+            if token_env:
+                adapter["token_env"] = token_env
+            if auth_header:
+                adapter["auth_header"] = auth_header
+            p["kg_adapter"] = adapter
+            matched = True
+            break
+    if matched:
+        data["projects"] = projects
+        _save(data)
+    return matched
+
+
+def get_kg_adapter(name_or_path: str) -> dict | None:
+    """Return the `kg_adapter` block for a project, or None if unset/unknown.
+
+    Matches against `label`, the project-path basename, or the full path —
+    the same identity the daemon's /api/graph/<project> route receives.
+    """
+    for p in list_attached():
+        if _matches_project(p, name_or_path) and p.get("kg_adapter"):
+            return p["kg_adapter"]
+    return None
+
+
+def _matches_project(entry: dict, name_or_path: str) -> bool:
+    """True if `entry` is identified by `name_or_path` (label / basename / path)."""
+    if not name_or_path:
+        return False
+    proj_path = entry.get("project_path") or ""
+    return name_or_path in (
+        entry.get("label") or "",
+        Path(proj_path).name if proj_path else "",
+        proj_path,
+    )
 
 
 def record_detach(project_path: Path) -> bool:
