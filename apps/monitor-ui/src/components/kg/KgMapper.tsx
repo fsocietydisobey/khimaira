@@ -1,43 +1,24 @@
 /**
- * KgMapper — interactive React Flow canvas for the generic graph contract.
+ * KgMapper — code-agnostic knowledge-graph viewer.
  *
- * Code-agnostic, like FlowCanvas (LangGraph mapper): renders ANY attached
- * project's graph via the generic {nodes,edges} contract. Same stack —
- * React Flow (@xyflow/react) + @dagrejs/dagre + ReactFlowProvider.
+ * Renders ANY khimaira-attached project's graph via the generic {nodes,edges}
+ * contract served by the khimaira daemon at /api/graph/<project>?scope=… (the
+ * daemon proxies to that project's KG adapter). The view never knows the
+ * project's schema — node/edge `type` are opaque strings, colored by a hash.
  *
- * Key points:
- * - Nodes/edges typed by an OPAQUE `type` string (no fixed enum); color is
- *   derived deterministically per type via graphStyle.typeColor.
- * - Edge `weight` (0–1, optional) modulates opacity/width.
- * - Node click → KgNodeInspector (fact side panel).
- * - Scope selector in the toolbar (e.g. shop:<id>); live data is served by the
- *   khimaira daemon at /api/graph/<project>?scope=… (wired at P3).
+ * Rendering: sigma.js (WebGL) over a graphology graph, laid out once with
+ * ForceAtlas2 (synchronous — positions are computed a single time, not a
+ * per-frame force sim). WebGL handles thousands of nodes smoothly (shop 10 ≈
+ * 5.7k), which is why sigma is used instead of a canvas force-graph for graphs
+ * at this scale.
  */
 
-import {
-  Background,
-  BackgroundVariant,
-  Controls,
-  Edge,
-  EdgeChange,
-  Handle,
-  MiniMap,
-  Node,
-  NodeChange,
-  NodeProps,
-  Position,
-  ReactFlow,
-  ReactFlowProvider,
-  useEdgesState,
-  useNodesState,
-  useReactFlow,
-} from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
-
-import dagre from "@dagrejs/dagre";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams, useSearchParams } from "react-router-dom";
+import Graph from "graphology";
+import Sigma from "sigma";
+import forceAtlas2 from "graphology-layout-forceatlas2";
 
-import { cn } from "@/lib/utils";
 import { typeColor } from "./graphStyle";
 import { KgNodeInspector } from "./KgNodeInspector";
 import {
@@ -50,199 +31,35 @@ import {
 } from "./kgTypes";
 
 // ---------------------------------------------------------------------------
-// Node data shape attached to React Flow nodes
+// Graph data shape (mapped from the generic contract)
 // ---------------------------------------------------------------------------
 
-interface KgNodeData extends Record<string, unknown> {
-  label: string;
+interface MapNode {
+  id: string;
   nodeType: string;
+  label: string;
   badge?: string | number;
-  isSelected: boolean;
+}
+interface MapLink {
+  source: string;
+  target: string;
+  linkType: string;
+  weight: number;
+}
+interface MapData {
+  nodes: MapNode[];
+  links: MapLink[];
+}
+
+interface ClickedNode {
+  nodeId: string;
+  type: string;
+  label: string;
+  badge?: string | number;
 }
 
 // ---------------------------------------------------------------------------
-// Dagre layout
-// ---------------------------------------------------------------------------
-
-function buildKgLayout(
-  nodes: GraphNode[],
-  edges: GraphEdge[],
-  selectedNodeId: string | null,
-): { rfNodes: Node<KgNodeData>[]; rfEdges: Edge[] } {
-  if (nodes.length === 0) return { rfNodes: [], rfEdges: [] };
-
-  const g = new dagre.graphlib.Graph();
-  g.setGraph({ rankdir: "TB", nodesep: 60, ranksep: 80, marginx: 40, marginy: 40 });
-  g.setDefaultEdgeLabel(() => ({}));
-
-  for (const n of nodes) {
-    g.setNode(n.id, { width: 180, height: 52 });
-  }
-
-  // Only add edges between nodes that exist in the set (avoid dagre crash
-  // on dangling references when the deliverable scope trims the node list).
-  const nodeIdSet = new Set(nodes.map((n) => n.id));
-  for (const e of edges) {
-    if (nodeIdSet.has(e.from) && nodeIdSet.has(e.to)) {
-      g.setEdge(e.from, e.to);
-    }
-  }
-
-  dagre.layout(g);
-
-  const rfNodes: Node<KgNodeData>[] = nodes.map((n) => {
-    const pos = g.node(n.id);
-    return {
-      id: n.id,
-      position: { x: pos.x - pos.width / 2, y: pos.y - pos.height / 2 },
-      type: "kgNode",
-      data: {
-        label: n.label,
-        nodeType: n.type,
-        badge: n.badge,
-        isSelected: n.id === selectedNodeId,
-      },
-      draggable: true,
-    };
-  });
-
-  const rfEdges: Edge[] = edges
-    .filter((e) => nodeIdSet.has(e.from) && nodeIdSet.has(e.to))
-    .map((e) => {
-      const color = typeColor(e.type);
-      // Weight (default 1) modulates opacity (0.4–1.0) and stroke width (1–2.5).
-      const weight = e.weight ?? 1;
-      const opacity = 0.4 + weight * 0.6;
-      const strokeWidth = 1 + weight * 1.5;
-      return {
-        id: `${e.from}->${e.to}:${e.type}`,
-        source: e.from,
-        target: e.to,
-        type: "smoothstep",
-        animated: false,
-        label: e.type,
-        labelStyle: { fontSize: 9, fill: color, opacity },
-        style: { stroke: color, strokeWidth, opacity },
-      };
-    });
-
-  return { rfNodes, rfEdges };
-}
-
-// ---------------------------------------------------------------------------
-// Custom node component
-// ---------------------------------------------------------------------------
-
-function KgNodeComponent({ data }: NodeProps) {
-  const d = data as KgNodeData;
-  const color = typeColor(d.nodeType);
-  const hasBadge = d.badge !== undefined && d.badge !== "" && d.badge !== 0;
-  return (
-    <div
-      className={cn(
-        "relative rounded-md border-2 px-3 py-2 text-xs font-medium text-white shadow-md min-w-[150px] text-center transition-all select-none",
-        d.isSelected && "ring-4 ring-white/70 ring-offset-2 ring-offset-background",
-      )}
-      style={{ backgroundColor: color, borderColor: color }}
-      title={`${d.nodeType}${hasBadge ? ` · ${d.badge}` : ""}`}
-    >
-      <Handle type="target" position={Position.Top} className="!bg-zinc-300/60" />
-
-      {/* optional badge chip */}
-      {hasBadge ? (
-        <span className="absolute -top-2 -right-2 z-10 inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-zinc-900/80 border border-zinc-600 text-[9px] font-bold text-zinc-200 px-1">
-          {d.badge}
-        </span>
-      ) : null}
-
-      <span className="block truncate max-w-[160px]" title={d.label}>
-        {d.label}
-      </span>
-      <span className="block text-[9px] opacity-70 mt-0.5 uppercase tracking-wider">
-        {d.nodeType}
-      </span>
-
-      <Handle type="source" position={Position.Bottom} className="!bg-zinc-300/60" />
-    </div>
-  );
-}
-
-const KG_NODE_TYPES = { kgNode: KgNodeComponent };
-
-// ---------------------------------------------------------------------------
-// Inner canvas (needs useReactFlow — must be inside ReactFlowProvider)
-// ---------------------------------------------------------------------------
-
-function KgFlowInner({
-  rfNodes,
-  rfEdges,
-  onNodesChange,
-  onEdgesChange,
-  onNodeClick,
-}: {
-  rfNodes: Node<KgNodeData>[];
-  rfEdges: Edge[];
-  onNodesChange: (changes: NodeChange<Node<KgNodeData>>[]) => void;
-  onEdgesChange: (changes: EdgeChange<Edge>[]) => void;
-  onNodeClick: (e: React.MouseEvent, node: Node) => void;
-}) {
-  const { fitView } = useReactFlow();
-  const wrapperRef = useRef<HTMLDivElement | null>(null);
-  const nodeCount = rfNodes.length;
-
-  // Fit view on resize
-  useEffect(() => {
-    const el = wrapperRef.current;
-    if (!el || nodeCount === 0) return;
-    let frame: number | null = null;
-    const obs = new ResizeObserver(() => {
-      if (frame !== null) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => fitView({ padding: 0.15, duration: 200 }));
-    });
-    obs.observe(el);
-    return () => {
-      obs.disconnect();
-      if (frame !== null) cancelAnimationFrame(frame);
-    };
-  }, [fitView, nodeCount]);
-
-  // Fit view when node set changes
-  useEffect(() => {
-    if (nodeCount === 0) return;
-    const id = requestAnimationFrame(() => fitView({ padding: 0.15, duration: 300 }));
-    return () => cancelAnimationFrame(id);
-  }, [nodeCount, fitView]);
-
-  return (
-    <div ref={wrapperRef} className="h-full w-full">
-      <ReactFlow
-        nodes={rfNodes}
-        edges={rfEdges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onNodeClick={onNodeClick}
-        nodeTypes={KG_NODE_TYPES}
-        fitView
-        fitViewOptions={{ padding: 0.15 }}
-        minZoom={0.05}
-        maxZoom={2.5}
-        proOptions={{ hideAttribution: true }}
-      >
-        <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#2d3748" />
-        <Controls />
-        <MiniMap
-          nodeColor={(n) => typeColor((n.data as KgNodeData).nodeType)}
-          maskColor="rgba(0,0,0,0.6)"
-          pannable
-          zoomable
-        />
-      </ReactFlow>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Legend
+// Legend (distinct node types present in the data — no fixed enum)
 // ---------------------------------------------------------------------------
 
 function KgLegend({
@@ -269,7 +86,7 @@ function KgLegend({
           {types.map((t) => (
             <div key={t} className="flex items-center gap-1.5">
               <span
-                className="inline-block h-2.5 w-2.5 rounded-sm border"
+                className="inline-block h-2.5 w-2.5 rounded-full"
                 style={{ backgroundColor: typeColor(t) }}
               />
               <span className="font-mono">{t}</span>
@@ -282,7 +99,7 @@ function KgLegend({
 }
 
 // ---------------------------------------------------------------------------
-// Data fetch hook
+// Data fetch hook — daemon proxy /api/graph/<project>?scope=…
 // ---------------------------------------------------------------------------
 
 type FetchState =
@@ -291,11 +108,11 @@ type FetchState =
   | { status: "error"; message: string }
   | { status: "ok"; graph: GraphResponse["data"] };
 
-function useKgGraph(scope: string): FetchState {
+function useKgGraph(scope: string, project: string | undefined): FetchState {
   const [state, setState] = useState<FetchState>({ status: "idle" });
 
   useEffect(() => {
-    if (!scope) {
+    if (!scope || !project) {
       setState({ status: "idle" });
       return;
     }
@@ -313,9 +130,8 @@ function useKgGraph(scope: string): FetchState {
       };
     }
 
-    // P3 wiring: same-origin daemon endpoint. The `/<project>` segment is
-    // prepended once this view is mounted with a project from routing.
-    const url = `${GRAPH_URL}?scope=${encodeURIComponent(scope)}`;
+    // Same-origin daemon proxy /api/graph/<project>?scope=… (vite /api → daemon).
+    const url = `${GRAPH_URL}/${encodeURIComponent(project)}?scope=${encodeURIComponent(scope)}`;
     fetch(url)
       .then((r) => {
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -331,92 +147,217 @@ function useKgGraph(scope: string): FetchState {
     return () => {
       cancelled = true;
     };
-  }, [scope]);
+  }, [scope, project]);
 
   return state;
+}
+
+// ---------------------------------------------------------------------------
+// Sigma (WebGL) canvas — graphology graph, ForceAtlas2 layout, WebGL render
+// ---------------------------------------------------------------------------
+
+function SigmaCanvas({
+  data,
+  selectedId,
+  onNodeClick,
+}: {
+  data: MapData;
+  selectedId: string | null;
+  onNodeClick: (n: ClickedNode) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const sigmaRef = useRef<Sigma | null>(null);
+  // keep the latest values for use inside sigma callbacks without rebuilding
+  const selectedRef = useRef<string | null>(selectedId);
+  selectedRef.current = selectedId;
+  const clickRef = useRef(onNodeClick);
+  clickRef.current = onNodeClick;
+
+  // Build graph + layout + render whenever the data changes.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const graph = new Graph({ multi: false, type: "directed" });
+
+    // Degree → node size (hubs render larger).
+    const degree = new Map<string, number>();
+    for (const l of data.links) {
+      degree.set(l.source, (degree.get(l.source) ?? 0) + 1);
+      degree.set(l.target, (degree.get(l.target) ?? 0) + 1);
+    }
+
+    const n = Math.max(data.nodes.length, 1);
+    data.nodes.forEach((node, i) => {
+      // Defensive dedup — the adapter's keyset pagination can occasionally
+      // surface a duplicate id; graphology throws on a repeat addNode.
+      if (graph.hasNode(node.id)) return;
+      const deg = degree.get(node.id) ?? 0;
+      const angle = (2 * Math.PI * i) / n;
+      graph.addNode(node.id, {
+        label: node.label,
+        nodeType: node.nodeType,
+        badge: node.badge,
+        color: typeColor(node.nodeType),
+        size: Math.min(2 + Math.sqrt(deg) * 1.1, 16),
+        x: Math.cos(angle) + (Math.random() - 0.5) * 0.01,
+        y: Math.sin(angle) + (Math.random() - 0.5) * 0.01,
+      });
+    });
+
+    data.links.forEach((l) => {
+      if (
+        graph.hasNode(l.source) &&
+        graph.hasNode(l.target) &&
+        !graph.hasEdge(l.source, l.target)
+      ) {
+        graph.addEdge(l.source, l.target, {
+          color: typeColor(l.linkType) + "44",
+          size: 0.4 + (l.weight ?? 1) * 0.6,
+        });
+      }
+    });
+
+    // ForceAtlas2 — synchronous, computed ONCE. Scale iterations down for big
+    // graphs (barnes-hut keeps it fast); this is not a per-frame simulation.
+    const iterations = n > 3000 ? 180 : n > 800 ? 260 : 400;
+    const settings = forceAtlas2.inferSettings(graph);
+    forceAtlas2.assign(graph, {
+      iterations,
+      settings: {
+        ...settings,
+        barnesHutOptimize: n > 800,
+        gravity: 0.6,
+        scalingRatio: 12,
+        slowDown: 1 + Math.log(n),
+      },
+    });
+
+    const renderer = new Sigma(graph, container, {
+      renderLabels: true,
+      labelColor: { color: "#cbd5e1" },
+      labelDensity: 0.6,
+      labelGridCellSize: 70,
+      // Only label nodes whose rendered size clears the threshold — declutters
+      // the big graph (hubs are labeled; the leaf tail is not until you zoom).
+      labelRenderedSizeThreshold: 9,
+      defaultEdgeColor: "#33415544",
+      minCameraRatio: 0.02,
+      maxCameraRatio: 12,
+      zIndex: true,
+    });
+
+    // Highlight the selected node via a reducer (re-applied on refresh()).
+    renderer.setSetting("nodeReducer", (node, attrs) => {
+      if (selectedRef.current && node === selectedRef.current) {
+        return {
+          ...attrs,
+          color: "#ffffff",
+          size: (attrs.size ?? 4) * 1.6,
+          zIndex: 2,
+          highlighted: true,
+        };
+      }
+      return attrs;
+    });
+
+    renderer.on("clickNode", ({ node }) => {
+      const a = graph.getNodeAttributes(node);
+      clickRef.current({
+        nodeId: node,
+        type: a.nodeType as string,
+        label: a.label as string,
+        badge: a.badge as string | number | undefined,
+      });
+    });
+
+    sigmaRef.current = renderer;
+    return () => {
+      renderer.kill();
+      sigmaRef.current = null;
+    };
+  }, [data]);
+
+  // Re-apply the selection highlight without rebuilding the graph.
+  useEffect(() => {
+    sigmaRef.current?.refresh();
+  }, [selectedId]);
+
+  return <div ref={containerRef} className="h-full w-full" />;
 }
 
 // ---------------------------------------------------------------------------
 // Main view — KgMapper
 // ---------------------------------------------------------------------------
 
-interface SelectedKgNode {
-  nodeId: string;
-  type: string;
-  label: string;
-  badge?: string | number;
-}
-
 export function KgMapper() {
-  // In mock mode the scope is pre-filled so the canvas renders immediately
-  // without requiring user input.
-  const [scope, setScope] = useState<string>(MOCK_MODE ? "shop:mock" : "");
-  const [inputValue, setInputValue] = useState<string>(MOCK_MODE ? "shop:mock" : "");
-  const [selectedNode, setSelectedNode] = useState<SelectedKgNode | null>(null);
+  // Project = the route's :name param (the khimaira-attached project label,
+  // e.g. "backend"); the daemon proxies /api/graph/<project> to its KG adapter.
+  const { name: project } = useParams<{ name: string }>();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Persist the scope in the URL (?scope=…) so a reload restores the same graph
+  // instead of dropping it. Falls back to the mock scope in MOCK_MODE.
+  const initialScope = searchParams.get("scope") ?? (MOCK_MODE ? "shop:mock" : "");
+  const [scope, setScope] = useState<string>(initialScope);
+  const [inputValue, setInputValue] = useState<string>(initialScope);
+  const [selectedNode, setSelectedNode] = useState<ClickedNode | null>(null);
   const [legendVisible, setLegendVisible] = useState<boolean>(false);
 
-  const fetchState = useKgGraph(scope);
+  const fetchState = useKgGraph(scope, project);
 
-  const { nodes: rawNodes, edges: rawEdges } = useMemo(() => {
-    if (fetchState.status !== "ok") return { nodes: [] as GraphNode[], edges: [] as GraphEdge[] };
-    return { nodes: fetchState.graph.nodes, edges: fetchState.graph.edges };
+  const { rawNodes, rawEdges } = useMemo(() => {
+    if (fetchState.status !== "ok")
+      return { rawNodes: [] as GraphNode[], rawEdges: [] as GraphEdge[] };
+    return { rawNodes: fetchState.graph.nodes, rawEdges: fetchState.graph.edges };
   }, [fetchState]);
 
-  // Distinct node types present in the data → drives the legend (no fixed enum).
   const presentTypes = useMemo(
-    () => Array.from(new Set(rawNodes.map((n) => n.type))).sort(),
+    () => Array.from(new Set(rawNodes.map((node) => node.type))).sort(),
     [rawNodes],
   );
 
-  const { rfNodes: initialRfNodes, rfEdges: initialRfEdges } = useMemo(
-    () => buildKgLayout(rawNodes, rawEdges, selectedNode?.nodeId ?? null),
-    [rawNodes, rawEdges, selectedNode?.nodeId],
-  );
+  // Generic contract → graph shape. Drop edges with missing endpoints.
+  const mapData = useMemo<MapData>(() => {
+    const ids = new Set(rawNodes.map((node) => node.id));
+    return {
+      nodes: rawNodes.map((node) => ({
+        id: node.id,
+        nodeType: node.type,
+        label: node.label,
+        badge: node.badge,
+      })),
+      links: rawEdges
+        .filter((e) => ids.has(e.from) && ids.has(e.to))
+        .map((e) => ({
+          source: e.from,
+          target: e.to,
+          linkType: e.type,
+          weight: e.weight ?? 1,
+        })),
+    };
+  }, [rawNodes, rawEdges]);
 
-  const [rfNodes, setRfNodes, onNodesChange] = useNodesState(initialRfNodes);
-  const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState(initialRfEdges);
-
-  // Re-layout when graph data changes; patch selection-state in place
-  // to preserve user-dragged positions when only the selected node flips.
-  const lastLayoutSig = useRef<string>("");
-  useEffect(() => {
-    const sig = `${rawNodes.length}:${rawEdges.length}`;
-    if (sig !== lastLayoutSig.current) {
-      lastLayoutSig.current = sig;
-      setRfNodes(initialRfNodes);
-      setRfEdges(initialRfEdges);
-      return;
-    }
-    // Only selection changed — patch isSelected without re-laying out.
-    setRfNodes((curr) =>
-      curr.map((n) => {
-        const fresh = initialRfNodes.find((nn) => nn.id === n.id);
-        if (!fresh) return n;
-        return { ...n, data: { ...n.data, isSelected: fresh.data.isSelected } };
-      }),
-    );
-  }, [initialRfNodes, initialRfEdges, rawNodes.length, rawEdges.length, setRfNodes, setRfEdges]);
-
-  const handleNodeClick = useCallback(
-    (_e: React.MouseEvent, node: Node) => {
-      const d = node.data as KgNodeData;
-      setSelectedNode({
-        nodeId: node.id,
-        type: d.nodeType,
-        label: d.label,
-        badge: d.badge,
-      });
-    },
-    [],
-  );
+  const handleNodeClick = useCallback((n: ClickedNode) => {
+    setSelectedNode(n);
+  }, []);
 
   const handleSubmitScope = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
-      setScope(inputValue.trim());
+      const next = inputValue.trim();
+      setScope(next);
       setSelectedNode(null);
+      setSearchParams(
+        (prev) => {
+          if (next) prev.set("scope", next);
+          else prev.delete("scope");
+          return prev;
+        },
+        { replace: true },
+      );
     },
-    [inputValue],
+    [inputValue, setSearchParams],
   );
 
   return (
@@ -473,19 +414,13 @@ export function KgMapper() {
             <div className="flex h-full items-center justify-center">
               <p className="text-sm text-muted-foreground">No nodes found for this scope.</p>
             </div>
-          ) : (
-            <div className="h-full w-full khimaira-flow">
-              <ReactFlowProvider>
-                <KgFlowInner
-                  rfNodes={rfNodes}
-                  rfEdges={rfEdges}
-                  onNodesChange={onNodesChange}
-                  onEdgesChange={onEdgesChange}
-                  onNodeClick={handleNodeClick}
-                />
-              </ReactFlowProvider>
-            </div>
-          )}
+          ) : fetchState.status === "ok" ? (
+            <SigmaCanvas
+              data={mapData}
+              selectedId={selectedNode?.nodeId ?? null}
+              onNodeClick={handleNodeClick}
+            />
+          ) : null}
 
           <KgLegend
             types={presentTypes}

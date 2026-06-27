@@ -115,6 +115,14 @@ function FactsPanel({ nodeId }: { nodeId: string }) {
     fetch(url)
       .then((r) => {
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        // The node-detail endpoint isn't wired yet — an unmatched /api path
+        // falls through to the SPA's index.html. Detect that (content-type is
+        // text/html, not JSON) and degrade gracefully instead of JSON-parsing
+        // an HTML document.
+        const ct = r.headers.get("content-type") ?? "";
+        if (!ct.includes("application/json")) {
+          throw new Error("node-detail endpoint not wired yet (topology-only)");
+        }
         return r.json();
       })
       .then((json) => {
@@ -133,7 +141,13 @@ function FactsPanel({ nodeId }: { nodeId: string }) {
     return <p className="text-xs text-muted-foreground">loading facts…</p>;
   }
   if (state.status === "error") {
-    return <p className="text-xs text-destructive">{state.message}</p>;
+    // The node-detail (facts/observations) endpoint isn't wired yet — show a
+    // calm note rather than a red error. The node header above still renders.
+    return (
+      <p className="text-xs text-muted-foreground italic">
+        Node facts aren't available yet — the node-detail endpoint isn't wired.
+      </p>
+    );
   }
 
   const { detail } = state;

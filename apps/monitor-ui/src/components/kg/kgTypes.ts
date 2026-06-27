@@ -21,7 +21,7 @@
 // via the vite /api proxy → daemon 8740), NOT a per-project API. Wired at P3.
 // ---------------------------------------------------------------------------
 
-export const MOCK_MODE = true;
+export const MOCK_MODE = false;
 
 /** Generic graph endpoint base — append `/<project>?scope=<scope>`. */
 export const GRAPH_URL = "/api/graph";
