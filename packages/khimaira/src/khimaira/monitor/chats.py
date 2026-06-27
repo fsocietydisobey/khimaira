@@ -4341,38 +4341,64 @@ def _broadcast(chat_id: str, record: dict[str, Any]) -> None:
             and record.get("kind") == MSG
             and member_roles.get(sid) in IDLE_CONSULT_ROLES
         ):
-            # Wake suppressed (idle-consult role + undirected). BUT if the sender
-            # clearly ADDRESSED this member (named its seat, or @role / role:) yet
-            # forgot to direct the msg, a dead-SSE target silently loses it: the
-            # next-turn catch-up can't run until a wake forces a turn, and wake
-            # latency can exceed the catch-up window (muther ISSUE 1 Path C,
-            # 2026-06-18 — gate consult "reached NEITHER critic-1 nor verifier-1").
-            # For that addressed-but-undirected + SSE-dead case ONLY, drop the same
-            # durable inbox notice directed msgs get. Unaddressed chatter stays
-            # suppressed + notice-free so a busy room never spams an idle consult seat.
+            # Consult-role wake-filter. Undirected broadcasts don't wake idle-by-
+            # default consult seats (they'd react to every broadcast — the cost
+            # leak the suppression was added to fix). BUT an explicit @mention is
+            # the sender saying "you specifically": it must be honored.
+            #
+            # RESTORED ORIGINAL CONTRACT (author-confirmed by Joseph, 2026-06-27,
+            # issue #29 sibling): the original roster design was broadcast-to-all +
+            # @mention with UNIVERSAL real-time delivery — you @ a seat and it reads
+            # it live. The consult-suppression optimization (correct in instinct:
+            # don't wake every consult seat on every broadcast) severed that by
+            # IGNORING the @. That omission is the regression — it caused the
+            # JEEVY-605 stall (an @-addressed architect that was SSE-subscribed yet
+            # idle got neither the live push nor a notice, so it sat 22 min).
+            #
+            # Fix: an @mention (by seat-name or role) restores live delivery to the
+            # MENTIONED member only — fall through to the normal push below. Non-
+            # mentioned consult seats stay suppressed (efficiency preserved). For an
+            # @-mentioned seat with NO live subscriber, drop a durable notice as the
+            # backstop so it survives to the agent's next turn. Weaker addressing
+            # (bare name / role:) also gets the notice backstop but NOT a live push;
+            # unaddressed chatter stays fully suppressed (no busy-room spam).
             _c_role = (member_roles.get(sid) or "").lower()
             _c_name = ((member or {}).get("session_name") or "").lower()
             _c_body = (record.get("body") or "").lower()
-            _addressed = (bool(_c_name) and _c_name in _c_body) or any(
-                tok and tok in _c_body
-                for tok in (f"@{_c_role}", f"{_c_role}:", f"{_c_role}-")
+            _at_mentioned = any(
+                tok and tok in _c_body for tok in (f"@{_c_name}", f"@{_c_role}")
             )
-            if _addressed and not (_subscribers.get(_slot_subscriber_key(sid)) or _subscribers.get(sid)):
-                try:
-                    sessions_mod.post_notice(
-                        target_session_id=sid,
-                        text=(
-                            f"📨 You were addressed in an undirected chat message in "
-                            f"{chat_id} from "
-                            f"{record.get('sender_name') or record.get('sender_id')} "
-                            f"while idle (SSE not connected). "
-                            f"Call chat_history(chat_id='{chat_id}') to read it."
-                        ),
-                        from_session_id="khimaira-daemon",
+            _has_sub = bool(
+                _subscribers.get(_slot_subscriber_key(sid)) or _subscribers.get(sid)
+            )
+            if _at_mentioned and _has_sub:
+                pass  # restored @-contract: fall through to live real-time delivery
+            else:
+                _addressed = (
+                    _at_mentioned
+                    or (bool(_c_name) and _c_name in _c_body)
+                    or any(
+                        tok and tok in _c_body
+                        for tok in (f"{_c_role}:", f"{_c_role}-")
                     )
-                except Exception:
-                    pass
-            continue  # idle consult role + undirected msg → suppress wake
+                )
+                if _addressed:
+                    try:
+                        sessions_mod.post_notice(
+                            target_session_id=sid,
+                            text=(
+                                f"📨 You were addressed in an undirected chat message "
+                                f"in {chat_id} from "
+                                f"{record.get('sender_name') or record.get('sender_id')} "
+                                f"that was not delivered in real time (consult-role "
+                                f"wake-suppression). "
+                                f"Call chat_history(chat_id='{chat_id}') to read it."
+                            ),
+                            from_session_id="khimaira-daemon",
+                        )
+                    except Exception:
+                        pass
+                continue  # not an @-mentioned live seat → suppress wake
         # Part F: resolve member sid → slot key so delivery follows the live
         # session across transfer/reattach. Slot-keyed subscriber receives the
         # event even when its membership entry is keyed to the prior sid.

@@ -459,3 +459,44 @@ session_post_notice(target_session_id="khimaira-0", text="...")
 Get UUID from `session_list()` or read `sender_id` from any prior chat message they sent.
 Symptom: sender gets `📨` success; recipient's inbox stays empty. If this happens, resend by UUID.
 See `docs/master-playbook.md#cross-session-uuid-bug` for full #63 context.
+
+### Consults to consult roles must be DIRECTED, not undirected
+
+**Rule:** When you send a consult / question / task to a consult role
+(**architect, analyst, critic, verifier**), reach them with a form that actually
+delivers — either an **`@mention`** or a **directed** `chat_send_to`. Do NOT
+address a consult seat by bare seat-name / `role:` in an undirected `chat_send`.
+
+**Why (audit-grade, issue #29 sibling, 2026-06-27, author-confirmed by Joseph):**
+the original roster design was broadcast-to-all + `@mention` with universal
+real-time delivery. A later wake-filter optimization (`monitor/chats.py`
+`_broadcast`) — correct in instinct: don't wake every consult seat on every
+broadcast — regressed it by **ignoring the `@`**. So a *non-`@`* undirected
+message that names an idle architect lands in chat history but is **never pushed
+to that seat in real time**; it waits for the agent's next turn, which an idle
+agent never fires. No drop is logged, so you get no signal.
+
+This is the **JEEVY-605 class**: a design consult to an idle architect sat
+unworked for 22 minutes. The agent was never prompted; master misread
+"dispatched" as "working" and relayed false progress.
+
+The `@`-contract is now **restored** (issue #29 sibling fix): an `@mention` to a
+subscribed consult seat delivers a live real-time push again. Either form works:
+
+```python
+# CORRECT — @mention restores live delivery to the consult seat
+chat_send(chat_id=cid, body="@architect-1 enumerate the JEEVY-605 ...")
+
+# CORRECT — directed send; guaranteed (live if online, durable notice if offline)
+chat_send_to(chat_id=cid, to=["architect-1"], body="enumerate the JEEVY-605 ...")
+
+# WRONG — non-@ addressing of a consult seat is still wake-suppressed; an idle
+# seat never sees it in real time
+chat_send(chat_id=cid, body="architect-1 please enumerate the JEEVY-605 ...")
+```
+
+Themis **IN-MASTER-10** (warn) fires only on the still-suppressed **non-`@`**
+forms (`architect-1`, `critic:`); an `@`-prefixed mention and a directed
+`chat_send_to` do not trigger it. Undirected `chat_send` stays correct for
+general roster chatter. A consult seat that is offline gets a durable inbox
+notice either way, so the message survives to the agent's next turn.

@@ -41,6 +41,33 @@ def test_in_master_6_themis_rule_present():
     assert "recent_dispatch_different_ctx" in content, "missing condition check reference"
 
 
+def test_master_md_contains_directed_consult_convention():
+    """Regression guard (issue #29 sibling, 2026-06-27): the convention that
+    consults to consult roles must be DIRECTED (@mention or chat_send_to) must
+    stay on disk. Closes the JEEVY-605 consult-role wake-suppression class
+    structurally."""
+    content = (ROLE_DIR / "master.md").read_text()
+    lowered = content.lower()
+    assert "consults to consult roles must be directed" in lowered, (
+        "master.md missing the directed-consult convention header"
+    )
+    assert "chat_send_to" in content, "master.md missing chat_send_to corrective example"
+    assert "wake-suppress" in lowered or "wake-filter" in lowered, (
+        "master.md missing the wake-suppression rationale"
+    )
+    assert "IN-MASTER-10" in content, "master.md missing IN-MASTER-10 cross-reference"
+
+
+def test_in_master_10_themis_rule_present():
+    """Regression guard: IN-MASTER-10 (directed-consult warn-hint) must be in
+    master.yaml — layer 2 of the 3-layer structural promotion."""
+    content = (THEMIS_RULES / "master.yaml").read_text()
+    assert "IN-MASTER-10" in content, "master.yaml missing IN-MASTER-10 rule"
+    assert "DIRECT_CONSULT_TO_CONSULT_ROLE" in content, "missing rule name"
+    assert "mcp__khimaira-chat__chat_send" in content, "missing chat_send matcher"
+    assert "architect|analyst|critic|verifier" in content, "missing consult-role pattern"
+
+
 def test_master_md_contains_pre_askuserquestion_routing_table():
     """Regression guard: master.md must enumerate WHEN each routing target applies."""
     content = (ROLE_DIR / "master.md").read_text()

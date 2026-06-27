@@ -170,6 +170,33 @@ invariants:
       transitions only; other status transitions (in_progress, done,
       changes_requested) are not blocked.
 
+  - id: IN-MASTER-10
+    name: DIRECT_CONSULT_TO_CONSULT_ROLE
+    severity: warn
+    matchers:
+      - tool: mcp__khimaira-chat__chat_send
+        tool_input_field:
+          field: body
+          pattern: '(?i)(?<!@)\b(architect|analyst|critic|verifier)(-\d+\b|:)'
+    message: |
+      ⚠️ Themis IN-MASTER-10 (DIRECT_CONSULT_TO_CONSULT_ROLE): you addressed a
+      consult role (architect / analyst / critic / verifier) in an UNDIRECTED
+      chat_send by seat-name / role: WITHOUT an @mention. The daemon's wake-filter
+      (chats.py) suppresses real-time delivery of undirected messages to consult
+      roles — and only an @mention (or a directed send) bypasses that. So this
+      form lands in history but is NOT pushed to an idle consult seat in real
+      time; it waits for the agent's next turn, which an idle agent never fires.
+      This is the JEEVY-605 class (a consult that sat unworked for 22 min).
+
+      Use either form that delivers:
+        • @mention:  chat_send(..., body="@architect-1 ...")   ← restored contract
+        • directed:  chat_send_to(chat_id=..., to=["architect-1"], body=...)  ← guaranteed
+
+      Undirected chat_send is fine for general roster chatter, and an @-prefixed
+      mention does NOT trigger this warn (it now delivers live). This fires only
+      on the still-suppressed non-@ forms (`architect-1`, `critic:`).
+      See master.md "Consults to consult roles must be DIRECTED, not undirected".
+
   # Override of the universal NO_STATE_CHANGING_GIT block (universal.base.yaml):
   # same id → master's copy wins for the master role only; every other role
   # keeps the universal BLOCK. Master is WARN (not block) because master
