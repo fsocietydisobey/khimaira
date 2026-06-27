@@ -9,7 +9,7 @@
  * only when a correlation_id is available (otherwise it'd 404 visually).
  */
 
-import { Activity, GitFork, Receipt } from "lucide-react";
+import { Activity, GitFork, Network, Receipt } from "lucide-react";
 import { NavLink } from "react-router-dom";
 
 import { cn } from "@/lib/utils";
@@ -56,6 +56,12 @@ export function ProjectNavTabs({
         ? "Trace waterfall — chain/llm/tool/external timeline for the current run"
         : "Trace waterfall — needs a correlation_id (set via khimaira_observer.tag_run() in your app)",
       disabled: !currentCorrelationId,
+    },
+    {
+      to: `/${projectName}/kg`,
+      label: "kg",
+      icon: Network,
+      title: "Knowledge graph — interactive node-edge view of the jeevy KG for a deliverable",
     },
   ];
 
