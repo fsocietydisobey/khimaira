@@ -64,12 +64,16 @@ interface ClickedNode {
 
 function KgLegend({
   types,
+  hiddenTypes,
   visible,
   onToggle,
+  onToggleType,
 }: {
   types: string[];
+  hiddenTypes: Set<string>;
   visible: boolean;
   onToggle: () => void;
+  onToggleType: (t: string) => void;
 }) {
   return (
     <div className="absolute bottom-4 left-4 z-10">
@@ -81,17 +85,30 @@ function KgLegend({
         {visible ? "hide legend" : "show legend"}
       </button>
       {visible && types.length > 0 ? (
-        <div className="rounded-md border border-border bg-card/90 p-2 text-[10px] space-y-0.5 max-h-64 overflow-auto shadow-lg">
-          <p className="uppercase tracking-wider text-muted-foreground mb-1">node types</p>
-          {types.map((t) => (
-            <div key={t} className="flex items-center gap-1.5">
-              <span
-                className="inline-block h-2.5 w-2.5 rounded-full"
-                style={{ backgroundColor: typeColor(t) }}
-              />
-              <span className="font-mono">{t}</span>
-            </div>
-          ))}
+        <div className="rounded-md border border-border bg-card/90 p-2 text-[10px] space-y-0.5 max-h-72 overflow-auto shadow-lg">
+          <p className="uppercase tracking-wider text-muted-foreground mb-1">
+            node types <span className="normal-case opacity-60">— click to filter</span>
+          </p>
+          {types.map((t) => {
+            const hidden = hiddenTypes.has(t);
+            return (
+              <button
+                key={t}
+                type="button"
+                onClick={() => onToggleType(t)}
+                title={hidden ? `show ${t}` : `hide ${t}`}
+                className={`flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-accent/40 ${
+                  hidden ? "opacity-35" : ""
+                }`}
+              >
+                <span
+                  className="inline-block h-2.5 w-2.5 rounded-full"
+                  style={{ backgroundColor: typeColor(t) }}
+                />
+                <span className="font-mono">{t}</span>
+              </button>
+            );
+          })}
         </div>
       ) : null}
     </div>
@@ -159,10 +176,12 @@ function useKgGraph(scope: string, project: string | undefined): FetchState {
 function SigmaCanvas({
   data,
   selectedId,
+  hiddenTypes,
   onNodeClick,
 }: {
   data: MapData;
   selectedId: string | null;
+  hiddenTypes: Set<string>;
   onNodeClick: (n: ClickedNode) => void;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -170,6 +189,8 @@ function SigmaCanvas({
   // keep the latest values for use inside sigma callbacks without rebuilding
   const selectedRef = useRef<string | null>(selectedId);
   selectedRef.current = selectedId;
+  const hiddenRef = useRef(hiddenTypes);
+  hiddenRef.current = hiddenTypes;
   const clickRef = useRef(onNodeClick);
   clickRef.current = onNodeClick;
 
@@ -247,8 +268,12 @@ function SigmaCanvas({
       zIndex: true,
     });
 
-    // Highlight the selected node via a reducer (re-applied on refresh()).
+    // Reducer: hide filtered-out node types + highlight the selected node.
+    // Re-applied on refresh() when selection / filters change.
     renderer.setSetting("nodeReducer", (node, attrs) => {
+      if (hiddenRef.current.has(attrs.nodeType as string)) {
+        return { ...attrs, hidden: true };
+      }
       if (selectedRef.current && node === selectedRef.current) {
         return {
           ...attrs,
@@ -278,10 +303,10 @@ function SigmaCanvas({
     };
   }, [data]);
 
-  // Re-apply the selection highlight without rebuilding the graph.
+  // Re-apply selection highlight + type filters without rebuilding the graph.
   useEffect(() => {
     sigmaRef.current?.refresh();
-  }, [selectedId]);
+  }, [selectedId, hiddenTypes]);
 
   return <div ref={containerRef} className="h-full w-full" />;
 }
@@ -303,6 +328,16 @@ export function KgMapper() {
   const [inputValue, setInputValue] = useState<string>(initialScope);
   const [selectedNode, setSelectedNode] = useState<ClickedNode | null>(null);
   const [legendVisible, setLegendVisible] = useState<boolean>(false);
+  const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(new Set());
+
+  const toggleType = useCallback((t: string) => {
+    setHiddenTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(t)) next.delete(t);
+      else next.add(t);
+      return next;
+    });
+  }, []);
 
   const fetchState = useKgGraph(scope, project);
 
@@ -418,14 +453,17 @@ export function KgMapper() {
             <SigmaCanvas
               data={mapData}
               selectedId={selectedNode?.nodeId ?? null}
+              hiddenTypes={hiddenTypes}
               onNodeClick={handleNodeClick}
             />
           ) : null}
 
           <KgLegend
             types={presentTypes}
+            hiddenTypes={hiddenTypes}
             visible={legendVisible}
             onToggle={() => setLegendVisible((v) => !v)}
+            onToggleType={toggleType}
           />
         </div>
 
