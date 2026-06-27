@@ -377,6 +377,25 @@ export function KgMapper() {
     setSelectedNode(n);
   }, []);
 
+  // Deep-link / programmatic node selection via ?selectNode=<id> — opens the
+  // detail panel for that node once the graph has loaded. Used for shareable
+  // links and Specter screenshots (the sigma canvas has no DOM node to click).
+  // Generic: matches the opaque node id, no schema knowledge.
+  const selectNodeParam = searchParams.get("selectNode");
+  useEffect(() => {
+    if (!selectNodeParam || rawNodes.length === 0) return;
+    if (selectedNode?.nodeId === selectNodeParam) return;
+    const n = rawNodes.find((node) => node.id === selectNodeParam);
+    if (n) {
+      setSelectedNode({
+        nodeId: n.id,
+        type: n.type,
+        label: n.label,
+        badge: n.badge,
+      });
+    }
+  }, [selectNodeParam, rawNodes, selectedNode?.nodeId]);
+
   const handleSubmitScope = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();

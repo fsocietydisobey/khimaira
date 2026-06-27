@@ -110,9 +110,13 @@ function FactsPanel({
   nodeId: string;
 }) {
   const [state, setState] = useState<LoadState>({ status: "idle" });
+  // History is collapsed by default — dense debug nodes can have dozens of
+  // superseded facts; the current values are what you usually want first.
+  const [showHistory, setShowHistory] = useState(false);
 
   useEffect(() => {
     setState({ status: "loading" });
+    setShowHistory(false);
     let cancelled = false;
 
     if (MOCK_MODE) {
@@ -190,14 +194,21 @@ function FactsPanel({
 
       {historical.length > 0 ? (
         <section>
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5 mt-3">
-            history ({historical.length})
-          </p>
-          <div className="space-y-1.5">
-            {historical.map((fact, i) => (
-              <FactRow key={i} fact={fact} dimmed />
-            ))}
-          </div>
+          <button
+            type="button"
+            onClick={() => setShowHistory((v) => !v)}
+            className="flex w-full items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5 mt-3 hover:text-foreground transition-colors"
+          >
+            <span>{showHistory ? "▾" : "▸"}</span>
+            <span>history ({historical.length})</span>
+          </button>
+          {showHistory ? (
+            <div className="space-y-1.5">
+              {historical.map((fact, i) => (
+                <FactRow key={i} fact={fact} dimmed />
+              ))}
+            </div>
+          ) : null}
         </section>
       ) : null}
 
@@ -250,6 +261,8 @@ function FactRow({
   );
 }
 
+const EDGE_CAP = 12;
+
 function EdgeList({
   edgesFrom,
   edgesTo,
@@ -257,19 +270,31 @@ function EdgeList({
   edgesFrom: GraphEdge[];
   edgesTo: GraphEdge[];
 }) {
+  const [showAll, setShowAll] = useState(false);
+  const rows = [
+    ...edgesFrom.map((e) => ({ edge: e, direction: "→" as const })),
+    ...edgesTo.map((e) => ({ edge: e, direction: "←" as const })),
+  ];
+  const shown = showAll ? rows : rows.slice(0, EDGE_CAP);
   return (
     <section>
       <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5 mt-3">
-        active edges
+        active edges ({rows.length})
       </p>
       <Card>
         <CardContent className="py-2 px-3 space-y-1">
-          {edgesFrom.map((e, i) => (
-            <EdgeRow key={`f-${i}`} edge={e} direction="→" />
+          {shown.map(({ edge, direction }, i) => (
+            <EdgeRow key={i} edge={edge} direction={direction} />
           ))}
-          {edgesTo.map((e, i) => (
-            <EdgeRow key={`t-${i}`} edge={e} direction="←" />
-          ))}
+          {rows.length > EDGE_CAP ? (
+            <button
+              type="button"
+              onClick={() => setShowAll((v) => !v)}
+              className="mt-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+            >
+              {showAll ? "show fewer" : `show all ${rows.length}`}
+            </button>
+          ) : null}
         </CardContent>
       </Card>
     </section>
