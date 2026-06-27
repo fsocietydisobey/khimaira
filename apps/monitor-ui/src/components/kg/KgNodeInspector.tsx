@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { typeColor, typeColorAlpha } from "./graphStyle";
+import { CopyJsonButton } from "./CopyJsonButton";
 import {
   GRAPH_URL,
   MOCK_MODE,
@@ -22,6 +23,7 @@ import {
   type GraphEdge,
   type GraphFact,
   type GraphNodeDetail,
+  type GraphSchemaTriple,
 } from "./kgTypes";
 
 // ---------------------------------------------------------------------------
@@ -37,6 +39,12 @@ interface KgNodeInspectorProps {
   type: string;
   label: string;
   badge?: string | number;
+  /** Type meta-graph (whole graph) — used to show THIS node type's schema. */
+  schemaTriples?: GraphSchemaTriple[];
+  /** Jump the canvas + panel to another node (a clicked edge's other end). */
+  onNavigateNode?: (nodeId: string) => void;
+  /** Open the edge-detail (provenance) panel for an edge id, if present. */
+  onOpenEdge?: (edgeId: string | null) => void;
   onClose: () => void;
 }
 
@@ -47,6 +55,9 @@ export function KgNodeInspector({
   type,
   label,
   badge,
+  schemaTriples,
+  onNavigateNode,
+  onOpenEdge,
   onClose,
 }: KgNodeInspectorProps) {
   return (
@@ -84,7 +95,14 @@ export function KgNodeInspector({
 
       {/* Body */}
       <div className="flex-1 overflow-auto p-3 space-y-3">
-        <FactsPanel project={project} scope={scope} nodeId={nodeId} />
+        <FactsPanel
+          project={project}
+          scope={scope}
+          nodeId={nodeId}
+          onNavigateNode={onNavigateNode}
+          onOpenEdge={onOpenEdge}
+        />
+        <SchemaSection type={type} triples={schemaTriples} />
       </div>
     </div>
   );
@@ -104,10 +122,14 @@ function FactsPanel({
   project,
   scope,
   nodeId,
+  onNavigateNode,
+  onOpenEdge,
 }: {
   project: string | undefined;
   scope: string;
   nodeId: string;
+  onNavigateNode?: (nodeId: string) => void;
+  onOpenEdge?: (edgeId: string | null) => void;
 }) {
   const [state, setState] = useState<LoadState>({ status: "idle" });
   // History is collapsed by default — dense debug nodes can have dozens of
@@ -178,7 +200,7 @@ function FactsPanel({
       {current.length > 0 ? (
         <section>
           <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5">
-            current facts ({current.length})
+            attributes ({current.length})
           </p>
           <div className="space-y-1.5">
             {current.map((fact, i) => (
@@ -188,7 +210,7 @@ function FactsPanel({
         </section>
       ) : (
         <p className="text-[11px] text-muted-foreground italic">
-          No current facts.
+          No attributes.
         </p>
       )}
 
@@ -213,8 +235,18 @@ function FactsPanel({
       ) : null}
 
       {detail.edgesFrom.length > 0 || detail.edgesTo.length > 0 ? (
-        <EdgeList edgesFrom={detail.edgesFrom} edgesTo={detail.edgesTo} />
+        <EdgeList
+          currentNodeId={nodeId}
+          edgesFrom={detail.edgesFrom}
+          edgesTo={detail.edgesTo}
+          onNavigateNode={onNavigateNode}
+          onOpenEdge={onOpenEdge}
+        />
       ) : null}
+
+      <div className="pt-1">
+        <CopyJsonButton value={detail} />
+      </div>
     </>
   );
 }
@@ -264,27 +296,51 @@ function FactRow({
 const EDGE_CAP = 12;
 
 function EdgeList({
+  currentNodeId,
   edgesFrom,
   edgesTo,
+  onNavigateNode,
+  onOpenEdge,
 }: {
+  currentNodeId: string;
   edgesFrom: GraphEdge[];
   edgesTo: GraphEdge[];
+  onNavigateNode?: (nodeId: string) => void;
+  onOpenEdge?: (edgeId: string | null) => void;
 }) {
   const [showAll, setShowAll] = useState(false);
+  // Each row's "other endpoint" is the end that ISN'T this node: outbound
+  // edges (→) point at `to`, inbound (←) come from `from`.
   const rows = [
-    ...edgesFrom.map((e) => ({ edge: e, direction: "→" as const })),
-    ...edgesTo.map((e) => ({ edge: e, direction: "←" as const })),
+    ...edgesFrom.map((e) => ({
+      edge: e,
+      direction: "→" as const,
+      other: e.to,
+    })),
+    ...edgesTo.map((e) => ({
+      edge: e,
+      direction: "←" as const,
+      other: e.from,
+    })),
   ];
   const shown = showAll ? rows : rows.slice(0, EDGE_CAP);
   return (
     <section>
       <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5 mt-3">
         active edges ({rows.length})
+        <span className="normal-case opacity-60"> — click to follow</span>
       </p>
       <Card>
         <CardContent className="py-2 px-3 space-y-1">
-          {shown.map(({ edge, direction }, i) => (
-            <EdgeRow key={i} edge={edge} direction={direction} />
+          {shown.map(({ edge, direction, other }, i) => (
+            <EdgeRow
+              key={edge.id ?? `${currentNodeId}-${other}-${i}`}
+              edge={edge}
+              direction={direction}
+              other={other}
+              onNavigateNode={onNavigateNode}
+              onOpenEdge={onOpenEdge}
+            />
           ))}
           {rows.length > EDGE_CAP ? (
             <button
@@ -304,24 +360,165 @@ function EdgeList({
 function EdgeRow({
   edge,
   direction,
+  other,
+  onNavigateNode,
+  onOpenEdge,
 }: {
   edge: GraphEdge;
   direction: "→" | "←";
+  other: string;
+  onNavigateNode?: (nodeId: string) => void;
+  onOpenEdge?: (edgeId: string | null) => void;
 }) {
   return (
     <div className="flex items-center gap-2 text-[11px]">
-      <span className="text-muted-foreground font-mono">{direction}</span>
+      {/* Row click → follow the edge to its other endpoint. */}
+      <button
+        type="button"
+        onClick={() => onNavigateNode?.(other)}
+        title={`follow to ${other}`}
+        className="flex flex-1 items-center gap-2 rounded px-1 py-0.5 text-left hover:bg-accent/40 transition-colors min-w-0"
+      >
+        <span className="text-muted-foreground font-mono">{direction}</span>
+        <span
+          className="font-mono font-medium"
+          style={{ color: typeColor(edge.type) }}
+        >
+          {edge.type}
+        </span>
+        <span className="font-mono text-muted-foreground/60 truncate">
+          {other}
+        </span>
+        {edge.weight !== undefined ? (
+          <span className="text-muted-foreground/60 ml-auto font-mono shrink-0">
+            {Math.round(edge.weight * 100)}%
+          </span>
+        ) : null}
+      </button>
+      {/* Provenance affordance — only when the adapter exposes an edge id. */}
+      {edge.id && onOpenEdge ? (
+        <button
+          type="button"
+          onClick={() => onOpenEdge(edge.id ?? null)}
+          title="edge provenance"
+          className="shrink-0 rounded px-1 text-muted-foreground/70 hover:text-foreground hover:bg-accent/40 transition-colors"
+        >
+          ⓘ
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Schema section — this node TYPE's relationship schema, derived from the live
+// graph (the (fromType, linkType, toType) patterns it participates in). Answers
+// "what shape is a node of this type?" without a schema-endpoint round trip.
+// ---------------------------------------------------------------------------
+
+function SchemaSection({
+  type,
+  triples,
+}: {
+  type: string;
+  triples?: GraphSchemaTriple[];
+}) {
+  const [open, setOpen] = useState(true);
+  if (!triples || triples.length === 0) return null;
+
+  const outgoing = triples.filter((t) => t.fromType === type);
+  const incoming = triples.filter((t) => t.toType === type);
+  if (outgoing.length === 0 && incoming.length === 0) return null;
+
+  return (
+    <section>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5 mt-3 hover:text-foreground transition-colors"
+        title="relationship patterns for this node type, derived from the loaded graph"
+      >
+        <span>{open ? "▾" : "▸"}</span>
+        <span>
+          schema · type{" "}
+          <span
+            className="normal-case font-mono"
+            style={{ color: typeColor(type) }}
+          >
+            {type}
+          </span>
+        </span>
+      </button>
+      {open ? (
+        <div className="space-y-2">
+          {outgoing.length > 0 ? (
+            <div>
+              <p className="text-[9px] uppercase tracking-wider text-muted-foreground/70 mb-1">
+                outgoing ({outgoing.length})
+              </p>
+              <div className="space-y-0.5">
+                {outgoing.map((t, i) => (
+                  <SchemaTripleRow
+                    key={`o${i}`}
+                    dir="→"
+                    link={t.linkType}
+                    other={t.toType}
+                    count={t.count}
+                  />
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {incoming.length > 0 ? (
+            <div>
+              <p className="text-[9px] uppercase tracking-wider text-muted-foreground/70 mb-1">
+                incoming ({incoming.length})
+              </p>
+              <div className="space-y-0.5">
+                {incoming.map((t, i) => (
+                  <SchemaTripleRow
+                    key={`i${i}`}
+                    dir="←"
+                    link={t.linkType}
+                    other={t.fromType}
+                    count={t.count}
+                  />
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function SchemaTripleRow({
+  dir,
+  link,
+  other,
+  count,
+}: {
+  dir: "→" | "←";
+  link: string;
+  other: string;
+  count: number;
+}) {
+  return (
+    <div className="flex items-center gap-2 text-[11px]">
+      <span className="text-muted-foreground font-mono">{dir}</span>
       <span
         className="font-mono font-medium"
-        style={{ color: typeColor(edge.type) }}
+        style={{ color: typeColor(link) }}
       >
-        {edge.type}
+        {link}
       </span>
-      {edge.weight !== undefined ? (
-        <span className="text-muted-foreground/60 ml-auto font-mono">
-          {Math.round(edge.weight * 100)}%
-        </span>
-      ) : null}
+      <span className="font-mono" style={{ color: typeColor(other) }}>
+        {other}
+      </span>
+      <span className="ml-auto text-muted-foreground/60 font-mono shrink-0">
+        ×{count}
+      </span>
     </div>
   );
 }

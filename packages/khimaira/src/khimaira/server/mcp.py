@@ -179,9 +179,7 @@ async def health() -> str:
 
 @mcp.tool()
 @logged_tool("mnemosyne_ask")
-async def mnemosyne_ask(
-    question: str, project: str = "khimaira", max_tokens: int = 256
-) -> str:
+async def mnemosyne_ask(question: str, project: str = "khimaira", max_tokens: int = 256) -> str:
     """Ask a local mnemosyne codebase oracle about khimaira or jeevy.
 
     Each oracle is a local model (Qwen2.5-Coder-7B, continued-pretrained on one
@@ -682,9 +680,7 @@ async def _delegate_impl(
                 return False
             return not circuit.is_open(runner_name)
 
-        decision = select_from_pool(
-            classification, runner_available=_runner_pickable
-        )
+        decision = select_from_pool(classification, runner_available=_runner_pickable)
         if decision.refused or decision.chosen is None:
             return f"❌ auto routing refused: {decision.refusal_reason}"
         chosen_runner = decision.chosen.runner
@@ -755,10 +751,7 @@ async def _delegate_impl(
         from khimaira.dispatch.runners.claude import ClaudeAuthError, ClaudeTransientError
 
         msg = str(e).lower()
-        is_transient = (
-            isinstance(e, ClaudeTransientError)
-            or "429" in msg
-        )
+        is_transient = isinstance(e, ClaudeTransientError) or "429" in msg
         is_account_hard_stop = isinstance(e, ClaudeAuthError)
         # Route: transient overload → short cooldown (record_rate_limit);
         # account-level hard stop → incremental failure counter (record_failure);
@@ -2525,9 +2518,7 @@ async def schedule_task(
 
 @mcp.tool()
 @logged_tool("list_scheduled_tasks")
-async def list_scheduled_tasks(
-    status: str | None = None, target: str | None = None
-) -> str:
+async def list_scheduled_tasks(status: str | None = None, target: str | None = None) -> str:
     """List scheduled tasks. Filter by status (`"scheduled,pending_retry"`)
     or target session name/id."""
     return await _monitor_tools.list_scheduled_tasks(status, target)
@@ -2572,6 +2563,217 @@ async def oracle_query(
     degraded=True in the response means one or more stores returned no data.
     """
     return await _monitor_tools.oracle_query(question, project, scope)
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-graph debug substrate (kg_*). Agent-facing surface over the
+# daemon's generic graph proxy. The daemon proxies each call to the project's
+# configured KG adapter; these tools format the generic contract for an agent
+# debugging an LLM-extracted graph. Ids + types are OPAQUE — code-agnostic, no
+# project schema terms. `scope` passes through verbatim (jeevy: "shop:<id>").
+# Drill path: kg_schema (shape) → kg_search (find a node id) → kg_node /
+# kg_edge (the facts + provenance). See monitor/api/graph.py (daemon side).
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@logged_tool("kg_graph")
+async def kg_graph(project: str, scope: str = "", node_cap: int = 40, since: str = "") -> str:
+    """Overview of a project's knowledge graph: counts + type histograms + a
+    node sample.
+
+    The orientation call for an LLM-extracted graph — how big is it, what node
+    and link types exist, and a sample of nodes (with their opaque ids) to
+    grab. For full structure use `kg_schema`; to find a specific node use
+    `kg_search`; to drill into one node use `kg_node`.
+
+    Args:
+        project: attached project with a registered KG adapter (e.g. "jeevy").
+        scope: adapter-specific scope passed through verbatim. Jeevy expects
+            `shop:<id>` (e.g. "shop:10"); empty means "no scope" (adapter
+            decides — may be required).
+        node_cap: max nodes to list in the sample (default 40). Counts +
+            histograms always reflect the full graph regardless of this cap.
+        since: optional ISO timestamp — restrict to nodes/edges first-seen ≥
+            this time (separates CURRENT data from pre-stable cruft).
+    """
+    return await _monitor_tools.kg_graph(project, scope, node_cap, since)
+
+
+@mcp.tool()
+@logged_tool("kg_node")
+async def kg_node(project: str, node_id: str, scope: str = "") -> str:
+    """A node's full detail: current facts, superseded history, and every
+    incident edge.
+
+    The keystone debug surface — what the graph actually KNOWS about a node,
+    including facts that were later overwritten and all edges (with their edge
+    ids, so you can call `kg_edge` for an edge's provenance). Resolve a human
+    label to a `node_id` with `kg_search` first.
+
+    Args:
+        project: attached project with a registered KG adapter.
+        node_id: the opaque node id (from `kg_search` / `kg_graph`). Passed to
+            the adapter verbatim — the daemon never interprets it.
+        scope: adapter-specific scope (jeevy: "shop:<id>").
+    """
+    return await _monitor_tools.kg_node(project, node_id, scope)
+
+
+@mcp.tool()
+@logged_tool("kg_edge")
+async def kg_edge(project: str, edge_id: str, scope: str = "") -> str:
+    """An edge's provenance: type, endpoints, weight, and all source metadata.
+
+    Answers "WHY does this edge exist?" for an LLM-extracted graph — match
+    method, source document / page / bounding-box, confidence, link origin.
+    All provenance folds into an opaque `meta` map (no schema terms). Get an
+    `edge_id` from a node's edge list (`kg_node`).
+
+    Args:
+        project: attached project with a registered KG adapter.
+        edge_id: the opaque edge id (from `kg_node`'s edge list). Passed
+            verbatim to the adapter.
+        scope: adapter-specific scope (jeevy: "shop:<id>").
+    """
+    return await _monitor_tools.kg_edge(project, edge_id, scope)
+
+
+@mcp.tool()
+@logged_tool("kg_schema")
+async def kg_schema(project: str, scope: str = "", since: str = "") -> str:
+    """The KG type meta-graph: node/link types + the (fromType,linkType,toType)
+    triples that occur.
+
+    The structural-gap finder — a relationship type that is ABSENT from the
+    triples is one the extractor never produced (e.g. an expected
+    shop→user membership edge that never got built). Triples are sorted by
+    occurrence count. Start here to understand a graph's shape before drilling
+    into specific nodes.
+
+    Args:
+        project: attached project with a registered KG adapter.
+        scope: adapter-specific scope (jeevy: "shop:<id>").
+        since: optional ISO timestamp — restrict to relationships first-seen ≥ ts.
+    """
+    return await _monitor_tools.kg_schema(project, scope, since)
+
+
+@mcp.tool()
+@logged_tool("kg_search")
+async def kg_search(project: str, query: str, scope: str = "", limit: int = 20) -> str:
+    """Find graph nodes whose id or label matches `query` (case-insensitive).
+
+    The "give me a node id" primitive: `kg_node` / `kg_edge` need opaque ids,
+    and this resolves a human-readable label → the id to drill into. Ranked
+    exact label → label prefix → label substring → id substring. Runs
+    client-side over the graph contract (no adapter search route assumed).
+
+    Args:
+        project: attached project with a registered KG adapter.
+        query: substring to match against node label or id.
+        scope: adapter-specific scope (jeevy: "shop:<id>").
+        limit: max matches to return (default 20).
+    """
+    return await _monitor_tools.kg_search(project, query, scope, limit)
+
+
+@mcp.tool()
+@logged_tool("kg_view_url")
+async def kg_view_url(
+    project: str,
+    scope: str,
+    select_node: str = "",
+    isolate: bool = False,
+    edge_mode: str = "type",
+    conf: float | None = None,
+    zoom: float | None = None,
+) -> str:
+    """Build a framed deep-link to the visual KG viewer (for a screenshot).
+
+    The kg_* tools above return the graph as DATA; this returns a URL to the
+    rendered graph so you can SEE it. The daemon serves the monitor-ui itself,
+    so the view is reachable + fully reconstructable from the URL. Capture it
+    with the existing Specter tools (specter_navigate_to + specter_take_screenshot)
+    — zero new dependency. The returned text includes the exact recipe.
+
+    Framing args (all optional — they map to URL params the viewer reads):
+        select_node: opaque node id to select + CENTER the camera on.
+        isolate: True shows ONLY that node + its neighbors (readable on a big
+            graph — pair with select_node).
+        edge_mode: "confidence" recolors edges so low-confidence ones pop.
+        conf: 0.9 or 0.7 — hide edges at/above that weight (show only suspect).
+        zoom: camera ratio on the focused node (lower = tighter, e.g. 0.15).
+
+    Args:
+        project: attached project with a registered KG adapter.
+        scope: adapter-specific scope (jeevy: "shop:<id>").
+    """
+    return await _monitor_tools.kg_view_url(
+        project, scope, select_node, isolate, edge_mode, conf, zoom
+    )
+
+
+# --- Phase 3: aggregate / monitoring KG tools (roster-wide graph audit) ----
+
+
+@mcp.tool()
+@logged_tool("kg_health")
+async def kg_health(project: str, scope: str = "", since: str = "") -> str:
+    """Whole-graph health in ONE call — the "audit the graph" keystone for
+    roster agents (who have no DB access).
+
+    Returns per-type node counts, ORPHANS, dangling edges, and parent-
+    containment coverage. TWO DISTINCT metrics — do not conflate:
+      • orphan = a node with NO edges at all (degree-0).
+      • disconnected-from-parent = a node that HAS edges but lacks its expected
+        upward containment link (the "172/276 jobs disconnected" headline; it
+        lives in `containment`, not the orphan counts).
+
+    Args:
+        project: attached project with a registered KG adapter.
+        scope: adapter-specific scope (jeevy: "shop:<id>").
+        since: optional ISO timestamp — restrict to first-appearance ≥ ts
+            (separates CURRENT data from pre-stable cruft).
+    """
+    return await _monitor_tools.kg_health(project, scope, since)
+
+
+@mcp.tool()
+@logged_tool("kg_coverage")
+async def kg_coverage(project: str, scope: str = "") -> str:
+    """Relational-vs-KG coverage per entity — the under-projection detector.
+
+    For each entity the adapter compares relational rows to KG nodes:
+    `ratio = kgCount / relationalCount`. A ratio well below 1 means the
+    projector under-built that entity (e.g. "46 users / 4 nodes" → 0.09).
+    Worst coverage is listed first. The adapter owns the entity→node-kind map.
+
+    Args:
+        project: attached project with a registered KG adapter.
+        scope: adapter-specific scope (jeevy: "shop:<id>").
+    """
+    return await _monitor_tools.kg_coverage(project, scope)
+
+
+@mcp.tool()
+@logged_tool("kg_edges_audit")
+async def kg_edges_audit(project: str, scope: str = "", since: str = "") -> str:
+    """Aggregate edge provenance: match-method + confidence histograms + the
+    low-confidence/fuzzy/llm SUSPECT tail — the population view that complements
+    one-at-a-time `kg_edge`.
+
+    The suspect list is capped, so `suspectTotal` + a `truncated` flag are
+    surfaced (no silent truncation — finding the shaky-edge tail is the point).
+    Confidence buckets isolate EXACTLY 1.0 from anything <1.0, so "are there
+    ANY sub-1.0 edges?" is unambiguous.
+
+    Args:
+        project: attached project with a registered KG adapter.
+        scope: adapter-specific scope (jeevy: "shop:<id>").
+        since: optional ISO timestamp — restrict to edges first-seen ≥ ts.
+    """
+    return await _monitor_tools.kg_edges_audit(project, scope, since)
 
 
 @mcp.tool()
@@ -2687,9 +2889,7 @@ async def delegate_to_agents(
     me_quoted = urllib.parse.quote(from_session_id)
     for target in targets:
         body = {"text": task, "target_session_id": target}
-        data = _mt._post(
-            f"/api/sessions/{me_quoted}/question", body, timeout=10.0
-        )
+        data = _mt._post(f"/api/sessions/{me_quoted}/question", body, timeout=10.0)
         if isinstance(data, str):
             # daemon returned an error string (down / 422 / etc.)
             fire_errors[target] = data
@@ -2701,9 +2901,7 @@ async def delegate_to_agents(
     # --- 2. asyncio.gather the per-target wait_for_answer calls. ---
     async def _await_one(target: str, qid: str) -> tuple[str, dict]:
         try:
-            body = await _mt.session_wait_for_answer(
-                from_session_id, qid, timeout=timeout
-            )
+            body = await _mt.session_wait_for_answer(from_session_id, qid, timeout=timeout)
             # Prose return shape:
             #   "✅ answer received for q=<qid> (answered by <id>):\n\n<body>"
             # OR
@@ -2719,9 +2917,7 @@ async def delegate_to_agents(
 
     results: dict[str, dict] = {}
     if fired:
-        gathered = await asyncio.gather(
-            *(_await_one(t, q) for t, q in fired.items())
-        )
+        gathered = await asyncio.gather(*(_await_one(t, q) for t, q in fired.items()))
         results = dict(gathered)
 
     payload = {

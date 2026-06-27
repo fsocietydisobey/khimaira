@@ -1733,8 +1733,7 @@ async def roster_progress(chat_id: str, session_id: str) -> str:
     import urllib.parse as _up
 
     data = _get(
-        f"/api/chats/{_up.quote(chat_id)}/roster-progress"
-        f"?session_id={_up.quote(session_id)}",
+        f"/api/chats/{_up.quote(chat_id)}/roster-progress?session_id={_up.quote(session_id)}",
         timeout=15.0,
     )
     if isinstance(data, str):
@@ -1759,9 +1758,7 @@ async def roster_progress(chat_id: str, session_id: str) -> str:
         wip_flag = " 💾 WIP" if has_wip else ""
         task_part = ""
         if task:
-            task_part = (
-                f" | task [{task['status']}]: {(task.get('body') or '')[:60]}"
-            )
+            task_part = f" | task [{task['status']}]: {(task.get('body') or '')[:60]}"
 
         done_part = f" | done-report: {done_ts[:16]}" if done_ts else ""
         manual_part = f' | manual: "{manual}"' if manual and stale else ""
@@ -1771,4 +1768,500 @@ async def roster_progress(chat_id: str, session_id: str) -> str:
             f"{task_part}{done_part}{manual_part}"
         )
 
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-graph debug substrate — thin HTTP wrappers over the daemon's
+# generic graph proxy (/api/graph/<project>...). The daemon proxies each
+# call to the project's configured KG adapter; these tools never interpret
+# the adapter's opaque ids or types — they format the generic contract
+# ({nodes,edges} / node-detail / edge-detail / type-meta-graph) for an agent
+# debugging an LLM-extracted graph. See monitor/api/graph.py (daemon side).
+#
+# Code-agnostic: `type` is an opaque category string, ids are opaque, and the
+# `scope` param passes through verbatim (jeevy uses `shop:<id>`; another
+# project may use anything). No project schema terms appear here.
+# ---------------------------------------------------------------------------
+
+
+def _kg_unwrap(resp: dict[str, Any] | str) -> tuple[dict[str, Any] | None, str | None]:
+    """Normalize a daemon graph response → (body, error_str).
+
+    The daemon returns the adapter's JSON verbatim; adapters wrap their
+    payload in a `{"data": ...}` envelope (the house convention). Unwrap it
+    defensively — if there's no `data` key, treat the whole dict as the body
+    so a future adapter that returns bare JSON still works.
+    """
+    if isinstance(resp, str):
+        return None, resp
+    body = resp.get("data") if isinstance(resp, dict) and "data" in resp else resp
+    if not isinstance(body, dict):
+        return None, f"KG adapter returned unexpected shape: {type(body).__name__}"
+    return body, None
+
+
+def _kg_scope_qs(scope: str) -> str:
+    """Render the `?scope=` query string (empty when no scope given)."""
+    return f"?scope={urllib.parse.quote(scope)}" if scope else ""
+
+
+def _kg_qs(scope: str, since: str = "") -> str:
+    """Render a `?scope=&since=` query string (omitting empties).
+
+    `since` (ISO timestamp) scopes aggregate/graph reads to first-appearance ≥
+    ts — the adapter applies the filter; the daemon/tool just forward it.
+    """
+    parts = []
+    if scope:
+        parts.append(f"scope={urllib.parse.quote(scope)}")
+    if since:
+        parts.append(f"since={urllib.parse.quote(since)}")
+    return ("?" + "&".join(parts)) if parts else ""
+
+
+def _kg_meta_chips(meta: dict[str, Any] | None) -> str:
+    """Format an opaque meta map as `k=v` chips, or '' when empty."""
+    if not meta:
+        return ""
+    return "  ·  ".join(f"{k}={v}" for k, v in meta.items())
+
+
+async def kg_graph(project: str, scope: str = "", node_cap: int = 40, since: str = "") -> str:
+    """Overview of a project's KG: counts + type histograms + a node sample.
+
+    `since` (ISO ts) scopes to nodes/edges first-seen ≥ ts (CURRENT vs cruft)."""
+    resp = _get(f"/api/graph/{urllib.parse.quote(project)}{_kg_qs(scope, since)}", timeout=30.0)
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    nodes = body.get("nodes") or []
+    edges = body.get("edges") or []
+    if not nodes and not edges:
+        return (
+            f"📭 KG for `{project}` (scope={scope or 'none'}) is empty — "
+            f"0 nodes, 0 edges. Check the scope is valid for this adapter."
+        )
+
+    # Node-type + link-type histograms (the structural shape at a glance).
+    node_types: dict[str, int] = {}
+    for n in nodes:
+        node_types[n.get("type", "?")] = node_types.get(n.get("type", "?"), 0) + 1
+    link_types: dict[str, int] = {}
+    for e in edges:
+        link_types[e.get("type", "?")] = link_types.get(e.get("type", "?"), 0) + 1
+
+    lines = [
+        f"🕸️ **KG `{project}`** (scope={scope or 'none'}) — "
+        f"{len(nodes)} nodes, {len(edges)} edges\n",
+        "**Node types:** "
+        + ", ".join(f"{t}×{c}" for t, c in sorted(node_types.items(), key=lambda x: -x[1])),
+        "**Link types:** "
+        + ", ".join(f"{t}×{c}" for t, c in sorted(link_types.items(), key=lambda x: -x[1])),
+        "",
+        f"**Node sample** (first {min(node_cap, len(nodes))} of {len(nodes)} — "
+        f"use `kg_search` to find specific nodes, `kg_node` to drill in):",
+    ]
+    for n in nodes[:node_cap]:
+        badge = f"  [{n['badge']}]" if n.get("badge") is not None else ""
+        lines.append(f"  `{n.get('id')}`  ({n.get('type', '?')})  {n.get('label', '')}{badge}")
+    if len(nodes) > node_cap:
+        lines.append(f"  … {len(nodes) - node_cap} more (narrow with `kg_search`)")
+    return "\n".join(lines)
+
+
+async def kg_node(project: str, node_id: str, scope: str = "") -> str:
+    """A node's full detail: facts (current + history) + its edges.
+
+    The keystone debug surface — shows what the graph actually KNOWS about a
+    node, including superseded facts and every incident edge (with edge ids so
+    you can call `kg_edge` for provenance).
+    """
+    resp = _get(
+        f"/api/graph/{urllib.parse.quote(project)}/node/"
+        f"{urllib.parse.quote(node_id, safe='')}{_kg_scope_qs(scope)}",
+        timeout=30.0,
+    )
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    badge = f"  [{body['badge']}]" if body.get("badge") is not None else ""
+    lines = [
+        f"🔵 **{body.get('label', '?')}**{badge}",
+        f"   type=`{body.get('type', '?')}`  id=`{body.get('id', node_id)}`\n",
+    ]
+
+    current = body.get("currentFacts") or []
+    lines.append(f"**Current facts ({len(current)}):**")
+    if current:
+        for f in current:
+            chips = _kg_meta_chips(f.get("meta"))
+            chip_str = f"   ·  {chips}" if chips else ""
+            lines.append(f"  • {f.get('label')} = {f.get('value')!r}{chip_str}")
+    else:
+        lines.append("  (none)")
+
+    history = body.get("historyFacts") or []
+    if history:
+        lines.append(f"\n**History / superseded ({len(history)}):**")
+        for f in history:
+            chips = _kg_meta_chips(f.get("meta"))
+            chip_str = f"   ·  {chips}" if chips else ""
+            lines.append(f"  ◦ {f.get('label')} = {f.get('value')!r}{chip_str}")
+
+    edges_from = body.get("edgesFrom") or []
+    edges_to = body.get("edgesTo") or []
+    lines.append(f"\n**Edges out ({len(edges_from)}):**")
+    for e in edges_from:
+        w = f"  w={e['weight']:.2f}" if isinstance(e.get("weight"), (int, float)) else ""
+        eid = f"  edge=`{e['id']}`" if e.get("id") else ""
+        lines.append(f"  → [{e.get('type', '?')}] `{e.get('to')}`{w}{eid}")
+    lines.append(f"\n**Edges in ({len(edges_to)}):**")
+    for e in edges_to:
+        w = f"  w={e['weight']:.2f}" if isinstance(e.get("weight"), (int, float)) else ""
+        eid = f"  edge=`{e['id']}`" if e.get("id") else ""
+        lines.append(f"  ← [{e.get('type', '?')}] `{e.get('from')}`{w}{eid}")
+    return "\n".join(lines)
+
+
+async def kg_edge(project: str, edge_id: str, scope: str = "") -> str:
+    """An edge's provenance: type, endpoints, weight, and all source meta.
+
+    The edge-debug surface — answers "WHY does this edge exist?" (match
+    method, source document/page/bbox, confidence, link origin) for an
+    LLM-extracted graph. All provenance folds into the opaque `meta` map.
+    """
+    resp = _get(
+        f"/api/graph/{urllib.parse.quote(project)}/edge/"
+        f"{urllib.parse.quote(edge_id, safe='')}{_kg_scope_qs(scope)}",
+        timeout=30.0,
+    )
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    w = f"  weight={body['weight']:.3f}" if isinstance(body.get("weight"), (int, float)) else ""
+    lines = [
+        f"🔗 **edge `{body.get('id', edge_id)}`**",
+        f"   [{body.get('type', '?')}]  `{body.get('from')}` → `{body.get('to')}`{w}\n",
+    ]
+    meta = body.get("meta") or {}
+    if meta:
+        lines.append(f"**Provenance ({len(meta)} fields):**")
+        for k, v in meta.items():
+            lines.append(f"  • {k}: {v}")
+    else:
+        lines.append("**Provenance:** (none recorded — the adapter returned no meta)")
+    return "\n".join(lines)
+
+
+async def kg_schema(project: str, scope: str = "", since: str = "") -> str:
+    """The KG type meta-graph: node/link types + the triples that occur.
+
+    The structural-gap finder — a relationship type that's *absent* from the
+    triples list is one the extractor never produced. Triples are sorted by
+    occurrence count (rarest patterns last — those are often the suspect ones).
+    `since` (ISO ts) scopes to relationships first-seen ≥ ts.
+    """
+    resp = _get(
+        f"/api/graph/{urllib.parse.quote(project)}/schema{_kg_qs(scope, since)}",
+        timeout=30.0,
+    )
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    node_types = body.get("nodeTypes") or []
+    link_types = body.get("linkTypes") or []
+    triples = body.get("triples") or []
+    if not node_types and not triples:
+        return (
+            f"📭 KG schema for `{project}` (scope={scope or 'none'}) is empty. "
+            f"Check the scope is valid for this adapter."
+        )
+
+    lines = [
+        f"🧬 **KG schema `{project}`** (scope={scope or 'none'})\n",
+        f"**Node types ({len(node_types)}):** {', '.join(node_types) or '(none)'}",
+        f"**Link types ({len(link_types)}):** {', '.join(link_types) or '(none)'}",
+        "",
+        f"**Triples ({len(triples)}) — (fromType) -[linkType]-> (toType) × count:**",
+    ]
+    for t in triples:
+        lines.append(
+            f"  {t.get('fromType', '?')} -[{t.get('linkType', '?')}]-> "
+            f"{t.get('toType', '?')}  × {t.get('count', 0)}"
+        )
+    if not triples:
+        lines.append("  (no relationship patterns — every node is isolated)")
+    return "\n".join(lines)
+
+
+async def kg_search(project: str, query: str, scope: str = "", limit: int = 20) -> str:
+    """Find nodes whose id or label matches `query` (case-insensitive).
+
+    The "give me a node_id" primitive: `kg_node`/`kg_edge` need ids, and this
+    is how an agent resolves a human label → the opaque id to drill into.
+    Ranked: exact label match → label prefix → substring (label then id).
+    Implemented client-side over the graph contract (no adapter search route
+    is assumed), so it stays code-agnostic.
+    """
+    if not query.strip():
+        return "❌ kg_search needs a non-empty query."
+    resp = _get(f"/api/graph/{urllib.parse.quote(project)}{_kg_scope_qs(scope)}", timeout=30.0)
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    q = query.strip().lower()
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for n in body.get("nodes") or []:
+        label = str(n.get("label", "")).lower()
+        nid = str(n.get("id", "")).lower()
+        if label == q:
+            rank = 0
+        elif label.startswith(q):
+            rank = 1
+        elif q in label:
+            rank = 2
+        elif q in nid:
+            rank = 3
+        else:
+            continue
+        scored.append((rank, n))
+
+    if not scored:
+        return f"🔍 no nodes in `{project}` match {query!r} (scope={scope or 'none'})."
+    scored.sort(key=lambda x: (x[0], str(x[1].get("label", ""))))
+
+    lines = [
+        f"🔍 **{len(scored)} match(es) for {query!r}** in `{project}` "
+        f"(showing {min(limit, len(scored))}):\n"
+    ]
+    for _rank, n in scored[:limit]:
+        badge = f"  [{n['badge']}]" if n.get("badge") is not None else ""
+        lines.append(f"  `{n.get('id')}`  ({n.get('type', '?')})  {n.get('label', '')}{badge}")
+    if len(scored) > limit:
+        lines.append(f"  … {len(scored) - limit} more (raise `limit` or refine the query)")
+    lines.append("\n→ feed an id to `kg_node(project, node_id, scope)` to drill in.")
+    return "\n".join(lines)
+
+
+async def kg_view_url(
+    project: str,
+    scope: str,
+    select_node: str = "",
+    isolate: bool = False,
+    edge_mode: str = "type",
+    conf: float | None = None,
+    zoom: float | None = None,
+) -> str:
+    """Build a fully-framed deep-link to the KG viewer for a screenshot.
+
+    The daemon serves the monitor-ui itself, so the KG view is reachable at
+    `<base>/<project>/kg?…` and is fully reconstructable from the URL. This
+    returns that link + the two-step Specter recipe to capture it — keeping
+    screenshotting zero-dependency (it reuses khimaira's existing CDP path
+    rather than shipping a headless browser).
+    """
+    base = _DEFAULT_BASE  # daemon serves the UI at the same origin as the API
+    params: list[tuple[str, str]] = [("scope", scope)]
+    if select_node:
+        params.append(("selectNode", select_node))
+    if isolate:
+        params.append(("isolate", "1"))
+    if edge_mode == "confidence":
+        params.append(("edgeMode", "confidence"))
+    # The UI reads exactly "0.9" / "0.7" for the threshold (anything else = off).
+    if conf in (0.9, 0.7):
+        params.append(("conf", str(conf)))
+    if zoom is not None and zoom > 0:
+        params.append(("zoom", str(zoom)))
+
+    qs = urllib.parse.urlencode(params)
+    url = f"{base}/{urllib.parse.quote(project)}/kg?{qs}"
+    return (
+        f"🖼️ KG view URL (framed):\n{url}\n\n"
+        "To capture it (zero-dep, via Specter's CDP):\n"
+        "  1. `specter_list_tabs` → `specter_connect_to_tab(<id>)` (a tab on a\n"
+        "     Chrome started with --remote-debugging-port=9222)\n"
+        f'  2. `specter_navigate_to("{url}")`\n'
+        "  3. `specter_wait_for_network_idle()` then `specter_take_screenshot()`\n"
+        "Tune the framing: `select_node` + `isolate=True` shows just one node's\n"
+        "neighborhood (readable on a big graph); `zoom` sets camera tightness\n"
+        "(lower = closer, e.g. 0.15); `edge_mode='confidence'` + `conf=0.7` makes\n"
+        "low-confidence edges pop."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — aggregate / monitoring tools. Roster agents have NO DB access, so
+# "audit the whole graph" was SQL-only; these turn it into one MCP call each.
+# Every shape is generic + opaque-keyed (the adapter is the only schema-aware
+# layer). created_at filtering via `since` separates CURRENT from pre-stable
+# cruft. The adapter computes; these just format.
+# ---------------------------------------------------------------------------
+
+
+async def kg_health(project: str, scope: str = "", since: str = "") -> str:
+    """Whole-graph health in one call: per-type counts, ORPHANS, and
+    parent-containment coverage — the "audit the graph" keystone.
+
+    TWO DISTINCT metrics (do not conflate):
+      • orphan  = a node with NO edges at all (degree-0).
+      • disconnected-from-parent = a node that HAS edges but no upward
+        containment link to its expected parent (e.g. a bom-line with no
+        part-of→job). This is the "172/276 jobs disconnected" headline, and
+        it lives in `containment`, NOT in the orphan counts.
+    `danglingEdges` = edges pointing at a missing node (integrity violation).
+    `since` (ISO ts) scopes to first-appearance ≥ ts.
+    """
+    resp = _get(
+        f"/api/graph/{urllib.parse.quote(project)}/health{_kg_qs(scope, since)}",
+        timeout=30.0,
+    )
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    totals = body.get("totals") or {}
+    node_types = body.get("nodeTypes") or []
+    edge_types = body.get("edgeTypes") or []
+    containment = body.get("containment") or []
+
+    since_note = f" since={since}" if since else ""
+    lines = [
+        f"🩺 **KG health `{project}`** (scope={scope or 'none'}{since_note})\n",
+        f"**Totals:** {totals.get('nodes', '?')} nodes · {totals.get('edges', '?')} edges · "
+        f"{totals.get('orphanNodes', '?')} orphan (degree-0) · "
+        f"{totals.get('danglingEdges', '?')} dangling edges",
+    ]
+
+    if node_types:
+        lines.append("\n**Node types** (count · degree-0 orphans):")
+        for t in sorted(node_types, key=lambda x: -(x.get("orphanCount") or 0)):
+            orphan = t.get("orphanCount", 0)
+            flag = f" · {orphan} orphan" if orphan else ""
+            lines.append(f"  {t.get('type', '?')} ×{t.get('count', 0)}{flag}")
+
+    if edge_types:
+        lines.append(
+            "\n**Link types:** "
+            + ", ".join(f"{t.get('type', '?')} ×{t.get('count', 0)}" for t in edge_types)
+        )
+
+    if containment:
+        lines.append("\n**Containment** — disconnected-from-parent (≠ degree-0):")
+        # Worst coverage first — the biggest gaps are the headline.
+        for c in sorted(containment, key=lambda x: x.get("ratio", 1)):
+            total = c.get("total", 0)
+            with_parent = c.get("withParent", 0)
+            disc = total - with_parent
+            ratio = c.get("ratio")
+            pct = f"{ratio:.0%}" if isinstance(ratio, (int, float)) else "?"
+            flag = f"  ← {disc} DISCONNECTED" if disc else ""
+            lines.append(
+                f"  {c.get('childType', '?')} -[{c.get('linkType', '?')}]-> "
+                f"{c.get('parentType', '?')}: {with_parent}/{total} have a parent "
+                f"({pct}){flag}"
+            )
+    return "\n".join(lines)
+
+
+async def kg_coverage(project: str, scope: str = "") -> str:
+    """Relational-vs-KG coverage per entity — the under-projection detector.
+
+    For each entity the adapter compares the relational row count to the KG
+    node count: `ratio = kgCount / relationalCount` (coverage fraction). A
+    ratio well below 1 means the projector under-built that entity — e.g.
+    "46 users / 4 nodes" (ratio 0.09). The adapter owns the entity→node-kind
+    map; the daemon/tool stay generic.
+    """
+    resp = _get(
+        f"/api/graph/{urllib.parse.quote(project)}/coverage{_kg_scope_qs(scope)}",
+        timeout=30.0,
+    )
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    entities = body.get("entities") or []
+    if not entities:
+        return f"📭 KG coverage for `{project}` (scope={scope or 'none'}) is empty."
+
+    lines = [
+        f"📊 **KG coverage `{project}`** (scope={scope or 'none'}) — relational rows vs KG nodes:\n"
+    ]
+    # Worst coverage first (the under-projected entities are the point).
+    for e in sorted(entities, key=lambda x: x.get("ratio", 1)):
+        rel = e.get("relationalCount", 0)
+        kg = e.get("kgCount", 0)
+        ratio = e.get("ratio")
+        rstr = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "?"
+        flag = " ⚠️ under-projected" if isinstance(ratio, (int, float)) and ratio < 0.95 else ""
+        lines.append(f"  {e.get('entity', '?')}: {kg}/{rel} nodes (ratio {rstr}){flag}")
+    return "\n".join(lines)
+
+
+async def kg_edges_audit(project: str, scope: str = "", since: str = "") -> str:
+    """Aggregate edge provenance: match-method + confidence histograms and the
+    low-confidence/fuzzy/llm SUSPECT tail — the population view that complements
+    one-at-a-time `kg_edge`.
+
+    The suspect list is capped, so `suspectTotal` + `truncated` are surfaced
+    (no silent truncation — surfacing the shaky-edge tail is the whole point).
+    Confidence buckets isolate EXACTLY 1.0 from anything <1.0, so "are there
+    ANY sub-1.0 edges?" is unambiguous. `since` scopes by first-appearance.
+    """
+    resp = _get(
+        f"/api/graph/{urllib.parse.quote(project)}/edges-audit{_kg_qs(scope, since)}",
+        timeout=30.0,
+    )
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    methods = body.get("matchMethods") or []
+    buckets = body.get("confidenceBuckets") or []
+    suspect = body.get("suspect") or []
+    suspect_total = body.get("suspectTotal", len(suspect))
+    truncated = body.get("truncated", suspect_total > len(suspect))
+
+    since_note = f" since={since}" if since else ""
+    lines = [f"🔗 **KG edges audit `{project}`** (scope={scope or 'none'}{since_note})\n"]
+
+    if methods:
+        lines.append(
+            "**Match methods:** "
+            + ", ".join(f"{m.get('method', '?')} ×{m.get('count', 0)}" for m in methods)
+        )
+
+    if buckets:
+        parts = []
+        for b in buckets:
+            lo, hi, count = b.get("lo"), b.get("hi"), b.get("count", 0)
+            label = f"{{{lo}}}" if lo == hi else f"[{lo},{hi})"
+            parts.append(f"{label}: {count}")
+        lines.append("**Confidence buckets:** " + " · ".join(parts))
+
+    lines.append(f"\n**Suspect edges (low-conf / fuzzy / llm) — {suspect_total} total:**")
+    if not suspect:
+        lines.append("  (none — no low-confidence/fuzzy/llm edges in scope)")
+    else:
+        shown = len(suspect)
+        if truncated:
+            lines.append(
+                f"  showing {shown} of {suspect_total} (TRUNCATED — raise cap to see all):"
+            )
+        for e in suspect:
+            w = f"w={e['weight']:.2f}" if isinstance(e.get("weight"), (int, float)) else "w=?"
+            label = f"  ({e['label']})" if e.get("label") else ""
+            chips = _kg_meta_chips(e.get("meta"))
+            chip_str = f" · {chips}" if chips else ""
+            lines.append(
+                f"  `{e.get('id')}` [{e.get('type', '?')}] "
+                f"`{e.get('from')}`→`{e.get('to')}` {w}{label}{chip_str}"
+            )
     return "\n".join(lines)

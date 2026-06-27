@@ -50,7 +50,9 @@ def test_set_and_get_kg_adapter_roundtrip(isolated_registry):
 
     # By label (defaults to dir basename)
     ok = reg.set_kg_adapter(
-        "jeevy_portal", url="http://127.0.0.1:8001/internal/kg/graph", token_env="JEEVY_KG_ADAPTER_TOKEN"
+        "jeevy_portal",
+        url="http://127.0.0.1:8001/internal/kg/graph",
+        token_env="JEEVY_KG_ADAPTER_TOKEN",
     )
     assert ok is True
 
@@ -165,7 +167,9 @@ def test_graph_404_no_adapter(graph_mod, monkeypatch):
 
 def test_graph_500_token_env_unset(graph_mod, monkeypatch):
     monkeypatch.setattr(
-        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/graph", "token_env": "MISSING_TOK"}
+        graph_mod,
+        "get_kg_adapter",
+        lambda _p: {"url": "http://x/graph", "token_env": "MISSING_TOK"},
     )
     monkeypatch.delenv("MISSING_TOK", raising=False)
     # Neutralize load_dotenv so it can't repopulate the env from a real .env.
@@ -269,9 +273,7 @@ def test_graph_custom_auth_header_sends_raw_token(graph_mod, monkeypatch):
 def test_set_kg_adapter_with_auth_header_roundtrip(isolated_registry):
     reg = isolated_registry
     reg.record_attach(Path("/abs/jeevy"), Path("/abs/jeevy/.venv"))
-    reg.set_kg_adapter(
-        "jeevy", url="http://x/graph", token_env="TOK", auth_header="X-Internal-Key"
-    )
+    reg.set_kg_adapter("jeevy", url="http://x/graph", token_env="TOK", auth_header="X-Internal-Key")
     assert reg.get_kg_adapter("jeevy") == {
         "url": "http://x/graph",
         "token_env": "TOK",
@@ -296,12 +298,16 @@ _NODE_DETAIL = {
 }
 
 
-def test_node_url_derivation():
-    from khimaira.monitor.api.graph import _node_url
+def test_sub_url_derivation():
+    from khimaira.monitor.api.graph import _sub_url
 
-    assert _node_url("http://j/internal/kg/graph", "u1") == "http://j/internal/kg/node/u1"
-    assert _node_url("http://j/internal/kg/", "u1") == "http://j/internal/kg/node/u1"
-    assert _node_url("http://j/kg", "u1") == "http://j/kg/node/u1"
+    assert _sub_url("http://j/internal/kg/graph", "node/u1") == "http://j/internal/kg/node/u1"
+    assert _sub_url("http://j/internal/kg/", "node/u1") == "http://j/internal/kg/node/u1"
+    assert _sub_url("http://j/kg", "node/u1") == "http://j/kg/node/u1"
+    assert _sub_url("http://j/internal/kg/graph", "health") == "http://j/internal/kg/health"
+    assert (
+        _sub_url("http://j/internal/kg/graph", "edges-audit") == "http://j/internal/kg/edges-audit"
+    )
 
 
 def test_graph_node_happy_proxies_to_node_subpath(graph_mod, monkeypatch):
@@ -313,9 +319,7 @@ def test_graph_node_happy_proxies_to_node_subpath(graph_mod, monkeypatch):
         "AsyncClient",
         _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_NODE_DETAIL)),
     )
-    r = _client(graph_mod).get(
-        "/api/graph/jeevy_portal/node/uuid-1", params={"scope": "shop:10"}
-    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/node/uuid-1", params={"scope": "shop:10"})
     assert r.status_code == 200
     assert r.json() == _NODE_DETAIL
     # Proxied to the derived node sub-path, scope forwarded.
@@ -340,3 +344,149 @@ def test_graph_node_502_adapter_unreachable(graph_mod, monkeypatch):
     )
     r = _client(graph_mod).get("/api/graph/jeevy_portal/node/uuid-1")
     assert r.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# Edge-detail proxy: GET /api/graph/<project>/edge/<id>
+# ---------------------------------------------------------------------------
+
+_EDGE_DETAIL = {
+    "data": {
+        "id": "edge-1",
+        "type": "has-type",
+        "from": "a",
+        "to": "b",
+        "weight": 0.62,
+        "meta": {"match_method": "fuzzy", "page": 3},
+    }
+}
+
+
+def test_edge_url_derivation():
+    from khimaira.monitor.api.graph import _sub_url
+
+    assert _sub_url("http://j/internal/kg/graph", "edge/e1") == "http://j/internal/kg/edge/e1"
+    assert _sub_url("http://j/internal/kg/", "edge/e1") == "http://j/internal/kg/edge/e1"
+
+
+def test_graph_edge_happy_proxies_to_edge_subpath(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_EDGE_DETAIL)),
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/edge/edge-1", params={"scope": "shop:10"})
+    assert r.status_code == 200
+    assert r.json() == _EDGE_DETAIL
+    assert _FakeClient.last_url == "http://x/internal/kg/edge/edge-1"
+    assert _FakeClient.last_params == {"scope": "shop:10"}
+
+
+def test_graph_edge_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/edge/edge-1")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Schema (type meta-graph) proxy: GET /api/graph/<project>/schema
+# ---------------------------------------------------------------------------
+
+_SCHEMA = {
+    "data": {
+        "nodeTypes": ["job", "task"],
+        "linkTypes": ["belongs-to"],
+        "triples": [{"fromType": "task", "linkType": "belongs-to", "toType": "job", "count": 2}],
+    }
+}
+
+
+def test_schema_url_derivation():
+    from khimaira.monitor.api.graph import _sub_url
+
+    assert _sub_url("http://j/internal/kg/graph", "schema") == "http://j/internal/kg/schema"
+    assert _sub_url("http://j/internal/kg/", "schema") == "http://j/internal/kg/schema"
+
+
+def test_graph_schema_happy_proxies_to_schema_subpath(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_SCHEMA)),
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/schema", params={"scope": "shop:10"})
+    assert r.status_code == 200
+    assert r.json() == _SCHEMA
+    assert _FakeClient.last_url == "http://x/internal/kg/schema"
+
+
+def test_graph_schema_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    assert _client(graph_mod).get("/api/graph/jeevy_portal/schema").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 aggregate routes — health / coverage / edges-audit + `since`
+# ---------------------------------------------------------------------------
+
+_HEALTH = {"data": {"totals": {"nodes": 5719, "edges": 9970, "orphanNodes": 1814}}}
+_COVERAGE = {"data": {"entities": [{"entity": "user", "relationalCount": 46, "kgCount": 4}]}}
+_AUDIT = {"data": {"matchMethods": [{"method": "normalized", "count": 9970}]}}
+
+
+def _ok(graph_mod, monkeypatch, payload):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=payload)),
+    )
+
+
+def test_graph_health_proxies_to_health_subpath(graph_mod, monkeypatch):
+    _ok(graph_mod, monkeypatch, _HEALTH)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/health", params={"scope": "shop:10"})
+    assert r.status_code == 200 and r.json() == _HEALTH
+    assert _FakeClient.last_url == "http://x/internal/kg/health"
+
+
+def test_graph_health_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    assert _client(graph_mod).get("/api/graph/jeevy_portal/health").status_code == 404
+
+
+def test_graph_coverage_proxies_to_coverage_subpath(graph_mod, monkeypatch):
+    _ok(graph_mod, monkeypatch, _COVERAGE)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/coverage", params={"scope": "shop:10"})
+    assert r.status_code == 200 and r.json() == _COVERAGE
+    assert _FakeClient.last_url == "http://x/internal/kg/coverage"
+
+
+def test_graph_edges_audit_proxies_to_subpath(graph_mod, monkeypatch):
+    _ok(graph_mod, monkeypatch, _AUDIT)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/edges-audit", params={"scope": "shop:10"})
+    assert r.status_code == 200 and r.json() == _AUDIT
+    assert _FakeClient.last_url == "http://x/internal/kg/edges-audit"
+
+
+def test_since_param_forwarded_to_adapter(graph_mod, monkeypatch):
+    _ok(graph_mod, monkeypatch, _HEALTH)
+    _client(graph_mod).get(
+        "/api/graph/jeevy_portal/health",
+        params={"scope": "shop:10", "since": "2026-06-01T00:00:00Z"},
+    )
+    assert _FakeClient.last_params == {"scope": "shop:10", "since": "2026-06-01T00:00:00Z"}
+
+
+def test_since_omitted_when_absent(graph_mod, monkeypatch):
+    _ok(graph_mod, monkeypatch, _HEALTH)
+    _client(graph_mod).get("/api/graph/jeevy_portal/health", params={"scope": "shop:10"})
+    assert _FakeClient.last_params == {"scope": "shop:10"}  # no since key

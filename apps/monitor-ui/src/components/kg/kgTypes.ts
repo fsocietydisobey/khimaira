@@ -45,12 +45,41 @@ export interface GraphNode {
 }
 
 export interface GraphEdge {
+  /** Opaque stable id (adapter-defined) — addresses the edge for edge-detail. */
+  id?: string;
   from: string;
   to: string;
   /** Opaque relation label — drives edge color. */
   type: string;
   /** Optional 0–1 emphasis (opacity/width). Defaults to 1 when absent. */
   weight?: number;
+}
+
+/** Edge provenance detail (the edge-debug surface). Jeevy provenance/source
+ *  fields fold into the opaque `meta` map — no schema terms here. */
+export interface GraphEdgeDetail {
+  id: string;
+  type: string;
+  from: string;
+  to: string;
+  weight?: number;
+  meta?: Record<string, string | number | boolean | null>;
+}
+
+/** A (fromType)-[linkType]->(toType) pattern that occurs in the graph. */
+export interface GraphSchemaTriple {
+  fromType: string;
+  linkType: string;
+  toType: string;
+  count: number;
+}
+
+/** Type meta-graph — distinct node/link types + the triples that occur. The
+ *  structural-gap finder: a missing triple = a relationship type never extracted. */
+export interface GraphSchema {
+  nodeTypes: string[];
+  linkTypes: string[];
+  triples: GraphSchemaTriple[];
 }
 
 export interface GraphContract {
@@ -153,13 +182,34 @@ export const MOCK_NODE_DETAIL: GraphNodeDetail = {
   label: "Procure angle iron",
   badge: 4,
   currentFacts: [
-    { label: "status", value: "open", meta: { trust: "high", confidence: "99%", at: "2024-05-01 10:00" } },
-    { label: "assignee", value: "jsmith", meta: { trust: "high", confidence: "95%", at: "2024-05-01 10:00" } },
-    { label: "due_date", value: "2024-05-15", meta: { trust: "medium", confidence: "80%", at: "2024-05-02 08:30" } },
-    { label: "priority", value: "high", meta: { trust: "high", confidence: "92%", at: "2024-05-01 10:00" } },
+    {
+      label: "status",
+      value: "open",
+      meta: { trust: "high", confidence: "99%", at: "2024-05-01 10:00" },
+    },
+    {
+      label: "assignee",
+      value: "jsmith",
+      meta: { trust: "high", confidence: "95%", at: "2024-05-01 10:00" },
+    },
+    {
+      label: "due_date",
+      value: "2024-05-15",
+      meta: { trust: "medium", confidence: "80%", at: "2024-05-02 08:30" },
+    },
+    {
+      label: "priority",
+      value: "high",
+      meta: { trust: "high", confidence: "92%", at: "2024-05-01 10:00" },
+    },
   ],
   historyFacts: [
-    { label: "status", value: "draft", deprecated: true, meta: { trust: "high", confidence: "99%", at: "2024-04-28 09:00" } },
+    {
+      label: "status",
+      value: "draft",
+      deprecated: true,
+      meta: { trust: "high", confidence: "99%", at: "2024-04-28 09:00" },
+    },
   ],
   edgesFrom: [],
   edgesTo: [],
