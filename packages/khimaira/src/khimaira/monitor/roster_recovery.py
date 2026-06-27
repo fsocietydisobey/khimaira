@@ -85,6 +85,25 @@ _DEBOUNCE: dict[tuple[int, str], float] = {}
 # or a changed prompt escalates fresh.
 _HITL_ESCALATED: dict[int, str] = {}
 
+# Compaction-effect evidence gate: session_id → (injection_ts, summary_count_at_injection).
+# After a /compact injection we record how many compaction-summary entries the
+# transcript held. A /compact that ACTUALLY executes writes a new summary entry; its
+# ABSENCE on the next cycle means the injection was a no-op (window blocked at a
+# permission dialog, busy false-negative, or idle so the transcript's last assistant
+# turn is still the pre-compact one). Without this gate, _compute_context_pct keeps
+# reading the same stale-high turn and the time-only cooldown re-fires /compact every
+# cooldown into a session whose context never dropped — the compact-storm (window 31 /
+# session 4685e875, 2026-06-27: /compact at 85% then 87% six minutes later with NO
+# compaction-summary written between). Keyed on session_id (stable across window
+# renumber, unlike _DEBOUNCE's window_id key).
+_COMPACT_PENDING: dict[str, tuple[float, int | None]] = {}
+# How long to suppress re-injection once a /compact produced no new summary. Far
+# longer than the normal cooldown so a stuck/blocked window isn't hammered every
+# 5 min; CC's own auto-compact is the backstop if the session genuinely fills.
+_COMPACT_NO_EFFECT_BACKSTOP_S = float(
+    os.environ.get("KHIMAIRA_COMPACT_NOEFFECT_BACKSTOP_S", "1800")
+)  # 30 min
+
 # ---------------------------------------------------------------------------
 # HITL auto-answering configuration
 # ---------------------------------------------------------------------------
@@ -666,6 +685,39 @@ def _compute_context_pct(session_id: str) -> int | None:
             context_window = _CONTEXT_WINDOW_1M
 
         return round(100 * last_ctx / context_window)
+    except Exception:
+        return None
+
+
+def _count_compact_summaries(session_id: str) -> int | None:
+    """Number of compaction-summary entries in the session transcript, or None.
+
+    Claude Code writes an entry flagged ``isCompactSummary`` (and/or
+    ``type == "summary"``) when a ``/compact`` actually executes. Counting them is
+    the ground-truth signal that a compaction RAN — used by the compact-effect
+    evidence gate (``_COMPACT_PENDING``) to distinguish "compaction worked" from
+    "/compact was a no-op". Returns None on read failure so the caller stays
+    conservative (treats unknown as "no confirmed effect" → backstop, not re-fire).
+    """
+    try:
+        from khimaira.monitor import sessions as _sess
+
+        transcript = _sess._find_transcript(session_id)
+        if transcript is None or not transcript.is_file():
+            return None
+
+        count = 0
+        for line in transcript.read_text(errors="replace").splitlines():
+            # Cheap substring pre-filter before json.loads on every transcript line.
+            if "isCompactSummary" not in line and '"summary"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if obj.get("isCompactSummary") or obj.get("type") == "summary":
+                count += 1
+        return count
     except Exception:
         return None
 
@@ -2080,6 +2132,67 @@ async def _process_window(win: dict[str, Any]) -> None:
             )
             return
 
+        # Dialog guard (independent of auto-HITL): a window sitting at a
+        # permission/HITL prompt cannot compact — the /compact keystrokes are
+        # consumed by the dialog and never start a compaction. When auto-HITL is
+        # enabled the HITL path above already returned; this also covers the
+        # auto-HITL-disabled / opted-out case so we never inject /compact into an
+        # open dialog (a no-op that would arm the storm).
+        if _detect_hitl_prompt(text) is not None:
+            _log.debug(
+                "roster-recovery: window %d role=%s at %d%% but a permission/HITL "
+                "dialog is open — skip compact (keystrokes can't compact a dialog)",
+                window_id,
+                role,
+                context_pct,
+            )
+            return
+
+        # Compaction-effect evidence gate: did our PREVIOUS /compact for this session
+        # actually execute? A real compaction writes a new summary entry to the
+        # transcript. If none has appeared since we injected, the injection was a
+        # no-op (blocked/busy/idle) and _compute_context_pct is still reading the
+        # stale pre-compact turn — suppress re-injection until a long backstop
+        # instead of re-firing every cooldown (the compact-storm root cause).
+        pending = _COMPACT_PENDING.get(session_id)
+        if pending is not None:
+            injected_ts, count_at_injection = pending
+            cur_count = await asyncio.get_running_loop().run_in_executor(
+                None, _count_compact_summaries, session_id
+            )
+            compaction_ran = (
+                cur_count is not None
+                and count_at_injection is not None
+                and cur_count > count_at_injection
+            )
+            if compaction_ran:
+                # Prior /compact worked; context has since climbed back to threshold.
+                # Clear the marker and treat this as a fresh, legitimate compaction.
+                _COMPACT_PENDING.pop(session_id, None)
+            elif time.time() - injected_ts < _COMPACT_NO_EFFECT_BACKSTOP_S:
+                # No new compaction-summary since we injected → the prior /compact
+                # never took effect. Do NOT re-inject every cooldown. Bump the
+                # time-cooldown so the next evidence re-check is one cooldown away
+                # (throttles the transcript read), and surface the stuck window.
+                _log.warning(
+                    "roster-recovery: window %d role=%s at %d%% but the prior "
+                    "/compact (%.0fs ago) produced NO new compaction-summary — the "
+                    "injection was a no-op (window blocked/busy/idle). Suppressing "
+                    "re-inject until the %.0fs backstop instead of re-firing every "
+                    "cooldown.",
+                    window_id,
+                    role,
+                    context_pct,
+                    time.time() - injected_ts,
+                    _COMPACT_NO_EFFECT_BACKSTOP_S,
+                )
+                _DEBOUNCE[action_key] = time.time()
+                return
+            else:
+                # Backstop elapsed with still no confirmed effect — clear the marker
+                # and allow one fresh attempt (the window may have since unblocked).
+                _COMPACT_PENDING.pop(session_id, None)
+
         # Guard (b): only compact when NOT actively running tools / compacting
         if busy:
             _log.debug(
@@ -2121,6 +2234,15 @@ async def _process_window(win: dict[str, Any]) -> None:
         # Cooling down on abort converts "retry every sweep" → "retry every cooldown".
         _DEBOUNCE[action_key] = time.time()
         if submitted:
+            # Arm the compaction-effect evidence gate: record the summary count NOW
+            # so the next cycle can tell whether this /compact produced a NEW summary
+            # (it worked) or not (no-op → suppress re-inject, don't storm). Storing
+            # None (read failure) is conservative: compaction_ran stays False, so the
+            # gate falls through to the backstop rather than re-firing immediately.
+            count_now = await asyncio.get_running_loop().run_in_executor(
+                None, _count_compact_summaries, session_id
+            )
+            _COMPACT_PENDING[session_id] = (time.time(), count_now)
             _log.info(
                 "roster-recovery: /compact submitted to window %d role=%s session=%s",
                 window_id,

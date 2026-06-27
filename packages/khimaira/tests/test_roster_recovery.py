@@ -444,6 +444,7 @@ class TestComputeContextPct:
         )
         assert result == 25
 
+
     def test_fresh_session_ramp_simulation(self):
         """Fresh 1M session at 170k reads ~17% NOT 85% — prevents premature compaction."""
         result = self._run({
@@ -462,6 +463,50 @@ class TestComputeContextPct:
             "cache_read_input_tokens": 0,
         })
         assert result is not None and result == 85
+
+
+# ---------------------------------------------------------------------------
+# _count_compact_summaries (compaction-effect ground-truth signal)
+# ---------------------------------------------------------------------------
+
+class TestCountCompactSummaries:
+    def _run(self, content: str) -> int | None:
+        mock_path = MagicMock()
+        mock_path.is_file.return_value = True
+        mock_path.read_text.return_value = content
+        from khimaira.monitor import sessions as sess_mod
+        with patch.object(sess_mod, "_find_transcript", return_value=mock_path):
+            return rr._count_compact_summaries("dummy")
+
+    def test_counts_both_summary_markers(self):
+        import json as _json
+        lines = [
+            _json.dumps({"type": "assistant", "message": {"usage": {}}}),
+            _json.dumps({"type": "summary", "summary": "rolled-up history"}),
+            _json.dumps({"type": "user", "isCompactSummary": True, "message": {}}),
+            _json.dumps({"type": "assistant", "message": {"usage": {}}}),
+        ]
+        # one type==summary + one isCompactSummary == 2
+        assert self._run("\n".join(lines) + "\n") == 2
+
+    def test_zero_when_no_summaries(self):
+        import json as _json
+        content = _json.dumps({"type": "assistant", "message": {"usage": {}}}) + "\n"
+        assert self._run(content) == 0
+
+    def test_ignores_malformed_lines(self):
+        import json as _json
+        content = (
+            "not json at all\n"
+            + _json.dumps({"type": "summary", "summary": "x"}) + "\n"
+            + "{partial\n"
+        )
+        assert self._run(content) == 1
+
+    def test_none_when_no_transcript(self):
+        from khimaira.monitor import sessions as sess_mod
+        with patch.object(sess_mod, "_find_transcript", return_value=None):
+            assert rr._count_compact_summaries("dummy") is None
 
 
 # ---------------------------------------------------------------------------
@@ -708,8 +753,10 @@ class TestProcessWindow:
     @pytest.fixture(autouse=True)
     def clear_debounce(self):
         rr._DEBOUNCE.clear()
+        rr._COMPACT_PENDING.clear()
         yield
         rr._DEBOUNCE.clear()
+        rr._COMPACT_PENDING.clear()
 
     def _win(self, role="agent-1", window_id=10, raw_name=""):
         return {"window_id": window_id, "role": role, "raw_name": raw_name, "cmdline": f"claude-chat -r {role}"}
@@ -800,6 +847,108 @@ class TestProcessWindow:
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
+
+    # -- compaction-effect evidence gate (compact-storm fix) -------------------
+
+    @pytest.mark.asyncio
+    async def test_compact_suppressed_when_prior_compact_had_no_effect(self):
+        """Storm fix: if the previous /compact wrote NO new compaction-summary, the
+        context reading is stale-high (window blocked/busy/idle) — suppress re-inject
+        instead of re-firing every cooldown."""
+        screen = ">"
+        rr._COMPACT_PENDING["uuid-1234"] = (time.time(), 2)  # injected recently, 2 summaries then
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=87),
+            patch.object(rr, "_count_compact_summaries", return_value=2),  # unchanged → no-op
+            patch.object(rr, "_distill_session", new_callable=AsyncMock),
+            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+        ):
+            await rr._process_window(self._win())
+        mock_inject.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compact_proceeds_when_prior_compact_took_effect(self):
+        """If a NEW compaction-summary appeared since the last injection, the prior
+        /compact worked and context legitimately climbed back — allow a fresh
+        compaction and re-arm the gate with the new count."""
+        screen = ">"
+        rr._COMPACT_PENDING["uuid-1234"] = (time.time(), 2)
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=90),
+            patch.object(rr, "_count_compact_summaries", return_value=3),  # +1 → it ran
+            patch.object(rr, "_distill_session", new_callable=AsyncMock),
+            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+        ):
+            await rr._process_window(self._win())
+        mock_inject.assert_called_once_with(10, "/compact", "")
+        assert rr._COMPACT_PENDING["uuid-1234"][1] == 3  # re-armed for the next cycle
+
+    @pytest.mark.asyncio
+    async def test_compact_retries_after_no_effect_backstop_elapses(self):
+        """Once the no-effect backstop elapses, allow a fresh attempt (the window may
+        have since unblocked)."""
+        screen = ">"
+        old_ts = time.time() - rr._COMPACT_NO_EFFECT_BACKSTOP_S - 1
+        rr._COMPACT_PENDING["uuid-1234"] = (old_ts, 2)
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=90),
+            patch.object(rr, "_count_compact_summaries", return_value=2),  # still no effect
+            patch.object(rr, "_distill_session", new_callable=AsyncMock),
+            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+        ):
+            await rr._process_window(self._win())
+        mock_inject.assert_called_once_with(10, "/compact", "")
+
+    @pytest.mark.asyncio
+    async def test_compact_skipped_when_permission_dialog_open(self):
+        """Dialog guard (independent of auto-HITL): never inject /compact into a
+        window sitting at a permission/HITL prompt — the keystrokes can't compact a
+        dialog, they only arm the storm."""
+        screen = "Do you want to proceed?\n❯ 1. Yes\n  2. No, tell Claude what to do differently"
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            # auto-HITL OFF → the upstream HITL path doesn't pre-empt; proves the
+            # compact-path dialog guard stands on its own.
+            patch.object(rr, "_env_auto_hitl_enabled", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=90),
+            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+        ):
+            await rr._process_window(self._win())
+        mock_inject.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compact_arms_evidence_gate_on_success(self):
+        """A successful /compact arms the evidence gate with the current summary
+        count so the next cycle can verify the compaction took effect."""
+        screen = ">"
+        with (
+            patch.object(rr, "_env_enabled", return_value=True),
+            patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
+            patch.object(rr, "_session_opt_out", return_value=False),
+            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_compute_context_pct", return_value=88),
+            patch.object(rr, "_count_compact_summaries", return_value=1),
+            patch.object(rr, "_distill_session", new_callable=AsyncMock),
+            patch.object(rr, "_inject_text_and_submit", return_value=True),
+        ):
+            await rr._process_window(self._win())
+        assert rr._COMPACT_PENDING.get("uuid-1234") is not None
+        assert rr._COMPACT_PENDING["uuid-1234"][1] == 1
 
     @pytest.mark.asyncio
     async def test_skips_when_global_opt_out(self):
@@ -1505,8 +1654,10 @@ class TestProcessWindowNameResolution:
     @pytest.fixture(autouse=True)
     def clear_debounce(self):
         rr._DEBOUNCE.clear()
+        rr._COMPACT_PENDING.clear()
         yield
         rr._DEBOUNCE.clear()
+        rr._COMPACT_PENDING.clear()
 
     def _win(self, raw_name="agent-2", role="agent", window_id=200):
         return {"window_id": window_id, "role": role, "raw_name": raw_name,
