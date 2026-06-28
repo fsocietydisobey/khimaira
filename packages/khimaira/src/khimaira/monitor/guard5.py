@@ -193,6 +193,9 @@ def _scan_chat_for_gates(
                 "status": chats_mod.TASK_PENDING,
                 "assignee_id": line.get("assignee_id"),
                 "assignee_role": line.get("assignee_role"),
+                # gate_required: lets Guard-7 skip verdict-watchdogging un-gated done
+                # tasks (a consult/research done-task was never meant to clear a gate).
+                "gate_required": bool(line.get("gate_required")),
                 "preview": (line.get("body") or "")[:120],
                 "begin_fired": False,
                 "has_verdict": False,

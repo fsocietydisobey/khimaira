@@ -17,9 +17,7 @@ NOW = 1_000_000.0  # fixed test clock
 
 
 def _iso(age_s: float) -> str:
-    return datetime.datetime.fromtimestamp(
-        NOW - age_s, datetime.timezone.utc
-    ).isoformat()
+    return datetime.datetime.fromtimestamp(NOW - age_s, datetime.timezone.utc).isoformat()
 
 
 def _gate(status="in_progress", task_age=12 * 60, assignee="agent-1", **kw):
@@ -91,6 +89,7 @@ def _wire(
     target="master-1",
     created_age=30 * 60,
     done_age=20 * 60,
+    has_reviewer=True,
 ):
     """Patch guard7's lazily-imported deps; return (notices, chat_posts) captured."""
     from khimaira.monitor import guard5, sessions, chats
@@ -98,6 +97,11 @@ def _wire(
     guard7._GUARD7_SEEN.clear()
     monkeypatch.setattr(guard7, "_ENABLED", True)
     monkeypatch.setattr(guard7.time, "time", lambda: NOW)
+
+    # Root B: _chat_has_reviewer_role reads load_room().meta.member_roles. Mock a roster
+    # that either has a verdict-authoring (gatekeeper) seat or doesn't.
+    _reviewer_roles = {"gk-1": chats.ROLE_GATEKEEPER} if has_reviewer else {"a": chats.ROLE_AGENT}
+    monkeypatch.setattr(chats, "load_room", lambda cid: {"meta": {"member_roles": _reviewer_roles}})
 
     # per-task timeline (created_ts / done_ts) the abandonment + done-recency checks use
     times = {"task-1": {"created_ts": _iso(created_age), "done_ts": _iso(done_age)}}
@@ -147,18 +151,46 @@ async def test_healthy_task_does_not_fire(monkeypatch):
 
 
 async def test_done_with_both_verdicts_does_not_fire(monkeypatch):
-    g = _gate(status="done", task_age=20 * 60)
+    g = _gate(status="done", task_age=20 * 60, gate_required=True)
     notices, _ = _wire(monkeypatch, [g], idle=60, committable=["task-1"])
     await guard7._guard7_check_once()
     assert notices == []  # committable → master owns the commit, not Guard-7
 
 
 async def test_done_verdict_owed_fires(monkeypatch):
-    g = _gate(status="done", task_age=20 * 60)
+    g = _gate(status="done", task_age=20 * 60, gate_required=True)
     notices, _ = _wire(monkeypatch, [g], idle=60, committable=[])
     await guard7._guard7_check_once()
     assert len(notices) == 1
     assert "verdict" in notices[0]["text"].lower()
+
+
+async def test_done_not_gate_required_does_not_fire(monkeypatch):
+    """Root B(a): an un-gated consult/research done-task was never meant to clear a
+    verdict gate → Guard-7 must NOT nag it for a verdict (un-satisfiable)."""
+    g = _gate(status="done", task_age=20 * 60, gate_required=False)
+    notices, _ = _wire(monkeypatch, [g], idle=60, committable=[])
+    await guard7._guard7_check_once()
+    assert notices == []
+
+
+async def test_done_gate_required_but_no_reviewer_role_does_not_fire(monkeypatch):
+    """Root B(b): a gate_required done-task in a roster with NO verdict-authoring seat
+    (lean roster missing a gatekeeper, or reviewers all left) → the verdict nag is
+    un-dischargeable → suppress it."""
+    g = _gate(status="done", task_age=20 * 60, gate_required=True)
+    notices, _ = _wire(monkeypatch, [g], idle=60, committable=[], has_reviewer=False)
+    await guard7._guard7_check_once()
+    assert notices == []
+
+
+async def test_done_gate_required_with_reviewer_role_fires(monkeypatch):
+    """Root B control: gate_required + a reviewer seat present → the nag IS satisfiable
+    → Guard-7 fires normally (legacy + lean-with-gatekeeper both keep working)."""
+    g = _gate(status="done", task_age=20 * 60, gate_required=True)
+    notices, _ = _wire(monkeypatch, [g], idle=60, committable=[], has_reviewer=True)
+    await guard7._guard7_check_once()
+    assert len(notices) == 1
 
 
 async def test_wind_down_suppresses(monkeypatch):

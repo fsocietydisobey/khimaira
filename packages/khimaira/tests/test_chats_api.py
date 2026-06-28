@@ -223,9 +223,7 @@ def test_chat_history_shows_current_name_after_rename(chats_api_client):
     # Rename alice to "alice-renamed".
     sessions_mod.set_name("alice", "alice-renamed")
 
-    history = client.get(f"/api/chats/{chat_id}/messages?session_id=bob").json()[
-        "messages"
-    ]
+    history = client.get(f"/api/chats/{chat_id}/messages?session_id=bob").json()["messages"]
     user_msgs = [m for m in history if m.get("sender_id") == "alice"]
     assert len(user_msgs) == 1
     assert user_msgs[0]["sender_name"] == "alice-renamed"
@@ -263,9 +261,7 @@ def test_chat_history_falls_back_to_stored_name_for_deleted_session(chats_api_cl
     assert alice_msgs[0]["sender_name"] == "alice"  # falls back to stored snapshot
 
 
-def test_chat_history_name_cache_per_request(
-    chats_api_client, monkeypatch: pytest.MonkeyPatch
-):
+def test_chat_history_name_cache_per_request(chats_api_client, monkeypatch: pytest.MonkeyPatch):
     """Per-request name cache: only 1 status.json read per unique sender per request."""
     import importlib
     from khimaira.monitor.api import chats as api_mod
@@ -373,9 +369,7 @@ def test_send_to_pending_recipient_times_out_with_408(
 
     importlib.reload(api_mod)
     monkeypatch.setattr(api_mod, "_PENDING_POLL_INTERVAL", 0.01)
-    monkeypatch.setattr(
-        api_mod, "_PENDING_WAIT_DEADLINE", 0.001
-    )  # expires on first check
+    monkeypatch.setattr(api_mod, "_PENDING_WAIT_DEADLINE", 0.001)  # expires on first check
 
     client, _ = chats_api_client
     created = client.post(
@@ -837,9 +831,7 @@ def test_overdue_watcher_fires_notice(registry_client, monkeypatch: pytest.Monke
     _, api_mod, _ = registry_client
     notices_fired: list[tuple[str, str]] = []
 
-    def _mock_post_notice(
-        target_session_id, text, *, from_session_id="external", **_kw
-    ):
+    def _mock_post_notice(target_session_id, text, *, from_session_id="external", **_kw):
         notices_fired.append((target_session_id, text))
         return {}
 
@@ -1096,9 +1088,7 @@ def test_cursor_persists_across_daemon_restart(chats_api_client, tmp_path, monke
     assert chats_mod._cursor_for("bob", "chat-y") == "evt-200"
 
 
-def _drain_backfill(
-    subscribe_coro, max_events: int = 100, timeout_s: float = 0.3
-) -> list[dict]:
+def _drain_backfill(subscribe_coro, max_events: int = 100, timeout_s: float = 0.3) -> list[dict]:
     """Drain backfill events from an async generator using per-event timeouts.
 
     Stops collecting when an event takes longer than timeout_s (meaning we've
@@ -1208,9 +1198,7 @@ def test_backfill_without_cursor_uses_last_50(chats_api_client):
 
     sd = sessions_mod._session_dir("carol")
     sd.mkdir(parents=True, exist_ok=True)
-    (sd / "status.json").write_text(
-        json.dumps({"status": "idle", "name": "carol"}), "utf-8"
-    )
+    (sd / "status.json").write_text(json.dumps({"status": "idle", "name": "carol"}), "utf-8")
 
     resp_b = client.post(
         "/api/chats",
@@ -1230,9 +1218,7 @@ def test_backfill_without_cursor_uses_last_50(chats_api_client):
 
     # Subscribe with anchor from chat A as the since_event_id hint.
     # Chat B has no cursor → falls to last-50 backfill.
-    collected = _drain_backfill(
-        chats_mod.subscribe("alice", since_event_id=anchor_event_id)
-    )
+    collected = _drain_backfill(chats_mod.subscribe("alice", since_event_id=anchor_event_id))
     chat_b_events = [r for r in collected if r.get("chat_id") == chat_b]
     assert len(chat_b_events) > 0, "expected backfill events from chat B"
     assert len(chat_b_events) <= 50, "backfill capped at 50"
@@ -1288,9 +1274,7 @@ def test_last_event_id_hint_used_when_no_cursor(chats_api_client):
     pivot_event_id = lines[1]["event_id"]  # last-event-id hint
 
     # No cursor set. Subscribe with since_event_id = pivot → only last msg delivered.
-    collected = _drain_backfill(
-        chats_mod.subscribe("alice", since_event_id=pivot_event_id)
-    )
+    collected = _drain_backfill(chats_mod.subscribe("alice", since_event_id=pivot_event_id))
     msg_bodies = [r["body"] for r in collected if r.get("kind") == "msg"]
     # msg 2 should appear (it comes after the pivot), msg 0 should NOT (it's before the pivot).
     assert "msg 2" in msg_bodies, f"expected 'msg 2' in backfill; got: {msg_bodies}"
@@ -1403,13 +1387,11 @@ def test_guard4_escalates_when_process_dead(guard4_env, monkeypatch):
     asyncio.run(api_mod._guard4_check_once())
 
     assert len(notices) >= 1, (
-        "Guard-4 must escalate when session has obligation + dead process. "
-        f"notices={notices}"
+        "Guard-4 must escalate when session has obligation + dead process. " f"notices={notices}"
     )
     # Assert the escalation mentions crash and the session
     all_text = " ".join(
-        str(n.get("kw", {}).get("text", "")) + " " + str(n.get("args", ""))
-        for n in notices
+        str(n.get("kw", {}).get("text", "")) + " " + str(n.get("args", "")) for n in notices
     )
     assert (
         "crash" in all_text or assignee_sid[:8] in all_text
@@ -1498,18 +1480,14 @@ def test_guard4_no_escalation_without_obligation(guard4_env, monkeypatch):
         return rows
 
     real_fn = sessions_mod.list_sessions
-    monkeypatch.setattr(
-        sessions_mod, "list_sessions", lambda **kw: real_fn(use_cache=False)
-    )
+    monkeypatch.setattr(sessions_mod, "list_sessions", lambda **kw: real_fn(use_cache=False))
     api_mod._GUARD4_STALLED.clear()
 
     asyncio.run(api_mod._guard4_check_once())
 
     # No tasks → no escalation regardless of liveness
     task_related = [n for n in notices if lone_sid[:8] in str(n)]
-    assert (
-        len(task_related) == 0
-    ), "Guard-4 must be silent when session has no task obligations."
+    assert len(task_related) == 0, "Guard-4 must be silent when session has no task obligations."
 
 
 def test_guard4_debounce_fires_once(guard4_env, monkeypatch):
@@ -1685,9 +1663,7 @@ def test_throttle_escalation_bare_idle(throttle_env, monkeypatch):
     )
     monkeypatch.setattr(api_mod, "_get_session_obligations", lambda sid: [])
     monkeypatch.setattr(api_mod, "_guard4_escalate", _fake_guard4)
-    monkeypatch.setattr(
-        api_mod, "_chats_for_session", lambda sid: ["chat-idle01", "chat-idle02"]
-    )
+    monkeypatch.setattr(api_mod, "_chats_for_session", lambda sid: ["chat-idle01", "chat-idle02"])
 
     api_mod._THROTTLE_STATE.clear()
 
@@ -1845,9 +1821,7 @@ def test_guard4_pending_no_begin_unknown_does_not_escalate(guard4_env, monkeypat
         lambda *a, **kw: notices.append(a) or {},
     )
 
-    monkeypatch.setattr(
-        api_mod, "_is_process_alive_for_session", lambda sid: None
-    )  # unknown
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: None)  # unknown
     monkeypatch.setattr(api_mod, "_compute_throttle_ceiling_s", lambda: 60.0)
 
     real_list = sessions_mod.list_sessions
@@ -1888,9 +1862,7 @@ def test_guard4_pending_no_begin_dead_escalates(guard4_env, monkeypatch):
         lambda *a, **kw: notices.append({"args": a, "kw": kw}) or {},
     )
 
-    monkeypatch.setattr(
-        api_mod, "_is_process_alive_for_session", lambda sid: False
-    )  # dead
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)  # dead
 
     real_list = sessions_mod.list_sessions
 
@@ -1955,9 +1927,7 @@ def test_guard4_pending_begin_fired_alive_escalates(guard4_env, monkeypatch):
         lambda *a, **kw: notices.append(a) or {},
     )
 
-    monkeypatch.setattr(
-        api_mod, "_is_process_alive_for_session", lambda sid: True
-    )  # alive
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: True)  # alive
     monkeypatch.setattr(api_mod, "_compute_throttle_ceiling_s", lambda: 60.0)
 
     real_list = sessions_mod.list_sessions
@@ -1999,9 +1969,7 @@ def test_guard4_debounce_not_reset_by_activity_blip(guard4_env, monkeypatch):
         lambda *a, **kw: notices.append(a) or {},
     )
 
-    monkeypatch.setattr(
-        api_mod, "_is_process_alive_for_session", lambda sid: False
-    )  # dead
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: False)  # dead
 
     silence = [300.0]  # mutable for sweep-by-sweep control
 
@@ -2108,9 +2076,7 @@ def test_post_grant_role_non_master_returns_403(chats_api_client):
 # ---------------------------------------------------------------------------
 
 
-def _setup_room_with_master(
-    client, chats_mod, master="alice", members=("bob",), member_roles=None
-):
+def _setup_room_with_master(client, chats_mod, master="alice", members=("bob",), member_roles=None):
     """Helper: create a room, accept all members, return chat_id."""
     roles = member_roles or {master: "master"}
     resp = client.post(
@@ -2154,12 +2120,21 @@ def test_create_task_with_assignee_role(chats_api_client):
 
 
 def test_auto_create_review_tasks_on_done(chats_api_client):
-    """When a gate_required task → done, AUTO-creates critic + verifier review-tasks."""
+    """LEGACY roster: a gate_required task → done AUTO-creates critic + verifier
+    review-tasks (the wrapper pair is created only for verdict-roles PRESENT in
+    member_roles)."""
     client, chats_mod = chats_api_client
+    _plant_session("dave")
     chat_id = _setup_room_with_master(
         client,
         chats_mod,
-        member_roles={"alice": "master", "bob": "agent"},
+        members=("bob", "carol", "dave"),
+        member_roles={
+            "alice": "master",
+            "bob": "agent",
+            "carol": "critic",
+            "dave": "verifier",
+        },
     )
     # Create a gate_required work-task
     r = client.post(
@@ -2196,6 +2171,68 @@ def test_auto_create_review_tasks_on_done(chats_api_client):
     verdict_roles = {t["verdict_role"] for t in review_tasks}
     assert "critic" in verdict_roles
     assert "verifier" in verdict_roles
+
+
+def _gate_required_done(client, chat_id):
+    """Helper: create a gate_required work-task assigned to bob and drive it to done."""
+    r = client.post(
+        f"/api/chats/{chat_id}/tasks",
+        json={
+            "sender_session_id": "alice",
+            "body": "Do the thing",
+            "assignee_session_id": "bob",
+            "gate_required": True,
+        },
+    )
+    work_task_id = r.json()["id"]
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "in_progress"},
+    )
+    client.post(
+        f"/api/chats/{chat_id}/tasks/{work_task_id}/status",
+        json={"by_session_id": "bob", "new_status": "done"},
+    )
+    return work_task_id
+
+
+def _wrapper_roles(chats_mod, chat_id, work_task_id):
+    room = chats_mod.load_room(chat_id)
+    return {
+        m["verdict_role"]
+        for m in room["messages"]
+        if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
+    }
+
+
+def test_auto_create_review_tasks_lean_gatekeeper_creates_zero(chats_api_client):
+    """LEAN roster (gatekeeper, no critic/verifier): a gate_required task → done creates
+    ZERO wrapper review-tasks — the gatekeeper discharges the gate via a DIRECT verdict
+    on the work-task, so a wrapper for an absent critic/verifier role (which nobody
+    could satisfy) must NOT be created."""
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client,
+        chats_mod,
+        members=("bob", "carol"),
+        member_roles={"alice": "master", "bob": "agent", "carol": "gatekeeper"},
+    )
+    work_task_id = _gate_required_done(client, chat_id)
+    assert _wrapper_roles(chats_mod, chat_id, work_task_id) == set()
+
+
+def test_auto_create_review_tasks_present_roles_only(chats_api_client):
+    """A roster with critic but NO verifier creates ONLY the critic wrapper — never a
+    wrapper for an absent role."""
+    client, chats_mod = chats_api_client
+    chat_id = _setup_room_with_master(
+        client,
+        chats_mod,
+        members=("bob", "carol"),
+        member_roles={"alice": "master", "bob": "agent", "carol": "critic"},
+    )
+    work_task_id = _gate_required_done(client, chat_id)
+    assert _wrapper_roles(chats_mod, chat_id, work_task_id) == {"critic"}
 
 
 def test_master_override_verdict_audited(chats_api_client):
@@ -2255,12 +2292,20 @@ def test_master_override_verdict_non_master_blocked(chats_api_client):
 
 
 def test_auto_create_review_tasks_no_duplicate_while_open(chats_api_client):
-    """Second AUTO-create doesn't duplicate while prior review-tasks are still OPEN."""
+    """LEGACY roster: a second AUTO-create doesn't duplicate while prior review-tasks
+    are still OPEN."""
     client, chats_mod = chats_api_client
+    _plant_session("dave")
     chat_id = _setup_room_with_master(
         client,
         chats_mod,
-        member_roles={"alice": "master", "bob": "agent"},
+        members=("bob", "carol", "dave"),
+        member_roles={
+            "alice": "master",
+            "bob": "agent",
+            "carol": "critic",
+            "dave": "verifier",
+        },
     )
     r = client.post(
         f"/api/chats/{chat_id}/tasks",
@@ -2304,9 +2349,7 @@ def test_auto_create_review_tasks_no_duplicate_while_open(chats_api_client):
         for m in room["messages"]
         if m.get("kind") == chats_mod.TASK and m.get("gate_for") == work_task_id
     ]
-    assert (
-        len(review_tasks) == 2
-    ), f"Expected 2 review-tasks (no dup), got {len(review_tasks)}"
+    assert len(review_tasks) == 2, f"Expected 2 review-tasks (no dup), got {len(review_tasks)}"
 
 
 def test_gate_bypass_prevented_on_satisfied_prior_round(chats_api_client):
@@ -2462,12 +2505,20 @@ def test_gate_satisfied_when_verdicts_precede_auto_advance_done(chats_api_client
 
 
 def test_auto_create_review_tasks_fresh_on_re_done_after_closed(chats_api_client):
-    """After prior review-tasks are closed, re-done creates fresh obligations."""
+    """LEGACY roster: after prior review-tasks are closed, re-done creates fresh
+    obligations."""
     client, chats_mod = chats_api_client
+    _plant_session("dave")
     chat_id = _setup_room_with_master(
         client,
         chats_mod,
-        member_roles={"alice": "master", "bob": "agent"},
+        members=("bob", "carol", "dave"),
+        member_roles={
+            "alice": "master",
+            "bob": "agent",
+            "carol": "critic",
+            "dave": "verifier",
+        },
     )
     r = client.post(
         f"/api/chats/{chat_id}/tasks",

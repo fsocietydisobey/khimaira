@@ -277,6 +277,27 @@ async def _guard7_check_once() -> None:
                 _committable_cache[chat_id] = set()
         return task_id in _committable_cache[chat_id]
 
+    # Root B (2026-06-28): a "verdict owed" nag is un-satisfiable if NO chat member holds
+    # a verdict-authoring role (gatekeeper/critic/verifier) — e.g. a lean roster with no
+    # reviewer seat, or any roster whose reviewers have left. Cache per chat per sweep.
+    _reviewer_role_cache: dict[str, bool] = {}
+
+    def _chat_has_reviewer_role(chat_id: str) -> bool:
+        if chat_id not in _reviewer_role_cache:
+            try:
+                from khimaira.monitor import chats as chats_mod
+
+                roles = (chats_mod.load_room(chat_id).get("meta") or {}).get("member_roles") or {}
+                authoring = {
+                    chats_mod.ROLE_GATEKEEPER,
+                    chats_mod.ROLE_CRITIC,
+                    chats_mod.ROLE_VERIFIER,
+                }
+                _reviewer_role_cache[chat_id] = any(r in authoring for r in roles.values())
+            except Exception:
+                _reviewer_role_cache[chat_id] = True  # fail-open: don't suppress on read error
+        return _reviewer_role_cache[chat_id]
+
     for gate in gates:
         try:
             chat_id = gate.get("chat_id", "")
@@ -314,6 +335,17 @@ async def _guard7_check_once() -> None:
                 )
 
             elif status == "done":
+                # Root B (2026-06-28): never verdict-watchdog a task whose verdict nag
+                # would be UN-SATISFIABLE. Skip if EITHER (a) the task isn't gate_required
+                # (an un-gated consult/research/verify done-task was never meant to clear a
+                # verdict gate) OR (b) no chat member holds a verdict-authoring role
+                # (gatekeeper/critic/verifier) — a lean roster with no reviewer seat, or a
+                # roster whose reviewers left. Legacy critic/verifier rosters: a
+                # gate_required task with reviewers present still nags + satisfies normally.
+                if not gate.get("gate_required"):
+                    continue
+                if not _chat_has_reviewer_role(chat_id):
+                    continue
                 # signal-3: done, no verdict activity for VERDICT_STALL, not committable
                 # (a reviewer slot is still empty). Reuse committable_gate_tasks so we
                 # don't dup auto_dispatch's commit path.

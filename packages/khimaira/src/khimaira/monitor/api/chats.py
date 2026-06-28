@@ -600,7 +600,10 @@ def _auto_create_review_tasks(
 ) -> None:
     """Guard-5 Part A: AUTO-create role-class review-tasks when a gate_required task → done.
 
-    Creates one review-task per verdict_role (critic + verifier) as obligation-wrappers.
+    Creates one review-task per LEGACY verdict_role (critic + verifier) PRESENT in the
+    chat's member_roles, as obligation-wrappers. A lean gatekeeper roster has neither →
+    ZERO wrappers (the gatekeeper discharges the gate via a direct work-task verdict; a
+    wrapper for an absent role would be an un-satisfiable obligation).
     Each review-task carries gate_for=work_task_id and verdict_role so that:
     - _get_session_obligations picks them up for role-holders
     - Guard-4/#14/roster_recovery gain gate-stall visibility for free
@@ -627,6 +630,7 @@ def _auto_create_review_tasks(
         # Fold status updates to find the current status per task.
         review_task_statuses: dict[str, str] = {}  # task_id → current status
         review_task_roles: dict[str, str] = {}  # task_id → verdict_role
+        last_meta: dict | None = None  # latest META wins → current member_roles
         for line in chats._read(chat_id):
             k = line.get("kind")
             if k == chats.TASK and line.get("gate_for") == work_task_id:
@@ -641,6 +645,8 @@ def _auto_create_review_tasks(
                     review_task_statuses[tid] = line.get(
                         "status", review_task_statuses[tid]
                     )
+            elif k == chats.META:
+                last_meta = line
 
         open_statuses = {chats.TASK_PENDING, chats.TASK_IN_PROGRESS}
         existing_verdict_roles: set[str] = {
@@ -654,8 +660,24 @@ def _auto_create_review_tasks(
         if not master_sid:
             return  # can't create review-tasks without a master
 
-        # Create review-tasks for critic and verifier if not already present
-        for verdict_role in (chats.ROLE_CRITIC, chats.ROLE_VERIFIER):
+        # Wrapper review-tasks are the LEGACY critic+verifier mechanism. Create them
+        # ONLY for verdict-roles actually present in this roster's member_roles —
+        # creating a wrapper for an ABSENT role makes an un-satisfiable obligation that
+        # Guard-7 then nags master about forever (the lean verdict-watchdog bug, 2026-06-28).
+        # A lean gatekeeper roster has NEITHER critic nor verifier → ZERO wrappers: the
+        # gatekeeper discharges the gate via a DIRECT verdict on the work-task (the
+        # direct-verdict obligation in _get_session_obligations, which clears on
+        # committable), so no wrapper is needed. Empty/unknown member_roles → preserve the
+        # legacy pair (Guard-7's role-existence guard still suppresses any un-satisfiable nag).
+        present_roles = set((last_meta or {}).get("member_roles", {}).values())
+        if present_roles:
+            wrapper_roles = [
+                r for r in (chats.ROLE_CRITIC, chats.ROLE_VERIFIER) if r in present_roles
+            ]
+        else:
+            wrapper_roles = [chats.ROLE_CRITIC, chats.ROLE_VERIFIER]
+
+        for verdict_role in wrapper_roles:
             if verdict_role in existing_verdict_roles:
                 continue
             body = (
