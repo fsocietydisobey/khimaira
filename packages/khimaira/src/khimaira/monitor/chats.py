@@ -78,6 +78,8 @@ ROLE_INTAKE = "intake"
 ROLE_ANALYST = "analyst"
 ROLE_VERIFIER = "verifier"
 ROLE_TRACKER = "tracker"
+ROLE_CONSULTANT = "consultant"  # lean roster: architect + analyst merged (design + analysis)
+ROLE_GATEKEEPER = "gatekeeper"  # lean roster: critic + verifier merged (the commit gate)
 ROLE_MEMBER = "member"  # neutral catch-all; empty Themis ruleset (see member.yaml)
 
 # Idle-by-default consult roles: wake ONLY on directed consults/assignments,
@@ -87,7 +89,14 @@ ROLE_MEMBER = "member"  # neutral catch-all; empty Themis ruleset (see member.ya
 # fails open on architect+critic). Critic is included (consult-idle in roster
 # operation) despite having no ROLE_BUDGET entry (its budget is orchestrator-chosen).
 IDLE_CONSULT_ROLES: frozenset[str] = frozenset(
-    {ROLE_ARCHITECT, ROLE_ANALYST, ROLE_CRITIC, ROLE_VERIFIER}
+    {
+        ROLE_ARCHITECT,
+        ROLE_ANALYST,
+        ROLE_CRITIC,
+        ROLE_VERIFIER,
+        ROLE_CONSULTANT,  # lean: idle-by-default design/analysis seat
+        ROLE_GATEKEEPER,  # lean: idle-by-default commit gate
+    }
 )
 
 try:
@@ -112,6 +121,8 @@ except ImportError:
             ROLE_ANALYST,
             ROLE_VERIFIER,
             ROLE_TRACKER,
+            ROLE_CONSULTANT,
+            ROLE_GATEKEEPER,
             ROLE_MEMBER,
         }
     )
@@ -143,6 +154,10 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
         "model": "sonnet",  # haiku→sonnet 2026-06-06 (synthesis role; haiku mis-dispatched boot registration)
         "effort": "medium",
     },  # checklist curator + Linear filer
+    # Lean roster (replaces architect+analyst→consultant, critic+verifier→gatekeeper).
+    # Tiers signed off by Joseph 2026-06-28; mirror C1 in LEAN-ROSTER-SPEC.md / bin/roster.
+    ROLE_CONSULTANT: {"model": "opus", "effort": "max"},  # design + analysis (idle-by-default)
+    ROLE_GATEKEEPER: {"model": "opus", "effort": "high"},  # commit gate (idle-by-default)
     # Domain leads: sonnet/medium default; escalate to opus only for rare decomposition-heavy
     # initiatives (per lead-role.md.j2 convention). Entries here must match the themis rule
     # yaml filenames in packages/themis/src/themis/rules/ — ROLE_BUDGET keys must be in
@@ -1348,6 +1363,7 @@ def create_task(
     required_effort: str | None = None,
     begin_gate_task_id: str | None = None,
     domain: str | None = None,
+    high_stakes: bool = False,
 ) -> dict[str, Any]:
     """Append a TASK record (status=pending). Sender must be an accepted member;
     if assignee_session_id is set, that session must also be accepted.
@@ -1439,6 +1455,8 @@ def create_task(
         # Guard-5 Part A fields
         "assignee_role": assignee_role,
         "gate_required": gate_required,
+        # Lean commit gate: high_stakes → N=2 distinct gatekeeper ships required.
+        "high_stakes": high_stakes,
         "gate_for": gate_for,
         "verdict_role": verdict_role,
         # #14 auto-BEGIN fields
@@ -1778,17 +1796,22 @@ def _maybe_wake_master_on_gate_complete(
     master on completion instead of relying on it to see the event live. Reuses
     the (now duplicate-safe) wake; conservative guards live in the worker.
     """
-    crit = ver = None
-    for m in room.get("messages", []):
-        if m.get("kind") != TASK_VERDICT or m.get("task_id") != task_id:
-            continue
-        v = m.get("verdict")
-        if v in ("approve", "changes"):
-            crit = v
-        elif v in ("ship", "hold"):
-            ver = v
-    if crit is None or ver is None:
-        return  # gate not yet complete — only one reviewer has voted
+    tally = _gate_tally(room)
+    entry = tally.get(task_id)
+    if not entry:
+        return
+    committable = _is_committable(entry)
+    gk = entry.get("gk_latest") or {}
+    has_hold = (
+        any(v == "hold" for v in gk.values())
+        or entry.get("ver") == "hold"
+        or entry.get("crit") == "changes"
+    )
+    # Only wake once the gate reaches a DECISION: committable (N distinct gatekeeper
+    # ships / legacy dual-positive), or a blocking hold on a done task. Otherwise the
+    # gate isn't complete yet (N not reached, only some reviewers voted).
+    if not committable and not (has_hold and entry.get("status") == TASK_DONE):
+        return  # gate not yet at a decision
 
     member_roles = (room.get("meta") or {}).get("member_roles") or {}
     master_id = next((sid for sid, r in member_roles.items() if r == ROLE_MASTER), None)
@@ -1806,18 +1829,20 @@ def _maybe_wake_master_on_gate_complete(
         )
         return
 
-    if crit == "approve" and ver == "ship":
+    n = _effective_gate_n(entry)
+    if committable:
         msg = (
-            f"⏰ DUAL-VERDICT COMPLETE for {task_id}: critic=approve + verifier=ship "
-            "are RECORDED (you may not have seen them live if your SSE dropped post-"
-            "compaction). Call chat_my_chats to re-register, then COMMIT + approve "
-            "the task now. Don't wait for an event — this IS the event."
+            f"⏰ COMMIT-READY for {task_id}: the commit gate is SATISFIED "
+            f"({n} distinct gatekeeper ship(s) recorded / legacy dual-positive) — you "
+            "may not have seen it live if your SSE dropped post-compaction. Call "
+            "chat_my_chats to re-register, then COMMIT + approve the task now. Don't "
+            "wait for an event — this IS the event."
         )
     else:
         msg = (
-            f"⏰ both verdicts in for {task_id} (critic={crit}, verifier={ver} — not "
-            "dual-positive). Call chat_my_chats, then dispatch rework or approve per "
-            "the outcome. Don't wait for an event."
+            f"⏰ gate decided for {task_id} with a HOLD (not commit-ready). Call "
+            "chat_my_chats, then dispatch rework per the gatekeeper verdict. Don't "
+            "wait for an event."
         )
 
     import threading
@@ -1830,44 +1855,104 @@ def _maybe_wake_master_on_gate_complete(
     ).start()
 
 
+# ---------------------------------------------------------------------------
+# Gate tally — single source of truth for the commit gate (lean Option B,
+# signed off 2026-06-28). LEAN model: a GATEKEEPER-role session posts ONE
+# ship/hold verdict (its reasoning covers BOTH axes — correctness + verification).
+# A task is committable when >= N DISTINCT gatekeeper sessions have a latest
+# verdict of `ship` AND no gatekeeper has an outstanding `hold`. N = 2 when the
+# task is high_stakes OR any gatekeeper verdict escalated (gatekeeper self-
+# escalation safety-default), else 1. The LEGACY dual (critic=approve +
+# verifier=ship) is kept as an alternate committable path so pre-cutover in-flight
+# tasks don't strand. DISTINCT-SESSION counting is load-bearing: one session
+# voting twice is NOT two independent verdicts (the independence property).
+# ---------------------------------------------------------------------------
+
+
+def _gate_tally(room: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per-task gate state keyed by task_id. Each entry:
+    {status, high_stakes, escalated, gk_latest:{sid:'ship'|'hold'}, crit, ver}.
+    `gk_latest` holds the LATEST ship/hold per gatekeeper-role session (later
+    events overwrite earlier — JSONL is append/ts order)."""
+    member_roles = (room.get("meta") or {}).get("member_roles") or {}
+    tally: dict[str, dict[str, Any]] = {}
+
+    def _entry(tid: str) -> dict[str, Any]:
+        return tally.setdefault(
+            tid,
+            {
+                "status": TASK_PENDING,
+                "high_stakes": False,
+                "escalated": False,
+                "gk_latest": {},
+                "crit": None,
+                "ver": None,
+            },
+        )
+
+    for m in room.get("messages", []):
+        k = m.get("kind")
+        if k == TASK and m.get("id"):
+            e = _entry(m["id"])
+            e["status"] = m.get("status") or TASK_PENDING
+            e["high_stakes"] = bool(m.get("high_stakes"))
+        elif k == TASK_UPDATE and m.get("task_id") and m.get("status"):
+            _entry(m["task_id"])["status"] = m["status"]
+        elif k == TASK_VERDICT and m.get("task_id"):
+            e = _entry(m["task_id"])
+            v = m.get("verdict")
+            sid = m.get("by_session_id")
+            if v in ("approve", "changes"):
+                e["crit"] = v
+            elif v in ("ship", "hold"):
+                e["ver"] = v
+            # Lean: a ship/hold from a GATEKEEPER-role session is a gate vote;
+            # latest per session wins (changed-mind handling).
+            if sid and v in ("ship", "hold") and member_roles.get(sid) == ROLE_GATEKEEPER:
+                e["gk_latest"][sid] = v
+            if m.get("escalate"):
+                e["escalated"] = True
+    return tally
+
+
+def _effective_gate_n(entry: dict[str, Any]) -> int:
+    """Distinct independent gatekeeper ships required: 2 for high-stakes (explicit
+    flag OR gatekeeper self-escalation), else 1."""
+    return 2 if (entry.get("high_stakes") or entry.get("escalated")) else 1
+
+
+def _is_committable(entry: dict[str, Any]) -> bool:
+    """True if a done task's commit gate is satisfied: lean N-distinct-gatekeeper
+    ships (no outstanding gatekeeper hold), OR the legacy critic=approve +
+    verifier=ship dual (pre-cutover compat)."""
+    if entry.get("status") != TASK_DONE:
+        return False
+    gk = entry.get("gk_latest") or {}
+    ships = {s for s, v in gk.items() if v == "ship"}
+    holds = {s for s, v in gk.items() if v == "hold"}
+    if not holds and len(ships) >= _effective_gate_n(entry):
+        return True
+    # Legacy dual-positive (pre-cutover in-flight tasks).
+    return entry.get("crit") == "approve" and entry.get("ver") == "ship"
+
+
 def committable_gate_tasks(chat_id: str) -> list[str]:
-    """Task ids that are `done` with BOTH structured verdicts dual-POSITIVE
-    (critic=approve + verifier=ship) but NOT yet `approved`/`changes_requested` —
-    i.e. fully reviewed and awaiting the master's commit.
+    """Task ids that are `done` and commit-gate-satisfied (lean N-distinct-
+    gatekeeper-ship per `_is_committable`, or the legacy critic+verifier dual) but
+    NOT yet `approved`/`changes_requested` — fully reviewed, awaiting master commit.
 
     The level-triggered backstop (F3, muther GAP #1) reads this every sweep so a
     commit-ready task can't be stranded by a missed edge-event. Excludes anything
-    the master already acted on (status moved off `done`), so the reconcile wake
-    naturally stops once committed.
+    the master already acted on (status moved off `done`).
     """
     return _committable_task_ids(load_room(chat_id))
 
 
 def _committable_task_ids(room: dict[str, Any]) -> list[str]:
     """Pure core of committable_gate_tasks — operates on a loaded room dict so it
-    can be unit-tested without touching disk."""
-    status_by_task: dict[str, str] = {}
-    crit_by_task: dict[str, str] = {}
-    ver_by_task: dict[str, str] = {}
-    for m in room.get("messages", []):
-        k = m.get("kind")
-        if k == TASK and m.get("id"):
-            status_by_task[m["id"]] = m.get("status") or TASK_PENDING
-        elif k == TASK_UPDATE and m.get("task_id") and m.get("status"):
-            status_by_task[m["task_id"]] = m["status"]
-        elif k == TASK_VERDICT and m.get("task_id"):
-            v = m.get("verdict")
-            if v in ("approve", "changes"):
-                crit_by_task[m["task_id"]] = v
-            elif v in ("ship", "hold"):
-                ver_by_task[m["task_id"]] = v
-    return [
-        tid
-        for tid, status in status_by_task.items()
-        if status == TASK_DONE
-        and crit_by_task.get(tid) == "approve"
-        and ver_by_task.get(tid) == "ship"
-    ]
+    can be unit-tested without touching disk. Delegates the gate decision to the
+    single-source `_gate_tally` / `_is_committable`."""
+    return [tid for tid, e in _gate_tally(room).items() if _is_committable(e)]
 
 
 def _auto_wake_targeted_idle(targets: list[tuple[str, str | None]]) -> None:
@@ -1890,10 +1975,12 @@ def _auto_wake_targeted_idle(targets: list[tuple[str, str | None]]) -> None:
 _VERDICT_NUDGED: set[tuple[str, str, str]] = set()
 
 # Which verdicts each reviewer role is responsible for (mirror of
-# record_gate_verdict's _VERDICT_AUTHOR_ROLES, inverted).
+# record_gate_verdict's _VERDICT_AUTHOR_ROLES, inverted). Lean: gatekeeper authors
+# the ship/hold gate verdict (critic/verifier kept for pre-cutover compat).
 _ROLE_VERDICTS: dict[str, frozenset[str]] = {
     ROLE_CRITIC: frozenset({"approve", "changes"}),
     ROLE_VERIFIER: frozenset({"ship", "hold"}),
+    ROLE_GATEKEEPER: frozenset({"ship", "hold"}),
 }
 
 
@@ -1996,26 +2083,44 @@ def _maybe_auto_advance_gate_complete(chat_id: str, task_id: str) -> bool:
     status: str | None = None
     assignee_id: str | None = None
     required_agents: list[str] = []
+    high_stakes = False
+    escalated = False
     crit_present = False
     ver_present = False
+    member_roles: dict[str, str] = {}
+    gk_authors: set[str] = set()  # distinct ship/hold authors (role-filtered below)
     for line in _read(chat_id):
         k = line.get("kind")
-        if k == TASK and line.get("id") == task_id:
+        if k == META and line.get("member_roles"):
+            member_roles = line.get("member_roles") or member_roles  # latest META wins
+        elif k == TASK and line.get("id") == task_id:
             status = line.get("status")
             assignee_id = line.get("assignee_id")
             required_agents = list(line.get("required_agents") or [])
+            high_stakes = bool(line.get("high_stakes"))
         elif k == TASK_UPDATE and line.get("task_id") == task_id:
             status = line.get("status")
         elif k == TASK_VERDICT and line.get("task_id") == task_id:
             v = line.get("verdict", "")
+            sid = line.get("by_session_id")
             if v in ("approve", "changes"):
                 crit_present = True
             elif v in ("ship", "hold"):
                 ver_present = True
+            if sid and v in ("ship", "hold"):
+                gk_authors.add(sid)
+            if line.get("escalate"):
+                escalated = True
+
+    # Lean gate-quorum: N DISTINCT gatekeeper-role ship/hold authors (they acted),
+    # N=2 high-stakes else 1; OR the legacy critic+verifier both-present dual.
+    gk_distinct = {s for s in gk_authors if member_roles.get(s) == ROLE_GATEKEEPER}
+    n = 2 if (high_stakes or escalated) else 1
+    gate_reached = (len(gk_distinct) >= n) or (crit_present and ver_present)
 
     if status not in (TASK_PENDING, TASK_IN_PROGRESS):
         return False  # already terminal / past in_progress — nothing to advance
-    if not (crit_present and ver_present):
+    if not gate_reached:
         return False  # gate not complete yet
     if not assignee_id:
         return False  # unassigned task — no solo owner to advance on behalf of
@@ -2054,16 +2159,24 @@ def record_gate_verdict(
     by_session_id: str,
     task_id: str,
     verdict: str,
+    *,
+    escalate: bool = False,
 ) -> dict[str, Any]:
     """Append a structured gate-verdict event (B3 Slice B-1).
 
     verdict ∈ {"approve", "changes", "ship", "hold"}:
-      - "approve" / "changes": written by critic
-      - "ship" / "hold": written by verifier
+      - "ship" / "hold": the GATE verdict — written by gatekeeper (lean) or verifier
+        (legacy compat). The gatekeeper's ship/hold reasoning must cover BOTH axes:
+        correctness/critique AND verification/tests.
+      - "approve" / "changes": legacy critic critique verdict (pre-cutover compat). In
+        the lean model the critique rides the ship/hold reason or the task note, not a
+        separate gate verdict.
 
-    Caller must be an accepted member. Verdict events are TASK_SIGNAL-shape
-    records that `get_gate_verdicts` reads back to compute the tri-state
-    (present+complete | absent | error) for the B3 commit/approve gate.
+    `escalate=True` (gatekeeper self-escalation): marks the task high-stakes so the
+    commit gate requires N=2 distinct gatekeeper ships (the safety-default for when a
+    gatekeeper judges a change high-stakes that master didn't flag).
+
+    Caller must be an accepted member holding a role authorized for the verdict.
     """
     by_session_id = _resolve_or_uuid(by_session_id, chat_id=chat_id)
     valid_verdicts = frozenset({"approve", "changes", "ship", "hold"})
@@ -2077,20 +2190,20 @@ def record_gate_verdict(
         raise ValueError(
             f"Session {by_session_id!r} is not an accepted member of {chat_id!r}."
         )
-    # Author-role-binding: only critic can write approve/changes; only verifier ship/hold.
-    # Prevents master or any non-reviewer from self-posting structured verdicts
-    # and bypassing IN-MASTER-9 (B3 follow-up fix).
-    _VERDICT_AUTHOR_ROLES: dict[str, str] = {
-        "approve": ROLE_CRITIC,
-        "changes": ROLE_CRITIC,
-        "ship": ROLE_VERIFIER,
-        "hold": ROLE_VERIFIER,
+    # Author-role-binding: ship/hold = gatekeeper (lean) or verifier (legacy);
+    # approve/changes = critic. Prevents master / any non-reviewer from self-posting
+    # structured verdicts and bypassing IN-MASTER-9 (B3 follow-up fix).
+    _VERDICT_AUTHOR_ROLES: dict[str, frozenset[str]] = {
+        "approve": frozenset({ROLE_CRITIC}),
+        "changes": frozenset({ROLE_CRITIC}),
+        "ship": frozenset({ROLE_GATEKEEPER, ROLE_VERIFIER}),
+        "hold": frozenset({ROLE_GATEKEEPER, ROLE_VERIFIER}),
     }
-    required_role = _VERDICT_AUTHOR_ROLES[verdict]
+    allowed_roles = _VERDICT_AUTHOR_ROLES[verdict]
     caller_role = (room.get("meta") or {}).get("member_roles", {}).get(by_session_id)
-    if caller_role != required_role:
+    if caller_role not in allowed_roles:
         raise ValueError(
-            f"verdict={verdict!r} requires {required_role!r} role; "
+            f"verdict={verdict!r} requires one of {sorted(allowed_roles)} role(s); "
             f"caller {by_session_id!r} resolved to role {caller_role!r}. "
             "Only the designated reviewer role may write this verdict."
         )
@@ -2113,6 +2226,8 @@ def record_gate_verdict(
         "verdict": verdict,
         "by_session_id": by_session_id,
         "by_name": member.get("session_name") or by_session_id[:8],
+        # Gatekeeper self-escalation → commit gate requires N=2 distinct ships.
+        "escalate": bool(escalate),
     }
     _append(chat_id, record)
     # Hybrid lifecycle auto-advance (ISSUE 3 / muther 2026-06-18): if this verdict

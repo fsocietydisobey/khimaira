@@ -738,6 +738,11 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                 # (gate_for/gate_required) are dormant in practice.
                 crit_present: set[str] = set()  # task_id has a critic verdict
                 ver_present: set[str] = set()  # task_id has a verifier verdict
+                # Lean gatekeeper gate: latest ship/hold per (task, session) for ALL
+                # ship/hold authors (role-filtered to gatekeeper AFTER the scan, once
+                # member_roles is known); + tasks a gatekeeper self-escalated to N=2.
+                gk_latest_by_task: dict[str, dict[str, str]] = {}
+                escalated_tasks: set[str] = set()
                 last_meta: dict | None = None  # latest META line wins (load_room)
                 for line in chats._read(chat_id):
                     k = line.get("kind")
@@ -755,6 +760,8 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                                 # obligation below (an un-gated done task must NOT
                                 # nag reviewers).
                                 "gate_required": bool(line.get("gate_required")),
+                                # Lean gate: high_stakes → N=2 distinct gatekeeper ships.
+                                "high_stakes": bool(line.get("high_stakes")),
                                 "status": line.get("status"),
                                 "begin_fired": False,
                                 "done_ts": (
@@ -803,6 +810,12 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                                 crit_present.add(ref_tid)
                             elif verdict_val in ("ship", "hold"):
                                 ver_present.add(ref_tid)
+                            # Lean: latest ship/hold per session (role-filtered later).
+                            sid = line.get("by_session_id")
+                            if sid and verdict_val in ("ship", "hold"):
+                                gk_latest_by_task.setdefault(ref_tid, {})[sid] = verdict_val
+                            if line.get("escalate"):
+                                escalated_tasks.add(ref_tid)
                     elif k == chats.META:
                         last_meta = line
 
@@ -913,6 +926,51 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                             reviewer_role == chats.ROLE_CRITIC and not has_crit
                         ) or (reviewer_role == chats.ROLE_VERIFIER and not has_ver)
                         if owes:
+                            obligations.append(
+                                {
+                                    "task_id": tid,
+                                    "chat_id": chat_id,
+                                    "status": chats.TASK_DONE,
+                                    "begin_fired": task.get("begin_fired", False),
+                                    "owed_verdict": reviewer_role,
+                                }
+                            )
+
+                # Lean gatekeeper owed-verdict (Option B): N DISTINCT gatekeeper
+                # ships close the gate (N=2 high-stakes/escalated else 1). A
+                # gatekeeper MEMBER owes iff the gate hasn't reached N distinct ships
+                # AND this session hasn't itself shipped — a gatekeeper that already
+                # shipped does NOT owe the 2nd ship (that's a DISTINCT session's job;
+                # distinct-session counting is the load-bearing independence property).
+                # This is what makes the C3 drain hook + roster wake work for gatekeeper.
+                if reviewer_role == chats.ROLE_GATEKEEPER:
+                    for task in tasks.values():
+                        if task.get("status") != chats.TASK_DONE:
+                            continue
+                        tid = task["task_id"]
+                        votes = {
+                            s: v
+                            for s, v in gk_latest_by_task.get(tid, {}).items()
+                            if member_roles.get(s) == chats.ROLE_GATEKEEPER
+                        }
+                        ships = {s for s, v in votes.items() if v == "ship"}
+                        n = 2 if (task.get("high_stakes") or tid in escalated_tasks) else 1
+                        # Cold-start storm guard (mirrors critic/verifier): a 0-vote
+                        # un-gated done task must NOT nag; a gate_required OR high_stakes
+                        # one is review-wanted → #39 cold-start engages the first gatekeeper.
+                        if (
+                            not votes
+                            and not task.get("gate_required")
+                            and not task.get("high_stakes")
+                        ):
+                            continue
+                        done_epoch = _iso_epoch_or_none(task.get("done_ts"))
+                        if (
+                            done_epoch is None
+                            or (now - done_epoch) > _OWED_VERDICT_WINDOW_S
+                        ):
+                            continue
+                        if len(ships) < n and votes.get(session_id) != "ship":
                             obligations.append(
                                 {
                                     "task_id": tid,
@@ -1403,6 +1461,8 @@ class CreateTaskReq(BaseModel):
     begin_gate_task_id: str | None = None
     # domain-specialist: inject <project>:<domain> mnemosyne context into the body
     domain: str | None = None
+    # Lean commit gate: high-stakes → N=2 distinct gatekeeper ships required.
+    high_stakes: bool = False
 
 
 class MasterOverrideVerdictReq(BaseModel):
@@ -1427,6 +1487,7 @@ class SignalTaskStartReq(BaseModel):
 class RecordGateVerdictReq(BaseModel):
     by_session_id: str
     verdict: str  # "approve" | "changes" | "ship" | "hold"
+    escalate: bool = False  # gatekeeper self-escalation → commit gate requires N=2
 
 
 class AutoAcceptReq(BaseModel):
@@ -1967,6 +2028,7 @@ def build_router():
                 required_effort=req.required_effort,
                 begin_gate_task_id=req.begin_gate_task_id,
                 domain=req.domain,
+                high_stakes=req.high_stakes,
             )
         except ValueError as exc:
             raise fastapi.HTTPException(403, str(exc)) from exc
@@ -2086,7 +2148,9 @@ def build_router():
             _actor, req.by_session_id, f"/chats/{chat_id}/tasks/{task_id}/verdict"
         )
         try:
-            return chats.record_gate_verdict(chat_id, actor, task_id, req.verdict)
+            return chats.record_gate_verdict(
+                chat_id, actor, task_id, req.verdict, escalate=req.escalate
+            )
         except ValueError as exc:
             msg = str(exc)
             code = 404 if "No task" in msg else 400 if "Invalid verdict" in msg else 403

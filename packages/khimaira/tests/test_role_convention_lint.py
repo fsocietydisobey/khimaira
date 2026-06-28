@@ -1030,7 +1030,13 @@ def test_idle_consult_roles_constant_and_doc_coherence():
     """
     from khimaira.monitor.chats import IDLE_CONSULT_ROLES
 
-    expected = frozenset({"architect", "analyst", "critic", "verifier"})
+    # Lean-roster transition: consultant (architect∪analyst) + gatekeeper
+    # (critic∪verifier) are added additively as idle-by-default seats. The legacy
+    # four narrow OUT of this set when those roles retire (the gate-rework step that
+    # drops critic/verifier). Until then the constant is the union.
+    expected = frozenset(
+        {"architect", "analyst", "critic", "verifier", "consultant", "gatekeeper"}
+    )
     assert IDLE_CONSULT_ROLES == expected, (
         f"IDLE_CONSULT_ROLES mismatch: got {set(IDLE_CONSULT_ROLES)}, expected {set(expected)}"
     )

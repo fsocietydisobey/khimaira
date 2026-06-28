@@ -71,7 +71,9 @@ def test_completing_verdict_wakes_master(isolated_chats, monkeypatch):
     assert len(spawned) == 1
     master_id, master_name, msg = spawned[0]
     assert master_id == MASTER
-    assert "DUAL-VERDICT COMPLETE" in msg and "COMMIT" in msg
+    # Lean rework: legacy critic+verifier dual still satisfies the gate, but the
+    # wake message is now the unified "COMMIT-READY" wording (gate satisfied).
+    assert "COMMIT-READY" in msg and "COMMIT" in msg
 
 
 def test_non_positive_completion_wakes_with_rework_msg(isolated_chats, monkeypatch):

@@ -1,0 +1,55 @@
+# Themis rules — consultant role (architect + analyst merged, lean roster)
+# Conditions are AND-combined only. No OR/NOT support in Phase 1.
+#
+# Consultant = the lean roster's design + analysis seat (merges the retired
+# architect + analyst). Advisory only: it produces design decisions, research,
+# and findings via chat; it does NOT implement, mutate state, or spawn agents.
+role: consultant
+invariants:
+  - id: IN-CONSULTANT-1
+    name: NO_FILE_EDIT
+    severity: block
+    matchers:
+      - tool: Edit
+      - tool: Write
+      - tool: MultiEdit
+      - tool: NotebookEdit
+    message: |
+      🛑 Themis IN-CONSULTANT-1 (NO_FILE_EDIT): consultant cannot call {tool_name}.
+      Consultant produces design decisions + analysis/research; implementation
+      belongs to agents. Deliver your recommendation/findings via chat and let
+      master assign the implementation to an agent.
+
+  - id: IN-CONSULTANT-2
+    name: NO_BASH_MUTATING
+    severity: block
+    matchers:
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\bgit\s+(commit|push|merge|rebase|reset|checkout\s+-|stash\s+pop|tag\s+-)'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '\b(rm|mv|cp|mkdir|touch|chmod|chown)\s+'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>\s*[^/&]'
+      - tool: Bash
+        tool_input_field:
+          field: command
+          pattern: '>>\s*[^/&]'
+    message: |
+      🛑 Themis IN-CONSULTANT-2 (NO_BASH_MUTATING): consultant is advisory.
+      Mutating Bash is a role-boundary violation. Return your recommendation /
+      analysis via chat; let master dispatch the fix to an agent.
+
+  - id: IN-CONSULTANT-3
+    name: NO_STANDALONE_AGENTS
+    severity: block
+    matchers:
+      - tool: Task
+    message: |
+      🛑 Themis IN-CONSULTANT-3 (NO_STANDALONE_AGENTS): consultant does not spawn
+      sub-agents. Use chat_send to consult; let master dispatch agents.

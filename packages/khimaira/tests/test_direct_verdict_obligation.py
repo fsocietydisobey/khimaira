@@ -21,7 +21,7 @@ who is not a member of the chat is not flagged (per-chat scoping).
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from datetime import UTC
 
 from khimaira.monitor import chats
 from khimaira.monitor.api import chats as apichats
@@ -57,13 +57,13 @@ def _done_task(ts: str | None = None) -> dict:
     """A done work-task. Stamps a RECENT done-ts by default so it passes the
     owed-verdict recency gate; pass an explicit old ts to test the stale-backlog skip.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     return {
         "kind": chats.TASK,
         "id": WORK_TASK,
         "status": chats.TASK_DONE,
-        "ts": ts or datetime.now(timezone.utc).isoformat(),
+        "ts": ts or datetime.now(UTC).isoformat(),
     }
 
 
@@ -77,10 +77,7 @@ def _verdict(task_id: str, verdict: str, by: str) -> dict:
 
 
 def _owed(obligations: list[dict], role: str, task_id: str) -> bool:
-    return any(
-        o.get("owed_verdict") == role and o.get("task_id") == task_id
-        for o in obligations
-    )
+    return any(o.get("owed_verdict") == role and o.get("task_id") == task_id for o in obligations)
 
 
 # --- FIRE -----------------------------------------------------------------
@@ -108,12 +105,79 @@ def test_changes_verdict_counts_as_critic_present(isolated_state):
     """A 'changes' verdict means the critic ACTED — only the verifier still owes."""
     _write_chat([_meta(), _done_task(), _verdict(WORK_TASK, "changes", CRITIC_SID)])
 
-    assert not _owed(
-        apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK
-    )
-    assert _owed(
-        apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
-    )
+    assert not _owed(apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK)
+    assert _owed(apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK)
+
+
+# --- LEAN GATEKEEPER obligations (Option B — distinct-session counting) -----
+# These drive the C3 drain hook + roster wake for the gatekeeper role: a gatekeeper
+# MEMBER owes a ship iff the gate hasn't reached N DISTINCT gatekeeper ships and this
+# session hasn't itself shipped (a shipped gatekeeper does NOT owe the 2nd — distinct
+# sessions only). N=2 high-stakes/escalated else 1.
+
+GK1_SID = "55555555-5555-5555-5555-555555555555"
+GK2_SID = "66666666-6666-6666-6666-666666666666"
+
+
+def _gk_meta() -> dict:
+    return {
+        "kind": chats.META,
+        "member_roles": {
+            GK1_SID: chats.ROLE_GATEKEEPER,
+            GK2_SID: chats.ROLE_GATEKEEPER,
+            MASTER_SID: "master",
+        },
+    }
+
+
+def _hs_done_task() -> dict:
+    t = _done_task()
+    t["high_stakes"] = True
+    return t
+
+
+def _gk_owed(sid: str) -> bool:
+    return _owed(apichats._get_session_obligations(sid), chats.ROLE_GATEKEEPER, WORK_TASK)
+
+
+def test_gatekeeper_cold_start_gate_required_owes(isolated_state):
+    """gate_required done task, 0 gatekeeper verdicts → the gatekeeper owes the first."""
+    t = _done_task()
+    t["gate_required"] = True
+    _write_chat([_gk_meta(), t])
+    assert _gk_owed(GK1_SID)
+
+
+def test_gatekeeper_high_stakes_cold_start_owes(isolated_state):
+    """high_stakes is itself a review-wanted signal → cold-start engages."""
+    _write_chat([_gk_meta(), _hs_done_task()])
+    assert _gk_owed(GK1_SID)
+
+
+def test_gatekeeper_shipped_does_not_self_owe(isolated_state):
+    """Normal task, GK1 shipped → N=1 met → GK1 does NOT still owe."""
+    _write_chat([_gk_meta(), _done_task(), _verdict(WORK_TASK, "ship", GK1_SID)])
+    assert not _gk_owed(GK1_SID)
+
+
+def test_gatekeeper_committable_no_second_owe(isolated_state):
+    """Normal task (N=1) with one ship is committable → no OTHER gatekeeper owes."""
+    _write_chat([_gk_meta(), _done_task(), _verdict(WORK_TASK, "ship", GK1_SID)])
+    assert not _gk_owed(GK2_SID)
+
+
+def test_gatekeeper_high_stakes_second_distinct_owes(isolated_state):
+    """high-stakes (N=2): GK1 shipped → a DISTINCT GK2 owes the 2nd ship; GK1 does
+    NOT (a shipped gatekeeper doesn't owe the second — distinct-session counting)."""
+    _write_chat([_gk_meta(), _hs_done_task(), _verdict(WORK_TASK, "ship", GK1_SID)])
+    assert _gk_owed(GK2_SID)
+    assert not _gk_owed(GK1_SID)
+
+
+def test_gatekeeper_ungated_zero_verdict_stays_quiet(isolated_state):
+    """Storm guard: a plain un-gated 0-verdict done task does NOT nag gatekeepers."""
+    _write_chat([_gk_meta(), _done_task()])
+    assert not _gk_owed(GK1_SID)
 
 
 # --- #39 COLD-START (0-verdict initiation, gate_required-gated) -------------
@@ -134,12 +198,8 @@ def test_gate_required_cold_start_fires_both_reviewers(isolated_state):
     task["gate_required"] = True
     _write_chat([_meta(), task])
 
-    assert _owed(
-        apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK
-    )
-    assert _owed(
-        apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
-    )
+    assert _owed(apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK)
+    assert _owed(apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK)
 
 
 def test_gate_required_cold_start_respects_recency(isolated_state):
@@ -151,9 +211,7 @@ def test_gate_required_cold_start_respects_recency(isolated_state):
     task["gate_required"] = True
     _write_chat([_meta(), task])
 
-    assert not _owed(
-        apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK
-    )
+    assert not _owed(apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK)
     assert not _owed(
         apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
     )
@@ -184,19 +242,17 @@ def test_stale_done_task_not_owed(isolated_state):
 
 def test_recent_done_task_owed(isolated_state):
     """A freshly-done partial-verdict task (within the window) → owed (live stall)."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     _write_chat(
         [
             _meta(),
-            _done_task(ts=datetime.now(timezone.utc).isoformat()),
+            _done_task(ts=datetime.now(UTC).isoformat()),
             _verdict(WORK_TASK, "approve", CRITIC_SID),
         ]
     )
 
-    assert _owed(
-        apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
-    )
+    assert _owed(apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK)
 
 
 def test_done_task_with_no_done_ts_not_owed(isolated_state):
@@ -231,9 +287,7 @@ def test_committable_task_does_not_reflag(isolated_state):
     assert not _owed(
         apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
     )
-    assert not _owed(
-        apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK
-    )
+    assert not _owed(apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK)
 
 
 def test_ungated_done_task_with_no_verdicts_stays_quiet(isolated_state):
