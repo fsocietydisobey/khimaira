@@ -31,6 +31,7 @@ reach.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -38,6 +39,8 @@ import httpx
 
 from ...attach.registry import get_kg_adapter
 from .._optional import require
+
+log = logging.getLogger(__name__)
 
 # Outbound timeout: generous read for a large shop graph (shop 10 ≈ 4.7k nodes),
 # short connect so a down adapter fails fast → 502.
@@ -75,6 +78,139 @@ def _sub_url(graph_url: str, suffix: str) -> str:
     """
     base = graph_url[:-6] if graph_url.endswith("/graph") else graph_url.rstrip("/")
     return f"{base}/{suffix.lstrip('/')}"
+
+
+# ---------------------------------------------------------------------------
+# Contract gate (#38 Tier-2) — fail-SAFE boundary enforcement of the khimaira-
+# owned generic graph contract (kgTypes.ts GraphNode/GraphEdge). The /graph
+# payload feeds a code-agnostic renderer that ASSUMES this shape; an adapter that
+# drifts (or leaks a raw jeevy column like node_type/canonical_key) would corrupt
+# the viewer. This DROPS nonconforming nodes/edges + annotates a structured
+# `data._contract` warning (counts + a bounded violation sample, no silent
+# truncation) rather than 502-ing the whole payload — this is a DEBUGGING surface,
+# so partial data > no data (default-toward-recoverable). Hard-fail is OPT-IN via
+# ?strict=true / KHIMAIRA_KG_CONTRACT_STRICT=1. The loud source-of-truth guard
+# lives in tests/test_kg_contract_gate.py (field rules parsed from kgTypes.ts);
+# the inline field sets below are a runtime-cheap copy that tests/test_graph_api.py
+# pins to that source so they can't drift.
+# ---------------------------------------------------------------------------
+
+_NODE_REQUIRED = ("id", "type", "label")  # all string
+_NODE_OPTIONAL = ("badge",)  # string | number
+_EDGE_REQUIRED = ("from", "to", "type")  # all string
+_EDGE_OPTIONAL = ("id", "weight")  # id: string, weight: number
+
+_CONTRACT_STRICT = os.environ.get("KHIMAIRA_KG_CONTRACT_STRICT", "0") == "1"
+
+
+def _is_str(v: Any) -> bool:
+    return isinstance(v, str)
+
+
+def _is_number(v: Any) -> bool:
+    # bool is an int subclass — exclude it (a bool badge/weight is nonsensical).
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _node_violations(item: Any) -> list[str]:
+    if not isinstance(item, dict):
+        return ["not an object"]
+    errs = [f"missing '{k}'" for k in _NODE_REQUIRED if k not in item]
+    errs += [f"'{k}' not a string" for k in _NODE_REQUIRED if k in item and not _is_str(item[k])]
+    if "badge" in item and not (_is_str(item["badge"]) or _is_number(item["badge"])):
+        errs.append("'badge' not string|number")
+    extra = sorted(set(item) - set(_NODE_REQUIRED) - set(_NODE_OPTIONAL))
+    if extra:
+        errs.append(f"non-contract field(s) {extra}")
+    return errs
+
+
+def _edge_violations(item: Any) -> list[str]:
+    if not isinstance(item, dict):
+        return ["not an object"]
+    errs = [f"missing '{k}'" for k in _EDGE_REQUIRED if k not in item]
+    errs += [f"'{k}' not a string" for k in _EDGE_REQUIRED if k in item and not _is_str(item[k])]
+    if "id" in item and not _is_str(item["id"]):
+        errs.append("'id' not a string")
+    if "weight" in item and not _is_number(item["weight"]):
+        errs.append("'weight' not a number")
+    extra = sorted(set(item) - set(_EDGE_REQUIRED) - set(_EDGE_OPTIONAL))
+    if extra:
+        errs.append(f"non-contract field(s) {extra}")
+    return errs
+
+
+def _filter_to_contract(payload: Any, *, strict: bool) -> Any:
+    """Fail-safe contract gate for the `{data:{nodes,edges}}` graph payload.
+
+    Drops nonconforming nodes/edges and annotates `data._contract` with the dropped
+    counts + a bounded violation sample. `strict=True` raises 502 on any violation
+    instead (CI / opt-in). Non-graph shapes (node/edge/schema/aggregate routes, or
+    an unrecognized body) pass through untouched — this gate only owns the graph
+    contract.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+        return payload
+    data = payload["data"]
+    nodes, edges = data.get("nodes"), data.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return payload  # not the {nodes,edges} graph shape — not ours to gate
+
+    good_nodes: list[Any] = []
+    good_edges: list[Any] = []
+    bad: list[tuple[str, Any, list[str]]] = []  # (kind, item, violations)
+    for n in nodes:
+        v = _node_violations(n)
+        if v:
+            bad.append(("node", n, v))
+        else:
+            good_nodes.append(n)
+    for e in edges:
+        v = _edge_violations(e)
+        if v:
+            bad.append(("edge", e, v))
+        else:
+            good_edges.append(e)
+
+    if not bad:
+        return payload
+    if strict:
+        fastapi = require("fastapi")
+        raise fastapi.HTTPException(
+            502,
+            f"KG adapter response violates contract: {len(bad)} nonconforming item(s)",
+        )
+
+    dropped_nodes = sum(1 for k, _, _ in bad if k == "node")
+    dropped_edges = len(bad) - dropped_nodes
+    samples = [
+        {
+            "kind": k,
+            "id": (it.get("id") if isinstance(it, dict) else None),
+            "violations": vs,
+        }
+        for (k, it, vs) in bad[:5]
+    ]
+    log.warning(
+        "kg contract-gate: dropped %d nonconforming item(s) (%d nodes, %d edges)",
+        len(bad),
+        dropped_nodes,
+        dropped_edges,
+    )
+    # Build a NEW payload — never mutate the adapter's response in place (defensive:
+    # the caller may hold a reference; in-place mutation is an aliasing footgun).
+    new_data = {
+        **data,
+        "nodes": good_nodes,
+        "edges": good_edges,
+        "_contract": {
+            "ok": False,
+            "droppedNodes": dropped_nodes,
+            "droppedEdges": dropped_edges,
+            "sampleViolations": samples,
+        },
+    }
+    return {**payload, "data": new_data}
 
 
 def build_router():
@@ -159,9 +295,14 @@ def build_router():
             ) from exc
 
     @router.get("/graph/{project}")
-    async def get_graph(project: str, scope: str = "", since: str = "") -> dict[str, Any]:
+    async def get_graph(
+        project: str, scope: str = "", since: str = "", strict: bool = False
+    ) -> dict[str, Any]:
         adapter = _adapter_or_404(project)
-        return await _proxy_get(project, adapter, adapter["url"], scope, since)
+        payload = await _proxy_get(project, adapter, adapter["url"], scope, since)
+        # #38 contract gate: fail-safe by default (drop+annotate nonconforming),
+        # hard-502 only when ?strict=true or KHIMAIRA_KG_CONTRACT_STRICT=1.
+        return _filter_to_contract(payload, strict=strict or _CONTRACT_STRICT)
 
     @router.get("/graph/{project}/node/{node_id}")
     async def get_graph_node(project: str, node_id: str, scope: str = "") -> dict[str, Any]:

@@ -490,3 +490,97 @@ def test_since_omitted_when_absent(graph_mod, monkeypatch):
     _ok(graph_mod, monkeypatch, _HEALTH)
     _client(graph_mod).get("/api/graph/jeevy_portal/health", params={"scope": "shop:10"})
     assert _FakeClient.last_params == {"scope": "shop:10"}  # no since key
+
+
+# ---------------------------------------------------------------------------
+# #38 Tier-2 — live contract gate on GET /api/graph/<project> (_filter_to_contract).
+# Fail-SAFE by default (drop nonconforming + annotate data._contract), hard-502
+# only under ?strict=true / KHIMAIRA_KG_CONTRACT_STRICT. The loud source-of-truth
+# conformance suite is tests/test_kg_contract_gate.py; this covers the LIVE route.
+# ---------------------------------------------------------------------------
+
+
+# one conforming node/edge + one leaking a raw jeevy term (node_type/canonical_key).
+# Factory (not a module constant) so each test gets a fresh dict — the gate returns a
+# new payload, but a shared mutable fixture is still a cross-test footgun.
+def _drifted() -> dict:
+    return {
+        "data": {
+            "nodes": [
+                {"id": "n1", "type": "shop", "label": "Shop 10"},
+                {"id": "n2", "node_type": "job", "canonical_key": "job:1", "label": "J"},
+            ],
+            "edges": [
+                {"from": "n2", "to": "n1", "type": "owns"},
+                {"from": "n2", "to": "n1", "type": "owns", "weight": "high"},  # bad weight
+            ],
+        }
+    }
+
+
+def test_contract_gate_permissive_drops_and_annotates(graph_mod, monkeypatch):
+    """Default (no strict): nonconforming items are DROPPED, conforming ones served,
+    and data._contract carries the dropped counts + a violation sample (no silent
+    truncation). Partial data > no data for a debugging surface."""
+    monkeypatch.setattr(graph_mod, "_CONTRACT_STRICT", False)
+    _ok(graph_mod, monkeypatch, _drifted())
+    r = _client(graph_mod).get("/api/graph/jeevy_portal", params={"scope": "shop:10"})
+    assert r.status_code == 200
+    body = r.json()["data"]
+    assert [n["id"] for n in body["nodes"]] == ["n1"]  # leaky node dropped
+    assert len(body["edges"]) == 1  # bad-weight edge dropped
+    c = body["_contract"]
+    assert c["ok"] is False
+    assert c["droppedNodes"] == 1 and c["droppedEdges"] == 1
+    assert c["sampleViolations"]  # populated, not silently truncated
+
+
+def test_contract_gate_strict_502(graph_mod, monkeypatch):
+    """?strict=true → hard-fail the whole payload (CI / opt-in posture)."""
+    monkeypatch.setattr(graph_mod, "_CONTRACT_STRICT", False)
+    _ok(graph_mod, monkeypatch, _drifted())
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal", params={"scope": "shop:10", "strict": "true"}
+    )
+    assert r.status_code == 502
+    assert "violates contract" in r.json()["detail"]
+
+
+def test_contract_gate_conforming_passes_through_untouched(graph_mod, monkeypatch):
+    """A fully-conforming payload is returned verbatim — no _contract annotation."""
+    monkeypatch.setattr(graph_mod, "_CONTRACT_STRICT", False)
+    _ok(graph_mod, monkeypatch, _CONTRACT)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal")
+    assert r.status_code == 200
+    assert r.json() == _CONTRACT
+    assert "_contract" not in r.json()["data"]
+
+
+def test_contract_gate_env_strict_default(graph_mod, monkeypatch):
+    """KHIMAIRA_KG_CONTRACT_STRICT=1 (module flag) makes strict the default even
+    without the query param."""
+    monkeypatch.setattr(graph_mod, "_CONTRACT_STRICT", True)
+    _ok(graph_mod, monkeypatch, _drifted())
+    r = _client(graph_mod).get("/api/graph/jeevy_portal")
+    assert r.status_code == 502
+
+
+def test_runtime_field_constants_match_kgtypes_source(graph_mod):
+    """Drift-pin: the runtime-cheap field sets in graph.py MUST equal the contract
+    parsed from kgTypes.ts (the source of truth). If kgTypes.ts changes, this fails
+    loud — the live gate can't silently diverge from the schema it enforces."""
+    from test_kg_contract_gate import _KG_TYPES_REL, _find_repo_file, _parse_ts_interface
+
+    src = _find_repo_file(_KG_TYPES_REL).read_text()
+    node = _parse_ts_interface(src, "GraphNode")
+    edge = _parse_ts_interface(src, "GraphEdge")
+
+    node_required = {f for f, s in node.items() if not s["optional"]}
+    node_optional = {f for f, s in node.items() if s["optional"]}
+    edge_required = {f for f, s in edge.items() if not s["optional"]}
+    edge_optional = {f for f, s in edge.items() if s["optional"]}
+
+    assert set(graph_mod._NODE_REQUIRED) == node_required
+    assert set(graph_mod._NODE_OPTIONAL) == node_optional
+    assert set(graph_mod._EDGE_REQUIRED) == edge_required
+    assert set(graph_mod._EDGE_OPTIONAL) == edge_optional
