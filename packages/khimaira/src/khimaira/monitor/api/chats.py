@@ -819,6 +819,26 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                     elif k == chats.META:
                         last_meta = line
 
+                # Per-chat member_roles (latest META wins) — needed by the lean
+                # gatekeeper gate-checks below (hoisted so the assignee GATE-COMPLETE
+                # guard can see it, not just the later reviewer-obligation branches).
+                member_roles = (last_meta or {}).get("member_roles") or {}
+
+                def _lean_gate_satisfied(tid: str, task: dict) -> bool:
+                    """Lean commit gate closed for this task: >= N distinct
+                    GATEKEEPER-role ships, no outstanding gatekeeper hold (N=2 if
+                    high_stakes/escalated else 1). Mirrors chats._is_committable's lean
+                    branch, role-filtered via this chat's member_roles."""
+                    votes = {
+                        s: v
+                        for s, v in gk_latest_by_task.get(tid, {}).items()
+                        if member_roles.get(s) == chats.ROLE_GATEKEEPER
+                    }
+                    ships = {s for s, v in votes.items() if v == "ship"}
+                    holds = {s for s, v in votes.items() if v == "hold"}
+                    n = 2 if (task.get("high_stakes") or tid in escalated_tasks) else 1
+                    return not holds and len(ships) >= n
+
                 for task in tasks.values():
                     status = task.get("status")
                     if status not in (chats.TASK_PENDING, chats.TASK_IN_PROGRESS):
@@ -828,16 +848,16 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                     if task.get("assignee_id") == session_id:
                         tid = task["task_id"]
                         # GATE-COMPLETE guard (ISSUE 3 / muther 2026-06-18): a task
-                        # with BOTH gate verdicts recorded (critic + verifier) is
-                        # substantively finished — the assignee no longer owes it;
-                        # only the master owes the commit + approve. Without this, a
-                        # task whose status-field is stuck at in_progress (the agent
-                        # did the work + got both verdicts, but the assignee-driven
-                        # done-transition never fired) reads as owed FOREVER → the
-                        # watchdog false-wakes an agent that is actually idle-and-done.
-                        # The assignee-vs-master obligation split is the lifecycle fix:
-                        # past the gate, the obligation belongs to master, not the agent.
-                        if tid in crit_present and tid in ver_present:
+                        # whose commit gate is closed is substantively finished — the
+                        # assignee no longer owes it; only the master owes the commit +
+                        # approve. Without this, a task stuck at in_progress (work done +
+                        # gate closed, but the assignee-driven done-transition never
+                        # fired) reads as owed FOREVER → the watchdog false-wakes an
+                        # agent that is actually idle-and-done. Lean-aware: relieve on
+                        # the lean gatekeeper gate OR the legacy critic+verifier presence.
+                        if (tid in crit_present and tid in ver_present) or _lean_gate_satisfied(
+                            tid, task
+                        ):
                             continue
                         obligations.append(
                             {
@@ -892,7 +912,7 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                 # this member's verdict slot is still empty. Scoped per-chat via
                 # member_roles (like _maybe_nudge_missing_verdict), never the global
                 # role — a reviewer only owes verdicts in chats it actually reviews.
-                member_roles = (last_meta or {}).get("member_roles") or {}
+                # (member_roles hoisted above for the lean assignee gate-check.)
                 reviewer_role = member_roles.get(session_id)
                 if reviewer_role in (chats.ROLE_CRITIC, chats.ROLE_VERIFIER):
                     for task in tasks.values():

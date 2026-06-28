@@ -97,11 +97,12 @@ invariants:
       - check: gate_verdicts_incomplete
     message: |
       🛑 Themis IN-AGENT-6 (GATE_BEFORE_COMMIT): git commit blocked — the active
-      task lacks critic APPROVE + verifier SHIP structured gate verdicts.
+      task's commit gate is not satisfied (no structured gate verdicts close it).
 
-      Get both verdicts via chat_task_verdict(task_id, verdict) before committing:
-        critic → verdict="approve" or "changes"
-        verifier → verdict="ship" or "hold"
+      Close the gate via chat_task_verdict(task_id, verdict) before committing:
+        lean   → N distinct gatekeeper SHIPs (N=2 if high_stakes/escalated, else 1):
+                   gatekeeper → verdict="ship" (or "hold" to block)
+        legacy → critic verdict="approve" + verifier verdict="ship"
 
       If critic/verifier is genuinely down and the daemon is unreachable, that is
       a hard escalation to Joseph + roster — NOT a bypass. The gate exists to
@@ -127,8 +128,8 @@ invariants:
       an eager agent treating visible-needed-work as a cue to act before master assigns
       + signals start (jeevy-agent-2, 2026-06-21).
 
-      The flow is: master assigns → BEGIN signal → you build → gate (critic + verifier)
-      → master commits. If you see work that needs doing, PROPOSE it in the roster chat
+      The flow is: master assigns → BEGIN signal → you build → gate (gatekeeper ship;
+      legacy: critic + verifier) → master commits. If you see work that needs doing, PROPOSE it in the roster chat
       and WAIT for master to create + assign the task — do not edit first.
 
       Autonomous initiative is wanted; UNGATED initiative is not. Severity is warn

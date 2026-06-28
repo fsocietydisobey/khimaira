@@ -157,12 +157,15 @@ invariants:
       - check: gate_verdicts_incomplete
     message: |
       🛑 Themis IN-MASTER-9 (APPROVE_WITHOUT_REVIEW_VERDICTS): task approval
-      blocked — the task lacks critic APPROVE + verifier SHIP structured gate
-      verdicts.
+      blocked — the task's commit gate is not satisfied (no structured gate
+      verdicts close it).
 
-      Get both verdicts before approving:
-        critic → chat_task_verdict(task_id, verdict="approve")
-        verifier → chat_task_verdict(task_id, verdict="ship")
+      Close the gate before approving:
+        lean   → N distinct gatekeeper SHIPs (N=2 if high_stakes/escalated, else 1):
+                   gatekeeper → chat_task_verdict(task_id, verdict="ship")
+        legacy → critic APPROVE + verifier SHIP:
+                   critic → chat_task_verdict(task_id, verdict="approve")
+                   verifier → chat_task_verdict(task_id, verdict="ship")
 
       Closes the rubber-stamp class: master.md Step-5 "no rubber-stamps" is now
       enforced structurally, not just by prose (the 2026-05-22 incident + this
@@ -177,10 +180,11 @@ invariants:
       - tool: mcp__khimaira-chat__chat_send
         tool_input_field:
           field: body
-          pattern: '(?i)(?<!@)\b(architect|analyst|critic|verifier)(-\d+\b|:)'
+          pattern: '(?i)(?<!@)\b(architect|analyst|critic|verifier|consultant|gatekeeper)(-\d+\b|:)'
     message: |
       ⚠️ Themis IN-MASTER-10 (DIRECT_CONSULT_TO_CONSULT_ROLE): you addressed a
-      consult role (architect / analyst / critic / verifier) in an UNDIRECTED
+      consult role (lean: consultant / gatekeeper; legacy: architect / analyst /
+      critic / verifier) in an UNDIRECTED
       chat_send by seat-name / role: WITHOUT an @mention. The daemon's wake-filter
       (chats.py) suppresses real-time delivery of undirected messages to consult
       roles — and only an @mention (or a directed send) bypasses that. So this

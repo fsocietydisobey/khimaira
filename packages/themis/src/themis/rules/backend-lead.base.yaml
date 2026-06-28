@@ -31,4 +31,4 @@ invariants:
     message: |
       🛑 Themis IN-BACKEND-LEAD-BASE-2 (NO_GIT_COMMIT): backend-lead cannot
       commit directly. Lead roles delegate commits to agents after
-      critic APPROVE + verifier SHIP gate has closed.
+      the commit gate has closed (lean: gatekeeper ship; legacy: critic APPROVE + verifier SHIP).

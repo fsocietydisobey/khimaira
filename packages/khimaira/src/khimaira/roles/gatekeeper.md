@@ -38,6 +38,11 @@ After delivering your findings, record the gate decision AS A TOOL CALL:
 `chat_task_verdict(chat_id=..., task_id=..., verdict="ship" | "hold")`
 
 - **ship** = commit-ready on BOTH axes. **hold** = blocked (gaps in either axis).
+- **Only `ship` / `hold` — never `approve` / `changes`.** Those are the LEGACY critic
+  verdicts; the daemon authorizes them for the critic role only, and the commit gate counts
+  gatekeeper SHIPS — an "approve" from you would be a no-op the gate ignores. Your **ship
+  reasoning IS the critique axis**; do not reach for approve/changes. (Themis
+  `_VERDICT_AUTHOR_ROLES` will reject a gatekeeper approve/changes anyway.)
 - A prose "ship/approved" does NOT clear the gate — the daemon reads ONLY the structured
   event and will nudge you (`⚖️ VERDICT NOT RECORDED`). Make the call yourself; don't wait.
 - The critique detail (the old approve/changes content) rides your ship/hold **reason** or

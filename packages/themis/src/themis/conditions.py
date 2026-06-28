@@ -544,15 +544,18 @@ _GATE_SENTINEL = object()  # distinguishes "key not in payload" from "key=None"
 
 
 def gate_verdicts_incomplete(payload: dict[str, Any]) -> bool:
-    """True when the current task lacks both critic APPROVE + verifier SHIP.
+    """True when the current task's commit gate is NOT satisfied.
+
+    Gate-satisfied = the enrichment's `committable` flag (single source of truth):
+    lean N-distinct-gatekeeper-ship OR legacy critic-APPROVE + verifier-SHIP.
 
     Implements B3's Joseph-ruled semantics (exact tri-state):
       - no gate_verdicts key in payload → False (fail-open; enrichment didn't run)
       - gate_verdicts is None → False (no active task → ad-hoc commit; allow)
       - "absent" → True (BLOCK: task found, no verdicts yet)
       - "error" → True (BLOCK: verdict lookup failed; fail toward loud/recoverable)
-      - dict present + critic_approved=True + verifier_shipped=True → False (allow)
-      - dict present + incomplete → True (BLOCK: one or both missing)
+      - dict present + committable=True → False (allow)
+      - dict present + committable=False → True (BLOCK: gate not satisfied)
 
     The daemon-unreachable case is NOT handled here — themis_pretool.py
     fail-opens on URLError before reaching this condition (D7 / #61 axis-A).
@@ -567,6 +570,12 @@ def gate_verdicts_incomplete(payload: dict[str, Any]) -> bool:
     if gate == "error":
         return True   # enrichment error → fail closed (Joseph's ruling)
     if isinstance(gate, dict):
+        # SINGLE SOURCE OF TRUTH: `committable` (chats._is_committable) covers BOTH the
+        # lean N-distinct-gatekeeper-ship gate AND the legacy critic-approve+verifier-ship
+        # dual. Fall back to the legacy pair only for a pre-change payload that predates
+        # the `committable` field (defensive; in-process enrichment always emits it now).
+        if "committable" in gate:
+            return not gate["committable"]
         return not (gate.get("critic_approved") and gate.get("verifier_shipped"))
     return True  # unknown shape → fail closed
 

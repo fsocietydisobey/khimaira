@@ -2386,6 +2386,53 @@ def _last_round_reset_ts(room: dict[str, Any], task_id: str) -> str:
     return last_reset
 
 
+def _round_aware_gate_entry(room: dict[str, Any], task_id: str) -> dict[str, Any]:
+    """Single-task gate entry (same shape as `_gate_tally`'s per-task value),
+    computed ROUND-AWARE: verdicts recorded BEFORE the last round-reset
+    (`_last_round_reset_ts`) are excluded, so a reopened task's stale prior-round
+    verdicts can't satisfy the current gate (Guard-5 Part A).
+
+    Use THIS — not `_gate_tally` — wherever round-reset matters (the Themis
+    enrichment path: `get_gate_verdicts` / `get_gate_verdicts_by_task`).
+    `_gate_tally` deliberately omits round-reset (its level-triggered backstop
+    callers tolerate it); the Themis gate must not. Returns the entry dict
+    `_is_committable` consumes: {status, high_stakes, escalated, gk_latest, crit, ver}.
+    """
+    member_roles = (room.get("meta") or {}).get("member_roles") or {}
+    last_reset_ts = _last_round_reset_ts(room, task_id)
+    entry: dict[str, Any] = {
+        "status": TASK_PENDING,
+        "high_stakes": False,
+        "escalated": False,
+        "gk_latest": {},
+        "crit": None,
+        "ver": None,
+    }
+    for m in room.get("messages", []):
+        k = m.get("kind")
+        if k == TASK and m.get("id") == task_id:
+            entry["status"] = m.get("status") or TASK_PENDING
+            entry["high_stakes"] = bool(m.get("high_stakes"))
+        elif k == TASK_UPDATE and m.get("task_id") == task_id and m.get("status"):
+            entry["status"] = m["status"]
+        elif k == TASK_VERDICT and m.get("task_id") == task_id:
+            # Skip stale prior-round verdicts (before the last reopen).
+            if last_reset_ts and m.get("ts", "") < last_reset_ts:
+                continue
+            v = m.get("verdict")
+            sid = m.get("by_session_id")
+            if v in ("approve", "changes"):
+                entry["crit"] = v
+            elif v in ("ship", "hold"):
+                entry["ver"] = v
+            # Lean: latest ship/hold per GATEKEEPER-role session is a gate vote.
+            if sid and v in ("ship", "hold") and member_roles.get(sid) == ROLE_GATEKEEPER:
+                entry["gk_latest"][sid] = v
+            if m.get("escalate"):
+                entry["escalated"] = True
+    return entry
+
+
 def session_has_in_progress_assigned_task(session_id: str) -> bool:
     """True if any chat has a task assigned to ``session_id`` with status in_progress.
 
@@ -2502,34 +2549,22 @@ def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
         except Exception:
             return _GATE_ERROR
 
-        # Invalidate stale prior-round verdicts: the round resets on a REOPEN
-        # (done→pending/in_progress), NOT on the last done-transition — last-done is
-        # poisoned by the daemon's gate-auto-advance. See _last_round_reset_ts.
-        last_reset_ts = _last_round_reset_ts(room, task_id)
+        # Round-aware single-source entry (excludes stale prior-round verdicts;
+        # the round resets on a REOPEN, not the last done-transition — see
+        # _round_aware_gate_entry / _last_round_reset_ts).
+        entry = _round_aware_gate_entry(room, task_id)
 
-        critic_verdict: str | None = None
-        verifier_verdict: str | None = None
-        for msg in room.get("messages", []):
-            if msg.get("kind") != TASK_VERDICT:
-                continue
-            if msg.get("task_id") != task_id:
-                continue
-            # Skip verdicts from a prior review round (before the last reopen).
-            if last_reset_ts and msg.get("ts", "") < last_reset_ts:
-                continue
-            v = msg.get("verdict")
-            if v in ("approve", "changes"):
-                critic_verdict = v
-            elif v in ("ship", "hold"):
-                verifier_verdict = v
-
-        if critic_verdict is None and verifier_verdict is None:
+        if entry["crit"] is None and entry["ver"] is None:
             return _GATE_ABSENT  # task found but no verdicts yet
 
+        # `committable` is the SINGLE SOURCE OF TRUTH (lean N-distinct-gatekeeper-ship
+        # OR legacy critic-approve+verifier-ship, via _is_committable). The legacy
+        # critic_approved/verifier_shipped fields are kept for observability only.
         return {
             "task_id": task_id,
-            "critic_approved": critic_verdict == "approve",
-            "verifier_shipped": verifier_verdict == "ship",
+            "critic_approved": entry["crit"] == "approve",
+            "verifier_shipped": entry["ver"] == "ship",
+            "committable": _is_committable(entry),
         }
 
     except Exception:
@@ -2569,35 +2604,22 @@ def get_gate_verdicts_by_task(session_id: str, task_id: str) -> dict[str, Any] |
             member = room["members"].get(sid)
             if not member or member["state"] != ACCEPTED:
                 continue
-            # Invalidate stale prior-round verdicts on a REOPEN (done→active), NOT on
-            # the last done-transition (Guard-5 Part A). last-done is poisoned by the
-            # daemon's gate-auto-advance, which writes a done FROM these very verdicts
-            # → they'd be wrongly treated as prior-round → IN-MASTER-9 false-blocks
-            # master's →approved (audit 2026-06-21, task 625). See _last_round_reset_ts.
-            last_reset_ts = _last_round_reset_ts(room, task_id)
+            # Round-aware single-source entry (excludes stale prior-round verdicts on
+            # a REOPEN, NOT on the last done-transition — last-done is poisoned by the
+            # daemon's gate-auto-advance, which writes a done FROM these very verdicts;
+            # keying on it would make IN-MASTER-9 false-block master's →approved
+            # (audit 2026-06-21, task 625). See _round_aware_gate_entry.
+            entry = _round_aware_gate_entry(room, task_id)
 
-            # Scan verdicts from the current review round only.
-            critic_verdict: str | None = None
-            verifier_verdict: str | None = None
-            for msg in room.get("messages", []):
-                if msg.get("kind") != TASK_VERDICT:
-                    continue
-                if msg.get("task_id") != task_id:
-                    continue
-                if last_reset_ts and msg.get("ts", "") < last_reset_ts:
-                    continue  # prior review round — skip
-                v = msg.get("verdict")
-                if v in ("approve", "changes"):
-                    critic_verdict = v
-                elif v in ("ship", "hold"):
-                    verifier_verdict = v
-
-            if critic_verdict is None and verifier_verdict is None:
+            if entry["crit"] is None and entry["ver"] is None:
                 return _GATE_ABSENT
+            # `committable` = SINGLE SOURCE OF TRUTH (lean N-distinct-gatekeeper-ship OR
+            # legacy dual, via _is_committable). Legacy fields kept for observability.
             return {
                 "task_id": task_id,
-                "critic_approved": critic_verdict == "approve",
-                "verifier_shipped": verifier_verdict == "ship",
+                "critic_approved": entry["crit"] == "approve",
+                "verifier_shipped": entry["ver"] == "ship",
+                "committable": _is_committable(entry),
             }
 
         return None  # task_id not found in any chat → no active task
@@ -3846,11 +3868,9 @@ def _try_auto_begin(chat_id: str, task_id: str) -> bool:
                 task_record.get("sender_id") or required_agents[0],
                 begin_gate_task_id,
             )
-            if not (
-                isinstance(verdicts, dict)
-                and verdicts.get("critic_approved")
-                and verdicts.get("verifier_shipped")
-            ):
+            # Lean-aware: `committable` covers BOTH the lean N-distinct-gatekeeper-ship
+            # gate AND the legacy critic-approve+verifier-ship dual (single source).
+            if not (isinstance(verdicts, dict) and verdicts.get("committable")):
                 log.debug(
                     "chats: auto-BEGIN blocked by verdict gate task=%s gate=%s verdicts=%r",
                     task_id,
