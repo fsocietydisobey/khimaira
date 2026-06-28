@@ -750,6 +750,11 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                                 "assignee_role": line.get("assignee_role"),
                                 "gate_for": line.get("gate_for"),
                                 "verdict_role": line.get("verdict_role"),
+                                # #39 cold-start: gate_required is the storm-safe
+                                # eligibility signal for the 0-verdict initiation
+                                # obligation below (an un-gated done task must NOT
+                                # nag reviewers).
+                                "gate_required": bool(line.get("gate_required")),
                                 "status": line.get("status"),
                                 "begin_fired": False,
                                 "done_ts": (
@@ -883,10 +888,14 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                         tid = task["task_id"]
                         has_crit = tid in crit_present
                         has_ver = tid in ver_present
-                        if not (has_crit or has_ver):
-                            # Not yet under review — review-initiation, not stall-
-                            # recovery; master's normal dispatch + commit-ready
-                            # reconcile cover cold-start.
+                        # 0 verdicts + not gate_required = review not yet started on a
+                        # task that doesn't need a gate → skip (the storm guard: an
+                        # un-gated audit/research done-task must NOT nag reviewers). A
+                        # gate_required 0-verdict done task is the #39 cold-start — the
+                        # master declared "this needs review", so it falls through to the
+                        # owed-check below and engages the FIRST reviewer of EACH role.
+                        # The recency window + verdict-presence flip still bound + clear it.
+                        if not (has_crit or has_ver) and not task.get("gate_required"):
                             continue
                         # Recency gate: only a RECENTLY-done task is a live mid-review
                         # stall worth a wake. Without this, a long-lived roster's

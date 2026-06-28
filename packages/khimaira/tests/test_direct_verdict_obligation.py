@@ -116,6 +116,49 @@ def test_changes_verdict_counts_as_critic_present(isolated_state):
     )
 
 
+# --- #39 COLD-START (0-verdict initiation, gate_required-gated) -------------
+
+
+def test_gate_required_cold_start_fires_both_reviewers(isolated_state):
+    """#39: a gate_required done task with ZERO verdicts engages BOTH reviewers.
+
+    The cold-start (review-never-started) case. gate_required is the master's
+    explicit "this needs review" signal, so the opening verdict from EACH role is
+    owed — closing the input-starvation hole where review-INITIATION was punted to
+    "master's normal dispatch" (which, dispatched via undirected chat_send, created
+    no obligation). Forms the engagement half of the class invariant; its storm-guard
+    twin is test_ungated_done_task_with_no_verdicts_stays_quiet — WITHOUT
+    gate_required the same 0-verdict done task stays silent. Together: engage iff gated.
+    """
+    task = _done_task()
+    task["gate_required"] = True
+    _write_chat([_meta(), task])
+
+    assert _owed(
+        apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK
+    )
+    assert _owed(
+        apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
+    )
+
+
+def test_gate_required_cold_start_respects_recency(isolated_state):
+    """#39 cold-start still obeys the recency gate: an ANCIENT gate_required done
+    task does NOT backfill as owed — so a long-lived roster's old gated-but-
+    unreviewed tasks can't storm reviewers on deploy (same guard as the partial-
+    verdict path in test_stale_done_task_not_owed)."""
+    task = _done_task(ts="2020-01-01T00:00:00+00:00")
+    task["gate_required"] = True
+    _write_chat([_meta(), task])
+
+    assert not _owed(
+        apichats._get_session_obligations(CRITIC_SID), chats.ROLE_CRITIC, WORK_TASK
+    )
+    assert not _owed(
+        apichats._get_session_obligations(VERIFIER_SID), chats.ROLE_VERIFIER, WORK_TASK
+    )
+
+
 # --- RECENCY (the muther long-lived-roster backlog storm) ------------------
 
 

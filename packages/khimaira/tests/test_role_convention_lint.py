@@ -58,6 +58,26 @@ def test_master_md_contains_directed_consult_convention():
     assert "IN-MASTER-10" in content, "master.md missing IN-MASTER-10 cross-reference"
 
 
+def test_master_md_contains_gate_required_review_dispatch_convention():
+    """Regression guard (#39, 2026-06-28): review-GATE dispatch must go through a
+    gate_required task (not prose chat_send), so the daemon's direct-verdict cold-start
+    obligation + wake engages an idle critic/verifier. This is the discipline (input)
+    half of the #39 PAIR; the substrate half is the cold-start branch in
+    api/chats._get_session_obligations. Per behavioral-rule-promotion the Themis layer
+    is DELIBERATELY skipped (a 'review-ish chat_send' matcher is the fragile IN-MASTER-10
+    content-matching class) — enforcement-by-construction comes from the substrate (only
+    gated dispatch engages reviewers) + this role-doc + lint, not a Themis hint."""
+    content = (ROLE_DIR / "master.md").read_text()
+    lowered = content.lower()
+    assert "gate_required" in content, (
+        "master.md missing the gate_required review-dispatch convention"
+    )
+    assert "#39" in content, "master.md missing #39 cross-reference"
+    assert "verdict-starvation" in lowered, (
+        "master.md missing the #39 verdict-starvation rationale"
+    )
+
+
 def test_in_master_10_themis_rule_present():
     """Regression guard: IN-MASTER-10 (directed-consult warn-hint) must be in
     master.yaml — layer 2 of the 3-layer structural promotion."""

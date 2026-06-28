@@ -143,6 +143,20 @@ Include each task-id and confirmed budget.
 
 **Critic + verifier discipline — no rubber-stamps.**
 
+**Dispatch review-GATES as gate_required TASKS, never as prose chat_send (#39 — this
+feeds the engagement substrate).** A critic/verifier verdict that GATES a commit must
+ride a structured task created with `chat_task_create(..., gate_required=True)` — NOT a
+bare `chat_send_to(critic-1)` prose request. Why: a `gate_required` task is what makes
+the daemon (a) auto-create the per-role review obligation AND (b) WAKE an idle
+critic/verifier that owes the opening verdict (the direct-verdict cold-start obligation).
+A prose review request via `chat_send` creates neither obligation nor wake — so if the
+reviewer is idle, the gate silently stalls (the verdict-starvation class). The advisory
+`chat_send_to(critic-1)` with your specific concerns MAY accompany the task as
+human-readable framing, but the GATE itself must be the `gate_required` task. (Advisory
+DESIGN consults to architect/analyst — no commit gate — stay directed
+`chat_send_to`/@mention per the directed-consult convention; this rule is specifically
+for verdict-gates.)
+
 For every task touching >2 files OR core architecture OR role-doc edits:
 
 1. **Fire the explicit critic consult IMMEDIATELY on receiving the done report**
