@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Toggle the roster between primary and backup Anthropic account (via the proxy).
+#   bin/failover on      -> route proxied sessions to the backup account
+#   bin/failover off     -> route them back to primary
+#   bin/failover status  -> show current routing + backup token freshness
+#
+# NOTE: only affects sessions launched with ANTHROPIC_BASE_URL=http://127.0.0.1:8741
+# (i.e. behind the proxy). A window without that env talks to primary directly and
+# is unaffected by this toggle.
+set -euo pipefail
+DROPIN="$HOME/.config/systemd/user/khimaira-proxy.service.d/10-force-backup.conf"
+BACKUP_CREDS="$HOME/.claude-backup/.credentials.json"
+
+show() {
+  curl -s http://127.0.0.1:8741/health | python3 -m json.tool 2>/dev/null \
+    | grep -A7 '"failover"' || echo "proxy not reachable on :8741"
+}
+
+token_age() {
+  python3 - "$BACKUP_CREDS" <<'PY'
+import json, sys, time
+try:
+    o = json.load(open(sys.argv[1]))["claudeAiOauth"]
+    s = o.get("expiresAt", 0) / 1000 - time.time()
+    if s < 0:
+        print(f"backup token: EXPIRED {round(-s/3600,1)}h ago — refresh before 'on':")
+        print("  env -u ANTHROPIC_BASE_URL CLAUDE_CONFIG_DIR=~/.claude-backup claude -p ok")
+    else:
+        print(f"backup token: fresh, {round(s/3600,1)}h left")
+except Exception as e:
+    print("backup token: unreadable —", e)
+PY
+}
+
+case "${1:-status}" in
+  on)
+    token_age
+    mkdir -p "$(dirname "$DROPIN")"
+    printf '[Service]\nEnvironment="KHIMAIRA_PROXY_FORCE_BACKUP=1"\n' > "$DROPIN"
+    systemctl --user daemon-reload
+    systemctl --user restart khimaira-proxy
+    sleep 2
+    echo "-> proxied sessions routed to BACKUP account"
+    show ;;
+  off)
+    rm -f "$DROPIN"
+    systemctl --user daemon-reload
+    systemctl --user restart khimaira-proxy
+    sleep 2
+    echo "-> proxied sessions routed to PRIMARY account"
+    show ;;
+  refresh)
+    # Re-mint the backup OAuth token (runs CC once under the backup dir, which
+    # uses the stored refreshToken to write a fresh accessToken). Proxy auto-reads it.
+    echo "refreshing backup token..."
+    env -u ANTHROPIC_BASE_URL CLAUDE_CONFIG_DIR="$HOME/.claude-backup" timeout 90 claude -p "ok" >/dev/null 2>&1 \
+      && echo "done." || echo "refresh FAILED — refreshToken may be dead; log into the backup account in a browser."
+    token_age ;;
+  status)
+    token_age
+    show ;;
+  *)
+    echo "usage: bin/failover {on|off|refresh|status}" ; exit 1 ;;
+esac
