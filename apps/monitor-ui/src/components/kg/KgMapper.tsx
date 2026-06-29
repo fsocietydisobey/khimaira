@@ -18,7 +18,6 @@ import { useParams, useSearchParams } from "react-router-dom";
 import Graph from "graphology";
 import Sigma from "sigma";
 import forceAtlas2 from "graphology-layout-forceatlas2";
-import dagre from "@dagrejs/dagre";
 import { createNodeBorderProgram } from "@sigma/node-border";
 import { drawDiscNodeLabel, type NodeHoverDrawingFunction } from "sigma/rendering";
 
@@ -458,30 +457,100 @@ function SigmaCanvas({
     });
 
     if (layoutMode === "tree") {
-      // Dagre layered layout — code-agnostic: uses ONLY graph structure + edge
-      // DIRECTION to rank nodes (no node-type/schema knowledge). Naturally spreads
-      // leaf clusters into clean rows under their hub. dagre is already a repo dep
-      // (used by FlowCanvas); this mirrors that pattern.
-      const dg = new dagre.graphlib.Graph();
-      dg.setGraph({ rankdir: "TB", nodesep: 30, ranksep: 70, marginx: 20, marginy: 20 });
-      dg.setDefaultEdgeLabel(() => ({}));
-      graph.forEachNode((node, attrs) => {
-        const sz = (attrs.size as number) ?? 4;
-        dg.setNode(node, { width: sz * 2, height: sz * 2 });
-      });
-      graph.forEachEdge((_edge, _attrs, src, tgt) => {
-        dg.setEdge(src, tgt);
-      });
-      dagre.layout(dg);
+      // Type-clustered tiers — code-agnostic: groups by the opaque `type` attr (same
+      // attr used for color/legend/filter) and tiers by STRUCTURAL graph-distance; NO
+      // hard-coded type→tier map. Replaces the flat dagre rows that strung 1000+
+      // same-rank nodes into one ~64000px-wide line. Each type → a compact grid block;
+      // blocks are tiered top-down by their nodes' median hop-distance from the hub
+      // (highest-degree node), and same-depth types share a row.
+      const NODE_GAP = 26; // px between nodes within a cluster grid
+      const CLUSTER_GAP = 140; // px between type-blocks in the same tier
+      const TIER_GAP = 160; // px between tiers (rows)
+
+      // 1. Root = highest-degree node (the hub); BFS depth = hop-distance from it.
+      //    Undirected (forEachNeighbor covers in+out); the visited set handles cycles.
+      let root: string | null = null;
+      let bestDeg = -1;
       graph.forEachNode((node) => {
-        const pos = dg.node(node);
-        if (pos) {
-          graph.setNodeAttribute(node, "x", pos.x);
-          // Flip Y: dagre ranks downward (rank 0 = smallest y); sigma's y axis points
-          // up, so negate to put rank 0 (the roots/hubs) at the TOP of the view.
-          graph.setNodeAttribute(node, "y", -pos.y);
+        const d = degree.get(node) ?? 0;
+        if (d > bestDeg) {
+          bestDeg = d;
+          root = node;
         }
       });
+      const depthByNode = new Map<string, number>();
+      if (root) {
+        depthByNode.set(root, 0);
+        let frontier: string[] = [root];
+        while (frontier.length > 0) {
+          const nextDepth = (depthByNode.get(frontier[0]) ?? 0) + 1;
+          const next: string[] = [];
+          for (const node of frontier) {
+            graph.forEachNeighbor(node, (nb) => {
+              if (!depthByNode.has(nb)) {
+                depthByNode.set(nb, nextDepth);
+                next.push(nb);
+              }
+            });
+          }
+          frontier = next;
+        }
+      }
+      let maxDepth = 0;
+      for (const d of depthByNode.values()) if (d > maxDepth) maxDepth = d;
+      const orphanDepth = maxDepth + 1; // disconnected nodes → a bottom tier
+      const nodeDepth = (node: string) => depthByNode.get(node) ?? orphanDepth;
+
+      // 2. Group nodes by opaque type.
+      const byType = new Map<string, string[]>();
+      graph.forEachNode((node, attrs) => {
+        const t = (attrs.nodeType as string) || "—";
+        const arr = byType.get(t);
+        if (arr) arr.push(node);
+        else byType.set(t, [node]);
+      });
+
+      const median = (nums: number[]): number => {
+        const s = [...nums].sort((a, b) => a - b);
+        const mid = Math.floor(s.length / 2);
+        return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+      };
+
+      // 3. Per-type tier = rounded median hop-depth of its nodes; bucket types per tier.
+      const tiers = new Map<number, string[]>();
+      for (const [t, nodes] of byType) {
+        const tier = Math.round(median(nodes.map(nodeDepth)));
+        const arr = tiers.get(tier);
+        if (arr) arr.push(t);
+        else tiers.set(tier, [t]);
+      }
+      const sortedTierKeys = [...tiers.keys()].sort((a, b) => a - b);
+
+      // 4 + 5. Lay tiers top→down; within a tier, grid-pack each type-cluster
+      //        (cols ≈ √count) and place the blocks side by side, centered.
+      let currentY = 0;
+      for (const tierKey of sortedTierKeys) {
+        const blocks = [...tiers.get(tierKey)!].sort().map((t) => {
+          const nodes = [...byType.get(t)!].sort();
+          const cols = Math.max(1, Math.ceil(Math.sqrt(nodes.length)));
+          const rows = Math.ceil(nodes.length / cols);
+          return { nodes, cols, w: cols * NODE_GAP, h: rows * NODE_GAP };
+        });
+        const totalW =
+          blocks.reduce((s, b) => s + b.w, 0) + CLUSTER_GAP * Math.max(0, blocks.length - 1);
+        const tierH = Math.max(...blocks.map((b) => b.h));
+        let x = -totalW / 2;
+        for (const b of blocks) {
+          b.nodes.forEach((node, i) => {
+            const col = i % b.cols;
+            const row = Math.floor(i / b.cols);
+            graph.setNodeAttribute(node, "x", x + col * NODE_GAP);
+            graph.setNodeAttribute(node, "y", currentY - row * NODE_GAP);
+          });
+          x += b.w + CLUSTER_GAP;
+        }
+        currentY -= tierH + TIER_GAP;
+      }
     } else {
       // ForceAtlas2 — synchronous, computed ONCE. Scale iterations down for big
       // graphs (barnes-hut keeps it fast); this is not a per-frame simulation.
