@@ -157,7 +157,7 @@ ROLE_BUDGET: dict[str, dict[str, str]] = {
     # Lean roster (replaces architect+analyst→consultant, critic+verifier→gatekeeper).
     # Tiers signed off by Joseph 2026-06-28; mirror C1 in LEAN-ROSTER-SPEC.md / bin/roster.
     ROLE_CONSULTANT: {"model": "opus", "effort": "max"},  # design + analysis (idle-by-default)
-    ROLE_GATEKEEPER: {"model": "opus", "effort": "high"},  # commit gate (idle-by-default)
+    ROLE_GATEKEEPER: {"model": "sonnet", "effort": "high"},  # commit gate (idle-by-default; demoted 2026-06-29)
     # Domain leads: sonnet/medium default; escalate to opus only for rare decomposition-heavy
     # initiatives (per lead-role.md.j2 convention). Entries here must match the themis rule
     # yaml filenames in packages/themis/src/themis/rules/ — ROLE_BUDGET keys must be in
