@@ -364,4 +364,17 @@ def build_router():
             project, adapter, _sub_url(adapter["url"], "edges-audit"), scope, since
         )
 
+    @router.get("/graph/{project}/scopes")
+    async def get_graph_scopes(project: str) -> dict[str, Any]:
+        """Scope discovery: lists available scopes (shops/tenants) for this
+        adapter.
+
+        No scope/since args — this IS the call that tells you which scopes
+        exist. Returns the adapter's JSON verbatim; the tool (kg_scopes) renders
+        it. Expected adapter shape: `{"data": {"scopes": [{"scope", "nodes",
+        "edges", "label"}, ...]}}` sorted by nodes DESC (richest first).
+        """
+        adapter = _adapter_or_404(project)
+        return await _proxy_get(project, adapter, _sub_url(adapter["url"], "scopes"), "")
+
     return router

@@ -2578,7 +2578,7 @@ async def oracle_query(
 
 @mcp.tool()
 @logged_tool("kg_graph")
-async def kg_graph(project: str, scope: str = "", node_cap: int = 40, since: str = "") -> str:
+async def kg_graph(project: str = "", scope: str = "", node_cap: int = 40, since: str = "") -> str:
     """Overview of a project's knowledge graph: counts + type histograms + a
     node sample.
 
@@ -2588,10 +2588,12 @@ async def kg_graph(project: str, scope: str = "", node_cap: int = 40, since: str
     `kg_search`; to drill into one node use `kg_node`.
 
     Args:
-        project: attached project with a registered KG adapter (e.g. "jeevy").
+        project: attached project with a registered KG adapter (e.g. "backend").
+            Omit when exactly one KG adapter is registered — it auto-resolves.
+            If multiple adapters exist, pass the project name explicitly.
         scope: adapter-specific scope passed through verbatim. Jeevy expects
             `shop:<id>` (e.g. "shop:10"); empty means "no scope" (adapter
-            decides — may be required).
+            decides — may be required). Use `kg_scopes` to list available values.
         node_cap: max nodes to list in the sample (default 40). Counts +
             histograms always reflect the full graph regardless of this cap.
         since: optional ISO timestamp — restrict to nodes/edges first-seen ≥
@@ -2602,7 +2604,7 @@ async def kg_graph(project: str, scope: str = "", node_cap: int = 40, since: str
 
 @mcp.tool()
 @logged_tool("kg_node")
-async def kg_node(project: str, node_id: str, scope: str = "") -> str:
+async def kg_node(project: str = "", node_id: str = "", scope: str = "") -> str:
     """A node's full detail: current facts, superseded history, and every
     incident edge.
 
@@ -2612,7 +2614,8 @@ async def kg_node(project: str, node_id: str, scope: str = "") -> str:
     label to a `node_id` with `kg_search` first.
 
     Args:
-        project: attached project with a registered KG adapter.
+        project: attached project with a registered KG adapter. Omit when
+            exactly one KG adapter is registered — it auto-resolves.
         node_id: the opaque node id (from `kg_search` / `kg_graph`). Passed to
             the adapter verbatim — the daemon never interprets it.
         scope: adapter-specific scope (jeevy: "shop:<id>").
@@ -2622,7 +2625,7 @@ async def kg_node(project: str, node_id: str, scope: str = "") -> str:
 
 @mcp.tool()
 @logged_tool("kg_edge")
-async def kg_edge(project: str, edge_id: str, scope: str = "") -> str:
+async def kg_edge(project: str = "", edge_id: str = "", scope: str = "") -> str:
     """An edge's provenance: type, endpoints, weight, and all source metadata.
 
     Answers "WHY does this edge exist?" for an LLM-extracted graph — match
@@ -2631,7 +2634,8 @@ async def kg_edge(project: str, edge_id: str, scope: str = "") -> str:
     `edge_id` from a node's edge list (`kg_node`).
 
     Args:
-        project: attached project with a registered KG adapter.
+        project: attached project with a registered KG adapter. Omit when
+            exactly one KG adapter is registered — it auto-resolves.
         edge_id: the opaque edge id (from `kg_node`'s edge list). Passed
             verbatim to the adapter.
         scope: adapter-specific scope (jeevy: "shop:<id>").
@@ -2641,18 +2645,18 @@ async def kg_edge(project: str, edge_id: str, scope: str = "") -> str:
 
 @mcp.tool()
 @logged_tool("kg_schema")
-async def kg_schema(project: str, scope: str = "", since: str = "") -> str:
+async def kg_schema(project: str = "", scope: str = "", since: str = "") -> str:
     """The KG type meta-graph: node/link types + the (fromType,linkType,toType)
-    triples that occur.
+    triples that occur, with dangling-edge counts where available.
 
     The structural-gap finder — a relationship type that is ABSENT from the
-    triples is one the extractor never produced (e.g. an expected
-    shop→user membership edge that never got built). Triples are sorted by
-    occurrence count. Start here to understand a graph's shape before drilling
-    into specific nodes.
+    triples is one the extractor never produced. A "⚠ N dangling" annotation
+    on a triple means N edges of that type point to a missing node (integrity
+    gap). Triples sorted by occurrence count.
 
     Args:
-        project: attached project with a registered KG adapter.
+        project: attached project with a registered KG adapter. Omit when
+            exactly one KG adapter is registered — it auto-resolves.
         scope: adapter-specific scope (jeevy: "shop:<id>").
         since: optional ISO timestamp — restrict to relationships first-seen ≥ ts.
     """
@@ -2661,7 +2665,7 @@ async def kg_schema(project: str, scope: str = "", since: str = "") -> str:
 
 @mcp.tool()
 @logged_tool("kg_search")
-async def kg_search(project: str, query: str, scope: str = "", limit: int = 20) -> str:
+async def kg_search(project: str = "", query: str = "", scope: str = "", limit: int = 20) -> str:
     """Find graph nodes whose id or label matches `query` (case-insensitive).
 
     The "give me a node id" primitive: `kg_node` / `kg_edge` need opaque ids,
@@ -2670,7 +2674,8 @@ async def kg_search(project: str, query: str, scope: str = "", limit: int = 20) 
     client-side over the graph contract (no adapter search route assumed).
 
     Args:
-        project: attached project with a registered KG adapter.
+        project: attached project with a registered KG adapter. Omit when
+            exactly one KG adapter is registered — it auto-resolves.
         query: substring to match against node label or id.
         scope: adapter-specific scope (jeevy: "shop:<id>").
         limit: max matches to return (default 20).
@@ -2719,7 +2724,7 @@ async def kg_view_url(
 
 @mcp.tool()
 @logged_tool("kg_health")
-async def kg_health(project: str, scope: str = "", since: str = "") -> str:
+async def kg_health(project: str = "", scope: str = "", since: str = "") -> str:
     """Whole-graph health in ONE call — the "audit the graph" keystone for
     roster agents (who have no DB access).
 
@@ -2731,7 +2736,8 @@ async def kg_health(project: str, scope: str = "", since: str = "") -> str:
         lives in `containment`, not the orphan counts).
 
     Args:
-        project: attached project with a registered KG adapter.
+        project: attached project with a registered KG adapter. Omit when
+            exactly one KG adapter is registered — it auto-resolves.
         scope: adapter-specific scope (jeevy: "shop:<id>").
         since: optional ISO timestamp — restrict to first-appearance ≥ ts
             (separates CURRENT data from pre-stable cruft).
@@ -2741,7 +2747,7 @@ async def kg_health(project: str, scope: str = "", since: str = "") -> str:
 
 @mcp.tool()
 @logged_tool("kg_coverage")
-async def kg_coverage(project: str, scope: str = "") -> str:
+async def kg_coverage(project: str = "", scope: str = "") -> str:
     """Relational-vs-KG coverage per entity — the under-projection detector.
 
     For each entity the adapter compares relational rows to KG nodes:
@@ -2750,7 +2756,8 @@ async def kg_coverage(project: str, scope: str = "") -> str:
     Worst coverage is listed first. The adapter owns the entity→node-kind map.
 
     Args:
-        project: attached project with a registered KG adapter.
+        project: attached project with a registered KG adapter. Omit when
+            exactly one KG adapter is registered — it auto-resolves.
         scope: adapter-specific scope (jeevy: "shop:<id>").
     """
     return await _monitor_tools.kg_coverage(project, scope)
@@ -2758,7 +2765,7 @@ async def kg_coverage(project: str, scope: str = "") -> str:
 
 @mcp.tool()
 @logged_tool("kg_edges_audit")
-async def kg_edges_audit(project: str, scope: str = "", since: str = "") -> str:
+async def kg_edges_audit(project: str = "", scope: str = "", since: str = "") -> str:
     """Aggregate edge provenance: match-method + confidence histograms + the
     low-confidence/fuzzy/llm SUSPECT tail — the population view that complements
     one-at-a-time `kg_edge`.
@@ -2769,11 +2776,31 @@ async def kg_edges_audit(project: str, scope: str = "", since: str = "") -> str:
     ANY sub-1.0 edges?" is unambiguous.
 
     Args:
-        project: attached project with a registered KG adapter.
+        project: attached project with a registered KG adapter. Omit when
+            exactly one KG adapter is registered — it auto-resolves.
         scope: adapter-specific scope (jeevy: "shop:<id>").
         since: optional ISO timestamp — restrict to edges first-seen ≥ ts.
     """
     return await _monitor_tools.kg_edges_audit(project, scope, since)
+
+
+@mcp.tool()
+@logged_tool("kg_scopes")
+async def kg_scopes(project: str = "") -> str:
+    """List available scopes (shops/tenants) for a KG-enabled project.
+
+    The cold-start primitive — call this first when you don't know which
+    `scope=` values to pass to the other kg_* tools. Returns one line per
+    scope with node + edge counts and an optional human label, sorted
+    richest-first (most nodes). Use the `scope` column from this output as
+    the `scope=` argument to kg_graph, kg_health, kg_schema, etc.
+
+    Args:
+        project: attached project with a registered KG adapter. Omit when
+            exactly one KG adapter is registered — it auto-resolves (the
+            common single-adapter deployment case).
+    """
+    return await _monitor_tools.kg_scopes(project)
 
 
 @mcp.tool()

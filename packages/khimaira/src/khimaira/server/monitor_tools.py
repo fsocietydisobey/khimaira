@@ -1827,10 +1827,49 @@ def _kg_meta_chips(meta: dict[str, Any] | None) -> str:
     return "  ·  ".join(f"{k}={v}" for k, v in meta.items())
 
 
-async def kg_graph(project: str, scope: str = "", node_cap: int = 40, since: str = "") -> str:
+def _kg_default_project(project: str) -> tuple[str | None, str | None]:
+    """Return (resolved_project, error_msg) for a kg_* tool's project arg.
+
+    If `project` is non-empty, returns it as-is (explicit always wins).
+    If empty, enumerates registered KG adapters from the registry JSON
+    (readable by the MCP server process — same disk, no HTTP needed):
+      • exactly one adapter → auto-resolve to its label.
+      • multiple adapters   → return an error listing them.
+      • no adapters         → return a "no KG adapter" message.
+
+    This lets agents omit `project=` in single-adapter deployments (the
+    common case: one jeevy instance attached as "backend").
+    """
+    if project:
+        return project, None
+
+    try:
+        from ..attach.registry import list_attached
+    except Exception:
+        return None, "no KG adapter registered"
+
+    adapters: list[str] = []
+    for p in list_attached():
+        if p.get("kg_adapter"):
+            name = p.get("label") or os.path.basename(p.get("project_path") or "")
+            if name:
+                adapters.append(name)
+
+    if len(adapters) == 1:
+        return adapters[0], None
+    if len(adapters) > 1:
+        names = ", ".join(adapters)
+        return None, f"multiple KG projects registered: {names} — pass project=…"
+    return None, "no KG adapter registered"
+
+
+async def kg_graph(project: str = "", scope: str = "", node_cap: int = 40, since: str = "") -> str:
     """Overview of a project's KG: counts + type histograms + a node sample.
 
     `since` (ISO ts) scopes to nodes/edges first-seen ≥ ts (CURRENT vs cruft)."""
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
     resp = _get(f"/api/graph/{urllib.parse.quote(project)}{_kg_qs(scope, since)}", timeout=30.0)
     body, err = _kg_unwrap(resp)
     if err:
@@ -1871,13 +1910,18 @@ async def kg_graph(project: str, scope: str = "", node_cap: int = 40, since: str
     return "\n".join(lines)
 
 
-async def kg_node(project: str, node_id: str, scope: str = "") -> str:
+async def kg_node(project: str = "", node_id: str = "", scope: str = "") -> str:
     """A node's full detail: facts (current + history) + its edges.
 
     The keystone debug surface — shows what the graph actually KNOWS about a
     node, including superseded facts and every incident edge (with edge ids so
     you can call `kg_edge` for provenance).
     """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
+    if not node_id:
+        return "❌ kg_node requires a node_id — get one from kg_search or kg_graph."
     resp = _get(
         f"/api/graph/{urllib.parse.quote(project)}/node/"
         f"{urllib.parse.quote(node_id, safe='')}{_kg_scope_qs(scope)}",
@@ -1926,13 +1970,18 @@ async def kg_node(project: str, node_id: str, scope: str = "") -> str:
     return "\n".join(lines)
 
 
-async def kg_edge(project: str, edge_id: str, scope: str = "") -> str:
+async def kg_edge(project: str = "", edge_id: str = "", scope: str = "") -> str:
     """An edge's provenance: type, endpoints, weight, and all source meta.
 
     The edge-debug surface — answers "WHY does this edge exist?" (match
     method, source document/page/bbox, confidence, link origin) for an
     LLM-extracted graph. All provenance folds into the opaque `meta` map.
     """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
+    if not edge_id:
+        return "❌ kg_edge requires an edge_id — get one from kg_node's edge list."
     resp = _get(
         f"/api/graph/{urllib.parse.quote(project)}/edge/"
         f"{urllib.parse.quote(edge_id, safe='')}{_kg_scope_qs(scope)}",
@@ -1957,7 +2006,7 @@ async def kg_edge(project: str, edge_id: str, scope: str = "") -> str:
     return "\n".join(lines)
 
 
-async def kg_schema(project: str, scope: str = "", since: str = "") -> str:
+async def kg_schema(project: str = "", scope: str = "", since: str = "") -> str:
     """The KG type meta-graph: node/link types + the triples that occur.
 
     The structural-gap finder — a relationship type that's *absent* from the
@@ -1965,6 +2014,9 @@ async def kg_schema(project: str, scope: str = "", since: str = "") -> str:
     occurrence count (rarest patterns last — those are often the suspect ones).
     `since` (ISO ts) scopes to relationships first-seen ≥ ts.
     """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
     resp = _get(
         f"/api/graph/{urllib.parse.quote(project)}/schema{_kg_qs(scope, since)}",
         timeout=30.0,
@@ -1990,16 +2042,18 @@ async def kg_schema(project: str, scope: str = "", since: str = "") -> str:
         f"**Triples ({len(triples)}) — (fromType) -[linkType]-> (toType) × count:**",
     ]
     for t in triples:
+        dangling = t.get("dangling", 0)
+        dangling_str = f"  ⚠ {dangling} dangling" if dangling > 0 else ""
         lines.append(
             f"  {t.get('fromType', '?')} -[{t.get('linkType', '?')}]-> "
-            f"{t.get('toType', '?')}  × {t.get('count', 0)}"
+            f"{t.get('toType', '?')}  × {t.get('count', 0)}{dangling_str}"
         )
     if not triples:
         lines.append("  (no relationship patterns — every node is isolated)")
     return "\n".join(lines)
 
 
-async def kg_search(project: str, query: str, scope: str = "", limit: int = 20) -> str:
+async def kg_search(project: str = "", query: str = "", scope: str = "", limit: int = 20) -> str:
     """Find nodes whose id or label matches `query` (case-insensitive).
 
     The "give me a node_id" primitive: `kg_node`/`kg_edge` need ids, and this
@@ -2008,6 +2062,9 @@ async def kg_search(project: str, query: str, scope: str = "", limit: int = 20) 
     Implemented client-side over the graph contract (no adapter search route
     is assumed), so it stays code-agnostic.
     """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
     if not query.strip():
         return "❌ kg_search needs a non-empty query."
     resp = _get(f"/api/graph/{urllib.parse.quote(project)}{_kg_scope_qs(scope)}", timeout=30.0)
@@ -2105,7 +2162,7 @@ async def kg_view_url(
 # ---------------------------------------------------------------------------
 
 
-async def kg_health(project: str, scope: str = "", since: str = "") -> str:
+async def kg_health(project: str = "", scope: str = "", since: str = "") -> str:
     """Whole-graph health in one call: per-type counts, ORPHANS, and
     parent-containment coverage — the "audit the graph" keystone.
 
@@ -2118,6 +2175,9 @@ async def kg_health(project: str, scope: str = "", since: str = "") -> str:
     `danglingEdges` = edges pointing at a missing node (integrity violation).
     `since` (ISO ts) scopes to first-appearance ≥ ts.
     """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
     resp = _get(
         f"/api/graph/{urllib.parse.quote(project)}/health{_kg_qs(scope, since)}",
         timeout=30.0,
@@ -2170,7 +2230,7 @@ async def kg_health(project: str, scope: str = "", since: str = "") -> str:
     return "\n".join(lines)
 
 
-async def kg_coverage(project: str, scope: str = "") -> str:
+async def kg_coverage(project: str = "", scope: str = "") -> str:
     """Relational-vs-KG coverage per entity — the under-projection detector.
 
     For each entity the adapter compares the relational row count to the KG
@@ -2179,6 +2239,9 @@ async def kg_coverage(project: str, scope: str = "") -> str:
     "46 users / 4 nodes" (ratio 0.09). The adapter owns the entity→node-kind
     map; the daemon/tool stay generic.
     """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
     resp = _get(
         f"/api/graph/{urllib.parse.quote(project)}/coverage{_kg_scope_qs(scope)}",
         timeout=30.0,
@@ -2205,7 +2268,7 @@ async def kg_coverage(project: str, scope: str = "") -> str:
     return "\n".join(lines)
 
 
-async def kg_edges_audit(project: str, scope: str = "", since: str = "") -> str:
+async def kg_edges_audit(project: str = "", scope: str = "", since: str = "") -> str:
     """Aggregate edge provenance: match-method + confidence histograms and the
     low-confidence/fuzzy/llm SUSPECT tail — the population view that complements
     one-at-a-time `kg_edge`.
@@ -2215,6 +2278,9 @@ async def kg_edges_audit(project: str, scope: str = "", since: str = "") -> str:
     Confidence buckets isolate EXACTLY 1.0 from anything <1.0, so "are there
     ANY sub-1.0 edges?" is unambiguous. `since` scopes by first-appearance.
     """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
     resp = _get(
         f"/api/graph/{urllib.parse.quote(project)}/edges-audit{_kg_qs(scope, since)}",
         timeout=30.0,
@@ -2264,4 +2330,43 @@ async def kg_edges_audit(project: str, scope: str = "", since: str = "") -> str:
                 f"  `{e.get('id')}` [{e.get('type', '?')}] "
                 f"`{e.get('from')}`→`{e.get('to')}` {w}{label}{chip_str}"
             )
+    return "\n".join(lines)
+
+
+async def kg_scopes(project: str = "") -> str:
+    """Lists available scopes (shops/tenants) for a KG-enabled project.
+
+    The cold-start primitive — tells an agent which `scope=` values to
+    pass to the other kg_* tools. Returns one line per scope with node +
+    edge counts and an optional human label, sorted richest-first (most
+    nodes). Call this first when the set of available scopes is unknown.
+    """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
+    resp = _get(
+        f"/api/graph/{urllib.parse.quote(project)}/scopes",
+        timeout=30.0,
+    )
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    scopes = body.get("scopes") or []
+    if not scopes:
+        return f"📭 no scopes with KG data for `{project}`"
+
+    richest = scopes[0]  # adapter sorts by nodes DESC (richest first per contract)
+    n = len(scopes)
+    headline = (
+        f"🗺️ {n} scope{'s' if n != 1 else ''} · "
+        f"richest = {richest.get('scope')} ({richest.get('nodes')} nodes)"
+    )
+    lines = [headline]
+    for s in scopes:
+        label_part = f" · {s['label']}" if s.get("label") else ""
+        lines.append(
+            f"  {s.get('scope')} · {s.get('nodes')} nodes · "
+            f"{s.get('edges')} edges{label_part}"
+        )
     return "\n".join(lines)
