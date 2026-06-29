@@ -850,6 +850,13 @@ export function KgMapper() {
   const [focusId, setFocusId] = useState<string | null>(null);
   const [focusNonce, setFocusNonce] = useState<number>(0);
 
+  // Staleness hint: when was the current graph data last fetched?
+  const [loadedAt, setLoadedAt] = useState<Date | null>(null);
+  // Ticks every 30 s to refresh the "~N min old" display.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  // Search disambiguation: when multiple nodes share the exact same label.
+  const [disambigMatches, setDisambigMatches] = useState<GraphNode[]>([]);
+
   // Color theme. Persisted to localStorage (per-browser preference). The active
   // palette is a module singleton typeColor reads — sync it here, in render,
   // so the legend + inspectors (which call typeColor) get the right colors on
@@ -1057,32 +1064,41 @@ export function KgMapper() {
     setSelectedEdgeId(edgeId);
   }, []);
 
-  // Search: first node whose label or id contains the query (case-insensitive),
-  // ranked label-exact → label-prefix → label-substring → id-substring.
+  // Search: ranked label-exact → label-prefix → label-substring → id-substring.
+  // When multiple nodes share an EXACT label, surface a disambiguation list
+  // instead of silently jumping to one — the user needs to pick.
   const handleSearch = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
+      setDisambigMatches([]);
       const q = searchValue.trim().toLowerCase();
       if (!q) return;
-      let best: { rank: number; node: GraphNode } | null = null;
+      const ranked: { rank: number; node: GraphNode }[] = [];
       for (const node of rawNodes) {
-        const label = node.label.toLowerCase();
-        const id = node.id.toLowerCase();
+        const labelL = node.label.toLowerCase();
+        const idL = node.id.toLowerCase();
         let rank: number;
-        if (label === q) rank = 0;
-        else if (label.startsWith(q)) rank = 1;
-        else if (label.includes(q)) rank = 2;
-        else if (id.includes(q)) rank = 3;
+        if (labelL === q) rank = 0;
+        else if (labelL.startsWith(q)) rank = 1;
+        else if (labelL.includes(q)) rank = 2;
+        else if (idL.includes(q)) rank = 3;
         else continue;
-        if (!best || rank < best.rank) best = { rank, node };
-        if (rank === 0) break;
+        ranked.push({ rank, node });
       }
-      if (best) {
-        setSearchMiss(false);
-        focusNode(best.node.id);
-      } else {
+      ranked.sort((a, b) => a.rank - b.rank);
+      if (ranked.length === 0) {
         setSearchMiss(true);
+        return;
       }
+      const exactMatches = ranked.filter((r) => r.rank === 0);
+      if (exactMatches.length > 1) {
+        // Multiple nodes share this label — let the user pick.
+        setDisambigMatches(exactMatches.map((r) => r.node));
+        setSearchMiss(false);
+        return;
+      }
+      setSearchMiss(false);
+      focusNode(ranked[0].node.id);
     },
     [searchValue, rawNodes, focusNode],
   );
@@ -1099,6 +1115,20 @@ export function KgMapper() {
     // (used by screenshots) frames the node, not just opens its panel.
     focusNode(selectNodeParam);
   }, [selectNodeParam, rawNodes, selectedNode?.nodeId, focusNode]);
+
+  // Record when each successful fetch completes (drives staleness hint).
+  useEffect(() => {
+    if (fetchState.status === "ok") {
+      setLoadedAt(new Date());
+      setNowMs(Date.now());
+    }
+  }, [fetchState.status]);
+
+  // Tick every 30 s so the "~N min old" badge updates without a refetch.
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   const handleSubmitScope = useCallback(
     (e: React.FormEvent) => {
@@ -1145,6 +1175,17 @@ export function KgMapper() {
           >
             load
           </button>
+          {/* Staleness badge — appears after first load; ticks every 30 s. */}
+          {loadedAt ? (
+            <span
+              className="text-[10px] text-muted-foreground/60 whitespace-nowrap"
+              title="Data may be stale — click 'load' to refresh"
+            >
+              {Math.floor((nowMs - loadedAt.getTime()) / 60_000) < 1
+                ? "just loaded"
+                : `~${Math.floor((nowMs - loadedAt.getTime()) / 60_000)}m old — reload?`}
+            </span>
+          ) : null}
         </form>
 
         {fetchState.status === "loading" ? (
@@ -1167,28 +1208,57 @@ export function KgMapper() {
         {/* Tier-1 controls — only meaningful once a graph is on screen. */}
         {fetchState.status === "ok" && rawNodes.length > 0 ? (
           <div className="ml-auto flex items-center gap-3 flex-wrap justify-end">
-            {/* Node search → center + select */}
-            <form onSubmit={handleSearch} className="flex items-center gap-1.5">
-              <input
-                type="text"
-                value={searchValue}
-                onChange={(e) => {
-                  setSearchValue(e.target.value);
-                  setSearchMiss(false);
-                }}
-                placeholder="search label / id"
-                className={`h-7 w-44 rounded-md border bg-background px-2 text-[11px] text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring font-mono ${
-                  searchMiss ? "border-destructive" : "border-input"
-                }`}
-              />
-              <button
-                type="submit"
-                className="h-7 rounded-md border border-input bg-background px-2 text-[11px] text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                title="center + select the first matching node"
-              >
-                find
-              </button>
-            </form>
+            {/* Node search → center + select. When multiple nodes share an
+                exact label, a disambiguation list appears instead of auto-jump. */}
+            <div className="relative">
+              <form onSubmit={handleSearch} className="flex items-center gap-1.5">
+                <input
+                  type="text"
+                  value={searchValue}
+                  onChange={(e) => {
+                    setSearchValue(e.target.value);
+                    setSearchMiss(false);
+                    setDisambigMatches([]);
+                  }}
+                  placeholder="search label / id"
+                  className={`h-7 w-44 rounded-md border bg-background px-2 text-[11px] text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring font-mono ${
+                    searchMiss ? "border-destructive" : "border-input"
+                  }`}
+                />
+                <button
+                  type="submit"
+                  className="h-7 rounded-md border border-input bg-background px-2 text-[11px] text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                  title="center + select the first matching node"
+                >
+                  find
+                </button>
+              </form>
+              {/* Disambiguation dropdown: shown when the query matches >1 node
+                  with the exact same label — node uuid + badge help the user pick. */}
+              {disambigMatches.length > 0 ? (
+                <div className="absolute top-full left-0 mt-1 z-20 min-w-[16rem] max-w-xs rounded-md border border-border bg-card shadow-lg text-[10px]">
+                  <p className="px-2.5 py-1.5 text-muted-foreground border-b border-border">
+                    {disambigMatches.length} nodes labeled "{disambigMatches[0].label}" — pick one:
+                  </p>
+                  {disambigMatches.map((n) => (
+                    <button
+                      key={n.id}
+                      type="button"
+                      onClick={() => {
+                        setDisambigMatches([]);
+                        focusNode(n.id);
+                      }}
+                      className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-accent/40 transition-colors"
+                    >
+                      <span className="font-mono text-muted-foreground truncate">{n.id.slice(0, 8)}…</span>
+                      {n.badge !== undefined && n.badge !== "" ? (
+                        <span className="ml-auto font-mono text-muted-foreground/60 shrink-0">{n.badge}</span>
+                      ) : null}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
 
             {/* Edge encoding: plain neutral web vs confidence overlay */}
             <div className="flex items-center gap-1 text-[10px]">

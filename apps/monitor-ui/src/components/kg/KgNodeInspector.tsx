@@ -195,8 +195,24 @@ function FactsPanel({
   const current = detail.currentFacts.filter((f) => !f.deprecated);
   const historical = detail.historyFacts.filter((f) => f.deprecated);
 
+  // Disambiguation identity: canonical_key + edge count surfaced prominently
+  // so same-label nodes (e.g. two "t-13" jobs) can be told apart at a glance.
+  const canonicalKey = current.find(
+    (f) => f.label === "canonical_key" || f.label === "key",
+  )?.value;
+  const edgeCount = detail.edgesFrom.length + detail.edgesTo.length;
+
   return (
     <>
+      {/* Identity row — canonical key + edge count. Helps distinguish nodes
+          that share a human label (e.g. two jobs both labeled "t-13"). */}
+      <div className="rounded-md border border-border/40 bg-muted/20 px-2.5 py-1.5 text-[10px] font-mono space-y-0.5 mb-1">
+        {canonicalKey !== undefined && canonicalKey !== null ? (
+          <p className="text-foreground/80 font-medium">{String(canonicalKey)}</p>
+        ) : null}
+        <p className="text-muted-foreground">{edgeCount} edges in scope</p>
+      </div>
+
       {current.length > 0 ? (
         <section>
           <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5">
@@ -431,26 +447,30 @@ function SchemaSection({
   if (outgoing.length === 0 && incoming.length === 0) return null;
 
   return (
-    <section>
+    <section className="mt-4 pt-3 border-t border-border/30">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5 mt-3 hover:text-foreground transition-colors"
-        title="relationship patterns for this node type, derived from the loaded graph"
+        className="flex w-full items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5 hover:text-foreground transition-colors"
+        title="Aggregate relationship patterns for ALL nodes of this type in the loaded graph — not just this node's own edges"
       >
         <span>{open ? "▾" : "▸"}</span>
         <span>
-          schema · type{" "}
+          all{" "}
           <span
             className="normal-case font-mono"
             style={{ color: typeColor(type) }}
           >
             {type}
-          </span>
+          </span>{" "}
+          nodes · type schema
         </span>
       </button>
       {open ? (
         <div className="space-y-2">
+          <p className="text-[9px] text-muted-foreground/60 italic mb-1">
+            Aggregate patterns across <em>all</em> {type} nodes in this scope — not this node's own edges.
+          </p>
           {outgoing.length > 0 ? (
             <div>
               <p className="text-[9px] uppercase tracking-wider text-muted-foreground/70 mb-1">
