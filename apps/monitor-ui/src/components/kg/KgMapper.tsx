@@ -302,6 +302,7 @@ function SigmaCanvas({
   edgeMode,
   edgeThreshold,
   isolateId,
+  hopDepth,
   focusId,
   focusNonce,
   focusRatio,
@@ -320,6 +321,8 @@ function SigmaCanvas({
   edgeThreshold: number | null;
   /** When set, show ONLY this node + its neighbors (Obsidian local-graph). */
   isolateId: string | null;
+  /** Hops out from the hover/isolate focus node to highlight (1/2/3 or whole component). */
+  hopDepth: 1 | 2 | 3 | "all";
   /** Node to center the camera on (search / sidebar navigation). */
   focusId: string | null;
   /** Bumped to retrigger focus even when focusId is unchanged. */
@@ -364,21 +367,39 @@ function SigmaCanvas({
   // isolate when both are present.
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const focusNeighborsRef = useRef<Set<string> | null>(null);
+  // `hopDepth` (prop, owned by the toolbar) governs how many hops out from the focus
+  // node both hover-dim and isolate highlight: 1 = direct neighbors (original), 2/3 =
+  // the in-between local graph, "all" = the whole reachable component.
 
-  // Recompute the neighbor set whenever the dim source (hover or isolate)
-  // changes, then refresh once. Hover takes precedence over isolate.
+  // Recompute the focus set whenever the dim source (hover or isolate) OR the hop
+  // depth changes, then refresh once. Hover takes precedence over isolate. BFS the
+  // undirected adjacency (forEachNeighbor covers in+out edges, so inverse links stay
+  // included) out to `hopDepth` hops — `"all"` walks the entire reachable component.
   useEffect(() => {
     const graph = graphRef.current;
     const source = hoveredId ?? isolateId;
     if (graph && source && graph.hasNode(source)) {
       const set = new Set<string>([source]);
-      graph.forEachNeighbor(source, (nb) => set.add(nb));
+      const maxHops = hopDepth === "all" ? Infinity : hopDepth;
+      let frontier: string[] = [source];
+      for (let depth = 0; depth < maxHops && frontier.length > 0; depth += 1) {
+        const next: string[] = [];
+        for (const node of frontier) {
+          graph.forEachNeighbor(node, (nb) => {
+            if (!set.has(nb)) {
+              set.add(nb);
+              next.push(nb);
+            }
+          });
+        }
+        frontier = next;
+      }
       focusNeighborsRef.current = set;
     } else {
       focusNeighborsRef.current = null;
     }
     sigmaRef.current?.refresh();
-  }, [hoveredId, isolateId]);
+  }, [hoveredId, isolateId, hopDepth]);
 
   // Build graph + layout + render whenever the data changes.
   useEffect(() => {
@@ -531,12 +552,15 @@ function SigmaCanvas({
         return { ...attrs, hidden: true };
       }
 
+      // Highlight edges INTERNAL to the focused subgraph — both endpoints within
+      // the hopDepth focus set (which includes the source). This shows the multi-hop
+      // neighborhood's real structure, not just spokes from the source. A boundary
+      // edge (one endpoint in focus, one outside) is dimmed/hidden like a non-focus
+      // edge, so the boundary doesn't distractingly over-light.
       const focusSet = focusNeighborsRef.current;
-      const incidentToFocus =
-        !focusSet ||
-        (hoveredId ?? isolateRef.current) === src ||
-        (hoveredId ?? isolateRef.current) === tgt;
-      if (focusSet && !incidentToFocus) {
+      const internalToFocus =
+        !focusSet || (focusSet.has(src) && focusSet.has(tgt));
+      if (focusSet && !internalToFocus) {
         if (isolateRef.current && !hoveredId) {
           return { ...attrs, hidden: true };
         }
@@ -661,6 +685,9 @@ export function KgMapper() {
   const [isolateMode, setIsolateMode] = useState<boolean>(
     searchParams.get("isolate") === "1",
   );
+  // Hops out from the hover/isolate focus node to highlight (1 = direct neighbors,
+  // the original behavior; 2/3 = local graph; "all" = whole reachable component).
+  const [hopDepth, setHopDepth] = useState<1 | 2 | 3 | "all">(1);
   const [searchValue, setSearchValue] = useState<string>("");
   const [searchMiss, setSearchMiss] = useState<boolean>(false);
 
@@ -1100,6 +1127,30 @@ export function KgMapper() {
               isolate
             </button>
 
+            {/* Hop depth: how many hops out the hover/isolate highlight reaches */}
+            <div className="flex items-center gap-1 text-[10px]">
+              <span className="text-muted-foreground">hops</span>
+              {([1, 2, 3, "all"] as const).map((h) => (
+                <button
+                  key={h}
+                  type="button"
+                  onClick={() => setHopDepth(h)}
+                  className={`h-7 rounded-md border px-2 font-mono transition-colors ${
+                    hopDepth === h
+                      ? "border-ring bg-accent text-foreground"
+                      : "border-input bg-background text-muted-foreground hover:text-foreground"
+                  }`}
+                  title={
+                    h === "all"
+                      ? "highlight the whole reachable component on hover/isolate"
+                      : `highlight nodes within ${h} hop${h === 1 ? "" : "s"} of the focus node`
+                  }
+                >
+                  {h}
+                </button>
+              ))}
+            </div>
+
             {/* Color theme picker */}
             <div className="flex items-center gap-1 text-[10px]">
               <span className="text-muted-foreground">theme</span>
@@ -1185,6 +1236,7 @@ export function KgMapper() {
               isolateId={
                 isolateMode && selectedNode ? selectedNode.nodeId : null
               }
+              hopDepth={hopDepth}
               focusId={focusId}
               focusNonce={focusNonce}
               focusRatio={focusRatio}
