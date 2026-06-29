@@ -288,7 +288,10 @@ def _call_engine(
         }
     try:
         engine = importlib.import_module("themis.engine")
-        result = engine.evaluate(role, tool_name, tool_input, conditions_payload=conditions_payload)
+        data_mod = importlib.import_module("themis.data")
+        app_rules_dir = data_mod.find_app_rules_dir(cwd) if cwd else None
+        rule_set = data_mod.load_rules(role, app_rules_dir=app_rules_dir)
+        result = engine.evaluate(role, tool_name, tool_input, conditions_payload=conditions_payload, rule_set=rule_set)
         # EvalResult is a dataclass/namedtuple — serialize to dict for the response
         if hasattr(result, "__dict__"):
             out: dict = {"ok": result.ok}

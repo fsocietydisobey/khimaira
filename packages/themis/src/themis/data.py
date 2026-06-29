@@ -352,17 +352,114 @@ def _merge_chain(
     return list(merged.values())
 
 
-def load_rules(role: str) -> RuleSet:
+# ---------------------------------------------------------------------------
+# App-scoped rule extension — additive overlay, CORE-WINS on id collision
+# ---------------------------------------------------------------------------
+
+
+def find_app_rules_dir(cwd: str) -> Path | None:
+    """Walk up from `cwd` to find the nearest `<ancestor>/.claude/themis/` dir.
+
+    Stops at the git root (`.git` exists as a file or dir) — never ascends past
+    the repository boundary. No subprocess; pure path scan so it works under
+    systemd/npm where PATH/env may be restricted.
+
+    Returns the `.claude/themis/` Path if found, else None (core-only, fail-open).
+    Sessions outside a git repo always get None → core-only.
+    """
+    if not cwd:
+        return None
+    p = Path(cwd).resolve()
+    while True:
+        candidate = p / ".claude" / "themis"
+        if candidate.is_dir():
+            return candidate
+        # .git as dir (normal checkout) or file (worktree) marks the repo root.
+        # We've already checked `candidate` above, so stop here.
+        if (p / ".git").exists():
+            break
+        parent = p.parent
+        if parent == p:
+            break  # filesystem root
+        p = parent
+    return None
+
+
+def _load_app_invariants(app_rules_dir: Path, role: str) -> list[Invariant] | None:
+    """Load app-scoped invariants for `role` from `app_rules_dir`.
+
+    Tries `<role>.yaml` first, then `<role>.app.yaml` as an alias.
+    Returns None when no file exists (not an error — no app rules for this role).
+    Returns [] on parse/load error (logged, fail-open — broken app file never
+    blocks enforcement of core rules).
+    """
+    for filename in (f"{role}.yaml", f"{role}.app.yaml"):
+        path = app_rules_dir / filename
+        if not path.exists():
+            continue
+        try:
+            raw_doc = path.read_text(encoding="utf-8")
+            doc = yaml.safe_load(raw_doc)
+            if not isinstance(doc, dict):
+                _log.warning(
+                    "Themis app rules: %s is not a YAML mapping — skipped (fail-open)", path
+                )
+                return []
+            return [
+                _parse_invariant(raw, source_layer=f"app:{path.stem}")
+                for raw in doc.get("invariants", [])
+            ]
+        except yaml.YAMLError as exc:
+            _log.warning("Themis app rules: YAML parse error in %s — fail-open: %s", path, exc)
+            return []
+        except Exception as exc:
+            _log.warning("Themis app rules: failed to load %s — fail-open: %s", path, exc)
+            return []
+    return None  # file not found — not an error
+
+
+def _merge_app_layer(
+    core_invariants: list[Invariant], app_invariants: list[Invariant]
+) -> list[Invariant]:
+    """Merge app-layer invariants into the core set. CORE-WINS on id collision.
+
+    App rules are ADDITIVE ONLY — they can add new invariant IDs but cannot
+    override, downgrade, or remove core rules (even unlocked ones). On any id
+    collision, the core entry is kept and a WARNING is emitted so the app author
+    can namespace their ids correctly (convention: `APP-<app-name>-N`).
+    """
+    core_ids = {inv.id for inv in core_invariants}
+    result = list(core_invariants)
+    for inv in app_invariants:
+        if inv.id in core_ids:
+            _log.warning(
+                "Themis app rule %r has the same id as a core rule — core wins; "
+                "use a namespaced id prefix (e.g. APP-<app-name>-N) to avoid collisions.",
+                inv.id,
+            )
+            continue
+        result.append(inv)
+    return result
+
+
+def load_rules(role: str, app_rules_dir: Path | None = None) -> RuleSet:
     """Load and merge the rule set for `role` via the extends-chain.
 
     Resolution:
       1. Load <role>.yaml; if it has `extends: <base>`, follow the chain.
       2. Merge universal.base → <role>.base → instance by invariant id.
       3. LOCKED rules in base layers are immutable to instances.
-      4. VALID_ROLES excludes *.base.yaml (bases are not assignable).
+      4. If `app_rules_dir` is given, load app-scoped rules from
+         `<app_rules_dir>/<role>.yaml` and merge AFTER the core chain.
+         CORE-WINS: app rules are additive only — they cannot override, weaken,
+         or remove any core rule regardless of `locked` status.
+      5. VALID_ROLES excludes *.base.yaml (bases are not assignable).
 
-    No caching — re-reads and re-merges from disk on every call. A base-file
-    change is live immediately on the next call.
+    `app_rules_dir` is typically resolved by `find_app_rules_dir(cwd)` in the
+    caller and points to `<project_root>/.claude/themis/`. Absent/unreadable
+    app file → core-only (fail-open; a bad app file never breaks governance).
+
+    No caching — re-reads and re-merges from disk on every call.
 
     Raises:
         FileNotFoundError: No rule file for this role.
@@ -377,6 +474,12 @@ def load_rules(role: str) -> RuleSet:
 
     chain = _resolve_extends_chain(role)
     invariants = _merge_chain(role, chain)
+
+    if app_rules_dir is not None:
+        app_invs = _load_app_invariants(app_rules_dir, role)
+        if app_invs:
+            invariants = _merge_app_layer(invariants, app_invs)
+
     return RuleSet(role=role, invariants=invariants)
 
 

@@ -161,7 +161,7 @@ def _invariant_to_dict(inv: Any) -> dict[str, Any]:
 
 
 @mcp.tool()
-def my_rules(session_id: str) -> list[dict[str, Any]]:
+def my_rules(session_id: str, cwd: str | None = None) -> list[dict[str, Any]]:
     """Return the invariants bound to the calling session's role.
 
     Resolves the session's role via the daemon (live chat membership
@@ -169,8 +169,13 @@ def my_rules(session_id: str) -> list[dict[str, Any]]:
     immediately). Returns [] if the session has no role assigned or if
     the role has no rule file.
 
+    If `cwd` is provided, app-scoped rules from `<project_root>/.claude/themis/`
+    are merged into the result (additive only — core rules always win on collision).
+
     Args:
         session_id: The calling session's khimaira session ID.
+        cwd: Optional working directory of the calling session. When given,
+            app-scoped rules for the session's git repo are included.
 
     Returns:
         List of [{id, name, severity, message_template, matcher_summary}]
@@ -180,9 +185,10 @@ def my_rules(session_id: str) -> list[dict[str, Any]]:
         return []
 
     try:
-        from themis.data import load_rules
+        from themis.data import find_app_rules_dir, load_rules
 
-        rule_set = load_rules(role)
+        app_rules_dir = find_app_rules_dir(cwd) if cwd else None
+        rule_set = load_rules(role, app_rules_dir=app_rules_dir)
         return [_invariant_to_dict(inv) for inv in rule_set.invariants]
     except Exception as exc:
         logger.warning("themis my_rules: failed to load rules for role %s: %s", role, exc)
