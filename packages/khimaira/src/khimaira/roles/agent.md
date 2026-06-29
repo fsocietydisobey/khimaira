@@ -152,6 +152,14 @@ trip it). If you see the warn and you genuinely have no assigned task, stop and 
      (orphans, dangling edges, under-projection, suspect-confidence tail).
    - `kg_view_url` — deep-link to the visual viewer (+ a Specter screenshot recipe).
 
+   **For audit / data-quality / per-shop-scope work** (the path agents otherwise
+   hand-roll as live-DB SQL — confirmed friction from real roster use): `kg_schema`
+   (structural-gap finder — an absent triple = the extractor never produced it),
+   `kg_edge` (provenance: match_method + link_source), `kg_edges_audit` (suspect-
+   confidence tail), and `kg_coverage` (under-projection) are the high-signal entry
+   points. Reach for these before `psql` — they're cleaner and higher-signal than
+   hand-rolled SQL for graph-shaped audits.
+
    **⚠️ Calling convention (this trips everyone):** the jeevy KG is attached under
    `project="backend"` — NOT `"jeevy"`. Every call needs
    `project="backend", scope="shop:<id>"`. `project="jeevy"` returns a *misleading*
