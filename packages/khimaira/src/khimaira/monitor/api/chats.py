@@ -266,19 +266,38 @@ async def _maybe_supersede_presumed_dead(sender_id: str) -> None:
             pass
 
 
+def _canon_sid(sid: str, chat_id: str = "") -> str:
+    """Canonical session UUID for a name-or-id, so the expected-reply registry keys
+    are STABLE whether the caller used a friendly name or a UUID.
+
+    Root cause of the presumed-dead false-positive (griffin-consultant-1, 2026-06-29):
+    master sends `chat_send_to(to=["consultant-1"])` by NAME, so the expectation was
+    keyed `("consultant-1", master_uuid)`; the consultant's reply resolved to its UUID
+    (`5ee33d55…`), and `name != uuid` left the expectation uncleared → the daemon fired
+    presumed-dead 3+ times despite the reply. Normalizing both sides to the canonical
+    UUID makes register + resolve match. Fail-open: return the input unchanged if the
+    session can't be resolved (e.g. a fresh session with no state dir yet)."""
+    try:
+        return chats._resolve_or_uuid(sid, chat_id=chat_id or None)
+    except Exception:
+        return sid
+
+
 async def _register_expected_reply(
     from_id: str, to_ids: list[str], chat_id: str = ""
 ) -> None:
     async with _REGISTRY_LOCK:
         ts = time.time()
+        from_uuid = _canon_sid(from_id, chat_id)
         for to_id in to_ids:
-            if to_id == from_id:
+            to_uuid = _canon_sid(to_id, chat_id)
+            if to_uuid == from_uuid:
                 continue
-            threshold = _threshold_for_session(to_id, chat_id)
-            _EXPECTED_REPLIES[(to_id, from_id)] = {
+            threshold = _threshold_for_session(to_uuid, chat_id)
+            _EXPECTED_REPLIES[(to_uuid, from_uuid)] = {
                 "ts": ts,
-                "from": from_id,
-                "to": to_id,
+                "from": from_uuid,
+                "to": to_uuid,
                 "chat_id": chat_id,
                 "threshold_s": threshold,
             }
@@ -287,12 +306,19 @@ async def _register_expected_reply(
 async def _resolve_expected_reply(
     from_id: str, to_ids: list[str], chat_id: str = ""
 ) -> None:
+    # A message from `from_id` proves it is alive AND responding, so it clears EVERY
+    # pending expectation awaiting a reply FROM it — independent of whether this
+    # particular message was directed back to the asker or broadcast, and of the
+    # name-vs-uuid form used in the original send. The registry key is
+    # (awaited_replier, asker); clear all keys whose awaited_replier == from_id.
+    from_uuid = _canon_sid(from_id, chat_id)
     async with _REGISTRY_LOCK:
-        for to_id in to_ids:
-            _EXPECTED_REPLIES.pop((from_id, to_id), None)
+        stale = [key for key in _EXPECTED_REPLIES if key[0] == from_uuid]
+        for key in stale:
+            _EXPECTED_REPLIES.pop(key, None)
     # Supersede check: from_id just sent — if it was previously presumed-dead,
     # master gets a retraction notice.
-    await _maybe_supersede_presumed_dead(from_id)
+    await _maybe_supersede_presumed_dead(from_uuid)
 
 
 async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:

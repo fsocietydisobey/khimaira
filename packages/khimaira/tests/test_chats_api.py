@@ -965,6 +965,69 @@ def test_broadcast_resolves_expected_reply_from_peer(registry_client):
     assert ("bob", "alice") not in api_mod._EXPECTED_REPLIES
 
 
+def test_presumed_dead_cleared_when_registered_by_name_replied_by_uuid(
+    registry_client, monkeypatch
+):
+    """REGRESSION (griffin-consultant-1, 2026-06-29): master sends
+    chat_send_to(to=['consultant-1']) by NAME; the consultant's reply resolves to its
+    UUID. Register + resolve must key on the SAME canonical UUID so the reply CLEARS the
+    expectation — otherwise the daemon fires a false presumed-dead despite the reply."""
+    import asyncio
+
+    _client, api_mod, chats_mod = registry_client
+    NAME, UUID, MASTER = "consultant-1", "5ee33d55-feed-dead-beef", "master-uuid"
+    resolve_map = {NAME: UUID, UUID: UUID, MASTER: MASTER}
+    monkeypatch.setattr(
+        chats_mod, "_resolve_or_uuid", lambda sid, *, chat_id=None: resolve_map.get(sid, sid)
+    )
+    monkeypatch.setattr(api_mod, "_threshold_for_session", lambda to_id, chat_id: 90.0)
+
+    async def _noop(_sender):
+        return None
+
+    monkeypatch.setattr(api_mod, "_maybe_supersede_presumed_dead", _noop)
+
+    # Master registers an expected reply addressing the consultant by NAME.
+    asyncio.run(api_mod._register_expected_reply(MASTER, [NAME], "chat-x"))
+    # Keyed by the canonical UUID, NOT the name (the bug keyed by the raw name).
+    assert (UUID, MASTER) in api_mod._EXPECTED_REPLIES
+    assert (NAME, MASTER) not in api_mod._EXPECTED_REPLIES
+
+    # The consultant replies — its sender id resolves to the UUID. Must clear → no dead.
+    asyncio.run(api_mod._resolve_expected_reply(UUID, [], "chat-x"))
+    assert (UUID, MASTER) not in api_mod._EXPECTED_REPLIES
+
+
+def test_reply_clears_all_expectations_awaiting_sender(registry_client, monkeypatch):
+    """A reply clears EVERY expectation awaiting that sender (directed OR broadcast),
+    not only those directed back at the asker — a session that sends anything is alive.
+    Expectations awaiting a DIFFERENT session are left intact."""
+    import asyncio
+
+    _client, api_mod, chats_mod = registry_client
+    monkeypatch.setattr(chats_mod, "_resolve_or_uuid", lambda sid, *, chat_id=None: sid)
+    monkeypatch.setattr(api_mod, "_threshold_for_session", lambda to_id, chat_id: 90.0)
+
+    async def _noop(_sender):
+        return None
+
+    monkeypatch.setattr(api_mod, "_maybe_supersede_presumed_dead", _noop)
+
+    # Two askers await bob; bob itself awaits carol (a different awaited-replier).
+    asyncio.run(api_mod._register_expected_reply("m1", ["bob"], "c"))
+    asyncio.run(api_mod._register_expected_reply("m2", ["bob"], "c"))
+    asyncio.run(api_mod._register_expected_reply("bob", ["carol"], "c"))
+    assert ("bob", "m1") in api_mod._EXPECTED_REPLIES
+    assert ("bob", "m2") in api_mod._EXPECTED_REPLIES
+    assert ("carol", "bob") in api_mod._EXPECTED_REPLIES
+
+    # bob sends ANY message → clears both (bob, *); (carol, bob) is untouched.
+    asyncio.run(api_mod._resolve_expected_reply("bob", [], "c"))
+    assert ("bob", "m1") not in api_mod._EXPECTED_REPLIES
+    assert ("bob", "m2") not in api_mod._EXPECTED_REPLIES
+    assert ("carol", "bob") in api_mod._EXPECTED_REPLIES
+
+
 def test_broadcast_resolves_multiple_pending_replies(registry_client):
     """Broadcast from a peer resolves all pending entries where that peer owes replies."""
     import asyncio

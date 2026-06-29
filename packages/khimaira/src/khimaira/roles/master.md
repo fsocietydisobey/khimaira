@@ -232,6 +232,24 @@ signal. Cancel affected tasks, surface the cause, test with one agent before re-
 3. `chat_send_to(<agent>)` — direct query if state isn't externalized.
 Asking the user for agent state when `session_state` can answer is friction.
 
+**Liveness ≠ the kitty footer meter (NEVER scrape "X% context used").**
+When you busy-check a window with `kitty @ get-text`, CC's TUI footer now renders a
+line like `… esc to interrupt · 100% context used · /model opus[1m]`. **Do NOT read
+that "X% context used" substring as an idle / compacting / dead / liveness signal.**
+It is CC's own terminal meter, it can be STALE (the screen buffer may still show the
+pre-compaction footer), and it contradicts the daemon. A high-context OR mid-compaction
+session is **BUSY, not idle/dead** — it's working, not stuck.
+
+Judge liveness ONLY by: `session_list` status + `last_active_age_s` + the daemon's
+context-% / heartbeat (`_compute_context_pct`, transcript-derived — the source of
+truth). The ONLY footer substrings that indicate *activity* are the spinner /
+`esc to interrupt`; ignore the context meter entirely.
+
+> Worked example (griffin, 2026-06-29): a consultant's scraped footer read
+> `100% context used` while the daemon read the same 1M seat at **62%**. Master
+> mis-read the footer → treated a busy high-context session as idle/dead. The
+> daemon's transcript-derived % was correct; the scraped footer was stale.
+
 ### Step 6 — Integrate
 
 Check cross-agent consistency: naming conflicts, API boundary mismatches, test

@@ -620,7 +620,10 @@ def _compute_context_pct(session_id: str) -> int | None:
 
     Reads the last assistant turn's usage block from the transcript JSONL.
     This is UI-independent — it works regardless of how Claude Code renders
-    context in the terminal (which does NOT show "NN% context used").
+    context in the terminal. (CC's TUI footer DOES now show "NN% context used",
+    but that scraped meter can be STALE — the screen buffer may still show the
+    pre-compaction footer — and it disagrees with this transcript-derived value;
+    this function, not the footer, is the source of truth for context usage.)
 
     Context window detection:
     - KHIMAIRA_CONTEXT_WINDOW env override (always takes precedence)
