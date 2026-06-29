@@ -800,7 +800,7 @@ export function KgMapper() {
       const ft = typeById.get(e.from);
       const tt = typeById.get(e.to);
       if (!ft || !tt) continue;
-      const key = `${ft} ${e.type} ${tt}`;
+      const key = `${ft}\x00${e.type}\x00${tt}`;
       const cur = counts.get(key);
       if (cur) cur.count += 1;
       else

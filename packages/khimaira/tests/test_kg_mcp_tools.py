@@ -64,6 +64,23 @@ def test_kg_graph_node_cap_truncates_sample_not_counts():
     assert "45 more" in out  # sample capped at 5
 
 
+def test_kg_graph_sample_is_type_stratified():
+    # 60 'task' nodes then 2 'user' nodes. A naive first-N sample at cap=10 would
+    # only ever show tasks (users sit at positions 60-61) — the exact bug that hid
+    # shop:10's user nodes. The stratified sample must surface the leaf type.
+    nodes = [{"id": f"t{i}", "type": "task", "label": f"T{i}"} for i in range(60)]
+    nodes += [
+        {"id": "u1", "type": "user", "label": "Alice"},
+        {"id": "u2", "type": "user", "label": "Bob"},
+    ]
+    payload = {"data": {"nodes": nodes, "edges": []}}
+    with patch.object(mt, "_get", return_value=payload):
+        out = _run(mt.kg_graph("jeevy", "shop:10", node_cap=10))
+    assert "62 nodes" in out  # counts reflect the full graph
+    assert "(user)" in out  # leaf type appears in the sample (was invisible pre-fix)
+    assert "type-stratified" in out  # header advertises the new behavior
+
+
 def test_kg_graph_empty():
     with patch.object(mt, "_get", return_value={"data": {"nodes": [], "edges": []}}):
         out = _run(mt.kg_graph("jeevy", "shop:99"))

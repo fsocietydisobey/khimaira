@@ -1891,6 +1891,29 @@ async def kg_graph(project: str = "", scope: str = "", node_cap: int = 40, since
     for e in edges:
         link_types[e.get("type", "?")] = link_types.get(e.get("type", "?"), 0) + 1
 
+    # Type-stratified sample: round-robin across node types so EVERY type is
+    # represented (≥1 each, capacity permitting) rather than just the first
+    # node_cap nodes — otherwise a leaf type (e.g. 46 `user` nodes among 1384)
+    # never appears in the sample even though the histogram counts it.
+    by_type: dict[str, list[dict]] = {}
+    for n in nodes:
+        by_type.setdefault(n.get("type", "?"), []).append(n)
+    ordered_types = sorted(by_type, key=lambda t: -len(by_type[t]))
+    sample: list[dict] = []
+    rank = 0
+    while len(sample) < node_cap:
+        progressed = False
+        for t in ordered_types:
+            bucket = by_type[t]
+            if rank < len(bucket):
+                sample.append(bucket[rank])
+                progressed = True
+                if len(sample) >= node_cap:
+                    break
+        if not progressed:
+            break
+        rank += 1
+
     lines = [
         f"🕸️ **KG `{project}`** (scope={scope or 'none'}) — "
         f"{len(nodes)} nodes, {len(edges)} edges\n",
@@ -1899,14 +1922,14 @@ async def kg_graph(project: str = "", scope: str = "", node_cap: int = 40, since
         "**Link types:** "
         + ", ".join(f"{t}×{c}" for t, c in sorted(link_types.items(), key=lambda x: -x[1])),
         "",
-        f"**Node sample** (first {min(node_cap, len(nodes))} of {len(nodes)} — "
-        f"use `kg_search` to find specific nodes, `kg_node` to drill in):",
+        f"**Node sample** ({len(sample)} of {len(nodes)}, type-stratified — ≥1 per "
+        f"type so leaf types appear; use `kg_search`/`kg_node` to drill in):",
     ]
-    for n in nodes[:node_cap]:
+    for n in sample:
         badge = f"  [{n['badge']}]" if n.get("badge") is not None else ""
         lines.append(f"  `{n.get('id')}`  ({n.get('type', '?')})  {n.get('label', '')}{badge}")
-    if len(nodes) > node_cap:
-        lines.append(f"  … {len(nodes) - node_cap} more (narrow with `kg_search`)")
+    if len(nodes) > len(sample):
+        lines.append(f"  … {len(nodes) - len(sample)} more (narrow with `kg_search`)")
     return "\n".join(lines)
 
 
