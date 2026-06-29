@@ -137,6 +137,26 @@ trip it). If you see the warn and you genuinely have no assigned task, stop and 
    with `psql` when `mcp__postgres__query` is one ToolSearch away is the failure
    mode this prevents.
 
+   **Knowledge-graph tools (`kg_*`) — reach for these on any jeevy KG work.**
+   When your task touches the jeevy knowledge graph — debugging data quality,
+   tracing why an entity/edge exists, finding extractor gaps, or orienting in
+   the graph — use the `mcp__khimaira__kg_*` tools BEFORE hand-querying the DB.
+   They're on the khimaira MCP server (always present, but DEFERRED — `ToolSearch`
+   to load the schema). The surface:
+   - `kg_search` — resolve a label/id → `node_id` (start here when you have a name).
+   - `kg_graph` — orientation: counts + type histograms + a node-id sample.
+   - `kg_node` — one node's full detail (current/history facts + incident edges).
+   - `kg_edge` — "why does this edge exist?" (match_method, source doc/page/bbox, confidence).
+   - `kg_schema` — type meta-graph; an ABSENT triple = the extractor never produced it.
+   - `kg_health` / `kg_coverage` / `kg_edges_audit` — data-quality aggregates
+     (orphans, dangling edges, under-projection, suspect-confidence tail).
+   - `kg_view_url` — deep-link to the visual viewer (+ a Specter screenshot recipe).
+
+   **⚠️ Calling convention (this trips everyone):** the jeevy KG is attached under
+   `project="backend"` — NOT `"jeevy"`. Every call needs
+   `project="backend", scope="shop:<id>"`. `project="jeevy"` returns a *misleading*
+   `404 no KG adapter registered`. Full map: `docs/KG-SYSTEM-TRACKER.md`.
+
    **During work — divergence self-check:** If you find yourself doing
    something not covered by the CONTEXT UPDATE's acceptance criteria, or that
    violates stated constraints or out-of-scope declarations — **stop and
