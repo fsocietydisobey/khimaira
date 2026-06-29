@@ -579,6 +579,11 @@ function SigmaCanvas({
       labelRenderedSizeThreshold: 18,
       defaultEdgeColor: edgeColorRef.current + EDGE_ALPHA,
       enableEdgeEvents: true,
+      // Pan/zoom perf on the large graph (~1954 nodes / ~3900 edges): hide edges +
+      // labels DURING camera motion so a drag/zoom redraws only nodes, then restore
+      // them when the camera settles. The standard sigma large-graph smoothness fix.
+      hideEdgesOnMove: true,
+      hideLabelsOnMove: true,
       minCameraRatio: 0.02,
       maxCameraRatio: 12,
       zIndex: true,
@@ -749,7 +754,38 @@ function SigmaCanvas({
     sigmaRef.current?.refresh();
   }, [edgeColor]);
 
-  return <div ref={containerRef} className="h-full w-full" />;
+  // Explicit camera controls so the mouse-wheel isn't the only way to zoom.
+  const zoomIn = () => sigmaRef.current?.getCamera().animatedZoom({ duration: 200 });
+  const zoomOut = () => sigmaRef.current?.getCamera().animatedUnzoom({ duration: 200 });
+  const zoomFit = () => sigmaRef.current?.getCamera().animatedReset({ duration: 300 });
+
+  const ctrlBtn =
+    "h-8 w-8 rounded-md border border-input bg-background/90 text-muted-foreground " +
+    "hover:text-foreground hover:bg-accent transition-colors text-base leading-none " +
+    "flex items-center justify-center backdrop-blur-sm";
+
+  return (
+    <div className="relative h-full w-full">
+      <div ref={containerRef} className="h-full w-full" />
+      {/* Floating zoom controls, bottom-right (common graph-viewer placement). */}
+      <div className="absolute bottom-3 right-3 flex flex-col gap-1">
+        <button type="button" onClick={zoomIn} className={ctrlBtn} title="zoom in">
+          +
+        </button>
+        <button type="button" onClick={zoomOut} className={ctrlBtn} title="zoom out">
+          −
+        </button>
+        <button
+          type="button"
+          onClick={zoomFit}
+          className={ctrlBtn}
+          title="zoom to fit / reset view"
+        >
+          ⤢
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
