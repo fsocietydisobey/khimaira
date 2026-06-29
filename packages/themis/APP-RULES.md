@@ -131,3 +131,24 @@ invariants:
 
 Once the file is in place, any agent in a session whose `cwd` is inside this repo
 will have their `Bash` calls matching `--env prod` or `--env production` blocked.
+
+## Tracking the rules in git (when `.claude/` is gitignored)
+
+Many repos gitignore `.claude/` (it holds local session state). If yours does,
+`.claude/themis/*.yaml` is **local-only** — enforced for local roster sessions but
+not committed, so other clones don't get the gate. For a durable, repo-wide rule,
+un-ignore just the `themis/` subtree with a gitignore negation:
+
+```gitignore
+# .gitignore — after the existing `.claude/` ignore
+!.claude/
+!.claude/themis/
+!.claude/themis/**
+```
+
+Git requires each parent directory to be un-ignored before the leaf — a bare
+`!.claude/themis/**` will not work while `.claude/` itself is ignored. This tracks
+ONLY the Themis rules while the rest of `.claude/` stays local. Prefer this over
+relocating the rules to a non-`.claude` path: the discovery convention stays
+identical across apps (`<repo>/.claude/themis/`), so the loader needs no per-app
+special-casing.
