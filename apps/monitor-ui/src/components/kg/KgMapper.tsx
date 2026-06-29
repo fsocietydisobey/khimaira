@@ -380,7 +380,10 @@ function SigmaCanvas({
   // included) out to `hopDepth` hops — `"all"` walks the entire reachable component.
   useEffect(() => {
     const graph = graphRef.current;
-    const source = hoveredId ?? isolateId;
+    // Selection locks the hop-anchor: once a node is selected (shown in the
+    // inspector), hops highlight ITS neighborhood regardless of where the mouse
+    // is. Hover drives the anchor only when nothing is selected.
+    const source = selectedId ?? hoveredId;
     if (graph && source && graph.hasNode(source)) {
       const set = new Set<string>([source]);
       const maxHops = hopDepth === "all" ? Infinity : hopDepth;
@@ -402,7 +405,9 @@ function SigmaCanvas({
       focusNeighborsRef.current = null;
     }
     sigmaRef.current?.refresh();
-  }, [hoveredId, isolateId, hopDepth]);
+    // isolateId kept in deps so toggling isolate mode (hard-hide vs dim switch)
+    // still fires a refresh even when the focus set itself doesn't change.
+  }, [selectedId, hoveredId, isolateId, hopDepth]);
 
   // Build graph + layout + render whenever the data changes.
   useEffect(() => {
