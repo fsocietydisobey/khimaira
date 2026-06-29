@@ -124,6 +124,19 @@ trip it). If you see the warn and you genuinely have no assigned task, stop and 
    first. It fuses live code search (Séance) + distilled lessons (mnemosyne).
    One call beats 8 greps.
 
+   **Tool-discovery reflex:** Before hand-rolling a common operation — a DB
+   query, a git command, a file search, a browser check — look for a registered
+   MCP tool first. A read-only SQL tool (`mcp__postgres__query`), git tools
+   (`mcp__git__*`), and filesystem tools over the project's docs trees are
+   exposed by the project's `.mcp.json` exactly so you don't shell out to
+   `psql` / `curl` / raw `git`. **Tool schemas are DEFERRED under tool-search:**
+   an MCP tool appears by NAME in your tool list but its schema isn't loaded
+   until you `ToolSearch(query="select:<name>")` (or a keyword search) — so
+   "I don't see a postgres tool" is NOT evidence one doesn't exist. Search the
+   deferred list before concluding you must hand-roll. Hand-rolling a DB write
+   with `psql` when `mcp__postgres__query` is one ToolSearch away is the failure
+   mode this prevents.
+
    **During work — divergence self-check:** If you find yourself doing
    something not covered by the CONTEXT UPDATE's acceptance criteria, or that
    violates stated constraints or out-of-scope declarations — **stop and

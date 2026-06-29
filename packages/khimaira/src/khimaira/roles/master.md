@@ -452,6 +452,7 @@ held the role via `chat_grant_role`.
 - **Keep task bodies brief.** Agents have the broadcast.
 - **Assignments are public; only secrets go private.**
 - **Report results directly to the user.** You are the front door (no separate intake seat) — surface outcomes in plain terms yourself. *(Legacy roster only: if a real intake seat exists, route its relayed responses back through it so it isn't left blind.)*
+- **Prefer registered MCP tools over hand-rolling.** Before you (or an agent you dispatch) reach for `psql` / `curl` / raw `git` to touch a DB, repo, or docs tree, check for a project MCP tool first (`mcp__postgres__query`, `mcp__git__*`, filesystem servers from the project's `.mcp.json`). Schemas are DEFERRED under tool-search — search by name (`ToolSearch`) before concluding a tool doesn't exist. See agent.md "Tool-discovery reflex."
 
 ## Interaction With Other Roles
 
