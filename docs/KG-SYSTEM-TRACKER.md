@@ -255,3 +255,15 @@ contract-gate test is built to this discipline (a missing `kgTypes.ts` FAILS, ne
   live-verified the viewer↔producer path end-to-end (`kg_health backend shop:10` → 200). Recorded
   the `project="backend"` label gotcha + the auth-fail-open risk. void-1 built the #38 Tier-2
   contract-gate test (11 green, uncommitted).
+- **2026-06-28 (eve)** — **KG-tooling extension v1** built two-repo from griffin-0's JEEVY-673 audit
+  feedback (contract: `scratchpad/KG-EXTENSION-CONTRACT-v1.md`). Adds (1) **`kg_scopes`** — scope/shop
+  discovery (the #1 cold-start blocker: agents could not learn which `scope=` to pass); (2) **`kg_schema`
+  per-triple `dangling` count** (the T4-witness gap); (3) **`project` auto-resolve** — empty `project`
+  resolves to the sole registered KG adapter, killing the `project="backend"` friction. khimaira half
+  committed `032e819` (daemon `/api/graph/{project}/scopes` route + tool + render + 16 tests; 54 kg
+  tests green). jeevy half committed `9e61465e` on `joseph/langgraph-dev` (`GET /internal/kg/scopes` +
+  schema `dangling`; gatekeeper-verified vs SQL ground truth) — **NOT yet pushed (Joseph, morning)**.
+  Also surfaced the whole `kg_*` surface to roster agents via role-doc blocks (agent.md/master.md).
+  **Activation pending:** Joseph push jeevy → khimaira daemon restart (new `/scopes` route) → session
+  relaunch (new `kg_scopes` tool) → end-to-end (`kg_scopes()` + `kg_schema` dangling on shop:10).
+  Read-only invariant affirmed (no write tool).
