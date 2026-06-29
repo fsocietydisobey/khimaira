@@ -442,7 +442,14 @@ let _active: GraphPalette = DEFAULT_PALETTE;
 
 /** Swap the active palette by name (no-op on an unknown name). */
 export function setActivePalette(name: string): void {
-  _active = PALETTES.find((p) => p.name === name) ?? _active;
+  const next = PALETTES.find((p) => p.name === name) ?? _active;
+  if (next !== _active) {
+    _active = next;
+    // The type→color registry is palette-bound — invalidate so it rebuilds
+    // against the new palette on the next registerTypes() call.
+    _typeColorRegistry.clear();
+    _registryPaletteName = "";
+  }
 }
 
 /** Name of the currently active palette. */
@@ -465,9 +472,77 @@ function hashString(s: string): number {
   return Math.abs(h);
 }
 
-/** Deterministic color for an opaque `type` string (active palette). */
+// ---------------------------------------------------------------------------
+// Collision-free type → color assignment.
+//
+// The old `palette[hashString(type) % len]` could map two DISTINCT types to the
+// SAME color (hash collision mod palette size). The legend then showed two
+// node-types in one color — indistinguishable. Fix: assign colors by the type's
+// ORDINAL in the stable sorted set of all present types, so each distinct type
+// gets a distinct slot. `registerTypes(presentTypes)` (called by KgMapper, which
+// has the full node_types set) builds the registry; `typeColor` reads it.
+//
+// Zero-collision guarantee: with N distinct types and a P-color palette, when
+// N <= P each ordinal maps to a distinct curated palette color. When N > P we do
+// NOT silently wrap (`% P` would re-collide) — we generate N evenly-spaced HSL
+// hues instead, so every type still gets a unique color for any N.
+// ---------------------------------------------------------------------------
+
+const _typeColorRegistry: Map<string, string> = new Map();
+let _registryPaletteName = "";
+
+/** HSL → #rrggbb (so generated overflow colors parse in typeColorAlpha like the
+ *  curated palette hexes do). */
+function hslToHex(h: number, s: number, l: number): string {
+  const sN = s / 100;
+  const lN = l / 100;
+  const k = (n: number) => (n + h / 30) % 12;
+  const a = sN * Math.min(lN, 1 - lN);
+  const f = (n: number) => {
+    const color = lN - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+    return Math.round(255 * color)
+      .toString(16)
+      .padStart(2, "0");
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+
+/** Color for ordinal `i` of `total` distinct types in the active palette. Uses
+ *  the curated palette while it's large enough; falls back to evenly-spaced HSL
+ *  hues (never a `% len` wrap) once the type set exceeds the palette. */
+function _colorForOrdinal(i: number, total: number): string {
+  const palette = _active.colors;
+  if (total <= palette.length) return palette[i];
+  // Overflow: more types than curated colors → generate a distinct hue per type.
+  // Evenly-spaced hues at fixed S/L give distinct hexes for any total > palette.
+  return hslToHex(Math.round((i * 360) / total), 65, 55);
+}
+
+/** Register the full set of present node types so `typeColor` can hand each a
+ *  collision-free color. Idempotent + cheap; rebuilds against the active palette.
+ *  KgMapper calls this with its sorted `presentTypes` set each render. */
+export function registerTypes(types: readonly string[]): void {
+  const distinct = Array.from(new Set(types.filter(Boolean))).sort();
+  // Skip the rebuild when nothing changed (same set + same palette this pass).
+  const sameSet =
+    _registryPaletteName === _active.name &&
+    distinct.length === _typeColorRegistry.size &&
+    distinct.every((t) => _typeColorRegistry.has(t));
+  if (sameSet) return;
+  _typeColorRegistry.clear();
+  distinct.forEach((t, i) => {
+    _typeColorRegistry.set(t, _colorForOrdinal(i, distinct.length));
+  });
+  _registryPaletteName = _active.name;
+}
+
+/** Deterministic, collision-free color for an opaque `type` string (active
+ *  palette). Reads the registry built by `registerTypes`; an unregistered type
+ *  (e.g. an edge type not in the node_types set) falls back to the legacy hash. */
 export function typeColor(type: string): string {
   if (!type) return _active.neutral;
+  const registered = _typeColorRegistry.get(type);
+  if (registered) return registered;
   return _active.colors[hashString(type) % _active.colors.length];
 }
 

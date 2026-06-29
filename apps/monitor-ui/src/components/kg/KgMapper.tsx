@@ -124,6 +124,7 @@ import {
   EDGE_BASE_HUE,
   EDGE_BASE_SIZE,
   PALETTES,
+  registerTypes,
   setActivePalette,
   typeColor,
 } from "./graphStyle";
@@ -769,6 +770,13 @@ export function KgMapper() {
     () => Array.from(new Set(rawNodes.map((node) => node.type))).sort(),
     [rawNodes],
   );
+
+  // Hand the full node-type set to the color registry so typeColor assigns each
+  // distinct type a COLLISION-FREE color (by sorted ordinal, never a hash-mod
+  // wrap). Done in render — after the palette sync above and before the legend +
+  // inspectors (which call typeColor) render this pass. Cheap + idempotent
+  // (registerTypes no-ops when the set + palette are unchanged).
+  registerTypes(presentTypes);
 
   // How many edges fall below the active confidence threshold — drives honest
   // feedback when a filter hides everything (e.g. a graph whose edges are ALL

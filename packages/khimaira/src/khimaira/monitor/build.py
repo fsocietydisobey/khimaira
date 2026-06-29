@@ -58,37 +58,72 @@ def needs_build() -> bool:
     return _dist_mtime() < _newest_source_mtime()
 
 
+def _dist_exists() -> bool:
+    """True if a previously-built `dist/` is present (something to serve)."""
+    return (dist_dir() / "index.html").is_file()
+
+
 def ensure_built() -> None:
     """Build `dist/` if missing or stale.
 
-    Logs progress to stderr. Exits the process if `npm` is unavailable or
-    the build fails — the daemon should not start with a broken UI.
+    FAIL-OPEN: the daemon must NEVER crash-loop over a UI build. If the build
+    can't run (e.g. `npm` not in PATH — systemd has a minimal PATH) or it fails,
+    but a `dist/` already exists, log a loud WARNING and serve the existing
+    (stale) bundle. ONLY hard-exit when there is NO dist at all — nothing to
+    serve. (Regression guard: a `sys.exit(1)` here when npm was missing
+    crash-looped the daemon in a real outage, 2026-06-29.)
     """
     if not _MONITOR_UI.is_dir():
         # Nothing to build — the frontend hasn't been scaffolded yet.
         # The server will fall back to a "frontend not built" placeholder.
-        print(f"khimaira monitor: monitor_ui/ not found at {_MONITOR_UI} — skipping build", file=sys.stderr)
+        print(
+            f"khimaira monitor: monitor_ui/ not found at {_MONITOR_UI} — skipping build",
+            file=sys.stderr,
+        )
         return
 
     if not needs_build():
         return
 
-    npm = shutil.which("npm")
-    if not npm:
-        print("khimaira monitor: `npm` not found in PATH — install Node.js to build the UI", file=sys.stderr)
+    def _fail_open_or_exit(reason: str) -> bool:
+        """On a build failure: return True (caller serves the existing stale dist)
+        if a dist exists; otherwise hard-exit (no dist → nothing to serve)."""
+        if _dist_exists():
+            print(
+                f"⚠️  khimaira monitor: {reason} — serving the EXISTING (stale) UI from "
+                f"{dist_dir()}. The UI may be out of date; rebuild once npm is available. "
+                "(Not crashing: a previously-built bundle is present.)",
+                file=sys.stderr,
+            )
+            return True
+        print(
+            f"khimaira monitor: {reason} — and no built UI exists at {dist_dir()} to fall "
+            "back on. Cannot serve the UI.",
+            file=sys.stderr,
+        )
         sys.exit(1)
+
+    # _fail_open_or_exit returns True (serve the stale dist) or sys.exit()s when
+    # there's no dist; in both branches below, True → return (we've served stale).
+    npm = shutil.which("npm")
+    if not npm and _fail_open_or_exit("`npm` not found in PATH (install Node.js to build the UI)"):
+        return
 
     print(f"khimaira monitor: building UI in {_MONITOR_UI}...", file=sys.stderr)
 
-    if not (_MONITOR_UI / "node_modules").is_dir():
-        result = subprocess.run([npm, "install"], cwd=_MONITOR_UI, stdin=subprocess.DEVNULL)
-        if result.returncode != 0:
-            print("khimaira monitor: `npm install` failed", file=sys.stderr)
-            sys.exit(1)
+    # subprocess can raise (e.g. OSError) as well as return non-zero — both are
+    # "the build couldn't complete" and must fail-open, never propagate a crash.
+    try:
+        if not (_MONITOR_UI / "node_modules").is_dir():
+            result = subprocess.run([npm, "install"], cwd=_MONITOR_UI, stdin=subprocess.DEVNULL)
+            if result.returncode != 0 and _fail_open_or_exit("`npm install` failed"):
+                return
 
-    result = subprocess.run([npm, "run", "build"], cwd=_MONITOR_UI, stdin=subprocess.DEVNULL)
-    if result.returncode != 0:
-        print("khimaira monitor: `npm run build` failed", file=sys.stderr)
-        sys.exit(1)
+        result = subprocess.run([npm, "run", "build"], cwd=_MONITOR_UI, stdin=subprocess.DEVNULL)
+        if result.returncode != 0 and _fail_open_or_exit("`npm run build` failed"):
+            return
+    except OSError as exc:
+        if _fail_open_or_exit(f"UI build subprocess could not run ({exc})"):
+            return
 
     print("khimaira monitor: UI build complete", file=sys.stderr)
