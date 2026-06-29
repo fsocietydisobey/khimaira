@@ -148,8 +148,11 @@ trip it). If you see the warn and you genuinely have no assigned task, stop and 
    - `kg_node` — one node's full detail (current/history facts + incident edges).
    - `kg_edge` — "why does this edge exist?" (match_method, source doc/page/bbox, confidence).
    - `kg_schema` — type meta-graph; an ABSENT triple = the extractor never produced it.
-   - `kg_health` / `kg_coverage` / `kg_edges_audit` — data-quality aggregates
-     (orphans, dangling edges, under-projection, suspect-confidence tail).
+   - `kg_health` — per-scope counts + **`orphanNodes`** (degree-0) + **`danglingEdges`**
+     (an edge pointing at a missing node). This already answers "are there dangling
+     edges?" — use it instead of hand-joining `kg_active_edges ⋈ kg_active_nodes`.
+   - `kg_coverage` — relational-vs-KG ratio per entity (under-projection detector).
+   - `kg_edges_audit` — match-method + confidence histograms + the suspect tail.
    - `kg_view_url` — deep-link to the visual viewer (+ a Specter screenshot recipe).
 
    **For audit / data-quality / per-shop-scope work** (the path agents otherwise
@@ -164,6 +167,15 @@ trip it). If you see the warn and you genuinely have no assigned task, stop and 
    `project="backend"` — NOT `"jeevy"`. Every call needs
    `project="backend", scope="shop:<id>"`. `project="jeevy"` returns a *misleading*
    `404 no KG adapter registered`. Full map: `docs/KG-SYSTEM-TRACKER.md`.
+
+   **Worked drill path** (real scope `shop:10`):
+   `kg_schema(project="backend", scope="shop:10")` → which node/edge types exist (and
+   which are absent = extractor gaps) → `kg_search(project="backend", scope="shop:10",
+   query="<label>")` → resolve a `node_id` → `kg_node(...)` → its facts + incident edges
+   → `kg_edge(...)` → that edge's provenance (match_method, source doc/page/bbox). For a
+   data-quality pass instead: `kg_health` (orphans + dangling) then `kg_coverage`
+   (under-projection). *(You still need a valid `shop:<id>` — there is not yet a tool to
+   enumerate scopes, so ask master which shop or rely on the task body to name it.)*
 
    **During work — divergence self-check:** If you find yourself doing
    something not covered by the CONTEXT UPDATE's acceptance criteria, or that
