@@ -18,6 +18,7 @@ import { useParams, useSearchParams } from "react-router-dom";
 import Graph from "graphology";
 import Sigma from "sigma";
 import forceAtlas2 from "graphology-layout-forceatlas2";
+import dagre from "@dagrejs/dagre";
 import { createNodeBorderProgram } from "@sigma/node-border";
 import { drawDiscNodeLabel, type NodeHoverDrawingFunction } from "sigma/rendering";
 
@@ -303,6 +304,7 @@ function SigmaCanvas({
   edgeThreshold,
   isolateId,
   hopDepth,
+  layoutMode,
   focusId,
   focusNonce,
   focusRatio,
@@ -323,6 +325,8 @@ function SigmaCanvas({
   isolateId: string | null;
   /** Hops out from the hover/isolate focus node to highlight (1/2/3 or whole component). */
   hopDepth: 1 | 2 | 3 | "all";
+  /** Node placement: "force" = ForceAtlas2 (organic); "tree" = dagre layered. */
+  layoutMode: "force" | "tree";
   /** Node to center the camera on (search / sidebar navigation). */
   focusId: string | null;
   /** Bumped to retrigger focus even when focusId is unchanged. */
@@ -453,20 +457,47 @@ function SigmaCanvas({
       }
     });
 
-    // ForceAtlas2 — synchronous, computed ONCE. Scale iterations down for big
-    // graphs (barnes-hut keeps it fast); this is not a per-frame simulation.
-    const iterations = n > 3000 ? 180 : n > 800 ? 260 : 400;
-    const settings = forceAtlas2.inferSettings(graph);
-    forceAtlas2.assign(graph, {
-      iterations,
-      settings: {
-        ...settings,
-        barnesHutOptimize: n > 800,
-        gravity: 0.6,
-        scalingRatio: 12,
-        slowDown: 1 + Math.log(n),
-      },
-    });
+    if (layoutMode === "tree") {
+      // Dagre layered layout — code-agnostic: uses ONLY graph structure + edge
+      // DIRECTION to rank nodes (no node-type/schema knowledge). Naturally spreads
+      // leaf clusters into clean rows under their hub. dagre is already a repo dep
+      // (used by FlowCanvas); this mirrors that pattern.
+      const dg = new dagre.graphlib.Graph();
+      dg.setGraph({ rankdir: "TB", nodesep: 30, ranksep: 70, marginx: 20, marginy: 20 });
+      dg.setDefaultEdgeLabel(() => ({}));
+      graph.forEachNode((node, attrs) => {
+        const sz = (attrs.size as number) ?? 4;
+        dg.setNode(node, { width: sz * 2, height: sz * 2 });
+      });
+      graph.forEachEdge((_edge, _attrs, src, tgt) => {
+        dg.setEdge(src, tgt);
+      });
+      dagre.layout(dg);
+      graph.forEachNode((node) => {
+        const pos = dg.node(node);
+        if (pos) {
+          graph.setNodeAttribute(node, "x", pos.x);
+          // Flip Y: dagre ranks downward (rank 0 = smallest y); sigma's y axis points
+          // up, so negate to put rank 0 (the roots/hubs) at the TOP of the view.
+          graph.setNodeAttribute(node, "y", -pos.y);
+        }
+      });
+    } else {
+      // ForceAtlas2 — synchronous, computed ONCE. Scale iterations down for big
+      // graphs (barnes-hut keeps it fast); this is not a per-frame simulation.
+      const iterations = n > 3000 ? 180 : n > 800 ? 260 : 400;
+      const settings = forceAtlas2.inferSettings(graph);
+      forceAtlas2.assign(graph, {
+        iterations,
+        settings: {
+          ...settings,
+          barnesHutOptimize: n > 800,
+          gravity: 0.6,
+          scalingRatio: 12,
+          slowDown: 1 + Math.log(n),
+        },
+      });
+    }
 
     const renderer = new Sigma(graph, container, {
       renderLabels: true,
@@ -603,7 +634,9 @@ function SigmaCanvas({
       sigmaRef.current = null;
       graphRef.current = null;
     };
-  }, [data]);
+    // layoutMode in deps: toggling force↔tree recomputes positions + rebuilds the
+    // renderer (which re-frames the camera to the new layout).
+  }, [data, layoutMode]);
 
   // Re-apply highlight + filters + encoding without rebuilding the graph.
   useEffect(() => {
@@ -688,6 +721,10 @@ export function KgMapper() {
   // Hops out from the hover/isolate focus node to highlight (1 = direct neighbors,
   // the original behavior; 2/3 = local graph; "all" = whole reachable component).
   const [hopDepth, setHopDepth] = useState<1 | 2 | 3 | "all">(1);
+  // Node placement: "force" = ForceAtlas2 (organic, default); "tree" = dagre layered.
+  const [layoutMode, setLayoutMode] = useState<"force" | "tree">(
+    searchParams.get("layout") === "tree" ? "tree" : "force",
+  );
   const [searchValue, setSearchValue] = useState<string>("");
   const [searchMiss, setSearchMiss] = useState<boolean>(false);
 
@@ -1151,6 +1188,30 @@ export function KgMapper() {
               ))}
             </div>
 
+            {/* Layout: organic force-directed vs layered tree (dagre) */}
+            <div className="flex items-center gap-1 text-[10px]">
+              <span className="text-muted-foreground">layout</span>
+              {(["force", "tree"] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setLayoutMode(m)}
+                  className={`h-7 rounded-md border px-2 transition-colors ${
+                    layoutMode === m
+                      ? "border-ring bg-accent text-foreground"
+                      : "border-input bg-background text-muted-foreground hover:text-foreground"
+                  }`}
+                  title={
+                    m === "tree"
+                      ? "layered hierarchy (dagre) — spreads leaf clusters into rows"
+                      : "organic force-directed layout (ForceAtlas2)"
+                  }
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+
             {/* Color theme picker */}
             <div className="flex items-center gap-1 text-[10px]">
               <span className="text-muted-foreground">theme</span>
@@ -1237,6 +1298,7 @@ export function KgMapper() {
                 isolateMode && selectedNode ? selectedNode.nodeId : null
               }
               hopDepth={hopDepth}
+              layoutMode={layoutMode}
               focusId={focusId}
               focusNonce={focusNonce}
               focusRatio={focusRatio}
