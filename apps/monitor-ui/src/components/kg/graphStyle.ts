@@ -481,14 +481,18 @@ function hashString(s: string): number {
 // are perceptually CLUSTERED (distinct slots, near-identical hues: e.g. 3 ambers,
 // 3 greens), so types still read as "duplicate" to the eye.
 //
-// Round 2: assign every present type an EVENLY-SPACED hue — `hue = ordinal*360/N`
-// over the stable sorted set — so adjacent types are maximally separated on the
-// wheel (min pairwise separation = 360/N) for ANY N. Saturation + lightness come
-// from the ACTIVE THEME (the average S/L of its curated palette = its "vibrancy
-// profile"), so Vibrant stays saturated, muted/dark themes stay muted, while the
-// hues are always max-spread. Tradeoff (accepted, 2026-06-29): themes then differ
-// by vibrancy/lightness rather than per-type hue identity, and a hue-constrained
-// theme (e.g. "Warm") spreads across the full wheel — distinctness wins there.
+// Round 2: spread every type an EVENLY-SPACED hue (`ordinal*360/N`) for max
+// separation — but that flattened every theme to the SAME full-wheel rainbow (only
+// S/L differed), erasing theme identity.
+//
+// Round 3 "balanced" (Joseph's pick): give each theme its CHARACTER back while keeping
+// distinctness. Derive the theme's hue character from its curated palette (circular
+// stats → `_paletteHueProfile` = {center, arc}); spread the N type hues evenly across
+// that arc CENTERED on the theme's center, but widen the arc to at least `N*MIN_GAP`
+// so adjacent types stay ≥ MIN_GAP apart. Net: few types → tight, strongly theme-tinted
+// spread; many types (13) → arc widens toward the full wheel so the gap floor holds
+// (distinctness wins, as accepted). Vibrant ≈ full spread; Cool leans cool; Warm warm.
+// S/L still come from the theme's vibrancy profile (`_paletteSL`, unchanged).
 //
 // `registerTypes(presentTypes)` (called by KgMapper, which has the full node_types
 // set) builds the registry; `typeColor` reads it.
@@ -528,6 +532,23 @@ function hexToSL(hex: string): { s: number; l: number } {
   return { s: s * 100, l: l * 100 };
 }
 
+/** #rrggbb → hue in [0,360). Grey (max===min) → 0. */
+function hexToHue(hex: string): number {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const d = max - min;
+  if (d === 0) return 0;
+  let h: number;
+  if (max === r) h = ((g - b) / d) % 6;
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h *= 60;
+  return h < 0 ? h + 360 : h;
+}
+
 // The active theme's "vibrancy profile" — average S/L of its curated colors.
 // Cached per palette name (the curated arrays are immutable).
 const _paletteSLCache: Map<string, { s: number; l: number }> = new Map();
@@ -547,11 +568,59 @@ function _paletteSL(palette: GraphPalette): { s: number; l: number } {
   return profile;
 }
 
-/** Color for ordinal `i` of `total` distinct types: an evenly-spaced hue (max
- *  perceptual separation) at the active theme's S/L profile. */
+// The active theme's "hue character" — where on the wheel its curated colors sit
+// (center) and how wide a band they span (arc), via CIRCULAR statistics. A clustered
+// palette (Cool ~ blues) → small arc around its center; a full-wheel palette (Vibrant)
+// → arc ≈ 360. Cached per palette name. Round 3 "balanced" (2026-06-29): the type
+// colors lean toward this character (theme identity) while a MIN_GAP floor preserves
+// distinctness — replacing round 2's flat full-wheel rainbow that erased theme identity.
+const _paletteHueCache: Map<string, { center: number; arc: number }> = new Map();
+function _paletteHueProfile(palette: GraphPalette): { center: number; arc: number } {
+  const cached = _paletteHueCache.get(palette.name);
+  if (cached) return cached;
+  const hues = palette.colors.map(hexToHue);
+  // Circular mean: average unit vectors, atan2 → mean angle (handles 350°/10° → 0°,
+  // NOT 180°). Resultant ~0 for a full-wheel palette → center is arbitrary, but its
+  // arc ≈ 360 covers the wheel anyway so the center barely matters there.
+  let x = 0;
+  let y = 0;
+  for (const h of hues) {
+    x += Math.cos((h * Math.PI) / 180);
+    y += Math.sin((h * Math.PI) / 180);
+  }
+  let center = (Math.atan2(y, x) * 180) / Math.PI;
+  if (center < 0) center += 360;
+  // Circular range = 360 − the largest empty gap between consecutive sorted hues.
+  // Full-wheel palette → small max gap → arc ≈ 360; clustered → big empty gap → small arc.
+  const sorted = [...hues].sort((a, b) => a - b);
+  let maxGap = 0;
+  for (let i = 0; i < sorted.length; i += 1) {
+    const next = sorted[(i + 1) % sorted.length];
+    const gap = (next - sorted[i] + 360) % 360;
+    if (gap > maxGap) maxGap = gap;
+  }
+  const arc = sorted.length > 1 ? 360 - maxGap : 0;
+  const profile = { center, arc };
+  _paletteHueCache.set(palette.name, profile);
+  return profile;
+}
+
+// Distinctness floor: adjacent type colors are kept ≥ this many degrees apart on the
+// wheel. Tunes the theme-character ↔ distinctness balance (lower = more theme tint,
+// tighter spacing). With N types the spread arc widens to at least N*MIN_GAP.
+const _MIN_HUE_GAP = 20;
+
+/** "Balanced" color for ordinal `i` of `total` distinct types: hues are spread
+ *  evenly across the theme's hue arc (CENTERED on its hue character) but the arc is
+ *  widened to at least `total * MIN_GAP` so adjacent types stay distinguishable.
+ *  S/L come from the theme's vibrancy profile. Few types → tight, strongly tinted
+ *  spread; many types → arc widens toward the full wheel (distinctness wins). */
 function _colorForOrdinal(i: number, total: number): string {
   const { s, l } = _paletteSL(_active);
-  const hue = total > 0 ? Math.round((i * 360) / total) : 0;
+  if (total <= 0) return hslToHex(0, s, l);
+  const { center, arc } = _paletteHueProfile(_active);
+  const effArc = Math.min(360, Math.max(arc, total * _MIN_HUE_GAP));
+  const hue = (((center - effArc / 2 + (i + 0.5) * (effArc / total)) % 360) + 360) % 360;
   return hslToHex(hue, s, l);
 }
 
