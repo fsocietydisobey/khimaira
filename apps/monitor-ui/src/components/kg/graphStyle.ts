@@ -473,26 +473,31 @@ function hashString(s: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// Collision-free type → color assignment.
+// Perceptually-distinct type → color assignment.
 //
 // The old `palette[hashString(type) % len]` could map two DISTINCT types to the
-// SAME color (hash collision mod palette size). The legend then showed two
-// node-types in one color — indistinguishable. Fix: assign colors by the type's
-// ORDINAL in the stable sorted set of all present types, so each distinct type
-// gets a distinct slot. `registerTypes(presentTypes)` (called by KgMapper, which
-// has the full node_types set) builds the registry; `typeColor` reads it.
+// SAME color (hash collision mod palette size). Round 1 fixed exact-hex collisions
+// by assigning curated-palette colors by sorted ordinal — but the curated palettes
+// are perceptually CLUSTERED (distinct slots, near-identical hues: e.g. 3 ambers,
+// 3 greens), so types still read as "duplicate" to the eye.
 //
-// Zero-collision guarantee: with N distinct types and a P-color palette, when
-// N <= P each ordinal maps to a distinct curated palette color. When N > P we do
-// NOT silently wrap (`% P` would re-collide) — we generate N evenly-spaced HSL
-// hues instead, so every type still gets a unique color for any N.
+// Round 2: assign every present type an EVENLY-SPACED hue — `hue = ordinal*360/N`
+// over the stable sorted set — so adjacent types are maximally separated on the
+// wheel (min pairwise separation = 360/N) for ANY N. Saturation + lightness come
+// from the ACTIVE THEME (the average S/L of its curated palette = its "vibrancy
+// profile"), so Vibrant stays saturated, muted/dark themes stay muted, while the
+// hues are always max-spread. Tradeoff (accepted, 2026-06-29): themes then differ
+// by vibrancy/lightness rather than per-type hue identity, and a hue-constrained
+// theme (e.g. "Warm") spreads across the full wheel — distinctness wins there.
+//
+// `registerTypes(presentTypes)` (called by KgMapper, which has the full node_types
+// set) builds the registry; `typeColor` reads it.
 // ---------------------------------------------------------------------------
 
 const _typeColorRegistry: Map<string, string> = new Map();
 let _registryPaletteName = "";
 
-/** HSL → #rrggbb (so generated overflow colors parse in typeColorAlpha like the
- *  curated palette hexes do). */
+/** HSL → #rrggbb (so generated colors parse in typeColorAlpha like palette hexes). */
 function hslToHex(h: number, s: number, l: number): string {
   const sN = s / 100;
   const lN = l / 100;
@@ -507,15 +512,47 @@ function hslToHex(h: number, s: number, l: number): string {
   return `#${f(0)}${f(8)}${f(4)}`;
 }
 
-/** Color for ordinal `i` of `total` distinct types in the active palette. Uses
- *  the curated palette while it's large enough; falls back to evenly-spaced HSL
- *  hues (never a `% len` wrap) once the type set exceeds the palette. */
+/** #rrggbb → S,L in 0–100 (hue is irrelevant for the theme S/L profile). */
+function hexToSL(hex: string): { s: number; l: number } {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  let s = 0;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  }
+  return { s: s * 100, l: l * 100 };
+}
+
+// The active theme's "vibrancy profile" — average S/L of its curated colors.
+// Cached per palette name (the curated arrays are immutable).
+const _paletteSLCache: Map<string, { s: number; l: number }> = new Map();
+function _paletteSL(palette: GraphPalette): { s: number; l: number } {
+  const cached = _paletteSLCache.get(palette.name);
+  if (cached) return cached;
+  let sSum = 0;
+  let lSum = 0;
+  for (const hex of palette.colors) {
+    const { s, l } = hexToSL(hex);
+    sSum += s;
+    lSum += l;
+  }
+  const n = palette.colors.length || 1;
+  const profile = { s: Math.round(sSum / n), l: Math.round(lSum / n) };
+  _paletteSLCache.set(palette.name, profile);
+  return profile;
+}
+
+/** Color for ordinal `i` of `total` distinct types: an evenly-spaced hue (max
+ *  perceptual separation) at the active theme's S/L profile. */
 function _colorForOrdinal(i: number, total: number): string {
-  const palette = _active.colors;
-  if (total <= palette.length) return palette[i];
-  // Overflow: more types than curated colors → generate a distinct hue per type.
-  // Evenly-spaced hues at fixed S/L give distinct hexes for any total > palette.
-  return hslToHex(Math.round((i * 360) / total), 65, 55);
+  const { s, l } = _paletteSL(_active);
+  const hue = total > 0 ? Math.round((i * 360) / total) : 0;
+  return hslToHex(hue, s, l);
 }
 
 /** Register the full set of present node types so `typeColor` can hand each a
