@@ -1195,3 +1195,30 @@ def test_agent_md_contains_no_self_dispatch_section():
     assert (
         "propose" in lowered and "wait" in lowered
     ), "agent.md missing the propose-then-wait instruction"
+
+
+def test_master_md_contains_design_vs_execute_routing():
+    """Regression guard: master.md must keep the design-vs-execute routing rule —
+    design/architecture → consultant, never an agent, and master never pre-carves
+    an arch ticket into agent-sized pieces (the JEEVY-651 behavioral→structural
+    promotion). Master is the PRIMARY layer (the incident was a master mis-route)."""
+    content = (ROLE_DIR / "master.md").read_text()
+    lowered = content.lower()
+    assert "design-vs-execute" in lowered, "master.md missing the design-vs-execute rule header"
+    assert "execute-only" in lowered, "master.md missing the agents-are-execute-only framing"
+    assert "itself a design judgment" in lowered, (
+        "master.md missing the load-bearing principle (carving an arch ticket is design)"
+    )
+    assert "JEEVY-651" in content, "master.md missing the JEEVY-651 worked example"
+
+
+def test_agent_md_contains_execute_only_design_bounce():
+    """Regression guard: agent.md must keep the execute-only / bounce-design backstop
+    (the agent-side layer of the design-vs-execute promotion + the tier rationale)."""
+    content = (ROLE_DIR / "agent.md").read_text()
+    lowered = content.lower()
+    assert "execute-only" in lowered, "agent.md missing the execute-only rule"
+    assert "design-vs-execute" in lowered, "agent.md missing the design-vs-execute header"
+    assert "bounce" in lowered, "agent.md missing the bounce-design instruction"
+    assert "sonnet/medium" in lowered, "agent.md missing the execution-tier rationale"
+    assert "JEEVY-651" in content, "agent.md missing the JEEVY-651 worked example"

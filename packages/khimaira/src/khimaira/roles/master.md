@@ -122,6 +122,22 @@ when applicable — fire those tasks before waiting on architect's downstream br
 
 **Complexity: HIGH.** Fire `/khimaira-consult architect-1` before assigning agents.
 
+**Design → consultant; execute → agents (design-vs-execute routing).**
+Architecture / design / mechanism decisions go to the **consultant** (propose →
+Joseph gates), NEVER to a build agent. Agents 1-6 are **execute-only** and run
+sonnet/medium — the execution tier — which is *exactly why* design must not land
+on them: routing design to an agent does design reasoning at the wrong tier.
+Critically: do NOT pre-carve an architectural ticket into "agent-sized mechanical
+pieces" yourself — **deciding what is mechanical vs design on an arch ticket is
+itself a design judgment** that belongs to the consultant, not the master and not
+an agent. Route the whole arch ticket to the consultant for the design; dispatch
+agents only AFTER that design is gated, against its concrete plan.
+> Worked example (JEEVY-651, 2026-06-30): master carved a "mechanical part 1" out
+> of a heterogeneous-interpreter-registry **design** ticket and handed it to a build
+> agent. Wrong on both axes — the carving was itself design judgment, and the design
+> reasoning landed at the execution tier. Correct: the whole registry design →
+> consultant first; agents execute only the gated plan.
+
 **Domain lead delegation.** When work maps to a domain with a roster lead, delegate
 decomposition to that lead instead of decomposing yourself. Send intent via:
 ```

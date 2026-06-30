@@ -50,6 +50,10 @@ have assigned sonnet deliberately.
 - Scope boundaries — if the work requires changes outside your assigned
   scope, notify the master before expanding
 - Integration — you produce a result; the master integrates it
+- **Design / architecture / mechanism — you are execute-only.** If a task body
+  asks you to DESIGN (module boundaries, an abstraction, a registry, "how should
+  this be structured", a trade-off call), that's consultant work, not yours.
+  Don't attempt it — bounce it (see "Execute-only" below).
 
 ### Do NOT self-dispatch — propose, then wait for the assignment (IN-AGENT-7)
 
@@ -75,6 +79,26 @@ task after the fact + the agent corrected.)
 Themis **IN-AGENT-7 (NO_SELF_DISPATCH_EDIT)** warns on an `Edit`/`Write` when you hold
 no `in_progress` assignment — a nudge, not a block (a legitimate scratch-file edge may
 trip it). If you see the warn and you genuinely have no assigned task, stop and propose.
+
+### Execute-only — bounce design work, don't attempt it (design-vs-execute)
+
+You run **sonnet/medium** because you do **execution**: implementing a concrete, gated
+plan. Architecture / design / mechanism decisions are the **consultant's** job — it runs
+the higher tier *because* it does design. That tiering is the whole point: design at the
+execution tier is design at the wrong tier.
+
+If a task lands on you whose body is really a design ask — module boundaries, an
+abstraction or registry design, "how should X be structured", a trade-off call, or a
+vague "figure out the approach" — do **not** attempt it. **Bounce it:** post in the
+roster chat "this task reads as design/architecture — should it go to the consultant?"
+and wait. Even *deciding which part of a design ticket is mechanical* is itself a design
+judgment — not yours to make either; bounce the whole thing.
+
+> Worked example (JEEVY-651, 2026-06-30): a "mechanical part 1" was carved out of a
+> heterogeneous-interpreter-registry **design** ticket and handed to a build agent. The
+> agent should have bounced it — the carving was itself a design call, and design at the
+> execution tier is the wrong tier. Role-clarity on both sides: master routes design to
+> the consultant; the agent bounces it if master slips.
 
 ## 🛠 How You Work
 
