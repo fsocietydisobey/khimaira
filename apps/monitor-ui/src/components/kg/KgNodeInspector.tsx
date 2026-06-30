@@ -454,16 +454,14 @@ function SourceRecordSection({
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<SourceLoadState>({ status: "idle" });
 
-  // Reset when the selected node changes — so expanding always shows the CURRENT
-  // node's record, never a stale fetch from a previously-selected node.
+  // Fetch whenever the section is open, and re-fetch if the node/scope changes
+  // while it stays open. Keyed on open/nodeId/scope/project ONLY — deliberately
+  // NOT on state.status: including it made the setState(loading) below re-run
+  // this effect, whose cleanup set cancelled=true and blocked the fetch's own
+  // state update → the panel hung on "loading…" forever. Collapsed-by-default
+  // keeps it on-demand (no fetch until the user expands it).
   useEffect(() => {
-    setOpen(false);
-    setState({ status: "idle" });
-  }, [nodeId, scope, project]);
-
-  // On-demand fetch — only when first expanded (idle → loading).
-  useEffect(() => {
-    if (!open || state.status !== "idle") return;
+    if (!open) return;
     if (!project) {
       setState({ status: "error", message: "no project in route" });
       return;
@@ -490,7 +488,7 @@ function SourceRecordSection({
     return () => {
       cancelled = true;
     };
-  }, [open, state.status, project, scope, nodeId]);
+  }, [open, project, scope, nodeId]);
 
   return (
     <section className="mt-4 pt-3 border-t border-border/30">
