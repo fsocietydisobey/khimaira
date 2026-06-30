@@ -303,6 +303,7 @@ function SigmaCanvas({
   edgeThreshold,
   isolateId,
   hopDepth,
+  hopDirection,
   layoutMode,
   focusId,
   focusNonce,
@@ -324,6 +325,11 @@ function SigmaCanvas({
   isolateId: string | null;
   /** Hops out from the hover/isolate focus node to highlight (1/2/3 or whole component). */
   hopDepth: 1 | 2 | 3 | "all";
+  /** Hop traversal direction. "both" = undirected neighborhood (default — in+out).
+   *  "down" = outgoing only (the focus node's SUBTREE: what it contains/owns,
+   *  recursively — prunes the hub explosion since it never walks up to shared
+   *  parents). "up" = incoming only (its ancestors). */
+  hopDirection: "both" | "down" | "up";
   /** Node placement: "force" = ForceAtlas2 (organic); "tree" = dagre layered. */
   layoutMode: "force" | "tree";
   /** Node to center the camera on (search / sidebar navigation). */
@@ -374,10 +380,13 @@ function SigmaCanvas({
   // node both hover-dim and isolate highlight: 1 = direct neighbors (original), 2/3 =
   // the in-between local graph, "all" = the whole reachable component.
 
-  // Recompute the focus set whenever the dim source (hover or isolate) OR the hop
-  // depth changes, then refresh once. Hover takes precedence over isolate. BFS the
-  // undirected adjacency (forEachNeighbor covers in+out edges, so inverse links stay
-  // included) out to `hopDepth` hops — `"all"` walks the entire reachable component.
+  // Recompute the focus set whenever the dim source (hover or isolate), the hop
+  // depth, OR the hop direction changes, then refresh once. Hover takes precedence
+  // over isolate. `hopDirection` picks the adjacency: "both" walks in+out
+  // (undirected neighborhood), "down" walks only OUTgoing edges (the node's
+  // subtree — what it contains/owns, which prunes the hub explosion because it
+  // never traverses up to a shared parent), "up" walks only INcoming edges.
+  // `"all"` depth walks the entire reachable component in the chosen direction.
   useEffect(() => {
     const graph = graphRef.current;
     // Selection locks the hop-anchor: once a node is selected (shown in the
@@ -387,11 +396,19 @@ function SigmaCanvas({
     if (graph && source && graph.hasNode(source)) {
       const set = new Set<string>([source]);
       const maxHops = hopDepth === "all" ? Infinity : hopDepth;
+      // Directed adjacency: graphology's out/in-neighbor iterators follow edge
+      // direction; forEachNeighbor is the undirected union.
+      const walk =
+        hopDirection === "down"
+          ? graph.forEachOutNeighbor.bind(graph)
+          : hopDirection === "up"
+            ? graph.forEachInNeighbor.bind(graph)
+            : graph.forEachNeighbor.bind(graph);
       let frontier: string[] = [source];
       for (let depth = 0; depth < maxHops && frontier.length > 0; depth += 1) {
         const next: string[] = [];
         for (const node of frontier) {
-          graph.forEachNeighbor(node, (nb) => {
+          walk(node, (nb: string) => {
             if (!set.has(nb)) {
               set.add(nb);
               next.push(nb);
@@ -407,7 +424,7 @@ function SigmaCanvas({
     sigmaRef.current?.refresh();
     // isolateId kept in deps so toggling isolate mode (hard-hide vs dim switch)
     // still fires a refresh even when the focus set itself doesn't change.
-  }, [selectedId, hoveredId, isolateId, hopDepth]);
+  }, [selectedId, hoveredId, isolateId, hopDepth, hopDirection]);
 
   // Build graph + layout + render whenever the data changes.
   useEffect(() => {
@@ -831,6 +848,12 @@ export function KgMapper() {
   // Hops out from the hover/isolate focus node to highlight (1 = direct neighbors,
   // the original behavior; 2/3 = local graph; "all" = whole reachable component).
   const [hopDepth, setHopDepth] = useState<1 | 2 | 3 | "all">(1);
+  // Hop traversal direction — "both" (undirected neighborhood) is the default;
+  // "down" = the focus node's subtree (outgoing edges only — what it contains/
+  // owns, recursively), "up" = its ancestors (incoming only). The directed modes
+  // prune the hub explosion (hop 2 no longer walks up to a shared parent and back
+  // down into sibling subtrees).
+  const [hopDirection, setHopDirection] = useState<"both" | "down" | "up">("both");
   // Node placement: "force" = ForceAtlas2 (organic, default); "tree" = dagre layered.
   const [layoutMode, setLayoutMode] = useState<"force" | "tree">(
     searchParams.get("layout") === "tree" ? "tree" : "force",
@@ -1368,6 +1391,41 @@ export function KgMapper() {
               ))}
             </div>
 
+            {/* Hop direction: undirected neighborhood vs directed subtree/ancestors.
+                The fix for "hop 2 lights up sibling subtrees through shared hubs". */}
+            <div className="flex items-center gap-1 text-[10px]">
+              <span className="text-muted-foreground">dir</span>
+              {(
+                [
+                  ["both", "↕", "both directions — undirected neighborhood (default)"],
+                  [
+                    "down",
+                    "↓",
+                    "downstream only — the node's subtree (what it contains/owns, recursively); prunes the hub explosion",
+                  ],
+                  [
+                    "up",
+                    "↑",
+                    "upstream only — the node's ancestors (what contains/owns it)",
+                  ],
+                ] as const
+              ).map(([dir, glyph, tip]) => (
+                <button
+                  key={dir}
+                  type="button"
+                  onClick={() => setHopDirection(dir)}
+                  className={`h-7 rounded-md border px-2 font-mono transition-colors ${
+                    hopDirection === dir
+                      ? "border-ring bg-accent text-foreground"
+                      : "border-input bg-background text-muted-foreground hover:text-foreground"
+                  }`}
+                  title={tip}
+                >
+                  {glyph}
+                </button>
+              ))}
+            </div>
+
             {/* Layout: organic force-directed vs layered tree (dagre) */}
             <div className="flex items-center gap-1 text-[10px]">
               <span className="text-muted-foreground">layout</span>
@@ -1478,6 +1536,7 @@ export function KgMapper() {
                 isolateMode && selectedNode ? selectedNode.nodeId : null
               }
               hopDepth={hopDepth}
+              hopDirection={hopDirection}
               layoutMode={layoutMode}
               focusId={focusId}
               focusNonce={focusNonce}
