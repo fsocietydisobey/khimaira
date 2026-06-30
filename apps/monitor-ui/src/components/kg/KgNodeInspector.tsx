@@ -23,6 +23,7 @@ import {
   type GraphEdge,
   type GraphFact,
   type GraphNodeDetail,
+  type GraphNodeSource,
   type GraphSchemaTriple,
 } from "./kgTypes";
 
@@ -102,6 +103,7 @@ export function KgNodeInspector({
           onNavigateNode={onNavigateNode}
           onOpenEdge={onOpenEdge}
         />
+        <SourceRecordSection project={project} scope={scope} nodeId={nodeId} />
         <SchemaSection type={type} triples={schemaTriples} />
       </div>
     </div>
@@ -422,6 +424,155 @@ function EdgeRow({
           ⓘ
         </button>
       ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Source-record section — the underlying jeevy DB row behind this node ("DB
+// RECORD" peek). The projection is lossy (drops owner_kind, status, timestamps);
+// this shows ground truth + doubles as a projection-QA surface (projected facts
+// above vs source row here). On-demand: fetches only when expanded, so rapid
+// node-clicking during exploration doesn't fire a request per click.
+// ---------------------------------------------------------------------------
+
+type SourceLoadState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ok"; source: GraphNodeSource };
+
+function SourceRecordSection({
+  project,
+  scope,
+  nodeId,
+}: {
+  project: string | undefined;
+  scope: string;
+  nodeId: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [state, setState] = useState<SourceLoadState>({ status: "idle" });
+
+  // Reset when the selected node changes — so expanding always shows the CURRENT
+  // node's record, never a stale fetch from a previously-selected node.
+  useEffect(() => {
+    setOpen(false);
+    setState({ status: "idle" });
+  }, [nodeId, scope, project]);
+
+  // On-demand fetch — only when first expanded (idle → loading).
+  useEffect(() => {
+    if (!open || state.status !== "idle") return;
+    if (!project) {
+      setState({ status: "error", message: "no project in route" });
+      return;
+    }
+    setState({ status: "loading" });
+    let cancelled = false;
+
+    const url =
+      `${GRAPH_URL}/${encodeURIComponent(project)}/node/${encodeURIComponent(nodeId)}/source` +
+      `?scope=${encodeURIComponent(scope)}`;
+    fetch(url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        return r.json();
+      })
+      .then((json) => {
+        if (!cancelled)
+          setState({ status: "ok", source: json.data as GraphNodeSource });
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setState({ status: "error", message: String(err) });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, state.status, project, scope, nodeId]);
+
+  return (
+    <section className="mt-4 pt-3 border-t border-border/30">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5 hover:text-foreground transition-colors"
+        title="Fetch the underlying source DB row behind this node — ground truth, including fields the KG projection drops (owner_kind, status, timestamps)"
+      >
+        <span>{open ? "▾" : "▸"}</span>
+        <span>db record</span>
+        <span className="normal-case opacity-50"> — source of truth</span>
+      </button>
+      {open ? <SourceRecordBody state={state} /> : null}
+    </section>
+  );
+}
+
+function SourceRecordBody({ state }: { state: SourceLoadState }) {
+  if (state.status === "idle" || state.status === "loading") {
+    return (
+      <p className="text-xs text-muted-foreground">loading source record…</p>
+    );
+  }
+  if (state.status === "error") {
+    return (
+      <p className="text-xs text-destructive">
+        Failed to load source record: {state.message}
+      </p>
+    );
+  }
+
+  const { source } = state;
+  // Graceful-empty: out-of-scope, or a name/composite-keyed type with no PK row.
+  if (!source.found) {
+    return (
+      <p className="text-[11px] text-muted-foreground italic">
+        {source.reason || "No single source row for this node type."}
+      </p>
+    );
+  }
+
+  const row = source.row ?? {};
+  const entries = Object.entries(row);
+  return (
+    <div className="space-y-1.5">
+      {/* Identity header — which table + PK this row came from. */}
+      <div className="rounded-md border border-border/40 bg-muted/20 px-2.5 py-1.5 text-[10px] font-mono text-muted-foreground space-y-0.5">
+        {source.table ? (
+          <p>
+            <span className="text-foreground/80">{source.table}</span>
+            {source.source_id !== undefined ? `  #${source.source_id}` : ""}
+          </p>
+        ) : null}
+        {source.canonical_key ? <p>{source.canonical_key}</p> : null}
+      </div>
+
+      {entries.length > 0 ? (
+        <div className="space-y-1">
+          {entries.map(([k, v]) => (
+            <div
+              key={k}
+              className="rounded-md border border-border bg-card/60 px-2.5 py-1 text-xs"
+            >
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="font-mono text-muted-foreground shrink-0">
+                  {k}
+                </span>
+                <span className="font-mono text-foreground/90 break-all text-right">
+                  {v === null ? (
+                    <span className="italic text-muted-foreground">null</span>
+                  ) : (
+                    String(v)
+                  )}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="text-[11px] text-muted-foreground italic">Empty row.</p>
+      )}
     </div>
   );
 }

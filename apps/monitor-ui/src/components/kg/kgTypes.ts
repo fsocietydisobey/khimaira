@@ -125,6 +125,32 @@ export interface GraphNodeDetailResponse {
   data: GraphNodeDetail;
 }
 
+/**
+ * Underlying SOURCE DB record behind a projected node — the "DB RECORD" peek.
+ * Served by GET /api/graph/<project>/node/<id>/source?scope=… (daemon → adapter).
+ *
+ * `found:false` is a graceful-empty case (NOT an error): the node is out of
+ * scope, OR its type is name/composite-keyed (part, bom-line, organization, …)
+ * with no single source PK to resolve. `reason` explains which. Only PK-keyed
+ * types (job, task, workstream, line_item, user, personnel) return a `row`.
+ * Secrets are redacted server-side, so `row` is safe to render verbatim.
+ */
+export interface GraphNodeSource {
+  found: boolean;
+  node_id: string;
+  node_type?: string;
+  canonical_key?: string;
+  table?: string;
+  source_id?: string | number;
+  row?: Record<string, string | number | boolean | null> | null;
+  reason?: string;
+}
+
+export interface GraphNodeSourceResponse {
+  data: GraphNodeSource;
+  meta?: Record<string, string | number | null>;
+}
+
 // ---------------------------------------------------------------------------
 // Mock fixture — generic-shaped. The sample VALUES are illustrative (a fab-shop
 // graph), but the TYPES are open strings: the renderer handles any of them via

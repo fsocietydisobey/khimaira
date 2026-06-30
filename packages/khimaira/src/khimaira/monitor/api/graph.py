@@ -316,6 +316,26 @@ def build_router():
             project, adapter, _sub_url(adapter["url"], f"node/{node_id}"), scope
         )
 
+    @router.get("/graph/{project}/node/{node_id}/source")
+    async def get_graph_node_source(
+        project: str, node_id: str, scope: str = ""
+    ) -> dict[str, Any]:
+        """Proxy a node's underlying SOURCE DB record — the "DB RECORD" peek.
+
+        Returns the real source row behind the projected KG node, so the viewer
+        can show ground-truth fields the projection drops (owner_kind, status,
+        timestamps). Adapter envelope passed through verbatim:
+        `{data:{found, node_type, canonical_key, table, source_id, row}, meta}`.
+        `found:false` (node out-of-scope, OR a name/composite-keyed type with no
+        single source PK) is a graceful-empty case with `data.reason`, NOT an
+        error. The opaque node_id passes through verbatim — only the adapter
+        resolves it (via its canonical_key → table+PK registry).
+        """
+        adapter = _adapter_or_404(project)
+        return await _proxy_get(
+            project, adapter, _sub_url(adapter["url"], f"node/{node_id}/source"), scope
+        )
+
     @router.get("/graph/{project}/edge/{edge_id}")
     async def get_graph_edge(project: str, edge_id: str, scope: str = "") -> dict[str, Any]:
         """Proxy a single edge's provenance (the edge-debug surface) to the

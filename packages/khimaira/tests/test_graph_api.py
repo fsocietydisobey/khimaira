@@ -347,6 +347,86 @@ def test_graph_node_502_adapter_unreachable(graph_mod, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Source-record proxy: GET /api/graph/<project>/node/<id>/source (DB-RECORD peek)
+# ---------------------------------------------------------------------------
+
+_NODE_SOURCE_FOUND = {
+    "data": {
+        "found": True,
+        "node_id": "uuid-1",
+        "node_type": "job",
+        "canonical_key": "job:688",
+        "table": "deliverables",
+        "source_id": 688,
+        "row": {"id": 688, "owner_kind": "project", "status": "active"},
+    },
+    "meta": {"scope": "shop:10", "shop_id": 10},
+}
+
+_NODE_SOURCE_NOT_FOUND = {
+    "data": {
+        "found": False,
+        "node_id": "uuid-2",
+        "node_type": "bom-line",
+        "row": None,
+        "reason": "name-keyed type has no single source PK",
+    },
+    "meta": {"scope": "shop:10"},
+}
+
+
+def test_source_url_derivation():
+    from khimaira.monitor.api.graph import _sub_url
+
+    assert (
+        _sub_url("http://j/internal/kg/graph", "node/u1/source")
+        == "http://j/internal/kg/node/u1/source"
+    )
+
+
+def test_graph_node_source_proxies_to_source_subpath(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_NODE_SOURCE_FOUND)),
+    )
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal/node/uuid-1/source", params={"scope": "shop:10"}
+    )
+    assert r.status_code == 200
+    assert r.json() == _NODE_SOURCE_FOUND
+    # Proxied to the derived node/<id>/source sub-path, scope forwarded.
+    assert _FakeClient.last_url == "http://x/internal/kg/node/uuid-1/source"
+    assert _FakeClient.last_params == {"scope": "shop:10"}
+
+
+def test_graph_node_source_found_false_passthrough(graph_mod, monkeypatch):
+    """found:false (name-keyed type / out-of-scope) is a graceful-empty case the
+    adapter returns at HTTP 200 — the proxy passes it through verbatim, NOT a 4xx."""
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_NODE_SOURCE_NOT_FOUND)),
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/node/uuid-2/source")
+    assert r.status_code == 200
+    assert r.json()["data"]["found"] is False
+    assert r.json()["data"]["reason"]
+
+
+def test_graph_node_source_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/node/uuid-1/source")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # Edge-detail proxy: GET /api/graph/<project>/edge/<id>
 # ---------------------------------------------------------------------------
 
