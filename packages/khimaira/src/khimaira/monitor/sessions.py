@@ -3224,6 +3224,37 @@ _LIST_SESSIONS_TTL = 2.0
 _list_sessions_cache: tuple[float, list[dict]] | None = None
 _list_sessions_lock = None  # lazy init to avoid threading import on cold path
 
+# Context-% cache. roster_recovery._compute_context_pct (the source of truth —
+# transcript-derived, 1M-window-aware) reads the WHOLE transcript, so it's too
+# heavy to run per session on every list_sessions call. Cache it per session at a
+# longer TTL than the 2s list cache: the accurate 1M-based % is what we surface to
+# the dashboard so nobody has to trust CC's footer (which meters against 200k and
+# pins at 100% for any 1M seat past 200k). See _compute_context_pct docstring.
+_CONTEXT_PCT_TTL = float(os.environ.get("KHIMAIRA_CONTEXT_PCT_TTL", "30"))
+_context_pct_cache: dict[str, tuple[float, int | None]] = {}
+
+
+def _cached_context_pct(session_id: str) -> int | None:
+    """Per-session-cached context-window usage % (0–100, 1M-aware), or None.
+
+    Wraps roster_recovery._compute_context_pct with a TTL cache so list_sessions
+    can surface the real number without a full transcript read per row per call.
+    Lazy import avoids the sessions↔roster_recovery circular dependency.
+    """
+    now = time.time()
+    cached = _context_pct_cache.get(session_id)
+    if cached is not None and now - cached[0] < _CONTEXT_PCT_TTL:
+        return cached[1]
+    pct: int | None
+    try:
+        from khimaira.monitor.roster_recovery import _compute_context_pct
+
+        pct = _compute_context_pct(session_id)
+    except Exception:
+        pct = None
+    _context_pct_cache[session_id] = (now, pct)
+    return pct
+
 
 def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[dict]:
     """All sessions with their last-modified timestamp + summary counts.
@@ -3347,6 +3378,10 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
                     "file_touch_count": files,
                     "open_question_count": open_q,
                     "roster_status": roster_status,
+                    # Accurate 1M-aware context usage % (0–100) — the gauge CC's
+                    # 200k-scaled footer can't show for opus[1m] seats. None on
+                    # read failure / no usage records yet.
+                    "context_pct": _cached_context_pct(sd.name),
                 }
             )
         out.sort(key=lambda r: r.get("last_active", 0), reverse=True)

@@ -1540,12 +1540,17 @@ async def session_list() -> str:
         age_str = f"{age_s / 60:.0f}m ago" if age_s < 3600 else f"{age_s / 3600:.1f}h ago"
         name = s.get("name")
         ident = f"`{name}` (id: {s['session_id']})" if name else f"`{s['session_id']}`"
+        # Accurate 1M-aware context usage — NOT CC's footer (which meters against
+        # 200k and pins at 100% for any opus[1m] seat past 200k).
+        ctx_pct = s.get("context_pct")
+        ctx_str = f", ctx={ctx_pct}%" if isinstance(ctx_pct, int) else ""
         parts.append(
             f"- {ident} "
             f"({status.get('status', '?')}) — "
             f"last active {age_str}, "
             f"decisions={s.get('decision_count', 0)}, "
             f"open_q={s.get('open_question_count', 0)}"
+            f"{ctx_str}"
         )
     parts.append(
         "\n_💡 Pass any name/id above directly to `session_state`, "

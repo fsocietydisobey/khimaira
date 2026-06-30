@@ -367,6 +367,54 @@ def test_is_mid_turn_crash_cap_false(isolated_state, monkeypatch):
     assert isolated_state.is_mid_turn(sid) is False
 
 
+# ---------------------------------------------------------------------------
+# context_pct surfacing — the accurate 1M-aware context % (CC's footer meters
+# against 200k and pins at 100% for opus[1m] seats; this is the real number).
+# ---------------------------------------------------------------------------
+
+
+def test_list_sessions_row_carries_context_pct(isolated_state, monkeypatch):
+    import khimaira.monitor.roster_recovery as rr
+
+    monkeypatch.setattr(rr, "_compute_context_pct", lambda _sid: 42)
+    isolated_state._context_pct_cache.clear()
+    sid = "ctx-pct-row"
+    isolated_state._session_dir(sid).mkdir(parents=True, exist_ok=True)
+    (isolated_state._session_dir(sid) / "status.json").write_text(
+        '{"status": "implementing"}'
+    )
+    rows = isolated_state.list_sessions(use_cache=False)
+    row = next(r for r in rows if r["session_id"] == sid)
+    assert row["context_pct"] == 42
+
+
+def test_cached_context_pct_caches_within_ttl(isolated_state, monkeypatch):
+    import khimaira.monitor.roster_recovery as rr
+
+    calls = {"n": 0}
+
+    def _fake(_sid):
+        calls["n"] += 1
+        return 50
+
+    monkeypatch.setattr(rr, "_compute_context_pct", _fake)
+    isolated_state._context_pct_cache.clear()
+    assert isolated_state._cached_context_pct("s1") == 50
+    assert isolated_state._cached_context_pct("s1") == 50  # served from cache
+    assert calls["n"] == 1  # computed once, not twice
+
+
+def test_cached_context_pct_failopen_none(isolated_state, monkeypatch):
+    import khimaira.monitor.roster_recovery as rr
+
+    def _boom(_sid):
+        raise RuntimeError("transcript read blew up")
+
+    monkeypatch.setattr(rr, "_compute_context_pct", _boom)
+    isolated_state._context_pct_cache.clear()
+    assert isolated_state._cached_context_pct("s2") is None  # fail-open, no raise
+
+
 def test_summary_surfaces_effective_status(isolated_state, busy_stale_thresholds):
     from khimaira.monitor.sessions import set_status, summary
 
