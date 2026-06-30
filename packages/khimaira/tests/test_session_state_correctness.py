@@ -290,6 +290,83 @@ def test_unreachable_still_wins_over_busy_stale(monkeypatch):
     assert out["effective_status"] == "unreachable"
 
 
+# ---------------------------------------------------------------------------
+# Mid-turn liveness (griffin-0 report 2026-06-29) — a seat mid-LLM-generation
+# emits no hooks, so the recency signals go silent and the staleness tiers
+# falsely demote it to idle/unreachable. An OPEN turn (turn_start.txt later than
+# turn_end.txt) proves it is alive-busy and must veto the demotion.
+# ---------------------------------------------------------------------------
+
+
+def test_mid_turn_suppresses_idle_rewrite(busy_stale_thresholds):
+    from khimaira.monitor.sessions import _compute_effective_status
+
+    old = time.time() - 5  # past busy-stale: would normally rewrite active→idle
+    out = _compute_effective_status({"status": "researching"}, old, mid_turn=True)
+    assert out["effective_status"] == "researching"  # NOT rewritten to idle
+    assert out["mid_turn"] is True
+    assert "status_stale" not in out
+
+
+def test_mid_turn_suppresses_unreachable_demotion(monkeypatch):
+    monkeypatch.setenv("KHIMAIRA_DEMOTE_THRESHOLD_S", "2")
+    from khimaira.monitor.sessions import _compute_effective_status
+
+    # 10s silence would demote to unreachable; mid_turn must veto that.
+    out = _compute_effective_status(
+        {"status": "implementing"}, time.time() - 10, mid_turn=True
+    )
+    assert out["effective_status"] == "implementing"
+    assert out["mid_turn"] is True
+
+
+def test_not_mid_turn_preserves_demotion(monkeypatch):
+    # regression: with mid_turn=False (default) the demotion path is unchanged.
+    monkeypatch.setenv("KHIMAIRA_DEMOTE_THRESHOLD_S", "2")
+    from khimaira.monitor.sessions import _compute_effective_status
+
+    out = _compute_effective_status({"status": "implementing"}, time.time() - 10)
+    assert out["effective_status"] == "unreachable"
+    assert "mid_turn" not in out
+
+
+def _write_marker(sessions_mod, sid: str, name: str, ts: float) -> None:
+    from datetime import datetime, timezone
+
+    sd = sessions_mod._session_dir(sid)
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / name).write_text(datetime.fromtimestamp(ts, timezone.utc).isoformat())
+
+
+def test_is_mid_turn_open_turn_true(isolated_state):
+    sid = "mid-turn-open"
+    _write_marker(isolated_state, sid, "turn_start.txt", time.time() - 30)
+    # no turn_end.txt → turn is open
+    assert isolated_state.is_mid_turn(sid) is True
+
+
+def test_is_mid_turn_closed_turn_false(isolated_state):
+    sid = "mid-turn-closed"
+    _write_marker(isolated_state, sid, "turn_start.txt", time.time() - 60)
+    _write_marker(isolated_state, sid, "turn_end.txt", time.time() - 30)  # end > start
+    assert isolated_state.is_mid_turn(sid) is False
+
+
+def test_is_mid_turn_no_start_false(isolated_state):
+    sid = "mid-turn-nostart"
+    isolated_state._session_dir(sid).mkdir(parents=True, exist_ok=True)
+    assert isolated_state.is_mid_turn(sid) is False
+
+
+def test_is_mid_turn_crash_cap_false(isolated_state, monkeypatch):
+    # turn open longer than KHIMAIRA_MAX_TURN_S = process likely died mid-turn
+    # without firing the Stop hook → stop trusting the marker, allow demotion.
+    monkeypatch.setenv("KHIMAIRA_MAX_TURN_S", "10")
+    sid = "mid-turn-crashed"
+    _write_marker(isolated_state, sid, "turn_start.txt", time.time() - 100)
+    assert isolated_state.is_mid_turn(sid) is False
+
+
 def test_summary_surfaces_effective_status(isolated_state, busy_stale_thresholds):
     from khimaira.monitor.sessions import set_status, summary
 

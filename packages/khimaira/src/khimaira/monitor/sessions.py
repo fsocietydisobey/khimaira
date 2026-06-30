@@ -1646,8 +1646,60 @@ _ACTIVE_WORK_STATUSES = frozenset(
 _WAITING_STATUSES = frozenset({"blocked", "awaiting-review", "awaiting_review"})
 
 
+def _read_marker_ts(path: Path) -> float | None:
+    """Read an ISO-8601 timestamp marker file → epoch seconds, or None on any
+    failure (missing, empty, unparseable)."""
+    try:
+        raw = path.read_text().strip()
+    except (OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def is_mid_turn(session_id: str) -> bool:
+    """True when the session has an OPEN turn — i.e. it is mid-LLM-generation.
+
+    The UserPromptSubmit hook stamps ``turn_start.txt`` at the top of every turn;
+    the Stop hook stamps ``turn_end.txt`` when the turn finishes (and the seat goes
+    idle at the prompt). A turn is OPEN when start > end.
+
+    This is the ONE liveness signal that survives a long no-tool-call turn:
+    ``last_sse_heartbeat`` and ``last_tool_call_ts`` both fire ONLY on tool calls
+    (the heartbeat is stamped by the PostToolUse hook), so a 40-minute "thinking"
+    turn looks silent to them and trips the staleness demotion in
+    ``_compute_effective_status``. An open turn proves the seat is alive-busy.
+
+    Capped at ``KHIMAIRA_MAX_TURN_S`` (default 3600s): a turn that has been open
+    longer than any real turn means the process likely died mid-turn without
+    firing the Stop hook — past the cap we stop trusting the marker so a
+    genuinely-dead seat can still be demoted. Within the cap the kitty-window
+    paths (roster_recovery / _classify_unresponsive) remain the death-detector.
+
+    Fail-open: any error → False (fall back to the recency heuristic).
+    """
+    try:
+        sd = _session_dir(session_id)
+        start = _read_marker_ts(sd / "turn_start.txt")
+        if start is None:
+            return False
+        end = _read_marker_ts(sd / "turn_end.txt")
+        if end is not None and end >= start:
+            return False  # turn closed — idle at the prompt
+        max_turn_s = int(os.environ.get("KHIMAIRA_MAX_TURN_S", 3600))
+        return (time.time() - start) < max_turn_s
+    except Exception:
+        return False
+
+
 def _compute_effective_status(
-    status: dict | None, last_tool_call_ts: float | None
+    status: dict | None,
+    last_tool_call_ts: float | None,
+    mid_turn: bool = False,
 ) -> dict:
     """Return status dict with `effective_status` field added.
 
@@ -1671,6 +1723,17 @@ def _compute_effective_status(
     out = dict(status)
     raw_status = status.get("status", "unknown")
     out["effective_status"] = raw_status  # default: trust the field
+
+    # Mid-generation override: an OPEN turn proves the seat is alive-busy even
+    # when the recency signals (heartbeat / tool-call) have gone silent. LLM
+    # generation emits no hooks, so a long no-tool-call turn would otherwise trip
+    # the staleness demotion below (false 'idle' at busy_stale_s, false
+    # 'unreachable' at demote_threshold_s). Trust the raw status; never demote
+    # mid-turn. (Filed by griffin-0 2026-06-29: working seats in 19-42min turns
+    # falsely read idle/unreachable; the SUPERSEDE retractions proved it false.)
+    if mid_turn:
+        out["mid_turn"] = True
+        return out
 
     now = time.time()
     last_hb_iso = status.get("last_sse_heartbeat")
@@ -1742,7 +1805,9 @@ def state(session_id: str, recent: int = 10, *, workspace: str | None = None) ->
             ).timestamp()
         except (ValueError, KeyError):
             pass
-    status = _compute_effective_status(status_raw, last_tool_ts)
+    status = _compute_effective_status(
+        status_raw, last_tool_ts, mid_turn=is_mid_turn(session_id)
+    )
 
     return {
         "session_id": session_id,
@@ -1789,7 +1854,13 @@ def summary(session_id: str) -> dict:
     # Apply staleness so a quiet 'researching'/'blocked' doesn't read as busy
     # (muther GAP symptom 1). last_mtime is the most-recent activity timestamp.
     # Preserve None when there's no status.json (don't synthesize a dict).
-    status = _compute_effective_status(status_raw, last_mtime or None) if status_raw else None
+    status = (
+        _compute_effective_status(
+            status_raw, last_mtime or None, mid_turn=is_mid_turn(session_id)
+        )
+        if status_raw
+        else None
+    )
 
     return {
         "session_id": session_id,
@@ -2838,7 +2909,11 @@ def post_notice(
         target_state = state(target_session_id)
         target_status = target_state.get("status") or {}
         effective = target_status.get("effective_status", "unknown")
-        note["target_reachable"] = effective in _USABLE_STATUSES
+        # A mid-turn seat is alive-busy → reachable, even if its raw work-status
+        # (reviewing/debugging/orchestrating) isn't in _USABLE_STATUSES.
+        note["target_reachable"] = (
+            effective in _USABLE_STATUSES or bool(target_status.get("mid_turn"))
+        )
         note["target_status"] = effective
         note["target_last_active_iso"] = target_status.get(
             "updated_at"
@@ -3236,7 +3311,9 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
                     ).timestamp()
                 except (ValueError, KeyError):
                     pass
-            status = _compute_effective_status(status_raw, last_tool_ts)
+            status = _compute_effective_status(
+                status_raw, last_tool_ts, mid_turn=is_mid_turn(sd.name)
+            )
 
             # Resolve workspace from status.json once + surface in the row
             # so cached lookups don't need to re-stat status.json.

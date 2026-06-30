@@ -150,6 +150,13 @@ def _classify_unresponsive(session_id: str) -> str:
         from khimaira.monitor import roster_recovery as _rr
         from khimaira.monitor import sessions as _sess
 
+        # Open turn = alive-busy, even with no new tool log. A cheap (two
+        # small file reads) ground-truth that survives a long no-tool-call
+        # generation — and covers the cases where the kitty probe below would
+        # return "unknown" (kitty unreachable) or mis-read the spinner.
+        if _sess.is_mid_turn(session_id):
+            return "busy"
+
         # session_id → session name (the kitty window title)
         name = None
         try:

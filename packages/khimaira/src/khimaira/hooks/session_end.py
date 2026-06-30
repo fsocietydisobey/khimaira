@@ -103,6 +103,32 @@ _DRAIN_ENABLED = os.environ.get("KHIMAIRA_DRAIN_BEFORE_IDLE", "1") != "0"
 _DRAIN_BLOCK_CAP = int(os.environ.get("KHIMAIRA_DRAIN_BLOCK_CAP", "10") or "10")
 
 
+def _stamp_turn_end(session_id: str) -> None:
+    """Mark the turn as ended (seat going idle at the prompt).
+
+    Paired with ``turn_start.txt`` (stamped by the UserPromptSubmit hook). The
+    daemon's liveness check (``sessions.is_mid_turn``) treats start>end as an
+    OPEN turn = alive-busy, so a long no-tool-call generation isn't mis-read as
+    idle/unreachable. Stamped ONLY when the Stop proceeds — NOT when
+    drain-before-idle blocks and the turn continues (a blocked Stop is still
+    'working'). Fail-open: never raises into the Stop hook.
+    """
+    import datetime
+
+    state_dir = (
+        Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
+        / "khimaira"
+        / "sessions"
+        / session_id
+    )
+    with contextlib.suppress(Exception):
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "turn_end.txt").write_text(
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            encoding="utf-8",
+        )
+
+
 def _drain_counter_path(session_id: str) -> Path:
     return Path(tempfile.gettempdir()) / f"khimaira-drain-{session_id}.count"
 
@@ -254,6 +280,12 @@ def main() -> int:
             return drain_exit
     except Exception:
         pass
+
+    # The Stop is proceeding (drain did NOT block) — the seat is going idle at
+    # the prompt. Close the turn so the daemon stops reading it as mid-generation.
+    # Placed AFTER the drain gate: a blocked Stop returns above and the turn stays
+    # open (still working). Fail-open.
+    _stamp_turn_end(session_id)
 
     session_name = _get_session_name(session_id)
     domain = detect_domain(session_name)
