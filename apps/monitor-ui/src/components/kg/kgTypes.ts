@@ -142,7 +142,10 @@ export interface GraphNodeSource {
   canonical_key?: string;
   table?: string;
   source_id?: string | number;
-  row?: Record<string, string | number | boolean | null> | null;
+  /** The source row. Values may be nested objects/arrays (jsonb columns like
+   *  `digest`, `strategy`), so the type is `unknown` per value — the renderer
+   *  pretty-prints objects rather than String()-ing them to "[object Object]". */
+  row?: Record<string, unknown> | null;
   reason?: string;
 }
 

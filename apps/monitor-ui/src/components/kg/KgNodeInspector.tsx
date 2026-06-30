@@ -549,27 +549,42 @@ function SourceRecordBody({ state }: { state: SourceLoadState }) {
       {entries.length > 0 ? (
         <div className="space-y-1">
           {entries.map(([k, v]) => (
-            <div
-              key={k}
-              className="rounded-md border border-border bg-card/60 px-2.5 py-1 text-xs"
-            >
-              <div className="flex items-baseline justify-between gap-2">
-                <span className="font-mono text-muted-foreground shrink-0">
-                  {k}
-                </span>
-                <span className="font-mono text-foreground/90 break-all text-right">
-                  {v === null ? (
-                    <span className="italic text-muted-foreground">null</span>
-                  ) : (
-                    String(v)
-                  )}
-                </span>
-              </div>
-            </div>
+            <SourceRow key={k} name={k} value={v} />
           ))}
         </div>
       ) : (
         <p className="text-[11px] text-muted-foreground italic">Empty row.</p>
+      )}
+    </div>
+  );
+}
+
+/** One source-row cell. Scalars render inline (key left, value right); nested
+ *  objects/arrays (jsonb columns) pretty-print as JSON below the key, so they
+ *  read instead of collapsing to "[object Object]". */
+function SourceRow({ name, value }: { name: string; value: unknown }) {
+  const isObject = value !== null && typeof value === "object";
+
+  return (
+    <div className="rounded-md border border-border bg-card/60 px-2.5 py-1 text-xs">
+      {isObject ? (
+        <div>
+          <span className="font-mono text-muted-foreground">{name}</span>
+          <pre className="mt-0.5 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/30 px-1.5 py-1 font-mono text-[10px] text-foreground/80">
+            {JSON.stringify(value, null, 2)}
+          </pre>
+        </div>
+      ) : (
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="font-mono text-muted-foreground shrink-0">{name}</span>
+          <span className="font-mono text-foreground/90 break-all text-right">
+            {value === null ? (
+              <span className="italic text-muted-foreground">null</span>
+            ) : (
+              String(value)
+            )}
+          </span>
+        </div>
       )}
     </div>
   );
