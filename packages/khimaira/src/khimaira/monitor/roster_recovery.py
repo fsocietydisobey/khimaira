@@ -2271,6 +2271,23 @@ async def _process_window(win: dict[str, Any]) -> None:
         from khimaira.monitor.api.chats import _get_session_obligations
         from khimaira.monitor import sessions as sessions_mod
 
+        # Robust, kitty-independent alive-busy guard (mid-turn fix d969f30): an
+        # OPEN turn (turn_start > turn_end) proves the seat is mid-generation even
+        # when the kitty `busy` spinner check above missed it (fragile footer
+        # parsing / kitty-read-unknown) or the turn does no file edits (the
+        # disk-WIP guard below only sees mtimes, so a long no-tool-call reasoning
+        # turn slips past it). Checked early — cheap (two small file reads) and
+        # short-circuits before the obligation/inbox probes.
+        if await asyncio.get_running_loop().run_in_executor(
+            None, sessions_mod.is_mid_turn, session_id
+        ):
+            _log.info(
+                "roster-recovery: skip wake window=%d role=%s session=%s "
+                "(mid-turn — open turn marker, alive-busy)",
+                window_id, role, session_id[:8],
+            )
+            return
+
         obligations = await asyncio.get_running_loop().run_in_executor(
             None, _get_session_obligations, session_id
         )
