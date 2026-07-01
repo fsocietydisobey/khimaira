@@ -397,14 +397,14 @@ function EdgeRow({
         title={`follow to ${other}`}
         className="flex flex-1 items-center gap-2 rounded px-1 py-0.5 text-left hover:bg-accent/40 transition-colors min-w-0"
       >
-        <span className="text-muted-foreground font-mono">{direction}</span>
+        <span className="text-muted-foreground font-mono shrink-0">{direction}</span>
         <span
-          className="font-mono font-medium"
+          className="font-mono font-medium whitespace-nowrap shrink-0"
           style={{ color: typeColor(edge.type) }}
         >
           {edge.type}
         </span>
-        <span className="font-mono text-muted-foreground/60 truncate">
+        <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground/60">
           {other}
         </span>
         {edge.weight !== undefined ? (
@@ -690,14 +690,17 @@ function SchemaTripleRow({
 }) {
   return (
     <div className="flex items-center gap-2 text-[11px]">
-      <span className="text-muted-foreground font-mono">{dir}</span>
+      <span className="text-muted-foreground font-mono shrink-0">{dir}</span>
       <span
-        className="font-mono font-medium"
+        className="font-mono font-medium whitespace-nowrap shrink-0"
         style={{ color: typeColor(link) }}
       >
         {link}
       </span>
-      <span className="font-mono" style={{ color: typeColor(other) }}>
+      <span
+        className="min-w-0 truncate font-mono"
+        style={{ color: typeColor(other) }}
+      >
         {other}
       </span>
       <span className="ml-auto text-muted-foreground/60 font-mono shrink-0">
