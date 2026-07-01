@@ -95,7 +95,7 @@ export function KgNodeInspector({
       </div>
 
       {/* Body */}
-      <div className="flex-1 overflow-auto p-3 space-y-3">
+      <div className="flex-1 overflow-y-auto overflow-x-hidden p-3 space-y-3">
         <FactsPanel
           project={project}
           scope={scope}
@@ -285,14 +285,14 @@ function FactRow({
       )}
     >
       <div className="flex items-baseline justify-between gap-2">
-        <span className="font-mono text-foreground/90">{fact.label}</span>
+        <span className="shrink-0 font-mono text-foreground/90">{fact.label}</span>
         {metaEntries.length > 0 ? (
-          <div className="flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
+          <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
             {metaEntries.map(([k, v]) => (
               <Badge
                 key={k}
                 variant="outline"
-                className="text-[10px] py-0 px-1"
+                className="max-w-full whitespace-normal break-all text-[10px] py-0 px-1"
               >
                 {k}:{String(v)}
               </Badge>
