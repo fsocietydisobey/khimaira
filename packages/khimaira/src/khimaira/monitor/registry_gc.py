@@ -48,6 +48,15 @@ _GC_ENABLED = os.environ.get("KHIMAIRA_REGISTRY_GC", "1") != "0"
 # turns is strong evidence the older one is orphaned — but non-zero to avoid reaping
 # a session that's merely between turns. Env-overridable.
 _DUP_REAP_IDLE_MIN_S = float(os.environ.get("KHIMAIRA_REGISTRY_DUP_REAP_IDLE_S", "300"))  # 5 min
+# Audit-grade activity veto (2026-07-02): a same-window duplicate that made a TOOL
+# CALL within this window is treated as live and NEVER reaped, regardless of how its
+# turn markers compare. Turn-marker freshness is inspection-grade (a live worker
+# mid-long-build stamps a stale turn_end and looks frozen); tool-call recency is the
+# side-effect signal that outranks it. Generous by design — a settled orphan hasn't
+# issued a tool call since /clear. Env-overridable.
+_DUP_REAP_ACTIVITY_VETO_S = float(
+    os.environ.get("KHIMAIRA_REGISTRY_DUP_ACTIVITY_VETO_S", "900")
+)  # 15 min
 
 
 def _name_from_cmdline(cmdline: list[str]) -> str | None:
@@ -63,6 +72,19 @@ def _name_from_cmdline(cmdline: list[str]) -> str | None:
         if tok.startswith("--session-name="):
             return tok.split("=", 1)[1].strip() or None
     return None
+
+
+def _iso_to_epoch(raw: str | None) -> float | None:
+    """Parse an ISO-8601 tool-call timestamp → epoch seconds, or None on any
+    failure. Mirrors sessions._read_marker_ts' parse for a raw string (not a file)."""
+    if not raw:
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return None
 
 
 def _live_window_identities() -> set[str] | None:
@@ -165,14 +187,15 @@ def reap_windowless_sessions() -> dict:
                 reaped += 1
                 log.info(
                     "registry_gc: reaped windowless session %s (name=%r, idle=%.0fs)",
-                    sid[:8], name or "(unnamed)", age,
+                    sid[:8],
+                    name or "(unnamed)",
+                    age,
                 )
         except Exception as exc:
             log.debug("registry_gc: delete %s failed: %s", sid[:8], exc)
 
     if reaped:
-        log.info("registry_gc: reaped %d windowless session(s); %d live titles",
-                 reaped, len(live))
+        log.info("registry_gc: reaped %d windowless session(s); %d live titles", reaped, len(live))
     return {"reaped": reaped, "live_titles": len(live)}
 
 
@@ -187,16 +210,25 @@ def reap_stale_window_duplicates() -> dict:
     a live window title (the live session shares it). This window_id pass is what
     catches it. Bitten twice (griffin-agent-2, then griffin-agent-1, 2026-07-01).
 
-    Discriminator = TURN-MARKER freshness. The live occupant was created AT the
-    /clear moment and takes turns afterward, so its `turn_start/turn_end` marker
-    is ALWAYS newer than the orphan's (frozen at /clear). We keep the freshest and
-    reap the clearly-staler ones.
+    Discriminator = TURN-MARKER freshness, GUARDED by tool-call activity. The live
+    occupant was created AT the /clear moment and takes turns afterward, so its
+    `turn_start/turn_end` marker is usually newer than the orphan's (frozen at
+    /clear). We keep the freshest and reap the clearly-staler ones — BUT turn-marker
+    freshness is inspection-grade and can point the wrong way: a live worker mid-
+    long-build stamps a stale `turn_end` (looks frozen) while making tool calls the
+    whole time, so a marker-only reap can evict the REAL worker and cascade its
+    chat-leave. griffin-agent-1 (2026-07-02) was reaped this way. So the survivor
+    decision is cross-checked against tool-call recency — the AUDIT-GRADE side-effect
+    signal (a session issuing tool calls, incl. chat_send/task_update, is alive).
 
     SAFETY (a false-reap here cascades chat-leaves — the BUG3 class; see
     reap_windowless_sessions' guards). We reap a duplicate ONLY when all hold:
       - it is NOT the freshest-turn session on that window,
       - the kept session has a marker and this one is CLEARLY older (skip the
         whole group if NObody has a turn marker — can't tell → reap nothing),
+      - it has NOT made a tool call within _DUP_REAP_ACTIVITY_VETO_S (absolute
+        liveness veto), AND is not at-least-as-tool-active as the kept session
+        (relative veto — audit-grade activity outranks marker freshness),
       - it is NOT mid-turn (`is_mid_turn`),
       - it has been idle >= _DUP_REAP_IDLE_MIN_S.
     Registry-only (no kitty dependency), so it runs even when the windowless
@@ -226,15 +258,26 @@ def reap_stale_window_duplicates() -> dict:
         ts = sessions_mod._read_marker_ts(sdir / "turn_start.txt")
         te = sessions_mod._read_marker_ts(sdir / "turn_end.txt")
         marks = [m for m in (ts, te) if m is not None]
+        # Audit-grade liveness: the most recent TOOL CALL (incl. chat_send /
+        # task_update). Outranks turn-marker freshness in the reap decision below.
+        last_tool: float | None = None
+        try:
+            calls = sessions_mod.recent_tool_calls(sid, limit=1)
+            if calls:
+                last_tool = _iso_to_epoch(calls[0].get("ts"))
+        except Exception:
+            last_tool = None
         groups.setdefault(int(wid), []).append(
             {
                 "sid": sid,
                 "name": (s.get("name") or "").strip(),
                 "fresh": max(marks) if marks else None,
+                "last_tool": last_tool,
                 "age": float(s.get("last_active_age_s") or 0.0),
             }
         )
 
+    now = time.time()
     reaped = 0
     for wid, members in groups.items():
         if len(members) < 2:
@@ -248,6 +291,17 @@ def reap_stale_window_duplicates() -> dict:
                 continue
             if m["fresh"] is not None and m["fresh"] >= keep["fresh"]:
                 continue  # not clearly staler than the kept session → skip
+            # AUDIT-GRADE VETO: tool-call activity outranks turn-marker freshness.
+            # A session issuing tool calls is definitionally alive; reaping it would
+            # evict a live worker and cascade its chat-leave (BUG3 class). This is
+            # what marker-only freshness got wrong for griffin-agent-1 (2026-07-02).
+            m_tool = m["last_tool"]
+            if m_tool is not None:
+                if (now - m_tool) < _DUP_REAP_ACTIVITY_VETO_S:
+                    continue  # made a tool call recently → alive (absolute veto)
+                keep_tool = keep["last_tool"]
+                if keep_tool is not None and m_tool >= keep_tool:
+                    continue  # ≥ as tool-active as the kept session → don't reap
             if m["age"] < _DUP_REAP_IDLE_MIN_S:
                 continue  # too fresh to be a settled orphan
             try:
@@ -262,7 +316,10 @@ def reap_stale_window_duplicates() -> dict:
                     log.info(
                         "registry_gc: reaped /clear-orphan %s (name=%r, idle=%.0fs) "
                         "— window %d now owned by live session %s",
-                        m["sid"][:8], m["name"] or "(unnamed)", m["age"], wid,
+                        m["sid"][:8],
+                        m["name"] or "(unnamed)",
+                        m["age"],
+                        wid,
                         keep["sid"][:8],
                     )
             except Exception as exc:
@@ -281,7 +338,8 @@ async def registry_gc_loop() -> None:
         return
     log.info(
         "registry_gc: started (idle_threshold=%ds, interval=%ds)",
-        int(_REAP_IDLE_MIN_S), int(_GC_INTERVAL_S),
+        int(_REAP_IDLE_MIN_S),
+        int(_GC_INTERVAL_S),
     )
     while True:
         try:

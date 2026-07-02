@@ -8,6 +8,7 @@ is treated as can't-tell (skip) rather than reap-everything.
 from __future__ import annotations
 
 import importlib
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -18,8 +19,10 @@ def gc_mod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     from khimaira.monitor import sessions as sess
+
     importlib.reload(sess)
     from khimaira.monitor import registry_gc as gc
+
     importlib.reload(gc)
     yield gc, sess
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
@@ -36,7 +39,9 @@ def test_noop_when_kitty_unavailable(gc_mod, monkeypatch):
     monkeypatch.setattr(gc, "_live_window_identities", lambda: None)  # kitty down
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-1", "agent-1", 99999)))
-    monkeypatch.setattr(sess, "delete_session", lambda *a, **k: deleted.append(a) or {"deleted": True})
+    monkeypatch.setattr(
+        sess, "delete_session", lambda *a, **k: deleted.append(a) or {"deleted": True}
+    )
     res = gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert res["skipped"] == "kitty-unavailable"
@@ -45,14 +50,18 @@ def test_noop_when_kitty_unavailable(gc_mod, monkeypatch):
 
 def test_reaps_windowless_idle_session(gc_mod, monkeypatch):
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1", "master"})  # agent-2 gone
+    monkeypatch.setattr(
+        gc, "_live_window_identities", lambda: {"agent-1", "master"}
+    )  # agent-2 gone
     deleted = []
     monkeypatch.setattr(
-        sess, "list_sessions",
+        sess,
+        "list_sessions",
         lambda **k: _rows(("uuid-1", "agent-1", 99999), ("uuid-2", "agent-2", 99999)),
     )
-    monkeypatch.setattr(sess, "delete_session",
-                        lambda sid, **k: deleted.append(sid) or {"deleted": True})
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
     res = gc.reap_windowless_sessions()
     assert res["reaped"] == 1
     assert deleted == ["uuid-2"], "only the windowless session is reaped"
@@ -63,8 +72,9 @@ def test_keeps_live_window_session(gc_mod, monkeypatch):
     monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-1", "agent-1", 99999)))
-    monkeypatch.setattr(sess, "delete_session",
-                        lambda sid, **k: deleted.append(sid) or {"deleted": True})
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
     res = gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == []
@@ -76,10 +86,12 @@ def test_keeps_fresh_session_even_if_windowless(gc_mod, monkeypatch):
     gc, sess = gc_mod
     monkeypatch.setattr(gc, "_live_window_identities", lambda: {"master"})
     deleted = []
-    monkeypatch.setattr(sess, "list_sessions",
-                        lambda **k: _rows(("uuid-new", "agent-9", 5)))  # 5s old
-    monkeypatch.setattr(sess, "delete_session",
-                        lambda sid, **k: deleted.append(sid) or {"deleted": True})
+    monkeypatch.setattr(
+        sess, "list_sessions", lambda **k: _rows(("uuid-new", "agent-9", 5))
+    )  # 5s old
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
     res = gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == [], "fresh session must not be reaped (window not bound yet)"
@@ -93,8 +105,9 @@ def test_empty_set_is_noop_not_mass_reap(gc_mod, monkeypatch):
     monkeypatch.setattr(gc, "_live_window_identities", lambda: set())
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-1", "agent-1", 99999)))
-    monkeypatch.setattr(sess, "delete_session",
-                        lambda sid, **k: deleted.append(sid) or {"deleted": True})
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
     res = gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert res["skipped"] == "kitty-empty-suspicious"
@@ -106,19 +119,23 @@ def test_title_drift_not_reaped_when_cmdline_name_matches(gc_mod, monkeypatch):
     session name must NOT be reaped — its launch `-n` name still proves it live."""
     gc, sess = gc_mod
     # window title is something unrelated, but cmdline carries -n muther-agent-3
-    monkeypatch.setattr(gc, "_live_window_identities",
-                        lambda: {"some-drifted-title", "muther-agent-3"})
+    monkeypatch.setattr(
+        gc, "_live_window_identities", lambda: {"some-drifted-title", "muther-agent-3"}
+    )
     deleted = []
-    monkeypatch.setattr(sess, "list_sessions",
-                        lambda **k: _rows(("uuid-3", "muther-agent-3", 99999)))
-    monkeypatch.setattr(sess, "delete_session",
-                        lambda sid, **k: deleted.append(sid) or {"deleted": True})
+    monkeypatch.setattr(
+        sess, "list_sessions", lambda **k: _rows(("uuid-3", "muther-agent-3", 99999))
+    )
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
     res = gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == [], "launch -n name proves liveness despite title drift"
 
 
 # --- _name_from_cmdline parsing + identity collection -----------------------
+
 
 def test_name_from_cmdline_variants(gc_mod):
     gc, _ = gc_mod
@@ -132,11 +149,25 @@ def test_name_from_cmdline_variants(gc_mod):
 def test_live_identities_includes_title_and_cmdline_name(gc_mod, monkeypatch):
     gc, _ = gc_mod
     import json as _json
-    ls = [{"tabs": [{"windows": [{
-        "title": "drifted-title",
-        "foreground_processes": [{"cmdline": ["claude", "-n", "muther-agent-3"]}],
-    }]}]}]
+
+    ls = [
+        {
+            "tabs": [
+                {
+                    "windows": [
+                        {
+                            "title": "drifted-title",
+                            "foreground_processes": [
+                                {"cmdline": ["claude", "-n", "muther-agent-3"]}
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
     from khimaira.monitor import roster_recovery as rr
+
     monkeypatch.setattr(rr, "_kitty", lambda *a: _json.dumps(ls))
     ids = gc._live_window_identities()
     assert "drifted-title" in ids and "muther-agent-3" in ids
@@ -150,11 +181,23 @@ def test_decorated_title_yields_de_decorated_identity(gc_mod, monkeypatch):
     de-decorated identity so the marked window still proves "muther" alive."""
     gc, _ = gc_mod
     import json as _json
-    ls = [{"tabs": [{"windows": [{
-        "title": "✳ muther",
-        "foreground_processes": [{"cmdline": ["claude-chat", "-r", "muther"]}],
-    }]}]}]
+
+    ls = [
+        {
+            "tabs": [
+                {
+                    "windows": [
+                        {
+                            "title": "✳ muther",
+                            "foreground_processes": [{"cmdline": ["claude-chat", "-r", "muther"]}],
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
     from khimaira.monitor import roster_recovery as rr
+
     monkeypatch.setattr(rr, "_kitty", lambda *a: _json.dumps(ls))
     ids = gc._live_window_identities()
     assert "muther" in ids, "de-decorated title must mark the session live"
@@ -168,8 +211,9 @@ def test_decorated_window_session_not_reaped(gc_mod, monkeypatch):
     monkeypatch.setattr(gc, "_live_window_identities", lambda: {"muther"})  # de-decorated
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-m", "muther", 99999)))
-    monkeypatch.setattr(sess, "delete_session",
-                        lambda sid, **k: deleted.append(sid) or {"deleted": True})
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
     res = gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == [], "decorated-title live session must survive the reaper"
@@ -182,17 +226,35 @@ def test_decorated_window_session_not_reaped(gc_mod, monkeypatch):
 # catches it by window_id + turn-marker freshness. False-reap here cascades
 # chat-leaves (BUG3), so the guards below are the contract.
 
-def _dup_env(monkeypatch, sess, rows, windows, fresh, mid=(), deleted=None):
-    """Wire the monkeypatches reap_stale_window_duplicates reads."""
+
+def _dup_env(monkeypatch, sess, rows, windows, fresh, mid=(), tools=None, deleted=None):
+    """Wire the monkeypatches reap_stale_window_duplicates reads.
+
+    `tools` maps session_id → epoch-seconds of its most recent tool call (the
+    audit-grade liveness signal). Omitted sessions report no tool calls (the
+    default), so pre-existing tests exercise the marker-only path unchanged.
+    """
+    from datetime import datetime
     from pathlib import Path
+
+    tools = tools or {}
     monkeypatch.setattr(sess, "list_sessions", lambda **k: rows)
     monkeypatch.setattr(sess, "get_session_window", lambda sid: windows.get(sid))
     monkeypatch.setattr(sess, "_session_dir", lambda sid: Path(sid))
     monkeypatch.setattr(sess, "_read_marker_ts", lambda p: fresh.get(Path(p).parent.name))
     monkeypatch.setattr(sess, "is_mid_turn", lambda sid: sid in mid)
+
+    def _fake_recent(sid, limit=1):
+        ep = tools.get(sid)
+        if ep is None:
+            return []
+        return [{"ts": datetime.fromtimestamp(ep, tz=UTC).isoformat()}]
+
+    monkeypatch.setattr(sess, "recent_tool_calls", _fake_recent)
     if deleted is not None:
-        monkeypatch.setattr(sess, "delete_session",
-                            lambda sid, **k: deleted.append(sid) or {"deleted": True})
+        monkeypatch.setattr(
+            sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+        )
 
 
 def test_reaps_clear_orphan_same_window(gc_mod, monkeypatch):
@@ -201,7 +263,8 @@ def test_reaps_clear_orphan_same_window(gc_mod, monkeypatch):
     # (turn-frozen at /clear, idle). Same name — the windowless sweep would keep it.
     deleted = []
     _dup_env(
-        monkeypatch, sess,
+        monkeypatch,
+        sess,
         rows=_rows(("live", "agent-1", 90), ("orphan", "agent-1", 99999)),
         windows={"live": 62, "orphan": 62},
         fresh={"live": 2000.0, "orphan": 1000.0},  # live turns are newer
@@ -218,7 +281,8 @@ def test_never_reaps_freshest_even_if_idle(gc_mod, monkeypatch):
     # idle past the threshold — reaping it would drop the live agent from its chats.
     deleted = []
     _dup_env(
-        monkeypatch, sess,
+        monkeypatch,
+        sess,
         rows=_rows(("live", "agent-1", 99999), ("orphan", "agent-1", 99999)),
         windows={"live": 62, "orphan": 62},
         fresh={"live": 2000.0, "orphan": 1000.0},
@@ -234,7 +298,8 @@ def test_skips_when_no_turn_markers(gc_mod, monkeypatch):
     # Neither has a turn marker → we can't tell which is live → reap NOTHING.
     deleted = []
     _dup_env(
-        monkeypatch, sess,
+        monkeypatch,
+        sess,
         rows=_rows(("a", "agent-1", 99999), ("b", "agent-1", 99999)),
         windows={"a": 62, "b": 62},
         fresh={},  # no markers for either
@@ -249,7 +314,8 @@ def test_skips_mid_turn_duplicate(gc_mod, monkeypatch):
     # An older-but-mid-turn duplicate is actively working → never reap it.
     deleted = []
     _dup_env(
-        monkeypatch, sess,
+        monkeypatch,
+        sess,
         rows=_rows(("live", "agent-1", 90), ("busy", "agent-1", 99999)),
         windows={"live": 62, "busy": 62},
         fresh={"live": 2000.0, "busy": 1000.0},
@@ -265,7 +331,8 @@ def test_skips_fresh_duplicate_under_idle_threshold(gc_mod, monkeypatch):
     # The staler session hasn't been idle long enough to be a settled orphan.
     deleted = []
     _dup_env(
-        monkeypatch, sess,
+        monkeypatch,
+        sess,
         rows=_rows(("live", "agent-1", 30), ("recent", "agent-1", 60)),  # both < 300s
         windows={"live": 62, "recent": 62},
         fresh={"live": 2000.0, "recent": 1000.0},
@@ -275,11 +342,88 @@ def test_skips_fresh_duplicate_under_idle_threshold(gc_mod, monkeypatch):
     assert res["reaped"] == 0, "too fresh to be a settled orphan → skip"
 
 
+# --- audit-grade tool-activity veto (2026-07-02) --------------------------------
+# griffin-agent-1: turn-marker freshness is inspection-grade — a live worker mid-
+# long-build stamps a stale turn_end (looks frozen) while making tool calls the
+# whole time. A marker-only reap evicted the REAL worker and cascaded its chat-leave.
+# The survivor decision is now cross-checked against tool-call recency (the side-
+# effect signal), which outranks marker freshness.
+
+
+def test_reaps_orphan_when_stale_by_both_signals(gc_mod, monkeypatch):
+    """The legit /clear-orphan case with tool data present: the orphan is staler by
+    BOTH turn markers AND tool activity (tool-silent since /clear) → still reaped."""
+    gc, sess = gc_mod
+    import time
+
+    now = time.time()
+    deleted = []
+    _dup_env(
+        monkeypatch,
+        sess,
+        rows=_rows(("live", "agent-1", 90), ("orphan", "agent-1", 99999)),
+        windows={"live": 62, "orphan": 62},
+        fresh={"live": 2000.0, "orphan": 1000.0},
+        tools={"live": now - 60, "orphan": now - 4000},  # orphan tool-silent since /clear
+        deleted=deleted,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 1 and deleted == ["orphan"], "stale by BOTH signals → reap"
+
+
+def test_never_reaps_worker_with_fresher_tool_activity(gc_mod, monkeypatch):
+    """THE griffin-agent-1 case (2026-07-02): the REAL worker has a STALER turn_end
+    (looked frozen mid-long-build) but made tool calls MORE recently than the fresher-
+    marker duplicate. Marker-only freshness would evict it + cascade its chat-leave.
+    The relative tool-activity veto catches it: audit-grade activity beats markers."""
+    gc, sess = gc_mod
+    import time
+
+    now = time.time()
+    deleted = []
+    _dup_env(
+        monkeypatch,
+        sess,
+        rows=_rows(("phantom", "agent-1", 99999), ("worker", "agent-1", 99999)),
+        windows={"phantom": 62, "worker": 62},
+        fresh={"phantom": 2000.0, "worker": 1000.0},  # phantom fresher BY MARKERS
+        tools={
+            "phantom": now - 5000,
+            "worker": now - 2000,
+        },  # worker fresher BY TOOLS (both > veto)
+        deleted=deleted,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 0 and deleted == [], "fresher tool activity vetoes marker-based reap"
+
+
+def test_recent_tool_call_vetoes_reap(gc_mod, monkeypatch):
+    """Absolute veto: a duplicate that issued a tool call within the activity window
+    is live — never reap it, even if its turn marker is staler than the kept one."""
+    gc, sess = gc_mod
+    import time
+
+    now = time.time()
+    deleted = []
+    _dup_env(
+        monkeypatch,
+        sess,
+        rows=_rows(("keep", "agent-1", 99999), ("busy", "agent-1", 99999)),
+        windows={"keep": 62, "busy": 62},
+        fresh={"keep": 2000.0, "busy": 1000.0},  # busy staler by markers
+        tools={"keep": now - 30, "busy": now - 60},  # busy tool call 60s ago (< 900s veto)
+        deleted=deleted,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 0 and deleted == [], "recent tool call → absolute liveness veto"
+
+
 def test_single_session_per_window_noop(gc_mod, monkeypatch):
     gc, sess = gc_mod
     deleted = []
     _dup_env(
-        monkeypatch, sess,
+        monkeypatch,
+        sess,
         rows=_rows(("a", "agent-1", 99999), ("b", "agent-2", 99999)),
         windows={"a": 62, "b": 63},  # distinct windows
         fresh={"a": 2000.0, "b": 2000.0},
