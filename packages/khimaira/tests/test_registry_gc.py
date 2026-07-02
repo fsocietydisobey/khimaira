@@ -173,3 +173,117 @@ def test_decorated_window_session_not_reaped(gc_mod, monkeypatch):
     res = gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == [], "decorated-title live session must survive the reaper"
+
+
+# --- /clear-orphan same-window dedup (2026-07-01) -------------------------------
+# `/clear` mints a fresh session in the same kitty window; the operator renames it
+# back, and the old record lingers with the same name+window_id. The name-based
+# windowless sweep keeps it (name is a live title). reap_stale_window_duplicates
+# catches it by window_id + turn-marker freshness. False-reap here cascades
+# chat-leaves (BUG3), so the guards below are the contract.
+
+def _dup_env(monkeypatch, sess, rows, windows, fresh, mid=(), deleted=None):
+    """Wire the monkeypatches reap_stale_window_duplicates reads."""
+    from pathlib import Path
+    monkeypatch.setattr(sess, "list_sessions", lambda **k: rows)
+    monkeypatch.setattr(sess, "get_session_window", lambda sid: windows.get(sid))
+    monkeypatch.setattr(sess, "_session_dir", lambda sid: Path(sid))
+    monkeypatch.setattr(sess, "_read_marker_ts", lambda p: fresh.get(Path(p).parent.name))
+    monkeypatch.setattr(sess, "is_mid_turn", lambda sid: sid in mid)
+    if deleted is not None:
+        monkeypatch.setattr(sess, "delete_session",
+                            lambda sid, **k: deleted.append(sid) or {"deleted": True})
+
+
+def test_reaps_clear_orphan_same_window(gc_mod, monkeypatch):
+    gc, sess = gc_mod
+    # window 62 held by BOTH: live (fresh turn marker, recently active) + orphan
+    # (turn-frozen at /clear, idle). Same name — the windowless sweep would keep it.
+    deleted = []
+    _dup_env(
+        monkeypatch, sess,
+        rows=_rows(("live", "agent-1", 90), ("orphan", "agent-1", 99999)),
+        windows={"live": 62, "orphan": 62},
+        fresh={"live": 2000.0, "orphan": 1000.0},  # live turns are newer
+        deleted=deleted,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 1
+    assert deleted == ["orphan"], "reap the turn-frozen orphan, keep the live occupant"
+
+
+def test_never_reaps_freshest_even_if_idle(gc_mod, monkeypatch):
+    gc, sess = gc_mod
+    # The freshest-turn session is the live one and must survive even if it too is
+    # idle past the threshold — reaping it would drop the live agent from its chats.
+    deleted = []
+    _dup_env(
+        monkeypatch, sess,
+        rows=_rows(("live", "agent-1", 99999), ("orphan", "agent-1", 99999)),
+        windows={"live": 62, "orphan": 62},
+        fresh={"live": 2000.0, "orphan": 1000.0},
+        deleted=deleted,
+    )
+    gc.reap_stale_window_duplicates()
+    assert deleted == ["orphan"]
+    assert "live" not in deleted, "the freshest-turn session is NEVER reaped"
+
+
+def test_skips_when_no_turn_markers(gc_mod, monkeypatch):
+    gc, sess = gc_mod
+    # Neither has a turn marker → we can't tell which is live → reap NOTHING.
+    deleted = []
+    _dup_env(
+        monkeypatch, sess,
+        rows=_rows(("a", "agent-1", 99999), ("b", "agent-1", 99999)),
+        windows={"a": 62, "b": 62},
+        fresh={},  # no markers for either
+        deleted=deleted,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 0 and deleted == [], "ambiguous → never reap"
+
+
+def test_skips_mid_turn_duplicate(gc_mod, monkeypatch):
+    gc, sess = gc_mod
+    # An older-but-mid-turn duplicate is actively working → never reap it.
+    deleted = []
+    _dup_env(
+        monkeypatch, sess,
+        rows=_rows(("live", "agent-1", 90), ("busy", "agent-1", 99999)),
+        windows={"live": 62, "busy": 62},
+        fresh={"live": 2000.0, "busy": 1000.0},
+        mid=("busy",),
+        deleted=deleted,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 0 and deleted == [], "never reap a mid-turn session"
+
+
+def test_skips_fresh_duplicate_under_idle_threshold(gc_mod, monkeypatch):
+    gc, sess = gc_mod
+    # The staler session hasn't been idle long enough to be a settled orphan.
+    deleted = []
+    _dup_env(
+        monkeypatch, sess,
+        rows=_rows(("live", "agent-1", 30), ("recent", "agent-1", 60)),  # both < 300s
+        windows={"live": 62, "recent": 62},
+        fresh={"live": 2000.0, "recent": 1000.0},
+        deleted=deleted,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 0, "too fresh to be a settled orphan → skip"
+
+
+def test_single_session_per_window_noop(gc_mod, monkeypatch):
+    gc, sess = gc_mod
+    deleted = []
+    _dup_env(
+        monkeypatch, sess,
+        rows=_rows(("a", "agent-1", 99999), ("b", "agent-2", 99999)),
+        windows={"a": 62, "b": 63},  # distinct windows
+        fresh={"a": 2000.0, "b": 2000.0},
+        deleted=deleted,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 0 and deleted == [], "no shared window → nothing to dedup"

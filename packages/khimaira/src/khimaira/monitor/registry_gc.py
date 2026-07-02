@@ -43,6 +43,11 @@ _GC_INTERVAL_S = float(os.environ.get("KHIMAIRA_REGISTRY_GC_INTERVAL_S", "600"))
 # treated as can't-tell rather than reap-everything. Opt out with
 # KHIMAIRA_REGISTRY_GC=0 if a new false-positive class surfaces.
 _GC_ENABLED = os.environ.get("KHIMAIRA_REGISTRY_GC", "1") != "0"
+# /clear-orphan dedup: how long a same-window duplicate must be idle before it's
+# reaped. Shorter than the windowless threshold — a co-located session with fresher
+# turns is strong evidence the older one is orphaned — but non-zero to avoid reaping
+# a session that's merely between turns. Env-overridable.
+_DUP_REAP_IDLE_MIN_S = float(os.environ.get("KHIMAIRA_REGISTRY_DUP_REAP_IDLE_S", "300"))  # 5 min
 
 
 def _name_from_cmdline(cmdline: list[str]) -> str | None:
@@ -171,8 +176,106 @@ def reap_windowless_sessions() -> dict:
     return {"reaped": reaped, "live_titles": len(live)}
 
 
+def reap_stale_window_duplicates() -> dict:
+    """Reap /clear-orphans: 2+ sessions sharing one kitty window_id where the
+    older one is a leftover.
+
+    The trigger: `/clear` in a roster window mints a FRESH session (new UUID,
+    nameless) in the SAME kitty window; the operator renames it back to the old
+    name, and the previous record lingers — same name AND same window_id. The
+    name-based `reap_windowless_sessions` KEEPS that orphan, because its name IS
+    a live window title (the live session shares it). This window_id pass is what
+    catches it. Bitten twice (griffin-agent-2, then griffin-agent-1, 2026-07-01).
+
+    Discriminator = TURN-MARKER freshness. The live occupant was created AT the
+    /clear moment and takes turns afterward, so its `turn_start/turn_end` marker
+    is ALWAYS newer than the orphan's (frozen at /clear). We keep the freshest and
+    reap the clearly-staler ones.
+
+    SAFETY (a false-reap here cascades chat-leaves — the BUG3 class; see
+    reap_windowless_sessions' guards). We reap a duplicate ONLY when all hold:
+      - it is NOT the freshest-turn session on that window,
+      - the kept session has a marker and this one is CLEARLY older (skip the
+        whole group if NObody has a turn marker — can't tell → reap nothing),
+      - it is NOT mid-turn (`is_mid_turn`),
+      - it has been idle >= _DUP_REAP_IDLE_MIN_S.
+    Registry-only (no kitty dependency), so it runs even when the windowless
+    sweep no-ops on kitty-unavailable.
+    """
+    try:
+        from khimaira.monitor import sessions as sessions_mod
+
+        rows = sessions_mod.list_sessions(use_cache=False)
+    except Exception as exc:
+        log.debug("registry_gc: dup-reap list_sessions failed: %s", exc)
+        return {"reaped": 0, "skipped": "list-failed"}
+
+    self_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    groups: dict[int, list[dict]] = {}
+    for s in rows:
+        sid = s.get("session_id") or ""
+        if not sid or sid == self_id:
+            continue
+        try:
+            wid = sessions_mod.get_session_window(sid)
+        except Exception:
+            wid = None
+        if not wid:
+            continue
+        sdir = sessions_mod._session_dir(sid)
+        ts = sessions_mod._read_marker_ts(sdir / "turn_start.txt")
+        te = sessions_mod._read_marker_ts(sdir / "turn_end.txt")
+        marks = [m for m in (ts, te) if m is not None]
+        groups.setdefault(int(wid), []).append(
+            {
+                "sid": sid,
+                "name": (s.get("name") or "").strip(),
+                "fresh": max(marks) if marks else None,
+                "age": float(s.get("last_active_age_s") or 0.0),
+            }
+        )
+
+    reaped = 0
+    for wid, members in groups.items():
+        if len(members) < 2:
+            continue
+        with_marker = [m for m in members if m["fresh"] is not None]
+        if not with_marker:
+            continue  # nobody has a turn marker → can't pick the live one → skip
+        keep = max(with_marker, key=lambda m: m["fresh"])
+        for m in members:
+            if m["sid"] == keep["sid"]:
+                continue
+            if m["fresh"] is not None and m["fresh"] >= keep["fresh"]:
+                continue  # not clearly staler than the kept session → skip
+            if m["age"] < _DUP_REAP_IDLE_MIN_S:
+                continue  # too fresh to be a settled orphan
+            try:
+                if sessions_mod.is_mid_turn(m["sid"]):
+                    continue  # never reap an actively-working session
+            except Exception:
+                continue  # can't confirm not-mid-turn → skip (conservative)
+            try:
+                res = sessions_mod.delete_session(m["sid"], force=True, reap=True)
+                if res.get("deleted"):
+                    reaped += 1
+                    log.info(
+                        "registry_gc: reaped /clear-orphan %s (name=%r, idle=%.0fs) "
+                        "— window %d now owned by live session %s",
+                        m["sid"][:8], m["name"] or "(unnamed)", m["age"], wid,
+                        keep["sid"][:8],
+                    )
+            except Exception as exc:
+                log.debug("registry_gc: dup-reap %s failed: %s", m["sid"][:8], exc)
+
+    if reaped:
+        log.info("registry_gc: reaped %d /clear-orphan duplicate(s)", reaped)
+    return {"reaped": reaped}
+
+
 async def registry_gc_loop() -> None:
-    """Background loop: reap windowless session records every _GC_INTERVAL_S."""
+    """Background loop: reap windowless records + /clear-orphan duplicates every
+    _GC_INTERVAL_S."""
     if not _GC_ENABLED:
         log.info("registry_gc: disabled via KHIMAIRA_REGISTRY_GC=0")
         return
@@ -185,4 +288,8 @@ async def registry_gc_loop() -> None:
             reap_windowless_sessions()
         except Exception:
             log.exception("registry_gc: sweep error")
+        try:
+            reap_stale_window_duplicates()
+        except Exception:
+            log.exception("registry_gc: dup-reap sweep error")
         await asyncio.sleep(_GC_INTERVAL_S)
