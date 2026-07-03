@@ -117,13 +117,17 @@ def _strip_fence(text: str) -> str:
     return m.group(1) if m else text.strip()
 
 
-async def _run_once(content: str, *, instruction: str = _INSTRUCTION) -> PipelineOutput:
-    """Single headless-claude invocation. Raises on any parse/validate failure.
+async def _invoke_claude(content: str, instruction: str) -> str:
+    """Single headless-claude invocation. Returns the raw `.result` string.
+    Raises on subprocess failure or a malformed envelope.
 
-    `content` goes via stdin, `instruction` via --append-system-prompt — reused
-    by both the initial structuring pass (default instruction) and
-    revalidate_note()'s "is this still accurate vs current code?" pass (its
-    own instruction, the note's existing pipeline JSON as content).
+    `content` goes via stdin, `instruction` via --append-system-prompt — the
+    shared recipe reused by the structuring pass, revalidate_note()'s
+    "is this still accurate vs current code?" pass, and answer_question()'s
+    synthesis pass. Each caller supplies its own instruction + content;
+    JSON-schema parsing (structuring/revalidation) happens one layer up in
+    _run_once — answer_question uses this raw string directly (free-form
+    prose, not a PipelineOutput).
     """
     cfg_dir = _isolated_config_dir()
     env = dict(os.environ)
@@ -156,7 +160,13 @@ async def _run_once(content: str, *, instruction: str = _INSTRUCTION) -> Pipelin
     result_text = envelope.get("result")
     if not isinstance(result_text, str):
         raise ValueError(f"envelope missing string .result: {envelope!r}")
+    return result_text
 
+
+async def _run_once(content: str, *, instruction: str = _INSTRUCTION) -> PipelineOutput:
+    """Structuring/revalidation invocation — parses+validates the result
+    against the PipelineOutput schema. Raises on any parse/validate failure."""
+    result_text = await _invoke_claude(content, instruction)
     payload = json.loads(_strip_fence(result_text))
     return PipelineOutput.model_validate(payload)
 
@@ -410,3 +420,89 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
         # so re-embedding would just waste an embed+upsert call.
         await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c: the ask-layer (the north-star capstone)
+#
+# ask → retrieve candidate notes → staleness-gated revalidate each hit
+# (cheap when the code hasn't moved, heals it when it has) → synthesize an
+# answer from the now-code-current note bodies. Every note the answer draws
+# on has just been re-grounded against the actual code, not a stale cache.
+# ---------------------------------------------------------------------------
+
+_ASK_INSTRUCTION_TEMPLATE = (
+    "Answer the question using ONLY the notes below, which have just been "
+    "re-validated against the current code. Cite the note titles you drew "
+    "on. If the notes don't cover the question, say so plainly — do not "
+    "invent an answer.\n\nNOTES:\n{notes}"
+)
+
+# Free-form prose, not the PipelineOutput schema — retry once on subprocess
+# failure, same discipline as transform_note, but no JSON parse/validate.
+_ASK_RETRY_ATTEMPTS = (1, 2)
+
+
+async def _synthesize_answer(question: str, instruction: str) -> str | None:
+    for attempt in _ASK_RETRY_ATTEMPTS:
+        try:
+            return (await _invoke_claude(question, instruction)).strip()
+        except (RuntimeError, ValueError, OSError) as exc:
+            log.warning("notebook_pipeline: answer synthesis attempt %d failed: %s", attempt, exc)
+    return None
+
+
+_NO_NOTES_ANSWER = "No relevant notes found."
+
+
+async def answer_question(question: str, *, repo: str | None = None) -> dict[str, Any]:
+    """ask → retrieve → heal-against-code → answer.
+
+    Returns {answer, sources: [note_id, ...], healed: [note_id, ...]}.
+    `sources` is every note the answer drew on (post-revalidation); `healed`
+    is the subset that actually changed during this call — a note passing
+    its staleness gate unchanged is a source but not "healed".
+    """
+    hits = await notebook_retrieval.search_notes_async(question, repo=repo)
+    if not hits:
+        return {"answer": _NO_NOTES_ANSWER, "sources": [], "healed": []}
+
+    sources: list[str] = []
+    healed: list[str] = []
+    note_sections: list[str] = []
+    for hit in hits:
+        note_id = hit["note_id"]
+        try:
+            before = notes.get_note(note_id)
+        except ValueError:
+            continue  # indexed but deleted since — skip, don't fail the whole ask
+        before_history_len = len(before.get("history") or [])
+
+        try:
+            updated = await revalidate_note(note_id)
+        except ValueError:
+            continue
+
+        if len(updated.get("history") or []) > before_history_len:
+            healed.append(note_id)
+
+        pipeline = updated.get("pipeline") or {}
+        body = (
+            pipeline.get("organized_md") or pipeline.get("summary") or updated.get("raw_text", "")
+        )
+        if not body:
+            continue
+        sources.append(note_id)
+        note_sections.append(f"### {updated.get('title', note_id)}\n\n{body}")
+
+    if not note_sections:
+        return {"answer": _NO_NOTES_ANSWER, "sources": [], "healed": healed}
+
+    instruction = _ASK_INSTRUCTION_TEMPLATE.format(notes="\n\n---\n\n".join(note_sections))
+    answer = await _synthesize_answer(question, instruction)
+    if answer is None:
+        answer = (
+            "Found relevant notes but couldn't synthesize an answer right now — "
+            "see the cited sources below."
+        )
+    return {"answer": answer, "sources": sources, "healed": healed}

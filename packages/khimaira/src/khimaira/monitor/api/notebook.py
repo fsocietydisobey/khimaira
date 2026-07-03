@@ -1,9 +1,10 @@
-"""`/api/notes`, `/api/tabs` — AI-notebook backend (Phase 1a-2b).
+"""`/api/notes`, `/api/tabs` — AI-notebook backend (Phase 1a-2c).
 
 Endpoints:
   POST   /notes                 — create a draft note; kicks off the (stub) pipeline
   GET    /notes?tab_id=         — list notes, optionally filtered by tab
   GET    /notes/search?q=       — Phase 2b: semantic search over embedded notes
+  POST   /notes/ask             — Phase 2c capstone: ask -> retrieve -> heal -> answer
   GET    /notes/{id}            — one note
   PATCH  /notes/{id}            — edit title/tab/raw_text/status/links/repo/pipeline-patch
   DELETE /notes/{id}            — delete a note
@@ -51,6 +52,11 @@ class UpdateNoteReq(BaseModel):
     pipeline: dict | None = None
 
 
+class AskReq(BaseModel):
+    question: str
+    repo: str | None = None
+
+
 class CreateTabReq(BaseModel):
     title: str = ""
 
@@ -86,6 +92,14 @@ def build_router():
         so "search" doesn't get swallowed as a note_id path param."""
         hits = await notebook_retrieval.search_notes_async(q, top_k=top_k)
         return {"hits": hits}
+
+    @router.post("/notes/ask")
+    async def ask(req: AskReq) -> dict:
+        """Phase 2c capstone: retrieve candidate notes, staleness-gated
+        revalidate (heals stale ones) each hit, synthesize an answer from
+        the now-code-current bodies. Awaited directly — an on-demand ask,
+        not a write path."""
+        return await notebook_pipeline.answer_question(req.question, repo=req.repo)
 
     @router.get("/notes/{note_id}")
     async def get_note(note_id: str) -> dict:

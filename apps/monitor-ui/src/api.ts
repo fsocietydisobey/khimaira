@@ -1,6 +1,6 @@
 import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
 
-import type { Note, NotebookTab, NoteStatus } from "@/components/notebook/notebookTypes";
+import type { AskAnswer, Note, NotebookTab, NoteStatus } from "@/components/notebook/notebookTypes";
 
 export interface Connection {
   var: string;
@@ -308,6 +308,18 @@ export const monitorApi = createApi({
       query: (id) => ({ url: `/notes/${encodeURIComponent(id)}/revalidate`, method: "POST" }),
       invalidatesTags: (_r, _e, id) => [{ type: "Notes", id }, { type: "Notes", id: "LIST" }],
     }),
+    askNotebook: build.mutation<AskAnswer, { question: string; repo?: string }>({
+      query: (body) => ({ url: "/notes/ask", method: "POST", body }),
+      // A heal during ask() changes the cited notes' pipeline — refresh the list
+      // so their cards show the corrected content next render.
+      invalidatesTags: (result) =>
+        result && result.healed.length > 0
+          ? [
+              ...result.healed.map((id) => ({ type: "Notes" as const, id })),
+              { type: "Notes" as const, id: "LIST" },
+            ]
+          : [],
+    }),
     deleteNote: build.mutation<{ id: string; deleted: boolean }, string>({
       query: (id) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "DELETE" }),
       invalidatesTags: (_r, _e, id) => [
@@ -352,6 +364,7 @@ export const {
   useUpdateNoteMutation,
   usePromoteNoteMutation,
   useRevalidateNoteMutation,
+  useAskNotebookMutation,
   useDeleteNoteMutation,
   useListTabsQuery,
   useCreateTabMutation,

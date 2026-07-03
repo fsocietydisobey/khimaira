@@ -13,9 +13,10 @@
 
 import { useState } from "react";
 import { useParams } from "react-router-dom";
-import { Plus, RefreshCw, Trash2, Upload } from "lucide-react";
+import { Plus, RefreshCw, Search, Trash2, Upload } from "lucide-react";
 
 import {
+  useAskNotebookMutation,
   useCreateNoteMutation,
   useCreateTabMutation,
   useDeleteNoteMutation,
@@ -86,6 +87,8 @@ export function Notebook() {
           <ProjectNavTabs projectName={projectName} />
         </div>
       </header>
+
+      <AskBox notes={notes} />
 
       <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border bg-card/20 px-3 py-1.5">
         <button
@@ -192,6 +195,65 @@ export function Notebook() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * AskBox — Phase 2c capstone. Retrieve → staleness-gated revalidate each hit
+ * (heals it if the code moved on) → synthesize an answer, all server-side in
+ * one POST. The "healed N notes" badge is the visible proof the self-healing
+ * loop just ran, not just a static answer from a possibly-stale cache.
+ */
+function AskBox({ notes }: { notes: Note[] }) {
+  const [question, setQuestion] = useState("");
+  const [askNotebook, { data, isLoading }] = useAskNotebookMutation();
+
+  const handleAsk = async () => {
+    const q = question.trim();
+    if (!q) return;
+    await askNotebook({ question: q }).unwrap();
+  };
+
+  const titleFor = (id: string) => notes.find((n) => n.id === id)?.title ?? id;
+
+  return (
+    <div className="shrink-0 border-b border-border bg-card/20 p-3">
+      <div className="flex gap-2">
+        <input
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void handleAsk();
+          }}
+          placeholder="Ask a question — answered from your notes, self-healed against the live code…"
+          className="h-8 flex-1 rounded-md border border-input bg-background px-3 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        <Button size="sm" disabled={!question.trim() || isLoading} onClick={handleAsk}>
+          <Search className="mr-1.5 h-3.5 w-3.5" />
+          {isLoading ? "asking…" : "ask"}
+        </Button>
+      </div>
+      {data ? (
+        <div className="mt-2 rounded-md border border-border bg-card/60 p-2.5 text-xs">
+          <p className="whitespace-pre-wrap text-foreground">{data.answer}</p>
+          {data.sources.length > 0 || data.healed.length > 0 ? (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5 border-t border-border/50 pt-2">
+              {data.sources.map((id) => (
+                <Badge key={id} variant="outline" className="text-[9px]">
+                  {titleFor(id)}
+                </Badge>
+              ))}
+              {data.healed.length > 0 ? (
+                <Badge variant="warning" className="text-[9px]">
+                  healed {data.healed.length} note{data.healed.length === 1 ? "" : "s"} vs
+                  current code
+                </Badge>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

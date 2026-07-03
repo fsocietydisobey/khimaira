@@ -58,3 +58,12 @@ export interface NotebookTab {
   /** Note ids grouped by tab_id — derived at read time, not stored redundantly. */
   note_ids: string[];
 }
+
+/** Phase 2c capstone — POST /notes/ask response. */
+export interface AskAnswer {
+  answer: string;
+  /** Every note the answer drew on, post-revalidation. */
+  sources: string[];
+  /** Subset of `sources` that actually changed (healed) during this ask. */
+  healed: string[];
+}

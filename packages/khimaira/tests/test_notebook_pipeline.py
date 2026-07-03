@@ -383,3 +383,151 @@ async def test_revalidate_note_not_a_git_checkout_returns_unchanged(
 async def test_revalidate_note_unknown_id_raises(pipeline):
     with pytest.raises(ValueError, match="No note with id"):
         await pipeline.revalidate_note("no-such-note")
+
+
+# ---------------------------------------------------------------------------
+# answer_question (Phase 2c — the ask-layer capstone)
+#
+# search_notes_async + revalidate_note are mocked directly here — the real
+# git/claude machinery behind revalidate_note is already covered above.
+# These tests exercise the orchestration: retrieve -> revalidate-each ->
+# synthesize, plus the empty/skip/failure edge cases.
+# ---------------------------------------------------------------------------
+
+
+async def test_answer_question_no_hits_returns_no_notes_found(pipeline, notes_store, monkeypatch):
+    async def fake_search(query, **kwargs):
+        return []
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+
+    result = await pipeline.answer_question("anything")
+    assert result == {"answer": "No relevant notes found.", "sources": [], "healed": []}
+
+
+async def test_answer_question_orchestrates_retrieve_revalidate_synth(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_note("raw", tab_id="t1")
+    notes_store.set_pipeline(note["id"], _VALID_PAYLOAD)
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)  # no heal — just current
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope("The answer is 42."))])
+
+    result = await pipeline.answer_question("what is the answer")
+    assert result["answer"] == "The answer is 42."
+    assert result["sources"] == [note["id"]]
+    assert result["healed"] == []
+
+
+async def test_answer_question_tracks_healed_notes(pipeline, notes_store, monkeypatch):
+    note = notes_store.add_note("raw", tab_id="t1")
+    notes_store.set_pipeline(note["id"], _VALID_PAYLOAD)
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.apply_validation(
+            note_id, git_sha="deadbeef", new_pipeline={**_VALID_PAYLOAD, "summary": "healed"}
+        )
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope("healed answer"))])
+
+    result = await pipeline.answer_question("question")
+    assert result["healed"] == [note["id"]]
+    assert result["sources"] == [note["id"]]
+
+
+async def test_answer_question_uses_healed_content_in_synthesis(pipeline, notes_store, monkeypatch):
+    """The stale hit must be healed BEFORE its content is fed to the synth
+    step — this proves the ordering, not just the healed[] bookkeeping."""
+    note = notes_store.add_note("raw", tab_id="t1")
+    notes_store.set_pipeline(
+        note["id"], {**_VALID_PAYLOAD, "summary": "STALE summary", "organized_md": "STALE body"}
+    )
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.apply_validation(
+            note_id,
+            git_sha="sha2",
+            new_pipeline={
+                **_VALID_PAYLOAD,
+                "summary": "HEALED summary",
+                "organized_md": "HEALED body",
+            },
+        )
+
+    captured: dict[str, str] = {}
+
+    async def fake_invoke(content, instruction):
+        captured["instruction"] = instruction
+        return "final answer"
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+    monkeypatch.setattr(pipeline, "_invoke_claude", fake_invoke)
+
+    result = await pipeline.answer_question("q")
+    assert "HEALED body" in captured["instruction"]
+    assert "STALE body" not in captured["instruction"]
+    assert result["healed"] == [note["id"]]
+
+
+async def test_answer_question_skips_hit_whose_note_vanished(pipeline, notes_store, monkeypatch):
+    async def fake_search(query, **kwargs):
+        return [{"note_id": "no-such-note", "score": 0.9}]
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+
+    result = await pipeline.answer_question("q")
+    assert result == {"answer": "No relevant notes found.", "sources": [], "healed": []}
+
+
+async def test_answer_question_synthesis_failure_still_returns_sources(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_note("raw")
+    notes_store.set_pipeline(note["id"], _VALID_PAYLOAD)
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)
+
+    async def fake_invoke(content, instruction):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+    monkeypatch.setattr(pipeline, "_invoke_claude", fake_invoke)
+
+    result = await pipeline.answer_question("q")
+    assert result["sources"] == [note["id"]]
+    assert "couldn't synthesize" in result["answer"].lower()
+
+
+async def test_answer_question_repo_filter_passed_through(pipeline, notes_store, monkeypatch):
+    captured_kwargs: dict = {}
+
+    async def fake_search(query, **kwargs):
+        captured_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+
+    await pipeline.answer_question("q", repo="jeevy_portal")
+    assert captured_kwargs.get("repo") == "jeevy_portal"

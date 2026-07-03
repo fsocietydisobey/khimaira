@@ -51,8 +51,10 @@ def retrieval(monkeypatch):
         pass
 
 
-def _note(note_id: str, *, raw_text: str = "raw", pipeline: dict | None = None) -> dict:
-    return {"id": note_id, "raw_text": raw_text, "pipeline": pipeline}
+def _note(
+    note_id: str, *, raw_text: str = "raw", pipeline: dict | None = None, repo: str = "khimaira"
+) -> dict:
+    return {"id": note_id, "raw_text": raw_text, "pipeline": pipeline, "repo": repo}
 
 
 def test_upsert_and_search_finds_note(retrieval):
@@ -131,3 +133,18 @@ def test_search_notes_fail_open_on_qdrant_error(monkeypatch):
     assert r.search_notes("anything") == []
     r.upsert_note({"id": "y", "raw_text": "hi"})
     r.delete_note("y")
+
+
+def test_search_notes_repo_filter_scopes_results(retrieval):
+    shared_text = "unique gronk widget frobnicator content"
+    retrieval.upsert_note(_note("note-khimaira", raw_text=shared_text, repo="khimaira"))
+    retrieval.upsert_note(_note("note-jeevy", raw_text=shared_text, repo="jeevy_portal"))
+
+    khimaira_hits = retrieval.search_notes(shared_text, threshold=0.3, repo="khimaira")
+    assert {h["note_id"] for h in khimaira_hits} == {"note-khimaira"}
+
+    jeevy_hits = retrieval.search_notes(shared_text, threshold=0.3, repo="jeevy_portal")
+    assert {h["note_id"] for h in jeevy_hits} == {"note-jeevy"}
+
+    unscoped_hits = retrieval.search_notes(shared_text, threshold=0.3)
+    assert {h["note_id"] for h in unscoped_hits} == {"note-khimaira", "note-jeevy"}

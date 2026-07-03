@@ -120,7 +120,7 @@ def upsert_note(record: dict[str, Any]) -> None:
                 PointStruct(
                     id=_point_id(record["id"]),
                     vector=vec,
-                    payload={"note_id": record["id"]},
+                    payload={"note_id": record["id"], "repo": record.get("repo", "khimaira")},
                 )
             ],
         )
@@ -142,9 +142,18 @@ def delete_note(note_id: str) -> None:
 
 
 def search_notes(
-    query: str, *, top_k: int = DEFAULT_TOP_K, threshold: float = DEFAULT_THRESHOLD
+    query: str,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    threshold: float = DEFAULT_THRESHOLD,
+    repo: str | None = None,
 ) -> list[dict[str, Any]]:
     """Top-k note ids above the similarity threshold, best-first.
+
+    `repo`: when set, scopes the search to notes tagged with that repo via a
+    qdrant payload filter (cheaper and more correct than fetching top_k
+    unfiltered then discarding — a filtered-out note never displaces one
+    that actually matters).
 
     Returns [{note_id, score}]. Empty on no hits, missing collection, RAG
     disabled, or any error (fail-open) — never raises.
@@ -156,8 +165,17 @@ def search_notes(
         if not client.collection_exists(_COLLECTION):
             return []
         qvec = _embed_query(query)
+        query_filter = None
+        if repo is not None:
+            from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+            query_filter = Filter(must=[FieldCondition(key="repo", match=MatchValue(value=repo))])
         res = client.query_points(
-            collection_name=_COLLECTION, query=qvec, limit=top_k, with_payload=True
+            collection_name=_COLLECTION,
+            query=qvec,
+            query_filter=query_filter,
+            limit=top_k,
+            with_payload=True,
         )
         hits = []
         for p in res.points:
@@ -173,12 +191,16 @@ def search_notes(
 
 
 async def search_notes_async(
-    query: str, *, top_k: int = DEFAULT_TOP_K, threshold: float = DEFAULT_THRESHOLD
+    query: str,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    threshold: float = DEFAULT_THRESHOLD,
+    repo: str | None = None,
 ) -> list[dict[str, Any]]:
     """Async-safe wrapper — embed+qdrant I/O is synchronous, so callers in an
     async route/handler must not call search_notes() directly (blocks the
     event loop). Use this instead."""
-    return await asyncio.to_thread(search_notes, query, top_k=top_k, threshold=threshold)
+    return await asyncio.to_thread(search_notes, query, top_k=top_k, threshold=threshold, repo=repo)
 
 
 def schedule_upsert(record: dict[str, Any]) -> None:
