@@ -79,8 +79,15 @@ def build_router():
     @router.post("/notes")
     async def create_note(req: CreateNoteReq) -> dict:
         record = notes.add_note(req.raw_text, tab_id=req.tab_id, title=req.title, repo=req.repo)
-        trigger_pipeline(record["id"])
-        notebook_retrieval.schedule_upsert(record)
+        if record["tab_id"] == notes.PERSONAL_TAB_ID:
+            # Personal/Behavior folder notes are read as raw_text directly
+            # (notebook_pipeline._personal_context) — no structuring, no
+            # embed (notebook_retrieval.upsert_note already refuses to
+            # embed them too; this just avoids the wasted structuring call).
+            record = notes.update_note(record["id"], status="processed")
+        else:
+            trigger_pipeline(record["id"])
+            notebook_retrieval.schedule_upsert(record)
         return record
 
     @router.get("/notes")

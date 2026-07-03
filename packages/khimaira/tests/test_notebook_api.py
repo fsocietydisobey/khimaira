@@ -34,6 +34,18 @@ def test_create_note_returns_draft(notebook_client):
     assert body["pipeline"] is None
 
 
+def test_create_note_in_personal_folder_skips_structuring(notebook_client):
+    """Personal/Behavior notes are behavioral context, not content to
+    structure — created directly as processed, no draft->structuring wait."""
+    r = notebook_client.post(
+        "/api/notes", json={"raw_text": "Always be terse.", "tab_id": "personal"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "processed"
+    assert body["pipeline"] is None
+
+
 def test_list_notes_empty_store(notebook_client):
     r = notebook_client.get("/api/notes")
     assert r.status_code == 200

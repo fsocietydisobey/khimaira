@@ -41,6 +41,13 @@ _DEFAULT_REPO = "khimaira"
 # both skip entirely for this repo — see notebook_pipeline.py.
 GENERAL_REPO = "general"
 
+# Well-known tab_id for the Personal/Behavior folder (Joseph, 2026-07-03):
+# notes here are behavioral CONTEXT injected into every LLM call, not
+# answerable knowledge content — never embedded, never surfaced as an ask
+# source, never auto-structured. See notebook_pipeline._personal_context
+# and api/notebook.py's create_note.
+PERSONAL_TAB_ID = "personal"
+
 
 def _base_dir() -> Path:
     xdg = Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))

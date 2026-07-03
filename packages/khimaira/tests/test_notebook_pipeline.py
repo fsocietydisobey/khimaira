@@ -998,3 +998,84 @@ async def test_answer_question_skips_code_grounding_for_general_repo(
     assert grounding_called == []
     assert result["code_unavailable"] == []
     assert result["code_sources"] == []
+
+
+# ---------------------------------------------------------------------------
+# Personal/Behavior folder (Joseph, 2026-07-03): notes.PERSONAL_TAB_ID notes
+# are behavioral context injected into every LLM call via _invoke_claude's
+# single choke point — never embedded, never a search/ask source, never
+# auto-structured.
+# ---------------------------------------------------------------------------
+
+
+def test_personal_context_empty_when_no_personal_notes(pipeline, notes_store):
+    assert pipeline._personal_context() == ""
+
+
+def test_personal_context_concatenates_raw_text(pipeline, notes_store):
+    notes_store.add_note("Rule one.", tab_id=notes_store.PERSONAL_TAB_ID)
+    notes_store.add_note("Rule two.", tab_id=notes_store.PERSONAL_TAB_ID)
+    # A regular note must not leak into the personal context.
+    notes_store.add_note("Not a behavioral rule.", tab_id="default")
+
+    context = pipeline._personal_context()
+    assert "Rule one." in context
+    assert "Rule two." in context
+    assert "Not a behavioral rule." not in context
+
+
+def test_personal_context_bounded(pipeline, notes_store, monkeypatch):
+    monkeypatch.setattr(pipeline, "_MAX_PERSONAL_CONTEXT_CHARS", 20)
+    notes_store.add_note("x" * 100, tab_id=notes_store.PERSONAL_TAB_ID)
+    assert len(pipeline._personal_context()) == 20
+
+
+def test_prepend_personal_context_noop_when_empty(pipeline, notes_store):
+    assert pipeline._prepend_personal_context("base instruction") == "base instruction"
+
+
+def test_prepend_personal_context_prepends_when_present(pipeline, notes_store):
+    notes_store.add_note("Always be terse.", tab_id=notes_store.PERSONAL_TAB_ID)
+    result = pipeline._prepend_personal_context("base instruction")
+    assert "Always be terse." in result
+    assert result.endswith("base instruction")
+
+
+async def test_invoke_claude_includes_personal_context_in_system_prompt(
+    pipeline, notes_store, monkeypatch
+):
+    """End-to-end through the real choke point — not just the helper
+    functions in isolation."""
+    notes_store.add_note("Write like a pirate.", tab_id=notes_store.PERSONAL_TAB_ID)
+    captured_args = []
+
+    async def fake_exec(*args, **kwargs):
+        captured_args.append(args)
+        return _FakeProc(_envelope(json.dumps(_VALID_PAYLOAD)))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+    await pipeline.transform_note("raw text")
+
+    assert len(captured_args) == 1
+    system_prompt_idx = captured_args[0].index("--append-system-prompt") + 1
+    assert "Write like a pirate." in captured_args[0][system_prompt_idx]
+
+
+def test_seed_personal_context_if_empty_seeds_once(pipeline, notes_store):
+    seeded_first = pipeline.seed_personal_context_if_empty()
+    assert seeded_first is True
+    personal_notes = notes_store.list_notes(tab_id=notes_store.PERSONAL_TAB_ID)
+    assert len(personal_notes) == 1
+    assert personal_notes[0]["status"] == "processed"
+    assert personal_notes[0]["pipeline"] is None
+    assert personal_notes[0]["repo"] == notes_store.GENERAL_REPO
+
+    seeded_second = pipeline.seed_personal_context_if_empty()
+    assert seeded_second is False
+    assert len(notes_store.list_notes(tab_id=notes_store.PERSONAL_TAB_ID)) == 1
+
+
+def test_seed_personal_context_skipped_when_notes_already_present(pipeline, notes_store):
+    notes_store.add_note("Existing rule.", tab_id=notes_store.PERSONAL_TAB_ID)
+    assert pipeline.seed_personal_context_if_empty() is False
+    assert len(notes_store.list_notes(tab_id=notes_store.PERSONAL_TAB_ID)) == 1

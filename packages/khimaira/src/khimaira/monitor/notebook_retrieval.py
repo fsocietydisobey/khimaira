@@ -103,7 +103,16 @@ def _passage_text(record: dict[str, Any]) -> str:
 def upsert_note(record: dict[str, Any]) -> None:
     """Embed + upsert a note. Call on create and again whenever its embedded
     content changes (structuring completes, or a heal lands a new pipeline).
-    Fail-open — never raises."""
+    Fail-open — never raises.
+
+    Personal/Behavior folder notes (tab_id="personal") are never embedded —
+    they're behavioral CONTEXT injected into every LLM call, not answerable
+    knowledge content. Embedding them would let "write in this voice" show
+    up as a retrieved "relevant note" and pollute real answers."""
+    from khimaira.monitor.notes import PERSONAL_TAB_ID
+
+    if record.get("tab_id") == PERSONAL_TAB_ID:
+        return
     if not _RAG_ENABLED:
         return
     text = _passage_text(record)

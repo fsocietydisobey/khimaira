@@ -62,6 +62,11 @@ const GRID_LEFT_WIDTH = 240;
  *  cross-cutting notes. Always in scope alongside whichever project the
  *  left list / ask are currently scoped to. */
 const GENERAL_REPO = "general";
+/** Well-known tab_id for the Personal/Behavior folder — a distinct left-list
+ *  section, independent of the regular tab filter / repo scope. The
+ *  pipeline reads notes in this tab as behavioral context for every LLM
+ *  call (structuring, revalidation, ask-synthesis). */
+const PERSONAL_TAB_ID = "personal";
 
 const SUGGESTED_QUESTIONS = [
   "What's changed recently in the code this notebook tracks?",
@@ -283,6 +288,8 @@ export function Notebook() {
   const [selectedTab, setSelectedTab] = useState<string>(ALL_TABS);
   const [showAddNote, setShowAddNote] = useState(false);
   const [draft, setDraft] = useState("");
+  const [showAddPersonalNote, setShowAddPersonalNote] = useState(false);
+  const [personalDraft, setPersonalDraft] = useState("");
   const [creatingTab, setCreatingTab] = useState(false);
   const [newTabTitle, setNewTabTitle] = useState("");
   const [centerView, setCenterView] = useState<CenterView>(null);
@@ -306,6 +313,13 @@ export function Notebook() {
     { tabId: selectedTab === ALL_TABS ? undefined : selectedTab, repo: repoScope },
     { pollingInterval: 3000 },
   );
+  // Personal/Behavior folder — independent of the tab filter / repo scope
+  // above; always the same notes regardless of what the regular list is
+  // scoped to.
+  const { data: personalNotesData } = useListNotesQuery(
+    { tabId: PERSONAL_TAB_ID },
+    { pollingInterval: 5000 },
+  );
   const { data: projectsData } = useListProjectsQuery();
   const [createNote, { isLoading: creatingNote }] = useCreateNoteMutation();
   const [saveAnswerAsNote, { isLoading: savingAnswer }] = useCreateNoteMutation();
@@ -317,7 +331,11 @@ export function Notebook() {
   const [askNotebook, { isLoading: asking }] = useAskNotebookMutation();
 
   const tabs = tabsData?.tabs ?? [];
-  const notes = notesData?.notes ?? [];
+  // Personal/Behavior notes are a distinct section (below) — never mixed
+  // into the regular list/grid/reader/@-mention flow, matching the backend
+  // excluding them from embedding + ask retrieval.
+  const notes = (notesData?.notes ?? []).filter((n) => n.tab_id !== PERSONAL_TAB_ID);
+  const personalNotes = personalNotesData?.notes ?? [];
   const repoOptions = [...(projectsData ?? []).map((p) => p.name), GENERAL_REPO];
   const selectedNote =
     viewMode === "reader" && centerView?.kind === "note"
@@ -361,6 +379,18 @@ export function Notebook() {
     setShowAddNote(false);
   };
 
+  const handleAddPersonalNote = async () => {
+    const text = personalDraft.trim();
+    if (!text) return;
+    await createNote({
+      raw_text: text,
+      tab_id: PERSONAL_TAB_ID,
+      repo: GENERAL_REPO,
+    }).unwrap();
+    setPersonalDraft("");
+    setShowAddPersonalNote(false);
+  };
+
   const handleCreateTab = async () => {
     const title = newTabTitle.trim();
     const created = await createTab({ title }).unwrap();
@@ -398,6 +428,23 @@ export function Notebook() {
     />
   );
 
+  const notesListWithPersonal = (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 overflow-hidden">{notesListPanel}</div>
+      <PersonalFolderSection
+        notes={personalNotes}
+        selectedNoteId={viewMode === "reader" && centerView?.kind === "note" ? centerView.noteId : null}
+        onSelectNote={handleSelectNote}
+        showAddNote={showAddPersonalNote}
+        onToggleAddNote={() => setShowAddPersonalNote((v) => !v)}
+        draft={personalDraft}
+        onDraftChange={setPersonalDraft}
+        creatingNote={creatingNote}
+        onAddNote={handleAddPersonalNote}
+      />
+    </div>
+  );
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <header className="shrink-0 border-b border-border bg-card/40 px-4 py-3">
@@ -427,7 +474,7 @@ export function Notebook() {
             onToggleCollapsed={() => setLeftCollapsed(!leftCollapsed)}
             resizable={false}
           >
-            {notesListPanel}
+            {notesListWithPersonal}
           </SidePanelShell>
           <GridView
             notes={notes}
@@ -451,7 +498,7 @@ export function Notebook() {
             resizable
             onResize={resizeLeft}
           >
-            {notesListPanel}
+            {notesListWithPersonal}
           </SidePanelShell>
           <CenterReaderPanel
             view={centerView}
@@ -720,6 +767,100 @@ function RepoSelector({
         </option>
       ) : null}
     </select>
+  );
+}
+
+/**
+ * PERSONAL — the Behavior/voice folder. Distinct from the regular
+ * notes/tabs above: independent of the tab filter and repo scope, never
+ * mixed into the grid/reader/@-mention flow (the backend never embeds or
+ * retrieves these either — see notebook_retrieval.upsert_note). The
+ * pipeline reads every note here as behavioral context, prepended to
+ * every LLM call (structuring, revalidation, ask-synthesis).
+ */
+function PersonalFolderSection({
+  notes,
+  selectedNoteId,
+  onSelectNote,
+  showAddNote,
+  onToggleAddNote,
+  draft,
+  onDraftChange,
+  creatingNote,
+  onAddNote,
+}: {
+  notes: Note[];
+  selectedNoteId: string | null;
+  onSelectNote: (id: string) => void;
+  showAddNote: boolean;
+  onToggleAddNote: () => void;
+  draft: string;
+  onDraftChange: (v: string) => void;
+  creatingNote: boolean;
+  onAddNote: () => void;
+}) {
+  return (
+    <div className="shrink-0 border-t border-border">
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <span className="text-[9px] font-medium uppercase tracking-wide text-muted-foreground/70">
+          personal · voice &amp; behavior
+        </span>
+        <button
+          type="button"
+          onClick={onToggleAddNote}
+          title="Add a behavioral-context note — read as instructions for every LLM call, never surfaced as an ask source"
+          className="rounded p-0.5 text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+        >
+          <Plus className="h-3 w-3" />
+        </button>
+      </div>
+      {showAddNote ? (
+        <div className="px-2 pb-2">
+          <textarea
+            autoFocus
+            value={draft}
+            onChange={(e) => onDraftChange(e.target.value)}
+            placeholder="A rule for how notes get structured and answers get written…"
+            rows={3}
+            className="w-full resize-y rounded-md border border-input bg-background px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+          <div className="mt-1.5 flex items-center justify-end gap-1">
+            <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-[10px]" onClick={onToggleAddNote}>
+              cancel
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              className="h-6 px-2 text-[10px]"
+              disabled={!draft.trim() || creatingNote}
+              onClick={onAddNote}
+            >
+              {creatingNote ? "adding…" : "add"}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      <div className="max-h-40 overflow-y-auto">
+        {notes.length === 0 ? (
+          <p className="px-3 pb-2 text-[10px] text-muted-foreground/60">no behavioral notes yet.</p>
+        ) : (
+          notes.map((n) => (
+            <button
+              key={n.id}
+              type="button"
+              onClick={() => onSelectNote(n.id)}
+              className={cn(
+                "block w-full min-w-0 truncate px-3 py-1.5 text-left text-[11px] transition-colors",
+                selectedNoteId === n.id ? "bg-accent" : "hover:bg-accent/40",
+              )}
+              title={n.title}
+            >
+              {n.title}
+            </button>
+          ))
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -1357,6 +1498,11 @@ function NoteStructuredReader({
               </div>
             ) : null}
           </>
+        ) : note.tab_id === PERSONAL_TAB_ID ? (
+          <p className="text-xs text-muted-foreground/70">
+            Behavioral context — read as raw_text directly (see the original panel), not
+            structured into sections. Never surfaced as an ask source.
+          </p>
         ) : (
           <p className="text-xs text-muted-foreground/70">
             Still processing — the original is shown on the right; this panel fills in once

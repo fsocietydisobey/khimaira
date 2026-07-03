@@ -52,9 +52,14 @@ def retrieval(monkeypatch):
 
 
 def _note(
-    note_id: str, *, raw_text: str = "raw", pipeline: dict | None = None, repo: str = "khimaira"
+    note_id: str,
+    *,
+    raw_text: str = "raw",
+    pipeline: dict | None = None,
+    repo: str = "khimaira",
+    tab_id: str = "default",
 ) -> dict:
-    return {"id": note_id, "raw_text": raw_text, "pipeline": pipeline, "repo": repo}
+    return {"id": note_id, "raw_text": raw_text, "pipeline": pipeline, "repo": repo, "tab_id": tab_id}
 
 
 def test_upsert_and_search_finds_note(retrieval):
@@ -164,3 +169,18 @@ def test_search_notes_repo_filter_includes_general_bucket(retrieval):
 
     jeevy_hits = retrieval.search_notes(shared_text, threshold=0.3, repo="jeevy_portal")
     assert {h["note_id"] for h in jeevy_hits} == {"note-jeevy", "note-general"}
+
+
+def test_upsert_note_never_embeds_personal_folder_notes(retrieval):
+    """Personal/Behavior notes (tab_id="personal") are behavioral CONTEXT
+    injected into every LLM call, not answerable knowledge content — must
+    never be embedded, or "write in this voice" would show up as a
+    retrieved "relevant note" and pollute real answers."""
+    shared_text = "unique gronk widget frobnicator content"
+    retrieval.upsert_note(
+        _note("note-personal", raw_text=shared_text, tab_id="personal")
+    )
+    retrieval.upsert_note(_note("note-regular", raw_text=shared_text, tab_id="default"))
+
+    hits = retrieval.search_notes(shared_text, threshold=0.3)
+    assert {h["note_id"] for h in hits} == {"note-regular"}

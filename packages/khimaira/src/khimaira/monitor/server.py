@@ -147,6 +147,20 @@ def build_app():
                 "notebook: backfill cleaned spurious heals from %d note(s)", len(changed)
             )
 
+    # One-time seed (Joseph, 2026-07-03): populate the Personal/Behavior
+    # folder with his distilled voice/structure rules if it's empty.
+    # Idempotent — no-op once any personal note exists.
+    @app.on_event("startup")
+    async def _seed_notebook_personal_context() -> None:
+        import logging as _logging
+
+        from . import notebook_pipeline as pipeline_mod
+
+        if pipeline_mod.seed_personal_context_if_empty():
+            _logging.getLogger("khimaira.monitor.notes").info(
+                "notebook: seeded the Personal/Behavior folder with default voice/structure rules"
+            )
+
     # SSE delivery cursor persistence — load cursors from disk at startup
     # so reconnecting subscribers resume from their last yielded position.
     @app.on_event("startup")

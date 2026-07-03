@@ -143,6 +143,70 @@ def _strip_fence(text: str) -> str:
     return m.group(1) if m else text.strip()
 
 
+# Personal/Behavior folder (Joseph, 2026-07-03): notes.PERSONAL_TAB_ID notes
+# are behavioral CONTEXT (voice, structure rules) injected into every LLM
+# call, not answerable knowledge content — never embedded, never a search/
+# ask source (see notebook_retrieval.upsert_note + Notebook.tsx filtering
+# them out of the regular list). raw_text only, never the structured
+# pipeline (no LLM paraphrase between the user's literal rules and the
+# system prompt) — and personal notes skip structuring entirely anyway
+# (api/notebook.py's create_note marks them "processed" directly).
+_MAX_PERSONAL_CONTEXT_CHARS = 6000
+
+
+def _personal_context() -> str:
+    """Concatenated raw_text of every Personal/Behavior note, bounded — this
+    rides every LLM call (structuring, revalidation, ask-synthesis), so it
+    must stay small. Fail-open: any error returns "" (no context, not a
+    crash) — a missing/broken personal folder must never break the ask."""
+    try:
+        personal_notes = notes.list_notes(tab_id=notes.PERSONAL_TAB_ID)
+    except Exception:
+        return ""
+    parts = [n["raw_text"] for n in personal_notes if n.get("raw_text")]
+    if not parts:
+        return ""
+    return "\n\n---\n\n".join(parts)[:_MAX_PERSONAL_CONTEXT_CHARS]
+
+
+def _prepend_personal_context(instruction: str) -> str:
+    personal = _personal_context()
+    if not personal:
+        return instruction
+    return (
+        "BEHAVIORAL CONTEXT — write and structure in this voice (the user's own "
+        f"rules, always in force):\n\n{personal}\n\n---\n\n{instruction}"
+    )
+
+
+_SEED_PERSONAL_CONTEXT = """STRUCTURE + ANSWER in this voice (INTJ-T, senior engineer):
+- Lead with the Goal/bottom-line (expert TL;DR), then 'In plain terms' (jargon-free, define terms inline), then the depth. (summary=Goal, plain=in-plain-terms, technical=depth.)
+- Depth over surface. State real trade-offs, failure modes, and second-order effects — not just the happy path.
+- Think in systems: data flow, contracts, boundaries; who calls what; what breaks under failure.
+- Be direct; no hedging or filler. Name the real symbols/files/functions.
+- Use Mermaid for data flows / state machines / architecture (not ASCII). Markdown headings, tables where they clarify.
+- Distinguish must-fix-now from worth-knowing-later."""
+
+
+def seed_personal_context_if_empty() -> bool:
+    """One-time seed (Joseph, 2026-07-03): if the Personal/Behavior folder is
+    empty, create one note with his distilled voice/structure rules.
+    Idempotent — no-op once any personal note exists, so it never re-seeds
+    or duplicates. Created directly as status="processed" (no structuring,
+    no embed — same treatment every personal note gets, see api/notebook.py's
+    create_note). Returns True if it seeded, False if already present."""
+    if notes.list_notes(tab_id=notes.PERSONAL_TAB_ID):
+        return False
+    record = notes.add_note(
+        _SEED_PERSONAL_CONTEXT,
+        tab_id=notes.PERSONAL_TAB_ID,
+        title="Voice & structure rules",
+        repo=notes.GENERAL_REPO,
+    )
+    notes.update_note(record["id"], status="processed")
+    return True
+
+
 async def _invoke_claude(content: str, instruction: str) -> str:
     """Single headless-claude invocation. Returns the raw `.result` string.
     Raises on subprocess failure or a malformed envelope.
@@ -154,7 +218,11 @@ async def _invoke_claude(content: str, instruction: str) -> str:
     JSON-schema parsing (structuring/revalidation) happens one layer up in
     _run_once — answer_question uses this raw string directly (free-form
     prose, not a PipelineOutput).
+
+    Personal/Behavior context is prepended here — the one choke point every
+    caller already funnels through — rather than at each call site.
     """
+    instruction = _prepend_personal_context(instruction)
     cfg_dir = _isolated_config_dir()
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(cfg_dir)
