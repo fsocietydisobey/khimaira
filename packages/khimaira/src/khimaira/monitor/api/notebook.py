@@ -93,11 +93,17 @@ def build_router():
         return {"notes": notes.list_notes(tab_id=tab_id)}
 
     @router.get("/notes/search")
-    async def search_notes(q: str, top_k: int = notebook_retrieval.DEFAULT_TOP_K) -> dict:
+    async def search_notes(
+        q: str, top_k: int = notebook_retrieval.DEFAULT_TOP_K, repo: str | None = None
+    ) -> dict:
         """Phase 2b: semantic search over embedded notes. [] on no hits / qdrant
         down / RAG disabled — never errors. Registered BEFORE /notes/{note_id}
-        so "search" doesn't get swallowed as a note_id path param."""
-        hits = await notebook_retrieval.search_notes_async(q, top_k=top_k)
+        so "search" doesn't get swallowed as a note_id path param.
+
+        `repo`: optional scope to one repo's notes (mirrors /notes/ask's repo
+        filter) — notebook_retrieval.search_notes_async already supports this;
+        v1 just never exposed it as a query param here."""
+        hits = await notebook_retrieval.search_notes_async(q, top_k=top_k, repo=repo)
         return {"hits": hits}
 
     @router.post("/notes/ask")

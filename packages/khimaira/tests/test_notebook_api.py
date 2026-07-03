@@ -188,6 +188,45 @@ def test_revalidate_note_unknown_id_returns_404(notebook_client):
 
 
 # ---------------------------------------------------------------------------
+# GET /notes/search (repo filter — v2 addition, needed by notebook_search
+# MCP tool; search_notes_async already supported repo=, the route just
+# never forwarded it)
+# ---------------------------------------------------------------------------
+
+
+def test_search_notes_forwards_repo_filter(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    captured_kwargs: dict = {}
+
+    async def fake_search(query, **kwargs):
+        captured_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(notebook_api.notebook_retrieval, "search_notes_async", fake_search)
+
+    r = notebook_client.get("/api/notes/search", params={"q": "race", "repo": "jeevy_portal"})
+    assert r.status_code == 200
+    assert captured_kwargs.get("repo") == "jeevy_portal"
+
+
+def test_search_notes_repo_omitted_defaults_to_none(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    captured_kwargs: dict = {}
+
+    async def fake_search(query, **kwargs):
+        captured_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(notebook_api.notebook_retrieval, "search_notes_async", fake_search)
+
+    r = notebook_client.get("/api/notes/search", params={"q": "race"})
+    assert r.status_code == 200
+    assert captured_kwargs.get("repo") is None
+
+
+# ---------------------------------------------------------------------------
 # POST /notes/{id}/resolution (v2 roster loop)
 # ---------------------------------------------------------------------------
 

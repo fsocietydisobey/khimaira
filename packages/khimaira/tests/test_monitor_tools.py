@@ -30,7 +30,10 @@ def test_get_http_404_surfaces_real_status():
 
     http_error = urllib.error.HTTPError(
         url="http://127.0.0.1:8740/api/sessions/foo/pending",
-        code=404, msg="Not Found", hdrs={}, fp=io.BytesIO(b'{"detail":"No session named or id\'d \'foo\'."}'),
+        code=404,
+        msg="Not Found",
+        hdrs={},
+        fp=io.BytesIO(b'{"detail":"No session named or id\'d \'foo\'."}'),
     )
 
     with patch("urllib.request.urlopen", side_effect=http_error):
@@ -49,7 +52,9 @@ def test_get_http_500_surfaces_real_status():
 
     http_error = urllib.error.HTTPError(
         url="http://127.0.0.1:8740/api/whatever",
-        code=500, msg="Internal Server Error", hdrs={},
+        code=500,
+        msg="Internal Server Error",
+        hdrs={},
         fp=io.BytesIO(b'{"detail":"boom"}'),
     )
     with patch("urllib.request.urlopen", side_effect=http_error):
@@ -102,8 +107,54 @@ def test_get_malformed_json_surfaces_parse_error():
     fake_resp = MagicMock()
     fake_resp.__enter__ = MagicMock(return_value=fake_resp)
     fake_resp.__exit__ = MagicMock(return_value=None)
-    fake_resp.read.return_value = b'<html>not json</html>'
+    fake_resp.read.return_value = b"<html>not json</html>"
 
     with patch("urllib.request.urlopen", return_value=fake_resp):
         result = _get("/api/whatever")
     assert "non-JSON" in result
+
+
+# ---------------------------------------------------------------------------
+# _patch — mirrors _post's error mapping (added for notebook_update, the
+# only PATCH-verb MCP tool today; see notebook_tools.py).
+# ---------------------------------------------------------------------------
+
+
+def test_patch_success_returns_parsed_json():
+    from khimaira.server.monitor_tools import _patch
+
+    fake_resp = MagicMock()
+    fake_resp.__enter__ = MagicMock(return_value=fake_resp)
+    fake_resp.__exit__ = MagicMock(return_value=None)
+    fake_resp.read.return_value = b'{"id": "note-1", "title": "renamed"}'
+
+    with patch("urllib.request.urlopen", return_value=fake_resp) as mock_open:
+        result = _patch("/api/notes/note-1", {"title": "renamed"})
+    assert result == {"id": "note-1", "title": "renamed"}
+    sent_request = mock_open.call_args[0][0]
+    assert sent_request.get_method() == "PATCH"
+
+
+def test_patch_http_404_surfaces_real_status():
+    from khimaira.server.monitor_tools import _patch
+
+    http_error = urllib.error.HTTPError(
+        url="http://127.0.0.1:8740/api/notes/no-such-id",
+        code=404,
+        msg="Not Found",
+        hdrs={},
+        fp=io.BytesIO(b'{"detail":"No note with id=\'no-such-id\'."}'),
+    )
+    with patch("urllib.request.urlopen", side_effect=http_error):
+        result = _patch("/api/notes/no-such-id", {"title": "x"})
+    assert "HTTP 404" in result
+    assert "No note with id" in result
+
+
+def test_patch_connection_refused_says_daemon_down():
+    from khimaira.server.monitor_tools import _patch
+
+    url_error = urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+    with patch("urllib.request.urlopen", side_effect=url_error):
+        result = _patch("/api/notes/note-1", {"title": "x"})
+    assert "daemon is not running" in result.lower()
