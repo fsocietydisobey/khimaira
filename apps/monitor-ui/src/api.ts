@@ -1,5 +1,7 @@
 import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
 
+import type { Note, NotebookTab, NoteStatus } from "@/components/notebook/notebookTypes";
+
 export interface Connection {
   var: string;
   host: string;
@@ -209,7 +211,7 @@ export interface CorrelationResponse {
 export const monitorApi = createApi({
   reducerPath: "monitorApi",
   baseQuery: fetchBaseQuery({ baseUrl: "/api" }),
-  tagTypes: ["Projects", "Topology", "Threads"],
+  tagTypes: ["Projects", "Topology", "Threads", "Notes", "Tabs"],
   endpoints: (build) => ({
     listProjects: build.query<Project[], void>({
       query: () => "/projects",
@@ -266,6 +268,68 @@ export const monitorApi = createApi({
       query: ({ project, correlationId }) =>
         `/heartbeats/${encodeURIComponent(project)}/by-correlation/${encodeURIComponent(correlationId)}`,
     }),
+
+    // -----------------------------------------------------------------------
+    // Notebook (Phase 1a backend: packages/khimaira/.../monitor/notes.py +
+    // api/notebook.py). Global daemon state — not scoped by project, despite
+    // the per-project route the frontend mounts it under.
+    // -----------------------------------------------------------------------
+    listNotes: build.query<{ notes: Note[] }, { tabId?: string } | void>({
+      query: (arg) => (arg?.tabId ? `/notes?tab_id=${encodeURIComponent(arg.tabId)}` : "/notes"),
+      providesTags: (result) =>
+        result
+          ? [
+              ...result.notes.map((n) => ({ type: "Notes" as const, id: n.id })),
+              { type: "Notes" as const, id: "LIST" },
+            ]
+          : [{ type: "Notes" as const, id: "LIST" }],
+    }),
+    getNote: build.query<Note, string>({
+      query: (id) => `/notes/${encodeURIComponent(id)}`,
+      providesTags: (_r, _e, id) => [{ type: "Notes", id }],
+    }),
+    createNote: build.mutation<Note, { raw_text: string; tab_id?: string; title?: string }>({
+      query: (body) => ({ url: "/notes", method: "POST", body }),
+      invalidatesTags: [{ type: "Notes", id: "LIST" }, { type: "Tabs", id: "LIST" }],
+    }),
+    updateNote: build.mutation<Note, { id: string; title?: string; tab_id?: string; status?: NoteStatus }>({
+      query: ({ id, ...body }) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "PATCH", body }),
+      invalidatesTags: (_r, _e, { id }) => [
+        { type: "Notes", id },
+        { type: "Notes", id: "LIST" },
+        { type: "Tabs", id: "LIST" },
+      ],
+    }),
+    promoteNote: build.mutation<Note, string>({
+      query: (id) => ({ url: `/notes/${encodeURIComponent(id)}/promote`, method: "POST" }),
+      invalidatesTags: (_r, _e, id) => [{ type: "Notes", id }, { type: "Notes", id: "LIST" }],
+    }),
+    deleteNote: build.mutation<{ id: string; deleted: boolean }, string>({
+      query: (id) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "DELETE" }),
+      invalidatesTags: (_r, _e, id) => [
+        { type: "Notes", id },
+        { type: "Notes", id: "LIST" },
+        { type: "Tabs", id: "LIST" },
+      ],
+    }),
+    listTabs: build.query<{ tabs: NotebookTab[] }, void>({
+      query: () => "/tabs",
+      providesTags: (result) =>
+        result
+          ? [
+              ...result.tabs.map((t) => ({ type: "Tabs" as const, id: t.id })),
+              { type: "Tabs" as const, id: "LIST" },
+            ]
+          : [{ type: "Tabs" as const, id: "LIST" }],
+    }),
+    createTab: build.mutation<NotebookTab, { title?: string }>({
+      query: (body) => ({ url: "/tabs", method: "POST", body }),
+      invalidatesTags: [{ type: "Tabs", id: "LIST" }],
+    }),
+    updateTab: build.mutation<NotebookTab, { id: string; title: string }>({
+      query: ({ id, ...body }) => ({ url: `/tabs/${encodeURIComponent(id)}`, method: "PATCH", body }),
+      invalidatesTags: (_r, _e, { id }) => [{ type: "Tabs", id }, { type: "Tabs", id: "LIST" }],
+    }),
   }),
 });
 
@@ -278,4 +342,13 @@ export const {
   useGetCostTimeseriesQuery,
   useGetSlowCallsQuery,
   useGetEventsByCorrelationQuery,
+  useListNotesQuery,
+  useGetNoteQuery,
+  useCreateNoteMutation,
+  useUpdateNoteMutation,
+  usePromoteNoteMutation,
+  useDeleteNoteMutation,
+  useListTabsQuery,
+  useCreateTabMutation,
+  useUpdateTabMutation,
 } = monitorApi;

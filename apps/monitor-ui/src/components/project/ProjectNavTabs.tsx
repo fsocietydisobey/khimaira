@@ -9,7 +9,7 @@
  * only when a correlation_id is available (otherwise it'd 404 visually).
  */
 
-import { Activity, GitFork, Network, Receipt } from "lucide-react";
+import { Activity, GitFork, Network, NotebookText, Receipt } from "lucide-react";
 import { NavLink } from "react-router-dom";
 
 import { cn } from "@/lib/utils";
@@ -62,6 +62,12 @@ export function ProjectNavTabs({
       label: "kg",
       icon: Network,
       title: "Knowledge graph — interactive node-edge view of the jeevy KG for a deliverable",
+    },
+    {
+      to: `/${projectName}/notebook`,
+      label: "notebook",
+      icon: NotebookText,
+      title: "AI-notebook — paste + auto-structure notes, curate into the mnemosyne knowledge loop",
     },
   ];
 

@@ -38,6 +38,28 @@ def test_list_notes_empty_store_returns_empty_list(notes_store):
     assert notes_store.list_notes() == []
 
 
+def test_list_notes_includes_raw_text_and_pipeline(notes_store):
+    """Listing must carry full render data (raw_text/pipeline/training) —
+    the frontend renders note cards straight from the list response,
+    no per-note get_note() round trip."""
+    note = notes_store.add_note("full text here", tab_id="t1")
+    notes_store.set_pipeline(
+        note["id"],
+        {
+            "summary": "s",
+            "technical": "t",
+            "plain": "p",
+            "organized_md": "m",
+            "tags": [],
+            "entities": [],
+        },
+    )
+    listed = notes_store.list_notes(tab_id="t1")
+    assert listed[0]["raw_text"] == "full text here"
+    assert listed[0]["pipeline"]["summary"] == "s"
+    assert listed[0]["training"]["promoted"] is False
+
+
 def test_list_notes_filters_by_tab_and_sorts_recent_first(notes_store):
     a = notes_store.add_note("a", tab_id="tab1")
     notes_store.add_note("b", tab_id="tab2")

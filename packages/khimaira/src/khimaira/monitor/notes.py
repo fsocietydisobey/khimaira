@@ -96,6 +96,9 @@ def _read_note_file(note_id: str) -> dict[str, Any] | None:
 
 
 def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, Any]:
+    """Listing projection of a note. Carries raw_text + pipeline + training
+    (not just id/title/status) so GET /notes can render note cards directly —
+    no N+1 get_note() round trip per listed note."""
     return {
         "id": record["id"],
         "tab_id": record["tab_id"],
@@ -103,6 +106,9 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "status": record["status"],
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
+        "raw_text": record["raw_text"],
+        "pipeline": record["pipeline"],
+        "training": record["training"],
         "deleted": deleted,
     }
 
