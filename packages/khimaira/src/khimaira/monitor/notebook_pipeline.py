@@ -98,6 +98,17 @@ class PipelineOutput(BaseModel):
     entities: list[str]
 
 
+class RevalidationOutput(PipelineOutput):
+    """revalidate_note()'s LLM response schema. `unchanged` is an explicit
+    model judgment, not inferred from equality — see _REVALIDATE_INSTRUCTION_TEMPLATE
+    and the bug this fixed: asking the model to "echo the exact same JSON" and then
+    diffing its regenerated output for equality false-positives on every call, since
+    free-text fields (organized_md especially) are never byte-identical across two
+    independent generations even when the model's own judgment is "still accurate"."""
+
+    unchanged: bool
+
+
 def _isolated_config_dir() -> Path:
     """Dedicated CLAUDE_CONFIG_DIR: credentials only, empty settings (no
     hooks), no CLAUDE.md. This is what keeps each transform cheap (kills the
@@ -174,26 +185,33 @@ async def _invoke_claude(content: str, instruction: str) -> str:
     return result_text
 
 
-async def _run_once(content: str, *, instruction: str = _INSTRUCTION) -> PipelineOutput:
+async def _run_once(
+    content: str, *, instruction: str = _INSTRUCTION, schema: type[BaseModel] = PipelineOutput
+) -> BaseModel:
     """Structuring/revalidation invocation — parses+validates the result
-    against the PipelineOutput schema. Raises on any parse/validate failure."""
+    against `schema` (PipelineOutput for structuring, RevalidationOutput for
+    revalidate_note's re-check pass). Raises on any parse/validate failure."""
     result_text = await _invoke_claude(content, instruction)
     payload = json.loads(_strip_fence(result_text))
-    return PipelineOutput.model_validate(payload)
+    return schema.model_validate(payload)
 
 
 async def transform_note(
-    raw_text: str, *, instruction: str = _INSTRUCTION
+    raw_text: str,
+    *,
+    instruction: str = _INSTRUCTION,
+    schema: type[BaseModel] = PipelineOutput,
 ) -> dict[str, Any] | None:
     """Run the transform, retrying up to _MAX_CLAUDE_ATTEMPTS with backoff
     between attempts on parse/validate failure.
 
-    Returns the validated pipeline dict on success, None if every attempt
-    failed — the caller marks the note status="failed" and keeps raw_text.
+    Returns the validated dict on success (shaped per `schema`), None if
+    every attempt failed — the caller marks the note status="failed" and
+    keeps raw_text.
     """
     for attempt in range(1, _MAX_CLAUDE_ATTEMPTS + 1):
         try:
-            output = await _run_once(raw_text, instruction=instruction)
+            output = await _run_once(raw_text, instruction=instruction, schema=schema)
             return output.model_dump()
         except (json.JSONDecodeError, ValidationError, ValueError, RuntimeError, OSError) as exc:
             log.warning("notebook_pipeline: attempt %d failed: %s", attempt, exc)
@@ -266,11 +284,15 @@ _MAX_ANCHOR_FILE_CHARS = 20_000  # per-file cap fed into the revalidation prompt
 _REVALIDATE_INSTRUCTION_TEMPLATE = (
     "You are checking whether a previously-structured note is still accurate against "
     "the CURRENT source code below. The user message contains the EXISTING NOTE as a "
-    "JSON object with keys summary/technical/plain/organized_md/tags/entities. If it "
-    "is still accurate, output that EXACT SAME JSON object unchanged. If it is stale "
-    "or wrong given the current code, output a CORRECTED JSON object with the same "
-    "schema, reflecting the current code. Output ONLY the JSON object, no prose, no "
-    "markdown fence.\n\nCURRENT CODE:\n{code}"
+    "JSON object with keys summary/technical/plain/organized_md/tags/entities. "
+    "Output a JSON object with those SAME keys plus one extra boolean key `unchanged`. "
+    "Judge by SUBSTANCE, not exact wording — minor rephrasing is not a change. Set "
+    "unchanged=true if the note's existing conclusions are still accurate given the "
+    "current code (you may echo the existing field values back, they will be "
+    "discarded either way). Set unchanged=false and provide CORRECTED values for "
+    "summary/technical/plain/organized_md/tags/entities if the note is stale or wrong "
+    "given the current code. Output ONLY the JSON object, no prose, no markdown "
+    "fence.\n\nCURRENT CODE:\n{code}"
 )
 
 
@@ -417,7 +439,9 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
     code_blob = "\n\n---\n\n".join(code_sections) if code_sections else "(no anchor files resolved)"
 
     instruction = _REVALIDATE_INSTRUCTION_TEMPLATE.format(code=code_blob)
-    result = await transform_note(json.dumps(pipeline or {}, indent=2), instruction=instruction)
+    result = await transform_note(
+        json.dumps(pipeline or {}, indent=2), instruction=instruction, schema=RevalidationOutput
+    )
 
     if result is None:
         log.warning(
@@ -427,7 +451,10 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
         )
         return record
 
-    new_pipeline = None if result == pipeline else result
+    # Explicit model judgment, not equality-diffing its own regenerated JSON —
+    # see RevalidationOutput's docstring for why that was the actual bug.
+    unchanged = result.pop("unchanged")
+    new_pipeline = None if unchanged else result
     updated = notes.apply_validation(note_id, git_sha=current_sha, new_pipeline=new_pipeline)
     if new_pipeline is not None:
         # Only re-embed on an actual heal — content is identical otherwise,

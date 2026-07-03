@@ -115,6 +115,32 @@ def test_list_notes_filters_by_tab_and_sorts_recent_first(notes_store):
     assert len(all_notes) == 2
 
 
+def test_list_notes_sorts_by_created_at_not_updated_at(notes_store):
+    """Regression: sorting by updated_at reshuffled the list every time an
+    older note got touched by a revalidate/heal pass (only updated_at
+    changes). Joseph wants stable newest-created-first ordering.
+
+    Stamps created_at explicitly (rather than relying on real wall-clock
+    gaps between two add_note() calls) per the no-wall-clock-timing rule —
+    two calls microseconds apart could otherwise tie."""
+    a = notes_store.add_note("a")
+    b = notes_store.add_note("b")
+    record_a = notes_store.get_note(a["id"])
+    record_b = notes_store.get_note(b["id"])
+    record_a["created_at"] = "2026-01-01T00:00:00+00:00"
+    record_b["created_at"] = "2026-01-02T00:00:00+00:00"
+    notes_store._write_note_atomic(a["id"], record_a)
+    notes_store._write_note_atomic(b["id"], record_b)
+    notes_store._append_jsonl(notes_store._index_path(), notes_store._index_stub(record_a))
+    notes_store._append_jsonl(notes_store._index_path(), notes_store._index_stub(record_b))
+
+    # Touch `a` after stamping — updated_at(a) > created_at(b) now, but
+    # creation order must still win.
+    notes_store.update_note(a["id"], title="a-touched")
+    listed = notes_store.list_notes()
+    assert [n["id"] for n in listed] == [b["id"], a["id"]]
+
+
 def test_update_note_round_trip(notes_store):
     note = notes_store.add_note("raw", tab_id="t1")
     updated = notes_store.update_note(note["id"], title="new title", tab_id="t2")

@@ -310,7 +310,7 @@ async def test_revalidate_note_heals_when_anchor_file_changed(
     _git(git_repo, "commit", "-q", "-m", "change")
     new_sha = _git_head(git_repo)
 
-    healed_payload = {**_ANCHORED_PAYLOAD, "summary": "updated summary"}
+    healed_payload = {**_ANCHORED_PAYLOAD, "summary": "updated summary", "unchanged": False}
     _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(healed_payload)))])
 
     result = await pipeline.revalidate_note(note["id"])
@@ -336,13 +336,52 @@ async def test_revalidate_note_llm_confirms_unchanged_skips_history(
     _git(git_repo, "commit", "-q", "-m", "cosmetic")
     new_sha = _git_head(git_repo)
 
-    # LLM re-checks (anchor changed) but confirms the note is still accurate.
-    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_ANCHORED_PAYLOAD)))])
+    # LLM re-checks (anchor changed) but judges the note still accurate.
+    _queue_responses(
+        pipeline,
+        monkeypatch,
+        [_FakeProc(_envelope(json.dumps({**_ANCHORED_PAYLOAD, "unchanged": True})))],
+    )
 
     result = await pipeline.revalidate_note(note["id"])
     assert result["pipeline"] == _ANCHORED_PAYLOAD
     assert result["history"] == []
     assert result["validated_git_sha"] == new_sha
+
+
+async def test_revalidate_note_unchanged_true_skips_history_despite_reworded_text(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    """Regression: revalidate_note used to infer "healed" from dict equality
+    against the model's own regenerated JSON. Real LLM calls never reproduce
+    a free-text field (organized_md especially) byte-for-byte even when the
+    model's own judgment is "still accurate" — so a genuinely unchanged note
+    got a spurious history entry + "healed" badge on nearly every revalidation
+    that went through the LLM path. The explicit `unchanged` flag must be what
+    decides this, not equality — so a reworded-but-unchanged=true response
+    must NOT create a history entry."""
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    note = notes_store.add_note("raw", repo="testrepo")
+    notes_store.set_pipeline(note["id"], _ANCHORED_PAYLOAD)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(note["id"], git_sha=initial_sha, new_pipeline=None)
+
+    (git_repo / "sessions.py").write_text("def foo():\n    pass  # cosmetic\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "cosmetic")
+
+    reworded_but_unchanged = {
+        **_ANCHORED_PAYLOAD,
+        "organized_md": "# organized (slightly different wording this time)",
+        "unchanged": True,
+    }
+    _queue_responses(
+        pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(reworded_but_unchanged)))]
+    )
+
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["history"] == []
+    assert result["pipeline"] == _ANCHORED_PAYLOAD  # untouched — reworded text discarded
 
 
 async def test_revalidate_note_no_file_entities_never_gate_skips(
@@ -357,7 +396,11 @@ async def test_revalidate_note_no_file_entities_never_gate_skips(
     initial_sha = _git_head(git_repo)
     notes_store.apply_validation(note["id"], git_sha=initial_sha, new_pipeline=None)
 
-    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(conceptual_payload)))])
+    _queue_responses(
+        pipeline,
+        monkeypatch,
+        [_FakeProc(_envelope(json.dumps({**conceptual_payload, "unchanged": True})))],
+    )
     result = await pipeline.revalidate_note(note["id"])
     assert result["pipeline"] == conceptual_payload
 

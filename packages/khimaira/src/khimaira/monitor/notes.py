@@ -194,10 +194,13 @@ def get_note(note_id: str) -> dict[str, Any]:
 
 
 def list_notes(tab_id: str | None = None) -> list[dict[str, Any]]:
+    """Newest-created first. Sorted by created_at (not updated_at) so a
+    revalidate/heal pass — which only bumps updated_at — doesn't reshuffle
+    the list out from under someone reading it."""
     stubs = list(_fold_index().values())
     if tab_id is not None:
         stubs = [s for s in stubs if s["tab_id"] == tab_id]
-    stubs.sort(key=lambda s: s["updated_at"], reverse=True)
+    stubs.sort(key=lambda s: s["created_at"], reverse=True)
     return stubs
 
 

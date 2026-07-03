@@ -288,7 +288,10 @@ export const monitorApi = createApi({
       query: (id) => `/notes/${encodeURIComponent(id)}`,
       providesTags: (_r, _e, id) => [{ type: "Notes", id }],
     }),
-    createNote: build.mutation<Note, { raw_text: string; tab_id?: string; title?: string }>({
+    createNote: build.mutation<
+      Note,
+      { raw_text: string; tab_id?: string; title?: string; repo?: string }
+    >({
       query: (body) => ({ url: "/notes", method: "POST", body }),
       invalidatesTags: [{ type: "Notes", id: "LIST" }, { type: "Tabs", id: "LIST" }],
     }),

@@ -14,10 +14,15 @@
  * wide descendant force the container wider in the first place.
  */
 
+import { lazy, Suspense } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import { MermaidBlock } from "@/components/notebook/MermaidBlock";
+// Lazy-loaded — mermaid.js is a sizeable chunk most notes never touch. Only
+// fetched the first time a note actually contains a ```mermaid fence.
+const MermaidBlock = lazy(() =>
+  import("@/components/notebook/MermaidBlock").then((m) => ({ default: m.MermaidBlock })),
+);
 
 export function MarkdownView({ content }: { content: string }) {
   return (
@@ -95,7 +100,17 @@ export function MarkdownView({ content }: { content: string }) {
             const text = String(children).replace(/\n$/, "");
 
             if (isBlock && lang === "mermaid") {
-              return <MermaidBlock code={text} />;
+              return (
+                <Suspense
+                  fallback={
+                    <pre className="mb-2 min-w-0 overflow-x-auto rounded bg-background/60 p-2 text-[11px]">
+                      <code>{text}</code>
+                    </pre>
+                  }
+                >
+                  <MermaidBlock code={text} />
+                </Suspense>
+              );
             }
             if (isBlock) {
               return (
