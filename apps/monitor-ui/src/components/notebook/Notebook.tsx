@@ -195,10 +195,14 @@ export function Notebook() {
   );
 }
 
-const STATUS_BADGE: Record<Note["status"], { label: string; variant: "outline" | "secondary" | "default" }> = {
+const STATUS_BADGE: Record<
+  Note["status"],
+  { label: string; variant: "outline" | "secondary" | "default" | "destructive" }
+> = {
   draft: { label: "processing…", variant: "outline" },
   processed: { label: "processed", variant: "secondary" },
   promoted: { label: "promoted", variant: "default" },
+  failed: { label: "structuring failed", variant: "destructive" },
 };
 
 function NoteCard({

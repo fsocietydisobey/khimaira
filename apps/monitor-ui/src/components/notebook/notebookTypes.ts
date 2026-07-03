@@ -7,7 +7,7 @@
  * daemon state, not per-project).
  */
 
-export type NoteStatus = "draft" | "processed" | "promoted";
+export type NoteStatus = "draft" | "processed" | "promoted" | "failed";
 
 export interface NotePipeline {
   summary: string;

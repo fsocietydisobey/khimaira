@@ -11,16 +11,17 @@ Endpoints:
   POST   /tabs               — create a tab
   PATCH  /tabs/{id}          — rename a tab
 
-`trigger_pipeline` is a Phase 1c stub — the headless `claude -p` transform
-spawn lands there; for now it's a no-op so POST /notes returns immediately
-with a draft note.
+`trigger_pipeline` schedules the Phase 1c headless `claude -p` transform as
+a background task — POST /notes returns immediately with a draft note; the
+note flips to processed/failed once notebook_pipeline.trigger_pipeline
+completes.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel
 
-from khimaira.monitor import notes
+from khimaira.monitor import notebook_pipeline, notes
 
 from .._optional import require
 
@@ -49,12 +50,8 @@ class UpdateTabReq(BaseModel):
 
 
 def trigger_pipeline(note_id: str) -> None:
-    """Phase 1c stub — spawns a headless `claude -p` transform for note_id.
-
-    No-op for now; Phase 1c fills this in to call notes.set_pipeline(note_id, ...)
-    asynchronously once the transform completes.
-    """
-    return None
+    """Fire the headless `claude -p` transform for note_id in the background."""
+    notebook_pipeline.schedule_pipeline(note_id)
 
 
 def build_router():

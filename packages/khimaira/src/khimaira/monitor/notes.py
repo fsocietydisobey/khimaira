@@ -31,7 +31,7 @@ from khimaira.monitor.sessions import _append_jsonl, _read_jsonl
 
 log = get_logger("monitor.notes")
 
-_VALID_STATUSES = frozenset({"draft", "processed", "promoted"})
+_VALID_STATUSES = frozenset({"draft", "processed", "promoted", "failed"})
 _NOTE_MUTABLE_FIELDS = frozenset({"title", "tab_id", "raw_text", "status", "links"})
 _DEFAULT_TAB_ID = "default"
 
