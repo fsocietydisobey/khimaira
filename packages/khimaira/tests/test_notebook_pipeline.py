@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -42,10 +44,18 @@ class _FakeProc:
 
 
 def _queue_responses(pipeline, monkeypatch, responses: list[_FakeProc]):
-    """Patch asyncio.create_subprocess_exec to pop canned responses in order."""
+    """Patch asyncio.create_subprocess_exec to pop canned responses in order.
+
+    Only intercepts the `claude` invocation — `git` calls (revalidate_note's
+    staleness-gate/sha lookups) pass through to the REAL subprocess so tests
+    exercise real git behavior against the disposable git_repo fixture.
+    """
     queue = list(responses)
+    real_exec = asyncio.create_subprocess_exec
 
     async def fake_exec(*args, **kwargs):
+        if args and args[0] == "git":
+            return await real_exec(*args, **kwargs)
         return queue.pop(0)
 
     monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
@@ -182,3 +192,194 @@ async def test_schedule_pipeline_creates_background_task(notes_store, pipeline, 
 
     updated = notes_store.get_note(note["id"])
     assert updated["status"] == "processed"
+
+
+# ---------------------------------------------------------------------------
+# revalidate_note (Phase 2a — north-star self-healing)
+#
+# Uses a REAL disposable git repo (fast local binary, no network) so the
+# staleness gate's `git diff` logic is exercised for real; only the `claude
+# -p` subprocess is mocked.
+# ---------------------------------------------------------------------------
+
+_GIT_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "test",
+    "GIT_AUTHOR_EMAIL": "test@example.com",
+    "GIT_COMMITTER_NAME": "test",
+    "GIT_COMMITTER_EMAIL": "test@example.com",
+}
+
+
+def _git(repo, *args):
+    subprocess.run(["git", *args], cwd=repo, env=_GIT_ENV, check=True, capture_output=True)
+
+
+def _git_head(repo) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        env=_GIT_ENV,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "sessions.py").write_text("def foo():\n    pass\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "init")
+    return repo
+
+
+def _patch_repo_root(pipeline, monkeypatch, repo_name, repo_path):
+    monkeypatch.setattr(
+        pipeline, "_repo_root", lambda repo: repo_path if repo == repo_name else None
+    )
+
+
+_ANCHORED_PAYLOAD = {**_VALID_PAYLOAD, "entities": ["sessions.py"]}
+
+
+async def test_revalidate_note_staleness_gate_skips_when_unchanged(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    note = notes_store.add_note("raw", repo="testrepo")
+    notes_store.set_pipeline(note["id"], _ANCHORED_PAYLOAD)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(note["id"], git_sha=initial_sha, new_pipeline=None)
+
+    # No canned responses queued — an LLM call here would raise IndexError.
+    _queue_responses(pipeline, monkeypatch, [])
+
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["validated_git_sha"] == initial_sha
+    assert result["history"] == []
+    assert result["pipeline"] == _ANCHORED_PAYLOAD
+
+
+async def test_revalidate_note_heals_when_anchor_file_changed(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    note = notes_store.add_note("raw", repo="testrepo")
+    notes_store.set_pipeline(note["id"], _ANCHORED_PAYLOAD)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(note["id"], git_sha=initial_sha, new_pipeline=None)
+
+    (git_repo / "sessions.py").write_text("def foo():\n    return 42\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "change")
+    new_sha = _git_head(git_repo)
+
+    healed_payload = {**_ANCHORED_PAYLOAD, "summary": "updated summary"}
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(healed_payload)))])
+
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["pipeline"]["summary"] == "updated summary"
+    assert result["validated_git_sha"] == new_sha
+    assert len(result["history"]) == 1
+    assert result["history"][0]["pipeline"] == _ANCHORED_PAYLOAD
+    assert result["history"][0]["validated_git_sha"] == initial_sha
+    assert result["raw_text"] == "raw"
+
+
+async def test_revalidate_note_llm_confirms_unchanged_skips_history(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    note = notes_store.add_note("raw", repo="testrepo")
+    notes_store.set_pipeline(note["id"], _ANCHORED_PAYLOAD)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(note["id"], git_sha=initial_sha, new_pipeline=None)
+
+    (git_repo / "sessions.py").write_text("def foo():\n    pass  # cosmetic\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "cosmetic")
+    new_sha = _git_head(git_repo)
+
+    # LLM re-checks (anchor changed) but confirms the note is still accurate.
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_ANCHORED_PAYLOAD)))])
+
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["pipeline"] == _ANCHORED_PAYLOAD
+    assert result["history"] == []
+    assert result["validated_git_sha"] == new_sha
+
+
+async def test_revalidate_note_no_file_entities_never_gate_skips(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    """Entities that aren't file-shaped resolve to zero anchor files — nothing
+    to diff, so the gate always pays for the LLM re-check."""
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    conceptual_payload = {**_VALID_PAYLOAD, "entities": ["session reaper", "lock"]}
+    note = notes_store.add_note("raw", repo="testrepo")
+    notes_store.set_pipeline(note["id"], conceptual_payload)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(note["id"], git_sha=initial_sha, new_pipeline=None)
+
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(conceptual_payload)))])
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["pipeline"] == conceptual_payload
+
+
+async def test_revalidate_note_llm_failure_leaves_record_unchanged(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    note = notes_store.add_note("raw", repo="testrepo")
+    notes_store.set_pipeline(note["id"], _ANCHORED_PAYLOAD)
+    # No prior validation — gate check is skipped, goes straight to the LLM.
+
+    _queue_responses(
+        pipeline,
+        monkeypatch,
+        [_FakeProc(_envelope("garbage")), _FakeProc(_envelope("still garbage"))],
+    )
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["pipeline"] == _ANCHORED_PAYLOAD
+    assert result["validated_git_sha"] is None
+    assert result["last_validated_at"] is None
+
+
+async def test_revalidate_note_unknown_repo_returns_unchanged(notes_store, pipeline, monkeypatch):
+    monkeypatch.setattr(pipeline, "_repo_root", lambda repo: None)
+    note = notes_store.add_note("raw", repo="nonexistent-repo")
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["validated_git_sha"] is None
+
+
+def test_repo_root_resolves_via_real_project_registry(pipeline):
+    """Regression: _repo_root's internal import path was wrong (khimaira.discovery
+    vs the real khimaira.monitor.discovery) and every other revalidate_note test
+    mocks _repo_root itself, so none of them would have caught it. This test
+    exercises the REAL function against the REAL registry — no mocking."""
+    from pathlib import Path
+
+    root = pipeline._repo_root("khimaira")
+    assert root is not None
+    assert Path(root) == Path(__file__).resolve().parents[3]
+    assert pipeline._repo_root("no-such-repo-xyz") is None
+
+
+async def test_revalidate_note_not_a_git_checkout_returns_unchanged(
+    notes_store, pipeline, monkeypatch, tmp_path
+):
+    non_git_dir = tmp_path / "plain"
+    non_git_dir.mkdir()
+    monkeypatch.setattr(pipeline, "_repo_root", lambda repo: non_git_dir)
+    note = notes_store.add_note("raw", repo="plain-repo")
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["validated_git_sha"] is None
+
+
+async def test_revalidate_note_unknown_id_raises(pipeline):
+    with pytest.raises(ValueError, match="No note with id"):
+        await pipeline.revalidate_note("no-such-note")

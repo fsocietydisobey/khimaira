@@ -32,8 +32,9 @@ from khimaira.monitor.sessions import _append_jsonl, _read_jsonl
 log = get_logger("monitor.notes")
 
 _VALID_STATUSES = frozenset({"draft", "processed", "promoted", "failed"})
-_NOTE_MUTABLE_FIELDS = frozenset({"title", "tab_id", "raw_text", "status", "links"})
+_NOTE_MUTABLE_FIELDS = frozenset({"title", "tab_id", "raw_text", "status", "links", "repo"})
 _DEFAULT_TAB_ID = "default"
+_DEFAULT_REPO = "khimaira"
 
 
 def _base_dir() -> Path:
@@ -98,7 +99,9 @@ def _read_note_file(note_id: str) -> dict[str, Any] | None:
 def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, Any]:
     """Listing projection of a note. Carries raw_text + pipeline + training
     (not just id/title/status) so GET /notes can render note cards directly —
-    no N+1 get_note() round trip per listed note."""
+    no N+1 get_note() round trip per listed note. history is summarized to a
+    count (not the full array) to keep the listing cheap; full history is
+    available via get_note()."""
     return {
         "id": record["id"],
         "tab_id": record["tab_id"],
@@ -109,6 +112,10 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "raw_text": record["raw_text"],
         "pipeline": record["pipeline"],
         "training": record["training"],
+        "repo": record.get("repo", _DEFAULT_REPO),
+        "last_validated_at": record.get("last_validated_at"),
+        "validated_git_sha": record.get("validated_git_sha"),
+        "history_count": len(record.get("history") or []),
         "deleted": deleted,
     }
 
@@ -140,8 +147,15 @@ def _fold_tabs() -> dict[str, dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def add_note(raw_text: str, tab_id: str = "", title: str = "") -> dict[str, Any]:
-    """Create a draft note. `pipeline` is null until the transform runs (Phase 1c)."""
+def add_note(raw_text: str, tab_id: str = "", title: str = "", repo: str = "") -> dict[str, Any]:
+    """Create a draft note. `pipeline` is null until the transform runs (Phase 1c).
+
+    `repo`: which codebase this note is validated against (north-star:
+    code is source of truth, notes are re-validated caches of it). Defaults
+    to _DEFAULT_REPO ("khimaira") — must match a project name khimaira's
+    discovery registry resolves to a filesystem path, or revalidate_note()
+    can't find anchor files to check against.
+    """
     note_id = _new_id()
     now = _now_iso()
     record: dict[str, Any] = {
@@ -161,10 +175,14 @@ def add_note(raw_text: str, tab_id: str = "", title: str = "") -> dict[str, Any]
             "distilled_pairs": 0,
         },
         "links": [],
+        "repo": repo or _DEFAULT_REPO,
+        "history": [],
+        "last_validated_at": None,
+        "validated_git_sha": None,
     }
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
-    log.info("notes: added %s in tab=%s", note_id, record["tab_id"])
+    log.info("notes: added %s in tab=%s repo=%s", note_id, record["tab_id"], record["repo"])
     return record
 
 
@@ -217,6 +235,39 @@ def set_pipeline(note_id: str, pipeline: dict[str, Any]) -> dict[str, Any]:
     record["pipeline"] = pipeline
     record["status"] = "processed"
     record["updated_at"] = _now_iso()
+    _write_note_atomic(note_id, record)
+    _append_jsonl(_index_path(), _index_stub(record))
+    return record
+
+
+def apply_validation(
+    note_id: str, *, git_sha: str, new_pipeline: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Record a revalidate_note() pass (north-star self-healing core).
+
+    `new_pipeline=None` — the note was checked and found CURRENT (staleness
+    gate skip, or the LLM confirmed it unchanged vs live code): just stamps
+    `last_validated_at`/`validated_git_sha`, no history churn.
+
+    `new_pipeline={...}` — the note was HEALED: the OUTGOING pipeline (plus
+    the validation stamp it was checked under) is pushed to `history` before
+    the new one replaces it, so prior versions are never lost. `raw_text` is
+    never touched either way — it's the immutable original paste.
+    """
+    record = get_note(note_id)
+    now = _now_iso()
+    if new_pipeline is not None:
+        history_entry = {
+            "pipeline": record["pipeline"],
+            "replaced_at": now,
+            "validated_git_sha": record.get("validated_git_sha"),
+        }
+        record.setdefault("history", []).append(history_entry)
+        record["pipeline"] = new_pipeline
+        record["status"] = "processed"
+    record["last_validated_at"] = now
+    record["validated_git_sha"] = git_sha
+    record["updated_at"] = now
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
     return record

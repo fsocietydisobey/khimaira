@@ -38,6 +38,16 @@ export interface Note {
   embedding_id: string | null;
   training: NoteTraining;
   links: string[];
+  /** North-star (Phase 2a): which codebase this note is validated against. */
+  repo: string;
+  /** Null if never revalidated. */
+  last_validated_at: string | null;
+  /** Git SHA the note was last checked against; null if never revalidated. */
+  validated_git_sha: string | null;
+  /** Count of prior pipeline versions superseded by a heal (list view carries
+   *  only the count — full version bodies are on the note's `history` array,
+   *  fetched via GET /notes/{id} if ever needed). */
+  history_count: number;
 }
 
 export interface NotebookTab {

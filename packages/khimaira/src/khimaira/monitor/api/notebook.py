@@ -1,20 +1,23 @@
-"""`/api/notes`, `/api/tabs` — AI-notebook backend (Phase 1a).
+"""`/api/notes`, `/api/tabs` — AI-notebook backend (Phase 1a-2a).
 
 Endpoints:
-  POST   /notes              — create a draft note; kicks off the (stub) pipeline
-  GET    /notes?tab_id=      — list notes, optionally filtered by tab
-  GET    /notes/{id}         — one note
-  PATCH  /notes/{id}         — edit title/tab/raw_text/status/links/pipeline-patch
-  DELETE /notes/{id}         — delete a note
-  POST   /notes/{id}/promote — curated promotion (training.promoted=True)
-  GET    /tabs               — list tabs (note_ids derived from live notes)
-  POST   /tabs               — create a tab
-  PATCH  /tabs/{id}          — rename a tab
+  POST   /notes                 — create a draft note; kicks off the (stub) pipeline
+  GET    /notes?tab_id=         — list notes, optionally filtered by tab
+  GET    /notes/{id}            — one note
+  PATCH  /notes/{id}            — edit title/tab/raw_text/status/links/repo/pipeline-patch
+  DELETE /notes/{id}            — delete a note
+  POST   /notes/{id}/promote    — curated promotion (training.promoted=True)
+  POST   /notes/{id}/revalidate — Phase 2a north-star: re-ground vs current code
+  GET    /tabs                  — list tabs (note_ids derived from live notes)
+  POST   /tabs                  — create a tab
+  PATCH  /tabs/{id}             — rename a tab
 
 `trigger_pipeline` schedules the Phase 1c headless `claude -p` transform as
 a background task — POST /notes returns immediately with a draft note; the
 note flips to processed/failed once notebook_pipeline.trigger_pipeline
-completes.
+completes. `revalidate_note` is awaited directly (not backgrounded) — it's a
+manual on-demand user action ("re-check vs code" button), not a write path
+that needs to return instantly.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ class CreateNoteReq(BaseModel):
     raw_text: str
     tab_id: str = ""
     title: str = ""
+    repo: str = ""
 
 
 class UpdateNoteReq(BaseModel):
@@ -38,6 +42,7 @@ class UpdateNoteReq(BaseModel):
     raw_text: str | None = None
     status: str | None = None
     links: list[str] | None = None
+    repo: str | None = None
     pipeline: dict | None = None
 
 
@@ -60,7 +65,7 @@ def build_router():
 
     @router.post("/notes")
     async def create_note(req: CreateNoteReq) -> dict:
-        record = notes.add_note(req.raw_text, tab_id=req.tab_id, title=req.title)
+        record = notes.add_note(req.raw_text, tab_id=req.tab_id, title=req.title, repo=req.repo)
         trigger_pipeline(record["id"])
         return record
 
@@ -96,6 +101,13 @@ def build_router():
     async def promote_note(note_id: str) -> dict:
         try:
             return notes.promote_note(note_id)
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e))
+
+    @router.post("/notes/{note_id}/revalidate")
+    async def revalidate_note(note_id: str) -> dict:
+        try:
+            return await notebook_pipeline.revalidate_note(note_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e))
 

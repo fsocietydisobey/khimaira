@@ -11,10 +11,12 @@ import pytest
 def notebook_client(isolated_state, monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+    from khimaira.monitor import notebook_pipeline as pipeline_mod
     from khimaira.monitor import notes as notes_mod
     from khimaira.monitor.api import notebook as notebook_api
 
     importlib.reload(notes_mod)
+    importlib.reload(pipeline_mod)
     importlib.reload(notebook_api)
 
     app = FastAPI()
@@ -142,3 +144,36 @@ def test_list_tabs_empty_store(notebook_client):
     r = notebook_client.get("/api/tabs")
     assert r.status_code == 200
     assert r.json() == {"tabs": []}
+
+
+def test_create_note_defaults_repo(notebook_client):
+    r = notebook_client.post("/api/notes", json={"raw_text": "hi"})
+    assert r.status_code == 200
+    assert r.json()["repo"] == "khimaira"
+
+
+def test_create_note_repo_override(notebook_client):
+    r = notebook_client.post("/api/notes", json={"raw_text": "hi", "repo": "jeevy_portal"})
+    assert r.status_code == 200
+    assert r.json()["repo"] == "jeevy_portal"
+
+
+def test_revalidate_note_happy_path(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+
+    async def fake_revalidate(note_id):
+        assert note_id == created["id"]
+        return {**created, "validated_git_sha": "deadbeef"}
+
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "revalidate_note", fake_revalidate)
+
+    r = notebook_client.post(f"/api/notes/{created['id']}/revalidate")
+    assert r.status_code == 200
+    assert r.json()["validated_git_sha"] == "deadbeef"
+
+
+def test_revalidate_note_unknown_id_returns_404(notebook_client):
+    r = notebook_client.post("/api/notes/no-such-id/revalidate")
+    assert r.status_code == 404

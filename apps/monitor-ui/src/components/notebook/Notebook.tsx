@@ -13,7 +13,7 @@
 
 import { useState } from "react";
 import { useParams } from "react-router-dom";
-import { Plus, Trash2, Upload } from "lucide-react";
+import { Plus, RefreshCw, Trash2, Upload } from "lucide-react";
 
 import {
   useCreateNoteMutation,
@@ -22,6 +22,7 @@ import {
   useListNotesQuery,
   useListTabsQuery,
   usePromoteNoteMutation,
+  useRevalidateNoteMutation,
 } from "@/api";
 import type { Note } from "@/components/notebook/notebookTypes";
 import { ProjectNavTabs } from "@/components/project/ProjectNavTabs";
@@ -205,6 +206,15 @@ const STATUS_BADGE: Record<
   failed: { label: "structuring failed", variant: "destructive" },
 };
 
+function relativeTime(iso: string): string {
+  const diffMin = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  return `${Math.floor(diffHr / 24)}d ago`;
+}
+
 function NoteCard({
   note,
   onPromote,
@@ -215,8 +225,19 @@ function NoteCard({
   onDelete: () => void;
 }) {
   const [section, setSection] = useState<"summary" | "technical" | "plain">("summary");
+  const [revalidateNote, { isLoading: revalidating }] = useRevalidateNoteMutation();
   const badge = STATUS_BADGE[note.status];
   const pipeline = note.pipeline;
+
+  // North-star validation indicator: "healed ×N" when a revalidate pass ever
+  // changed the note, else "current as of <time>" once checked, else
+  // "never validated". Not a live git-diff check — that's what the
+  // "re-check vs code" button triggers on demand.
+  const validationLabel = note.last_validated_at
+    ? note.history_count > 0
+      ? `healed ×${note.history_count} · checked ${relativeTime(note.last_validated_at)}`
+      : `current as of ${relativeTime(note.last_validated_at)}`
+    : "never validated vs code";
 
   return (
     <Card className="flex flex-col">
@@ -227,6 +248,15 @@ function NoteCard({
           </h3>
           <p className="mt-0.5 text-[10px] text-muted-foreground">
             {new Date(note.updated_at).toLocaleString()}
+          </p>
+          <p
+            className={cn(
+              "mt-0.5 text-[10px]",
+              note.history_count > 0 ? "text-amber-400/80" : "text-muted-foreground/70",
+            )}
+            title={`repo: ${note.repo}`}
+          >
+            {validationLabel}
           </p>
         </div>
         <Badge variant={badge.variant} className="shrink-0 text-[10px]">
@@ -272,6 +302,17 @@ function NoteCard({
         )}
       </CardContent>
       <div className="flex items-center justify-end gap-1 border-t border-border/50 px-3 py-1.5">
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 px-2 text-[10px] text-muted-foreground"
+          title="Re-ground this note against the current code — heals it if the code moved on"
+          disabled={revalidating}
+          onClick={() => revalidateNote(note.id)}
+        >
+          <RefreshCw className={cn("mr-1 h-3 w-3", revalidating && "animate-spin")} />
+          {revalidating ? "checking…" : "re-check vs code"}
+        </Button>
         {!note.training.promoted ? (
           <Button
             size="sm"

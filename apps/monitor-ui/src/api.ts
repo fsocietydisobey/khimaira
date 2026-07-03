@@ -304,6 +304,10 @@ export const monitorApi = createApi({
       query: (id) => ({ url: `/notes/${encodeURIComponent(id)}/promote`, method: "POST" }),
       invalidatesTags: (_r, _e, id) => [{ type: "Notes", id }, { type: "Notes", id: "LIST" }],
     }),
+    revalidateNote: build.mutation<Note, string>({
+      query: (id) => ({ url: `/notes/${encodeURIComponent(id)}/revalidate`, method: "POST" }),
+      invalidatesTags: (_r, _e, id) => [{ type: "Notes", id }, { type: "Notes", id: "LIST" }],
+    }),
     deleteNote: build.mutation<{ id: string; deleted: boolean }, string>({
       query: (id) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "DELETE" }),
       invalidatesTags: (_r, _e, id) => [
@@ -347,6 +351,7 @@ export const {
   useCreateNoteMutation,
   useUpdateNoteMutation,
   usePromoteNoteMutation,
+  useRevalidateNoteMutation,
   useDeleteNoteMutation,
   useListTabsQuery,
   useCreateTabMutation,

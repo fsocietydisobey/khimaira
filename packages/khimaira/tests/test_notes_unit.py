@@ -34,6 +34,51 @@ def test_add_note_derives_title_and_default_tab(notes_store):
     assert note["tab_id"] == "default"
 
 
+def test_add_note_defaults_repo_and_north_star_fields(notes_store):
+    note = notes_store.add_note("raw")
+    assert note["repo"] == "khimaira"
+    assert note["history"] == []
+    assert note["last_validated_at"] is None
+    assert note["validated_git_sha"] is None
+
+
+def test_add_note_repo_override(notes_store):
+    note = notes_store.add_note("raw", repo="jeevy_portal")
+    assert note["repo"] == "jeevy_portal"
+
+
+def test_apply_validation_current_no_history_churn(notes_store):
+    note = notes_store.add_note("raw")
+    notes_store.set_pipeline(note["id"], {"summary": "s1"})
+    updated = notes_store.apply_validation(note["id"], git_sha="abc123", new_pipeline=None)
+    assert updated["last_validated_at"] is not None
+    assert updated["validated_git_sha"] == "abc123"
+    assert updated["pipeline"] == {"summary": "s1"}
+    assert updated["history"] == []
+
+
+def test_apply_validation_heal_pushes_history(notes_store):
+    note = notes_store.add_note("raw")
+    notes_store.set_pipeline(note["id"], {"summary": "old"})
+    notes_store.apply_validation(note["id"], git_sha="sha1", new_pipeline=None)
+
+    healed = notes_store.apply_validation(
+        note["id"], git_sha="sha2", new_pipeline={"summary": "new"}
+    )
+    assert healed["pipeline"] == {"summary": "new"}
+    assert healed["validated_git_sha"] == "sha2"
+    assert len(healed["history"]) == 1
+    assert healed["history"][0]["pipeline"] == {"summary": "old"}
+    assert healed["history"][0]["validated_git_sha"] == "sha1"
+    # raw_text is never touched by validation.
+    assert healed["raw_text"] == "raw"
+
+
+def test_apply_validation_unknown_id_raises(notes_store):
+    with pytest.raises(ValueError, match="No note with id"):
+        notes_store.apply_validation("no-such-note", git_sha="abc")
+
+
 def test_list_notes_empty_store_returns_empty_list(notes_store):
     assert notes_store.list_notes() == []
 
