@@ -22,6 +22,25 @@ SAFETY (this sweep can DELETE records, so it is conservative by construction):
     marks the session LEFT in its chats (skipping chats where it's master).
   - Self-protection — delete_session already refuses to delete the daemon's
     own CLAUDE_CODE_SESSION_ID.
+
+WINDOW-ID LIVENESS (2026-07-03, id-split fix): the name check above has a gap —
+a Claude Code `/clear` mints a fresh, UNNAMED session bound to the SAME kitty
+window as its (differently-named) agent. An unnamed session can never satisfy
+"name in live titles", so the name-only sweep reaped it even though its window
+was very much alive (journal-observed: `reaped WINDOWLESS session 3edda8d8
+(name='(unnamed)', idle=2355s)` immediately followed by a chat-leave cascade).
+`_live_window_ids()` cross-checks the session's registered `window_id` (see
+`sessions.get_session_window`) against the live kitty window ids from the same
+`kitty @ ls` snapshot — a session is reapable only if BOTH the name check AND
+the window-id check say "not live".
+
+ACCEPTED-CHAT-MEMBER GUARD (2026-07-03, defense-in-depth): independent of the
+window checks, a session that is an ACCEPTED member of a chat and has shown
+recent tool-call activity is never reap-cascaded, even if the window/name
+checks above somehow missed it. See `_accepted_member_skip_reason`. Fail-open
+toward SKIP — a false-reap cascades `chats.leave()` across every chat the
+session is in, which is far worse than leaving one dead record in the registry
+for one more sweep.
 """
 
 from __future__ import annotations
@@ -57,6 +76,13 @@ _DUP_REAP_IDLE_MIN_S = float(os.environ.get("KHIMAIRA_REGISTRY_DUP_REAP_IDLE_S",
 _DUP_REAP_ACTIVITY_VETO_S = float(
     os.environ.get("KHIMAIRA_REGISTRY_DUP_ACTIVITY_VETO_S", "900")
 )  # 15 min
+# Accepted-chat-member guard (2026-07-03): a session that is an ACCEPTED member
+# of a chat and made a tool call within this window is treated as live and
+# never reap-cascaded, regardless of which reaper (windowless or dup) reached
+# it. Same rationale as _DUP_REAP_ACTIVITY_VETO_S — tool-call recency is the
+# audit-grade liveness signal — but applied as an independent guard on TOP of
+# the name/window checks, not a replacement for them. Env-overridable.
+_REAP_MEMBER_ACTIVITY_S = float(os.environ.get("KHIMAIRA_REAP_MEMBER_ACTIVITY_S", "1800"))  # 30 min
 
 
 def _name_from_cmdline(cmdline: list[str]) -> str | None:
@@ -87,6 +113,28 @@ def _iso_to_epoch(raw: str | None) -> float | None:
         return None
 
 
+def _kitty_ls_data() -> list | None:
+    """Fetch + parse `kitty @ ls` JSON once. Returns None if kitty is
+    unavailable or the response can't be parsed.
+
+    Shared by `_live_window_identities` (name-based liveness) and
+    `_live_window_ids` (id-based liveness, 2026-07-03) so both checks read the
+    same snapshot instead of shelling out to kitty twice per sweep.
+    """
+    try:
+        from khimaira.monitor import roster_recovery as rr
+
+        raw = rr._kitty("ls")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 def _live_window_identities() -> set[str] | None:
     """Return the set of identities (names) that prove a LIVE window, or None if
     kitty is UNAVAILABLE (the no-op signal — caller must reap nothing).
@@ -101,17 +149,8 @@ def _live_window_identities() -> set[str] | None:
     also skips — the daemon's own tooling keeps ≥1 window, so empty almost always
     means a transient kitty hiccup, not a genuinely empty desktop.
     """
-    try:
-        from khimaira.monitor import roster_recovery as rr
-
-        raw = rr._kitty("ls")
-    except Exception:
-        return None
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    data = _kitty_ls_data()
+    if data is None:
         return None
 
     names: set[str] = set()
@@ -140,6 +179,94 @@ def _live_window_identities() -> set[str] | None:
     return names
 
 
+def _live_window_ids() -> set[int] | None:
+    """Return the set of kitty window IDs currently live, or None if kitty is
+    UNAVAILABLE (same no-op signal as `_live_window_identities`).
+
+    2026-07-03 id-split fix: a Claude Code `/clear` mints a fresh, UNNAMED
+    session bound to the SAME kitty window as its (differently-named) agent.
+    Name-based liveness can never protect that session — it has no name to
+    match — but its window is very much alive. This is the cross-check:
+    `reap_windowless_sessions` keeps a session whose registered `window_id`
+    (`sessions.get_session_window`) is in this set, even when its name matches
+    nothing live.
+
+    None here means "can't tell" — callers must treat it exactly like a
+    `_live_window_identities` None (degrade gracefully, don't reap on it
+    alone). Unlike the name check, an empty set from THIS function is not
+    independently treated as suspicious — `reap_windowless_sessions` only
+    calls this after the name check already passed its own empty/None guard,
+    so an empty id set here just means "no additional id-based protection",
+    not "kitty is lying".
+    """
+    data = _kitty_ls_data()
+    if data is None:
+        return None
+
+    ids: set[int] = set()
+    for os_win in data:
+        for tab in os_win.get("tabs", []):
+            for win in tab.get("windows", []):
+                wid = win.get("id")
+                if wid is None:
+                    continue
+                try:
+                    ids.add(int(wid))
+                except (TypeError, ValueError):
+                    continue
+    return ids
+
+
+def _accepted_member_skip_reason(session_id: str) -> str | None:
+    """Defense-in-depth guard shared by both reapers (2026-07-03): a session
+    that is an ACCEPTED member of a chat and has shown recent tool-call
+    activity must never be reap-cascaded, even if the caller's window/name
+    liveness checks somehow missed it.
+
+    Returns a short, grep-able skip-reason string if the reap should be
+    SKIPPED, or None if the caller may proceed (not an accepted member of any
+    chat, or accepted but genuinely stale — no recent tool call, safe to reap
+    as legitimate cleanup of a dead roster member).
+
+    Fail-open toward SKIP: a false-reap here cascades `chats.leave()` across
+    every chat the session is in (the BUG3 class), which is far worse than
+    leaving one dead record in the registry for one more sweep. ANY error
+    while checking membership or activity is treated as "can't tell" → skip.
+    """
+    try:
+        from khimaira.monitor import chats as chats_mod
+
+        rooms = chats_mod.my_chats(session_id)
+    except Exception as exc:
+        log.debug(
+            "registry_gc: membership check failed for %s (%s) — skipping reap (conservative)",
+            session_id[:8],
+            exc,
+        )
+        return "membership-check-failed"
+
+    if not any(c.get("my_state") == chats_mod.ACCEPTED for c in rooms):
+        return None  # not an accepted chat member — no extra protection needed
+
+    try:
+        from khimaira.monitor import sessions as sessions_mod
+
+        calls = sessions_mod.recent_tool_calls(session_id, limit=1)
+        last_tool = _iso_to_epoch(calls[0].get("ts")) if calls else None
+    except Exception as exc:
+        log.debug(
+            "registry_gc: activity check failed for %s (%s) — skipping reap (conservative)",
+            session_id[:8],
+            exc,
+        )
+        return "activity-check-failed"
+
+    if last_tool is not None and (time.time() - last_tool) < _REAP_MEMBER_ACTIVITY_S:
+        return "accepted-chat-member-recent-activity"
+
+    return None  # accepted member but idle past the activity window → genuinely dead
+
+
 def reap_windowless_sessions() -> dict:
     """One GC pass. Reap registry records whose window is gone AND idle past
     the threshold. Returns a summary dict (no raise — fail-open).
@@ -147,6 +274,11 @@ def reap_windowless_sessions() -> dict:
     A record is reaped iff ALL hold:
       - live window titles could be enumerated (else NO-OP),
       - the session's name is NOT among live window titles,
+      - the session's registered window_id is NOT among live window ids
+        (2026-07-03 id-split fix — protects an unnamed session sharing a live
+        agent's window; see `_live_window_ids`),
+      - it is not an ACCEPTED chat member showing recent tool-call activity
+        (defense-in-depth; see `_accepted_member_skip_reason`),
       - it has been idle >= _REAP_IDLE_MIN_S,
       - it is not the daemon's own session (delete_session enforces this too).
     """
@@ -159,6 +291,18 @@ def reap_windowless_sessions() -> dict:
         # whole registry on a transient empty was a mass false-positive path —
         # treat empty as can't-tell and skip.
         return {"reaped": 0, "skipped": "kitty-empty-suspicious"}
+
+    # id-split fix: cross-check against live window IDS too, so an unnamed
+    # session sharing a live agent's window survives even though its name (or
+    # lack thereof) never matches. A failed id enumeration degrades gracefully
+    # to the pre-fix name-only behavior instead of blocking the whole sweep —
+    # it's additive protection, not a new no-op gate.
+    live_window_ids = _live_window_ids()
+    if live_window_ids is None:
+        log.debug(
+            "registry_gc: live window-id enumeration failed — falling back to name-only liveness"
+        )
+        live_window_ids = set()
 
     try:
         from khimaira.monitor import sessions as sessions_mod
@@ -180,6 +324,28 @@ def reap_windowless_sessions() -> dict:
             continue  # too fresh — its window may not be titled/bound yet
         if name and name in live:
             continue  # a live window holds this name → keep
+        try:
+            wid = sessions_mod.get_session_window(sid)
+        except Exception:
+            wid = None
+        if wid is not None and wid in live_window_ids:
+            log.info(
+                "registry_gc: keeping id-split session %s (name=%r) — window %s is live "
+                "though the name doesn't match any live title",
+                sid[:8],
+                name or "(unnamed)",
+                wid,
+            )
+            continue  # window is live even though name isn't → keep
+        skip_reason = _accepted_member_skip_reason(sid)
+        if skip_reason:
+            log.info(
+                "registry_gc: keeping windowless session %s (name=%r) — %s",
+                sid[:8],
+                name or "(unnamed)",
+                skip_reason,
+            )
+            continue
         # window gone + idle past threshold → reap
         try:
             res = sessions_mod.delete_session(sid, force=True, reap=True)
@@ -287,6 +453,8 @@ def reap_stale_window_duplicates() -> dict:
         liveness veto), AND is not at-least-as-tool-active as the kept session
         (relative veto — audit-grade activity outranks marker freshness),
       - it is NOT mid-turn (`is_mid_turn`),
+      - it is NOT an ACCEPTED chat member showing recent tool-call activity
+        (2026-07-03 defense-in-depth guard; see `_accepted_member_skip_reason`),
       - it has been idle >= _DUP_REAP_IDLE_MIN_S.
     Registry-only (no kitty dependency), so it runs even when the windowless
     sweep no-ops on kitty-unavailable.
@@ -366,6 +534,20 @@ def reap_stale_window_duplicates() -> dict:
                     continue  # never reap an actively-working session
             except Exception:
                 continue  # can't confirm not-mid-turn → skip (conservative)
+            # ACCEPTED-CHAT-MEMBER GUARD (2026-07-03, defense-in-depth): applies to
+            # both reapers — see _accepted_member_skip_reason. Catches the case
+            # where a duplicate is an accepted roster member with recent tool
+            # activity that the marker/tool-veto logic above didn't already skip.
+            skip_reason = _accepted_member_skip_reason(m["sid"])
+            if skip_reason:
+                log.info(
+                    "registry_gc: keeping /clear-orphan candidate %s (name=%r, window %d) — %s",
+                    m["sid"][:8],
+                    m["name"] or "(unnamed)",
+                    wid,
+                    skip_reason,
+                )
+                continue
             # MEMBERSHIP MIGRATION (2026-07-02): hand the orphan's chat memberships
             # to the live heir BEFORE the reap, so the session the operator /cleared
             # into inherits roster-chat access instead of the reap silently dropping

@@ -3,6 +3,13 @@
 2026-06-12 (muther symptom 2): liveness now matches the drift-proof launch `-n`
 name in addition to the mutable window title, and a transient empty kitty result
 is treated as can't-tell (skip) rather than reap-everything.
+
+2026-07-03 (id-split fix + accepted-member guard): `_live_window_ids()` cross-
+checks a session's registered window_id against live kitty window ids, so an
+unnamed session sharing a live agent's window survives even though its name
+never matches. `_accepted_member_skip_reason()` adds an independent guard on
+both reapers — an ACCEPTED chat member with recent tool-call activity is never
+reap-cascaded regardless of the window/name checks.
 """
 
 from __future__ import annotations
@@ -24,6 +31,17 @@ def gc_mod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from khimaira.monitor import registry_gc as gc
 
     importlib.reload(gc)
+    # Deterministic defaults for the two new liveness dependencies this fixture's
+    # tests didn't previously need to know about. Individual tests override these
+    # to exercise the id-split protection / membership guard; everyone else gets
+    # the pre-fix behavior (no real `kitty @ ls` shell-out, no chat membership).
+    from khimaira.monitor import chats as chats_mod
+    from khimaira.monitor import roster_recovery as rr
+
+    monkeypatch.setattr(
+        rr, "_kitty", lambda *a, **k: None
+    )  # kitty unavailable → _live_window_ids() None
+    monkeypatch.setattr(chats_mod, "my_chats", lambda sid: [])  # no accepted chat memberships
     yield gc, sess
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     importlib.reload(sess)
@@ -560,4 +578,242 @@ def test_no_migration_when_guard_skips_reap(gc_mod, monkeypatch):
     res = gc.reap_stale_window_duplicates()
     assert res["reaped"] == 0 and deleted == [] and transfers == [], (
         "a guard-skipped session's memberships are never migrated"
+    )
+
+
+# --- window-id liveness / id-split fix (2026-07-03) -------------------------------
+# journal-observed bug (2026-07-03 13:08:24): a Claude Code `/clear` mints a fresh,
+# UNNAMED session sharing its live agent's kitty window. Name-based liveness can
+# never protect it — it has no name to match — so the sweep reaped it and cascaded
+# a chat-leave: "reaped WINDOWLESS session 3edda8d8 (name='(unnamed)', idle=2355s)"
+# immediately followed by "3edda8d8 left chat-05b948bc2d2b". `_live_window_ids()`
+# closes the gap by cross-checking the session's registered window_id.
+
+
+def test_live_window_ids_from_kitty_ls(gc_mod, monkeypatch):
+    gc, _ = gc_mod
+    import json as _json
+
+    ls = [
+        {
+            "tabs": [
+                {
+                    "windows": [
+                        {"id": 42, "title": "agent-1"},
+                        {"id": 7, "title": "master"},
+                    ]
+                }
+            ]
+        }
+    ]
+    from khimaira.monitor import roster_recovery as rr
+
+    monkeypatch.setattr(rr, "_kitty", lambda *a: _json.dumps(ls))
+    assert gc._live_window_ids() == {42, 7}
+
+
+def test_live_window_ids_none_when_kitty_unavailable(gc_mod, monkeypatch):
+    gc, _ = gc_mod
+    from khimaira.monitor import roster_recovery as rr
+
+    monkeypatch.setattr(rr, "_kitty", lambda *a: None)
+    assert gc._live_window_ids() is None
+
+
+def test_id_split_session_not_reaped_when_window_live(gc_mod, monkeypatch):
+    """THE load-bearing test: an unnamed post-/clear session shares its live
+    agent's kitty window. Its name never matches a live title, but its
+    registered window_id proves it alive — must NOT be reaped."""
+    gc, sess = gc_mod
+    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
+    monkeypatch.setattr(gc, "_live_window_ids", lambda: {42})
+    deleted = []
+    monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-unnamed", "", 99999)))
+    monkeypatch.setattr(
+        sess, "get_session_window", lambda sid: 42 if sid == "uuid-unnamed" else None
+    )
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
+    res = gc.reap_windowless_sessions()
+    assert res["reaped"] == 0
+    assert deleted == [], "window_id liveness must protect the unnamed id-split session"
+
+
+def test_genuinely_windowless_session_still_reaped(gc_mod, monkeypatch):
+    """The id-split fix is additive protection, not a blanket amnesty — a session
+    with neither a live name NOR a live window is still cleaned up."""
+    gc, sess = gc_mod
+    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
+    monkeypatch.setattr(gc, "_live_window_ids", lambda: {42})
+    deleted = []
+    monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-dead", "old-name", 99999)))
+    monkeypatch.setattr(sess, "get_session_window", lambda sid: None)
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
+    res = gc.reap_windowless_sessions()
+    assert res["reaped"] == 1
+    assert deleted == ["uuid-dead"], "no live name, no live window → cleanup still works"
+
+
+def test_window_id_enumeration_failure_falls_back_to_name_only(gc_mod, monkeypatch):
+    """If _live_window_ids can't tell (kitty id-enumeration failed) but the name
+    check already succeeded, the sweep degrades to name-only behavior instead of
+    aborting entirely — the id check is additive, not a new no-op gate."""
+    gc, sess = gc_mod
+    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
+    monkeypatch.setattr(gc, "_live_window_ids", lambda: None)
+    deleted = []
+    monkeypatch.setattr(
+        sess,
+        "list_sessions",
+        lambda **k: _rows(("uuid-1", "agent-1", 99999), ("uuid-2", "agent-2", 99999)),
+    )
+    monkeypatch.setattr(sess, "get_session_window", lambda sid: None)
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
+    res = gc.reap_windowless_sessions()
+    assert res["reaped"] == 1
+    assert deleted == ["uuid-2"], "id-enum failure degrades to name-only, doesn't block the sweep"
+
+
+# --- accepted-chat-member guard (2026-07-03, defense-in-depth) --------------------
+# Independent of the window/name checks: a session that is an ACCEPTED member of a
+# chat and has shown recent tool-call activity must never be reap-cascaded. Applies
+# to BOTH reapers. A genuinely-dead accepted member (no window, no recent activity,
+# long idle) is still legitimate cleanup.
+
+
+def test_accepted_member_skip_reason_none_for_non_member(gc_mod, monkeypatch):
+    gc, _ = gc_mod
+    from khimaira.monitor import chats as chats_mod
+
+    monkeypatch.setattr(chats_mod, "my_chats", lambda sid: [])
+    assert gc._accepted_member_skip_reason("some-sid") is None
+
+
+def test_accepted_member_skip_reason_fails_open_on_membership_error(gc_mod, monkeypatch):
+    gc, _ = gc_mod
+    from khimaira.monitor import chats as chats_mod
+
+    def _raise(sid):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(chats_mod, "my_chats", _raise)
+    assert gc._accepted_member_skip_reason("some-sid") == "membership-check-failed"
+
+
+def test_accepted_member_with_recent_activity_not_reaped(gc_mod, monkeypatch):
+    """An accepted chat member with a tool call inside the activity window is
+    protected even though it's otherwise windowless/name-mismatched."""
+    gc, sess = gc_mod
+    import time
+    from datetime import datetime
+
+    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
+    monkeypatch.setattr(gc, "_live_window_ids", lambda: set())
+    deleted = []
+    monkeypatch.setattr(
+        sess, "list_sessions", lambda **k: _rows(("uuid-member", "old-name", 99999))
+    )
+    monkeypatch.setattr(sess, "get_session_window", lambda sid: None)
+
+    from khimaira.monitor import chats as chats_mod
+
+    monkeypatch.setattr(
+        chats_mod, "my_chats", lambda sid: [{"chat_id": "chat-a", "my_state": "accepted"}]
+    )
+    now = time.time()
+    monkeypatch.setattr(
+        sess,
+        "recent_tool_calls",
+        lambda sid, limit=1: [{"ts": datetime.fromtimestamp(now - 60, tz=UTC).isoformat()}],
+    )
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
+    res = gc.reap_windowless_sessions()
+    assert res["reaped"] == 0
+    assert deleted == [], "accepted chat member with recent tool activity must not be reap-cascaded"
+
+
+def test_accepted_member_truly_dead_still_reaped(gc_mod, monkeypatch):
+    """A genuinely-dead accepted member (no window, no recent activity, idle long)
+    is still legitimate cleanup — the guard doesn't grant blanket immunity."""
+    gc, sess = gc_mod
+    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
+    monkeypatch.setattr(gc, "_live_window_ids", lambda: set())
+    deleted = []
+    monkeypatch.setattr(
+        sess, "list_sessions", lambda **k: _rows(("uuid-stale-member", "old-name", 99999))
+    )
+    monkeypatch.setattr(sess, "get_session_window", lambda sid: None)
+
+    from khimaira.monitor import chats as chats_mod
+
+    monkeypatch.setattr(
+        chats_mod, "my_chats", lambda sid: [{"chat_id": "chat-a", "my_state": "accepted"}]
+    )
+    monkeypatch.setattr(sess, "recent_tool_calls", lambda sid, limit=1: [])
+    monkeypatch.setattr(
+        sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
+    )
+    res = gc.reap_windowless_sessions()
+    assert res["reaped"] == 1
+    assert deleted == ["uuid-stale-member"], (
+        "accepted but genuinely dead member is still cleaned up"
+    )
+
+
+def test_dup_reap_accepted_member_with_recent_activity_not_reaped(gc_mod, monkeypatch):
+    """The accepted-chat-member guard also applies to the dup reaper: a same-window
+    duplicate that clears the audit-grade tool-activity veto (>900s tool-silent) but
+    is STILL an accepted chat member with activity inside the wider member-activity
+    window (1800s default) must not be reap-cascaded."""
+    gc, sess = gc_mod
+    import time
+
+    now = time.time()
+    deleted, transfers = [], []
+    _dup_env(
+        monkeypatch,
+        sess,
+        rows=_rows(("keep", "agent-1", 90), ("orphan", "agent-1", 99999)),
+        windows={"keep": 62, "orphan": 62},
+        fresh={"keep": 2000.0, "orphan": 1000.0},
+        tools={"orphan": now - 1200},  # clears the 900s absolute dup-veto...
+        deleted=deleted,
+    )
+    _chats_env(
+        monkeypatch,
+        rooms_for={"orphan": [{"chat_id": "chat-a", "my_state": "accepted"}]},
+        transfers=transfers,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 0 and deleted == [], (
+        "...but the 1800s accepted-member activity guard still protects it"
+    )
+    assert transfers == [], "no migration should run for a guard-skipped session"
+
+
+def test_dup_reap_accepted_member_truly_dead_still_reaped(gc_mod, monkeypatch):
+    gc, sess = gc_mod
+    deleted = []
+    _dup_env(
+        monkeypatch,
+        sess,
+        rows=_rows(("keep", "agent-1", 90), ("orphan", "agent-1", 99999)),
+        windows={"keep": 62, "orphan": 62},
+        fresh={"keep": 2000.0, "orphan": 1000.0},
+        deleted=deleted,
+    )
+    _chats_env(
+        monkeypatch,
+        rooms_for={"orphan": [{"chat_id": "chat-a", "my_state": "accepted"}]},
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 1 and deleted == ["orphan"], (
+        "accepted but genuinely dead (no recent tool call) — still cleaned up"
     )
