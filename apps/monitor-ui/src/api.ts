@@ -274,8 +274,14 @@ export const monitorApi = createApi({
     // api/notebook.py). Global daemon state — not scoped by project, despite
     // the per-project route the frontend mounts it under.
     // -----------------------------------------------------------------------
-    listNotes: build.query<{ notes: Note[] }, { tabId?: string } | void>({
-      query: (arg) => (arg?.tabId ? `/notes?tab_id=${encodeURIComponent(arg.tabId)}` : "/notes"),
+    listNotes: build.query<{ notes: Note[] }, { tabId?: string; repo?: string } | void>({
+      query: (arg) => {
+        const params = new URLSearchParams();
+        if (arg?.tabId) params.set("tab_id", arg.tabId);
+        if (arg?.repo) params.set("repo", arg.repo);
+        const qs = params.toString();
+        return qs ? `/notes?${qs}` : "/notes";
+      },
       providesTags: (result) =>
         result
           ? [
@@ -295,7 +301,10 @@ export const monitorApi = createApi({
       query: (body) => ({ url: "/notes", method: "POST", body }),
       invalidatesTags: [{ type: "Notes", id: "LIST" }, { type: "Tabs", id: "LIST" }],
     }),
-    updateNote: build.mutation<Note, { id: string; title?: string; tab_id?: string; status?: NoteStatus }>({
+    updateNote: build.mutation<
+      Note,
+      { id: string; title?: string; tab_id?: string; status?: NoteStatus; repo?: string }
+    >({
       query: ({ id, ...body }) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "PATCH", body }),
       invalidatesTags: (_r, _e, { id }) => [
         { type: "Notes", id },

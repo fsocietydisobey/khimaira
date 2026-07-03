@@ -50,6 +50,20 @@ def test_list_notes_filters_by_tab(notebook_client):
     assert notes[0]["tab_id"] == "t1"
 
 
+def test_list_notes_repo_filter_includes_general(notebook_client):
+    notebook_client.post("/api/notes", json={"raw_text": "a", "repo": "khimaira"})
+    notebook_client.post("/api/notes", json={"raw_text": "b", "repo": "jeevy_portal"})
+    notebook_client.post("/api/notes", json={"raw_text": "c", "repo": "general"})
+
+    r = notebook_client.get("/api/notes", params={"repo": "khimaira"})
+    assert r.status_code == 200
+    repos = {n["repo"] for n in r.json()["notes"]}
+    assert repos == {"khimaira", "general"}
+
+    r_all = notebook_client.get("/api/notes")
+    assert {n["repo"] for n in r_all.json()["notes"]} == {"khimaira", "jeevy_portal", "general"}
+
+
 def test_get_note_happy_path(notebook_client):
     created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
     r = notebook_client.get(f"/api/notes/{created['id']}")

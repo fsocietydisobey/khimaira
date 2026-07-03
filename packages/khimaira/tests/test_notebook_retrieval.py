@@ -148,3 +148,19 @@ def test_search_notes_repo_filter_scopes_results(retrieval):
 
     unscoped_hits = retrieval.search_notes(shared_text, threshold=0.3)
     assert {h["note_id"] for h in unscoped_hits} == {"note-khimaira", "note-jeevy"}
+
+
+def test_search_notes_repo_filter_includes_general_bucket(retrieval):
+    """A repo-scoped search must ALSO surface General-bucket notes (no
+    codebase, cross-cutting) — they're always in scope alongside whichever
+    project is being asked about."""
+    shared_text = "unique gronk widget frobnicator content"
+    retrieval.upsert_note(_note("note-khimaira", raw_text=shared_text, repo="khimaira"))
+    retrieval.upsert_note(_note("note-jeevy", raw_text=shared_text, repo="jeevy_portal"))
+    retrieval.upsert_note(_note("note-general", raw_text=shared_text, repo="general"))
+
+    khimaira_hits = retrieval.search_notes(shared_text, threshold=0.3, repo="khimaira")
+    assert {h["note_id"] for h in khimaira_hits} == {"note-khimaira", "note-general"}
+
+    jeevy_hits = retrieval.search_notes(shared_text, threshold=0.3, repo="jeevy_portal")
+    assert {h["note_id"] for h in jeevy_hits} == {"note-jeevy", "note-general"}

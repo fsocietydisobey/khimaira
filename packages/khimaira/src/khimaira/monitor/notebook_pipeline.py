@@ -408,8 +408,15 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
     a git checkout, or an LLM parse failure all leave the record untouched
     (never corrupt good data over a health-check glitch) and log a warning.
     Raises ValueError only if note_id itself doesn't exist (mirrors get_note).
+
+    General-bucket notes (repo == notes.GENERAL_REPO, cross-cutting notes
+    with no codebase) return as-is immediately — there's nothing to
+    validate against, so this isn't a degrade and doesn't warn.
     """
     record = notes.get_note(note_id)
+    if record.get("repo") == notes.GENERAL_REPO:
+        return record
+
     repo = record.get("repo") or "khimaira"
     repo_root = _repo_root(repo)
     if repo_root is None:
@@ -700,6 +707,8 @@ async def answer_question(
     code_chunks: list[dict[str, Any]] = []
     code_unavailable: list[str] = []
     for r in sorted(repos_seen):
+        if r == notes.GENERAL_REPO:
+            continue  # no codebase to ground General notes against — not a degrade
         chunks, unavailable = await _code_grounding_for_repo(r, question)
         code_chunks.extend(chunks)
         if unavailable:

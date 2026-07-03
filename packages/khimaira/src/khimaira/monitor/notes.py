@@ -36,6 +36,11 @@ _NOTE_MUTABLE_FIELDS = frozenset({"title", "tab_id", "raw_text", "status", "link
 _DEFAULT_TAB_ID = "default"
 _DEFAULT_REPO = "khimaira"
 
+# "General" — a repo value meaning "no codebase to validate against" (cross-
+# cutting notes). revalidate_note() and answer_question()'s code-grounding
+# both skip entirely for this repo — see notebook_pipeline.py.
+GENERAL_REPO = "general"
+
 
 def _base_dir() -> Path:
     xdg = Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
@@ -193,21 +198,33 @@ def get_note(note_id: str) -> dict[str, Any]:
     return record
 
 
-def list_notes(tab_id: str | None = None) -> list[dict[str, Any]]:
+def list_notes(tab_id: str | None = None, repo: str | None = None) -> list[dict[str, Any]]:
     """Newest-created first. Sorted by created_at (not updated_at) so a
     revalidate/heal pass — which only bumps updated_at — doesn't reshuffle
-    the list out from under someone reading it."""
+    the list out from under someone reading it.
+
+    `repo`, when given, scopes to that repo PLUS GENERAL_REPO (the "no
+    codebase" bucket for cross-cutting notes always stays visible alongside
+    whichever project is in view). `repo=None` returns everything — the
+    "All projects" view."""
     stubs = list(_fold_index().values())
     if tab_id is not None:
         stubs = [s for s in stubs if s["tab_id"] == tab_id]
+    if repo is not None:
+        stubs = [s for s in stubs if s.get("repo") in (repo, GENERAL_REPO)]
     stubs.sort(key=lambda s: s["created_at"], reverse=True)
     return stubs
 
 
 def update_note(note_id: str, **fields: Any) -> dict[str, Any]:
-    """Edit a note. Accepts title/tab_id/raw_text/status/links, plus a
+    """Edit a note. Accepts title/tab_id/raw_text/status/links/repo, plus a
     `pipeline` kwarg treated as a partial patch merged onto the existing
-    pipeline dict (manual edits to summary/technical/plain/etc)."""
+    pipeline dict (manual edits to summary/technical/plain/etc).
+
+    Changing `repo` to a different value re-anchors future validation: the
+    old validated_git_sha means nothing against a different repo's git
+    history, so it's cleared along with last_validated_at, forcing a full
+    re-check (not a heal-vs-stale-sha comparison) on the next revalidate."""
     record = get_note(note_id)
     pipeline_patch = fields.pop("pipeline", None)
     unknown = set(fields) - _NOTE_MUTABLE_FIELDS
@@ -220,6 +237,9 @@ def update_note(note_id: str, **fields: Any) -> dict[str, Any]:
         raise ValueError(
             f"Invalid status {fields['status']!r}; must be one of {sorted(_VALID_STATUSES)}."
         )
+    if "repo" in fields and fields["repo"] != record.get("repo"):
+        record["validated_git_sha"] = None
+        record["last_validated_at"] = None
     record.update(fields)
     if pipeline_patch is not None:
         merged = dict(record.get("pipeline") or {})
@@ -313,6 +333,78 @@ def delete_note(note_id: str) -> dict[str, Any]:
     _append_jsonl(_index_path(), _index_stub(record, deleted=True))
     log.info("notes: deleted %s", note_id)
     return {"id": note_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# One-time backfill (Joseph, 2026-07-03): drop pre-fix spurious "heals".
+#
+# Before notebook_pipeline.RevalidationOutput's explicit `unchanged` field,
+# revalidate_note() inferred a heal from dict-equality between the model's
+# regenerated JSON and the prior pipeline — but real LLM output is never
+# byte-identical across two generations even when nothing substantive
+# changed, so nearly every LLM re-check got mis-flagged as a heal. The
+# signature of that specific bug: summary/technical/plain/tags/entities
+# identical, only organized_md drifted (wording noise). This backfill
+# removes exactly that signature from existing history — a real heal
+# always changes more than just organized_md, so genuine heals are untouched.
+# ---------------------------------------------------------------------------
+
+_SUBSTANCE_FIELDS = ("summary", "technical", "plain", "tags", "entities")
+
+
+def _same_substance_different_organized_md(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return all(a.get(k) == b.get(k) for k in _SUBSTANCE_FIELDS) and a.get(
+        "organized_md"
+    ) != b.get("organized_md")
+
+
+def backfill_drop_spurious_heals(note_id: str) -> dict[str, Any]:
+    """Drops any history entry whose archived pipeline differs from the
+    NEXT version in the chain (or the current pipeline, for the last
+    entry) ONLY in organized_md. Idempotent — a no-op on already-clean
+    history."""
+    record = get_note(note_id)
+    history = record.get("history") or []
+    if not history:
+        return record
+
+    kept = []
+    for i, entry in enumerate(history):
+        next_pipeline = (
+            history[i + 1]["pipeline"] if i + 1 < len(history) else record.get("pipeline") or {}
+        )
+        if _same_substance_different_organized_md(entry.get("pipeline") or {}, next_pipeline):
+            continue  # spurious wording-only "heal" — drop
+        kept.append(entry)
+
+    if len(kept) == len(history):
+        return record
+
+    record["history"] = kept
+    _write_note_atomic(note_id, record)
+    _append_jsonl(_index_path(), _index_stub(record))
+    log.info(
+        "notes: backfill dropped %d spurious heal entr%s from %s",
+        len(history) - len(kept),
+        "y" if len(history) - len(kept) == 1 else "ies",
+        note_id,
+    )
+    return record
+
+
+def backfill_drop_spurious_heals_all() -> list[str]:
+    """Runs backfill_drop_spurious_heals() across every note. Returns ids of
+    notes that were actually changed. Cheap (pure JSON diffing, no LLM/git
+    calls) — safe to call on every daemon startup."""
+    changed: list[str] = []
+    for stub in list_notes():
+        if not stub.get("history_count"):
+            continue
+        before = stub["history_count"]
+        updated = backfill_drop_spurious_heals(stub["id"])
+        if len(updated.get("history") or []) != before:
+            changed.append(stub["id"])
+    return changed
 
 
 # ---------------------------------------------------------------------------

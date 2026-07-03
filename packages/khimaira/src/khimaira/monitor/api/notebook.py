@@ -84,8 +84,10 @@ def build_router():
         return record
 
     @router.get("/notes")
-    async def list_notes_endpoint(tab_id: str | None = None) -> dict:
-        return {"notes": notes.list_notes(tab_id=tab_id)}
+    async def list_notes_endpoint(tab_id: str | None = None, repo: str | None = None) -> dict:
+        """`repo`, when given, scopes to that repo plus the "General" bucket
+        (repo=None returns every project's notes — the "All projects" view)."""
+        return {"notes": notes.list_notes(tab_id=tab_id, repo=repo)}
 
     @router.get("/notes/search")
     async def search_notes(q: str, top_k: int = notebook_retrieval.DEFAULT_TOP_K) -> dict:

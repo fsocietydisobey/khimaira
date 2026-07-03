@@ -79,6 +79,83 @@ def test_apply_validation_unknown_id_raises(notes_store):
         notes_store.apply_validation("no-such-note", git_sha="abc")
 
 
+_BASE_PIPELINE = {
+    "summary": "s",
+    "technical": "t",
+    "plain": "p",
+    "organized_md": "# original",
+    "tags": ["a"],
+    "entities": ["b"],
+}
+
+
+def test_backfill_drops_spurious_wording_only_heal(notes_store):
+    """Regression for the pre-fix dict-equality bug: a history entry whose
+    pipeline differs from the current one ONLY in organized_md is spurious
+    wording noise, not a real heal — must be dropped."""
+    note = notes_store.add_note("raw")
+    notes_store.set_pipeline(note["id"], _BASE_PIPELINE)
+    notes_store.apply_validation(note["id"], git_sha="sha1", new_pipeline=None)
+    # Simulate the old bug: only organized_md drifted, everything else identical.
+    notes_store.apply_validation(
+        note["id"],
+        git_sha="sha2",
+        new_pipeline={**_BASE_PIPELINE, "organized_md": "# reworded, same substance"},
+    )
+    assert len(notes_store.get_note(note["id"])["history"]) == 1
+
+    cleaned = notes_store.backfill_drop_spurious_heals(note["id"])
+    assert cleaned["history"] == []
+    assert cleaned["pipeline"]["organized_md"] == "# reworded, same substance"  # current untouched
+
+
+def test_backfill_keeps_real_heal(notes_store):
+    """A heal that changes actual substance (not just organized_md wording)
+    must survive the backfill untouched."""
+    note = notes_store.add_note("raw")
+    notes_store.set_pipeline(note["id"], _BASE_PIPELINE)
+    notes_store.apply_validation(note["id"], git_sha="sha1", new_pipeline=None)
+    notes_store.apply_validation(
+        note["id"], git_sha="sha2", new_pipeline={**_BASE_PIPELINE, "summary": "genuinely new"}
+    )
+
+    cleaned = notes_store.backfill_drop_spurious_heals(note["id"])
+    assert len(cleaned["history"]) == 1
+    assert cleaned["history"][0]["pipeline"] == _BASE_PIPELINE
+
+
+def test_backfill_is_idempotent_on_clean_history(notes_store):
+    note = notes_store.add_note("raw")
+    notes_store.set_pipeline(note["id"], _BASE_PIPELINE)
+    notes_store.apply_validation(note["id"], git_sha="sha1", new_pipeline=None)
+
+    first = notes_store.backfill_drop_spurious_heals(note["id"])
+    second = notes_store.backfill_drop_spurious_heals(note["id"])
+    assert first == second
+    assert first["history"] == []
+
+
+def test_backfill_all_reports_only_changed_notes(notes_store):
+    spurious = notes_store.add_note("raw")
+    notes_store.set_pipeline(spurious["id"], _BASE_PIPELINE)
+    notes_store.apply_validation(spurious["id"], git_sha="sha1", new_pipeline=None)
+    notes_store.apply_validation(
+        spurious["id"],
+        git_sha="sha2",
+        new_pipeline={**_BASE_PIPELINE, "organized_md": "# reworded only"},
+    )
+
+    clean = notes_store.add_note("other raw")
+    notes_store.set_pipeline(clean["id"], _BASE_PIPELINE)
+    notes_store.apply_validation(clean["id"], git_sha="sha1", new_pipeline=None)
+    notes_store.apply_validation(
+        clean["id"], git_sha="sha2", new_pipeline={**_BASE_PIPELINE, "summary": "real change"}
+    )
+
+    changed = notes_store.backfill_drop_spurious_heals_all()
+    assert changed == [spurious["id"]]
+
+
 def test_list_notes_empty_store_returns_empty_list(notes_store):
     assert notes_store.list_notes() == []
 
@@ -139,6 +216,49 @@ def test_list_notes_sorts_by_created_at_not_updated_at(notes_store):
     notes_store.update_note(a["id"], title="a-touched")
     listed = notes_store.list_notes()
     assert [n["id"] for n in listed] == [b["id"], a["id"]]
+
+
+def test_list_notes_repo_filter_includes_general_bucket(notes_store):
+    """repo=None is the "All projects" view; repo=<x> scopes to that repo
+    PLUS the General bucket (cross-cutting notes always stay visible)."""
+    khimaira_note = notes_store.add_note("a", repo="khimaira")
+    jeevy_note = notes_store.add_note("b", repo="jeevy_portal")
+    general_note = notes_store.add_note("c", repo=notes_store.GENERAL_REPO)
+
+    scoped = notes_store.list_notes(repo="khimaira")
+    assert {n["id"] for n in scoped} == {khimaira_note["id"], general_note["id"]}
+
+    all_projects = notes_store.list_notes()
+    assert {n["id"] for n in all_projects} == {
+        khimaira_note["id"],
+        jeevy_note["id"],
+        general_note["id"],
+    }
+
+
+def test_update_note_repo_change_resets_validation_state(notes_store):
+    """Changing repo re-anchors future validation — the old validated_git_sha
+    is meaningless against a different repo's git history."""
+    note = notes_store.add_note("raw", repo="khimaira")
+    notes_store.apply_validation(note["id"], git_sha="deadbeef")
+    validated = notes_store.get_note(note["id"])
+    assert validated["validated_git_sha"] == "deadbeef"
+    assert validated["last_validated_at"] is not None
+
+    updated = notes_store.update_note(note["id"], repo="jeevy_portal")
+    assert updated["validated_git_sha"] is None
+    assert updated["last_validated_at"] is None
+    assert updated["repo"] == "jeevy_portal"
+
+
+def test_update_note_same_repo_keeps_validation_state(notes_store):
+    """Setting repo to its CURRENT value (e.g. an unrelated field edit that
+    happens to pass repo through) must not spuriously reset validation."""
+    note = notes_store.add_note("raw", repo="khimaira")
+    notes_store.apply_validation(note["id"], git_sha="deadbeef")
+
+    updated = notes_store.update_note(note["id"], repo="khimaira", title="new title")
+    assert updated["validated_git_sha"] == "deadbeef"
 
 
 def test_update_note_round_trip(notes_store):

@@ -42,9 +42,11 @@ import {
   useCreateTabMutation,
   useDeleteNoteMutation,
   useListNotesQuery,
+  useListProjectsQuery,
   useListTabsQuery,
   usePromoteNoteMutation,
   useRevalidateNoteMutation,
+  useUpdateNoteMutation,
 } from "@/api";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
 import type { AskAnswer, Note } from "@/components/notebook/notebookTypes";
@@ -56,6 +58,10 @@ import { cn } from "@/lib/utils";
 
 const ALL_TABS = "__all__";
 const GRID_LEFT_WIDTH = 240;
+/** Mirrors notes.GENERAL_REPO — a repo value meaning "no codebase", for
+ *  cross-cutting notes. Always in scope alongside whichever project the
+ *  left list / ask are currently scoped to. */
+const GENERAL_REPO = "general";
 
 const SUGGESTED_QUESTIONS = [
   "What's changed recently in the code this notebook tracks?",
@@ -290,22 +296,29 @@ export function Notebook() {
   );
   const [leftWidth, resizeLeft] = useResizableWidth("notebook-left-width", 256, 200, 480, 1);
   const [rightWidth, resizeRight] = useResizableWidth("notebook-right-width", 420, 280, 720, -1);
+  // "All projects" — default OFF (scoped to the current project + General).
+  // Doesn't hard-hide anything; it's a toggle, not a filter you can't undo.
+  const [allProjects, setAllProjects] = usePersistedBoolean("notebook-all-projects", false);
+  const repoScope = allProjects ? undefined : projectName || undefined;
 
   const { data: tabsData } = useListTabsQuery();
   const { data: notesData, isLoading: notesLoading } = useListNotesQuery(
-    selectedTab === ALL_TABS ? undefined : { tabId: selectedTab },
+    { tabId: selectedTab === ALL_TABS ? undefined : selectedTab, repo: repoScope },
     { pollingInterval: 3000 },
   );
+  const { data: projectsData } = useListProjectsQuery();
   const [createNote, { isLoading: creatingNote }] = useCreateNoteMutation();
   const [saveAnswerAsNote, { isLoading: savingAnswer }] = useCreateNoteMutation();
   const [createTab] = useCreateTabMutation();
   const [promoteNote] = usePromoteNoteMutation();
   const [deleteNote] = useDeleteNoteMutation();
+  const [updateNote] = useUpdateNoteMutation();
   const [revalidateNote, { isLoading: revalidating }] = useRevalidateNoteMutation();
   const [askNotebook, { isLoading: asking }] = useAskNotebookMutation();
 
   const tabs = tabsData?.tabs ?? [];
   const notes = notesData?.notes ?? [];
+  const repoOptions = [...(projectsData ?? []).map((p) => p.name), GENERAL_REPO];
   const selectedNote =
     viewMode === "reader" && centerView?.kind === "note"
       ? (notes.find((n) => n.id === centerView.noteId) ?? null)
@@ -319,10 +332,12 @@ export function Notebook() {
   };
 
   const handleAsk = async (question: string, noteIds: string[]) => {
-    const result = await askNotebook({ question, note_ids: noteIds }).unwrap();
+    const result = await askNotebook({ question, note_ids: noteIds, repo: repoScope }).unwrap();
     setViewMode("reader");
     setCenterView({ kind: "answer", data: result, question });
   };
+
+  const handleChangeRepo = (noteId: string, repo: string) => updateNote({ id: noteId, repo });
 
   const handleSaveAnswer = async () => {
     if (centerView?.kind !== "answer") return;
@@ -378,6 +393,8 @@ export function Notebook() {
         setCreatingTab(false);
         setNewTabTitle("");
       }}
+      allProjects={allProjects}
+      onToggleAllProjects={() => setAllProjects(!allProjects)}
     />
   );
 
@@ -419,6 +436,8 @@ export function Notebook() {
             onOpenNote={handleSelectNote}
             onPromote={(id) => promoteNote(id)}
             onDelete={(id) => deleteNote(id)}
+            repoOptions={repoOptions}
+            onChangeRepo={handleChangeRepo}
           />
         </div>
       ) : (
@@ -451,6 +470,8 @@ export function Notebook() {
             onSaveAnswer={handleSaveAnswer}
             savingAnswer={savingAnswer}
             answerSaved={centerView?.kind === "answer" && savedAnswerRef === centerView.data}
+            repoOptions={repoOptions}
+            onChangeRepo={handleChangeRepo}
           />
           <SidePanelShell
             side="right"
@@ -502,6 +523,7 @@ function AskBar({
   const [mentions, setMentions] = useState<Mention[]>([]);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionMatchStart, setMentionMatchStart] = useState<number | null>(null);
+  const [highlightedIndex, setHighlightedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const mentionMatches =
@@ -510,12 +532,14 @@ function AskBar({
           .filter((n) => n.title.toLowerCase().includes(mentionQuery.toLowerCase()))
           .slice(0, 6)
       : [];
+  const highlighted = Math.min(highlightedIndex, Math.max(mentionMatches.length - 1, 0));
 
   const updateMentionState = (value: string, cursorPos: number) => {
     const match = /@([^\s@]*)$/.exec(value.slice(0, cursorPos));
     if (match) {
       setMentionQuery(match[1]);
       setMentionMatchStart(cursorPos - match[0].length);
+      setHighlightedIndex(0);
     } else {
       setMentionQuery(null);
       setMentionMatchStart(null);
@@ -578,16 +602,28 @@ function AskBar({
               updateMentionState(e.target.value, e.target.selectionStart ?? e.target.value.length);
             }}
             onKeyDown={(e) => {
+              const dropdownOpen = mentionQuery !== null && mentionMatches.length > 0;
+              if (dropdownOpen && e.key === "ArrowDown") {
+                e.preventDefault();
+                setHighlightedIndex((i) => (i + 1) % mentionMatches.length);
+                return;
+              }
+              if (dropdownOpen && e.key === "ArrowUp") {
+                e.preventDefault();
+                setHighlightedIndex((i) => (i - 1 + mentionMatches.length) % mentionMatches.length);
+                return;
+              }
               if (e.key === "Enter") {
-                if (mentionQuery !== null && mentionMatches.length > 0) {
+                if (dropdownOpen) {
                   e.preventDefault();
-                  selectMention(mentionMatches[0]);
+                  selectMention(mentionMatches[highlighted]);
                 } else if (mentionQuery === null) {
                   e.preventDefault();
                   submit();
                 }
               }
               if (e.key === "Escape" && mentionQuery !== null) {
+                e.preventDefault();
                 setMentionQuery(null);
                 setMentionMatchStart(null);
               }
@@ -607,12 +643,16 @@ function AskBar({
         </div>
         {mentionQuery !== null && mentionMatches.length > 0 ? (
           <div className="absolute left-0 right-16 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-card shadow-lg">
-            {mentionMatches.map((n) => (
+            {mentionMatches.map((n, i) => (
               <button
                 key={n.id}
                 type="button"
                 onClick={() => selectMention(n)}
-                className="block w-full truncate px-3 py-1.5 text-left text-xs hover:bg-accent"
+                onMouseEnter={() => setHighlightedIndex(i)}
+                className={cn(
+                  "block w-full truncate px-3 py-1.5 text-left text-xs",
+                  i === highlighted ? "bg-accent" : "hover:bg-accent/50",
+                )}
               >
                 {n.title}
               </button>
@@ -645,6 +685,44 @@ const STATUS_DOT: Record<Note["status"], string> = {
   failed: "bg-rose-400",
 };
 
+/** Repo selector — set/change which codebase a note validates against.
+ *  "general" (GENERAL_REPO) means no codebase (cross-cutting notes);
+ *  revalidate/ask code-grounding skip it entirely. Changing repo re-anchors
+ *  future validation (the backend clears validated_git_sha/last_validated_at). */
+function RepoSelector({
+  repo,
+  options,
+  onChange,
+}: {
+  repo: string;
+  options: string[];
+  onChange: (repo: string) => void;
+}) {
+  return (
+    <select
+      value={repo}
+      onChange={(e) => {
+        e.stopPropagation();
+        onChange(e.target.value);
+      }}
+      onClick={(e) => e.stopPropagation()}
+      title="Repo this note validates against — change it if mis-tagged"
+      className="rounded border border-border/50 bg-transparent px-1 py-0.5 text-[9px] uppercase tracking-wide text-muted-foreground hover:border-border hover:text-foreground focus:outline-none"
+    >
+      {options.map((r) => (
+        <option key={r} value={r} className="bg-card text-foreground">
+          {r === GENERAL_REPO ? "general" : r}
+        </option>
+      ))}
+      {!options.includes(repo) ? (
+        <option value={repo} className="bg-card text-foreground">
+          {repo}
+        </option>
+      ) : null}
+    </select>
+  );
+}
+
 /** The notes library: tab filter, collapsible add-note, click-to-load list. */
 function NotesListPanel({
   tabs,
@@ -666,6 +744,8 @@ function NotesListPanel({
   onNewTabTitleChange,
   onCreateTab,
   onCancelCreateTab,
+  allProjects,
+  onToggleAllProjects,
 }: {
   tabs: { id: string; title: string; note_ids: string[] }[];
   notes: Note[];
@@ -686,6 +766,8 @@ function NotesListPanel({
   onNewTabTitleChange: (v: string) => void;
   onCreateTab: () => void;
   onCancelCreateTab: () => void;
+  allProjects: boolean;
+  onToggleAllProjects: () => void;
 }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -745,6 +827,24 @@ function NotesListPanel({
             <Plus className="h-3 w-3" />
           </button>
         )}
+      </div>
+
+      <div className="flex shrink-0 items-center justify-between border-b border-border/70 px-2 py-1">
+        <span className="text-[9px] uppercase tracking-wide text-muted-foreground/60">
+          {allProjects ? "all projects" : "current project + general"}
+        </span>
+        <button
+          type="button"
+          onClick={onToggleAllProjects}
+          className={cn(
+            "rounded-md px-1.5 py-0.5 text-[9px] font-medium transition-colors",
+            allProjects
+              ? "bg-accent text-accent-foreground"
+              : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+          )}
+        >
+          all projects
+        </button>
       </div>
 
       <div className="shrink-0 border-b border-border/70 p-2">
@@ -858,6 +958,8 @@ function GridView({
   onOpenNote,
   onPromote,
   onDelete,
+  repoOptions,
+  onChangeRepo,
 }: {
   notes: Note[];
   notesLoading: boolean;
@@ -865,6 +967,8 @@ function GridView({
   onOpenNote: (id: string) => void;
   onPromote: (id: string) => void;
   onDelete: (id: string) => void;
+  repoOptions: string[];
+  onChangeRepo: (noteId: string, repo: string) => void;
 }) {
   return (
     <div className="min-w-0 flex-1 overflow-y-auto p-4">
@@ -883,6 +987,8 @@ function GridView({
               onOpen={() => onOpenNote(n.id)}
               onPromote={() => onPromote(n.id)}
               onDelete={() => onDelete(n.id)}
+              repoOptions={repoOptions}
+              onChangeRepo={(repo) => onChangeRepo(n.id, repo)}
             />
           ))}
         </div>
@@ -896,11 +1002,15 @@ function NoteCard({
   onOpen,
   onPromote,
   onDelete,
+  repoOptions,
+  onChangeRepo,
 }: {
   note: Note;
   onOpen: () => void;
   onPromote: () => void;
   onDelete: () => void;
+  repoOptions: string[];
+  onChangeRepo: (repo: string) => void;
 }) {
   const [section, setSection] = useState<"summary" | "technical" | "plain">("summary");
   const [revalidateNote, { isLoading: revalidating }] = useRevalidateNoteMutation();
@@ -932,14 +1042,16 @@ function NoteCard({
               "mt-0.5 text-[10px]",
               note.history_count > 0 ? "text-amber-400/80" : "text-muted-foreground/70",
             )}
-            title={`repo: ${note.repo}`}
           >
             {validationLabel}
           </p>
         </div>
-        <Badge variant={badge.variant} className="shrink-0 text-[10px]">
-          {badge.label}
-        </Badge>
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          <Badge variant={badge.variant} className="text-[10px]">
+            {badge.label}
+          </Badge>
+          <RepoSelector repo={note.repo} options={repoOptions} onChange={onChangeRepo} />
+        </div>
       </CardHeader>
       <CardContent className="min-w-0 flex-1 pt-0 text-xs">
         {pipeline ? (
@@ -1031,6 +1143,8 @@ function CenterReaderPanel({
   onSaveAnswer,
   savingAnswer,
   answerSaved,
+  repoOptions,
+  onChangeRepo,
 }: {
   view: CenterView;
   onSelectSource: (id: string) => void;
@@ -1041,6 +1155,8 @@ function CenterReaderPanel({
   onSaveAnswer: () => void;
   savingAnswer: boolean;
   answerSaved: boolean;
+  repoOptions: string[];
+  onChangeRepo: (noteId: string, repo: string) => void;
 }) {
   const [section, setSection] = useState<"summary" | "technical" | "plain">("summary");
 
@@ -1129,6 +1245,8 @@ function CenterReaderPanel({
       onDelete={onDelete}
       onRevalidate={onRevalidate}
       revalidating={revalidating}
+      repoOptions={repoOptions}
+      onChangeRepo={onChangeRepo}
     />
   );
 }
@@ -1146,6 +1264,8 @@ function NoteStructuredReader({
   onDelete,
   onRevalidate,
   revalidating,
+  repoOptions,
+  onChangeRepo,
 }: {
   noteId: string;
   section: "summary" | "technical" | "plain";
@@ -1154,6 +1274,8 @@ function NoteStructuredReader({
   onDelete?: () => void;
   onRevalidate?: () => void;
   revalidating: boolean;
+  repoOptions: string[];
+  onChangeRepo: (noteId: string, repo: string) => void;
 }) {
   const { data: notesData } = useListNotesQuery();
   const note = notesData?.notes.find((n) => n.id === noteId);
@@ -1188,14 +1310,20 @@ function NoteStructuredReader({
               "mt-0.5 text-[10px]",
               note.history_count > 0 ? "text-amber-400/80" : "text-muted-foreground/70",
             )}
-            title={`repo: ${note.repo}`}
           >
             {validationLabel}
           </p>
         </div>
-        <Badge variant={badge.variant} className="shrink-0 text-[10px]">
-          {badge.label}
-        </Badge>
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          <Badge variant={badge.variant} className="text-[10px]">
+            {badge.label}
+          </Badge>
+          <RepoSelector
+            repo={note.repo}
+            options={repoOptions}
+            onChange={(repo) => onChangeRepo(note.id, repo)}
+          />
+        </div>
       </div>
 
       <div className="min-w-0 flex-1 overflow-y-auto p-4">

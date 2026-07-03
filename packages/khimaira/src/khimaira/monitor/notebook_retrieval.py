@@ -150,10 +150,12 @@ def search_notes(
 ) -> list[dict[str, Any]]:
     """Top-k note ids above the similarity threshold, best-first.
 
-    `repo`: when set, scopes the search to notes tagged with that repo via a
-    qdrant payload filter (cheaper and more correct than fetching top_k
-    unfiltered then discarding — a filtered-out note never displaces one
-    that actually matters).
+    `repo`: when set, scopes the search to notes tagged with that repo OR
+    the "General" bucket (cross-cutting notes with no codebase — always in
+    scope alongside whichever project is being asked about) via a qdrant
+    payload filter (cheaper and more correct than fetching top_k unfiltered
+    then discarding — a filtered-out note never displaces one that
+    actually matters).
 
     Returns [{note_id, score}]. Empty on no hits, missing collection, RAG
     disabled, or any error (fail-open) — never raises.
@@ -167,9 +169,13 @@ def search_notes(
         qvec = _embed_query(query)
         query_filter = None
         if repo is not None:
-            from qdrant_client.models import FieldCondition, Filter, MatchValue
+            from qdrant_client.models import FieldCondition, Filter, MatchAny
 
-            query_filter = Filter(must=[FieldCondition(key="repo", match=MatchValue(value=repo))])
+            from khimaira.monitor.notes import GENERAL_REPO
+
+            query_filter = Filter(
+                must=[FieldCondition(key="repo", match=MatchAny(any=[repo, GENERAL_REPO]))]
+            )
         res = client.query_points(
             collection_name=_COLLECTION,
             query=qvec,

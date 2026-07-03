@@ -486,6 +486,19 @@ async def test_revalidate_note_unknown_repo_returns_unchanged(notes_store, pipel
     assert result["validated_git_sha"] is None
 
 
+async def test_revalidate_note_general_repo_returns_as_is(pipeline, notes_store, monkeypatch):
+    """General-bucket notes (no codebase) skip validation entirely — no
+    _repo_root lookup, no git, no LLM call, no warning."""
+    repo_root_called = []
+    monkeypatch.setattr(pipeline, "_repo_root", lambda repo: repo_root_called.append(repo))
+    note = notes_store.add_note("raw", repo=notes_store.GENERAL_REPO)
+
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["id"] == note["id"]
+    assert result["validated_git_sha"] is None
+    assert repo_root_called == []
+
+
 def test_repo_root_resolves_via_real_project_registry(pipeline):
     """Regression: _repo_root's internal import path was wrong (khimaira.discovery
     vs the real khimaira.monitor.discovery) and every other revalidate_note test
@@ -952,4 +965,36 @@ async def test_answer_question_code_unavailable_surfaced(pipeline, notes_store, 
 
     result = await pipeline.answer_question("q")
     assert result["code_unavailable"] == ["khimaira"]
+    assert result["code_sources"] == []
+
+
+async def test_answer_question_skips_code_grounding_for_general_repo(
+    pipeline, notes_store, monkeypatch
+):
+    """General-bucket notes have no codebase — code-grounding must not even
+    be attempted (not attempted ≠ unavailable; General shouldn't show up in
+    code_unavailable either, since that field means 'tried and failed')."""
+    note = notes_store.add_note("raw", tab_id="t1", repo=notes_store.GENERAL_REPO)
+    notes_store.set_pipeline(note["id"], _VALID_PAYLOAD)
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)
+
+    grounding_called = []
+
+    async def fake_grounding(repo, question):
+        grounding_called.append(repo)
+        return [], True
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+    monkeypatch.setattr(pipeline, "_code_grounding_for_repo", fake_grounding)
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope("answer"))])
+
+    result = await pipeline.answer_question("q")
+    assert grounding_called == []
+    assert result["code_unavailable"] == []
     assert result["code_sources"] == []

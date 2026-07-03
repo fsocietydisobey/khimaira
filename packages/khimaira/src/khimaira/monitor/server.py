@@ -131,6 +131,22 @@ def build_app():
     app.include_router(graph_api.build_router(), prefix="/api")
     app.include_router(notebook_api.build_router(), prefix="/api")
 
+    # One-time backfill (Joseph, 2026-07-03): drop pre-fix spurious "heals"
+    # from notebook history — see notes.backfill_drop_spurious_heals_all's
+    # docstring. Idempotent (no-op once history is clean), cheap (pure JSON
+    # diffing, no LLM/git calls) — safe to run on every startup.
+    @app.on_event("startup")
+    async def _backfill_notebook_spurious_heals() -> None:
+        import logging as _logging
+
+        from . import notes as notes_mod
+
+        changed = notes_mod.backfill_drop_spurious_heals_all()
+        if changed:
+            _logging.getLogger("khimaira.monitor.notes").info(
+                "notebook: backfill cleaned spurious heals from %d note(s)", len(changed)
+            )
+
     # SSE delivery cursor persistence — load cursors from disk at startup
     # so reconnecting subscribers resume from their last yielded position.
     @app.on_event("startup")
