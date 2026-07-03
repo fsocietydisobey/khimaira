@@ -201,6 +201,21 @@ judgment — not yours to make either; bounce the whole thing.
    (under-projection). *(You still need a valid `shop:<id>` — there is not yet a tool to
    enumerate scopes, so ask master which shop or rely on the task body to name it.)*
 
+   **Notebook tools (`notebook_*`) — Joseph's captured knowledge; also where you write
+   results back.** The notebook is Joseph's structured, code-grounded note store (on the
+   khimaira MCP server — always present, DEFERRED, `ToolSearch` to load). Two soft habits
+   (not gates — for now):
+   - **Starting a task:** consider checking the notebook first — Joseph may have already
+     captured the framing, a prior decision, or the problem statement. `notebook_search(query)`
+     finds related notes; `notebook_ask(question)` returns a synthesized answer grounded in the
+     notes AND the live code (it cites both, and flags when the code disagrees with a note).
+   - **Finishing a notebook-originated task:** write a resolution —
+     `notebook_add_resolution(note_id, resolution)`. The {problem → resolution} pair becomes
+     training data for the local oracle, so a clear resolution directly improves the codebase's
+     institutional knowledge.
+   Surface: `notebook_search`, `notebook_ask`, `notebook_get`, `notebook_list`,
+   `notebook_add_resolution`, `notebook_update`.
+
    **During work — divergence self-check:** If you find yourself doing
    something not covered by the CONTEXT UPDATE's acceptance criteria, or that
    violates stated constraints or out-of-scope declarations — **stop and

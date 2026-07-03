@@ -25,17 +25,38 @@ Every stage maps to an existing pattern:
 | "gets smarter on the codebase" | real-time RAG + periodic re-bake | mnemosyne hippocampus + distiller |
 | "use as training data" | curated notes → training pairs | mnemosyne distiller |
 
+## ⭐ NORTH STAR (locked by Joseph 2026-07-03) — self-healing, code-grounded KB
+
+The notebook is NOT a static structured scratchpad — it's a **self-healing knowledge base
+where the CODE is the source of truth and notes are re-validated caches of it.**
+
+1. **Ingest everything** — NO curation gate. Every paste is structured + stored.
+2. **Validate-on-query** — when Joseph asks a question, re-ground the relevant note(s)
+   against the ACTUAL code: read the anchor files the note's `entities` reference (via Séance
+   + Read), compare note ⇄ code, answer from the code-current version.
+3. **Auto-heal staleness** — if the note diverges from the code, UPDATE it to match (a new
+   VERSION; raw_text is immutable; prior versions kept → reversible). "It just updates it."
+4. **Validation = the quality gate** (replaces manual curation). Training promotion is now
+   AUTOMATIC on code-validation — you train only on code-grounded truth, so ingest-everything
+   is safe (the code-check catches wrong/stale notes, no human gate needed).
+
+**Refinement (accepted): staleness-GATE the re-grounding — don't re-read the codebase on
+every query.** Each note stores `last_validated_at` + the git SHA it was validated against.
+On query, a cheap `git diff`-since check on the note's anchor files decides: unchanged → answer
+from cache instantly; changed (or never validated) → pay the full code-read + heal. Preserves
+"always aligned with the code" without the per-query cost.
+
 ## Decisions (locked by Joseph 2026-07-03)
 
-1. **Pipeline LLM = a background Claude Code session**, NOT the Anthropic API. Spin up a
-   headless `claude -p` (print mode) process that transforms the paste and returns JSON.
-   Uses Joseph's CC auth (no API key/cost), full Claude quality. This is the *perception*
-   step; the local oracle *learns* from its output (no degenerate loop).
-2. **Curated promotion** — a note becomes training data only when Joseph explicitly marks
-   it "good for training." Notes are RAG-retrievable immediately regardless; only *promoted*
-   ones feed the distiller/bake. Propose, don't dispose.
-3. **Full vision** — build all phases (capture pipeline + consolidation + training wiring),
-   not MVP-only. Backend-first, then frontend, then consolidation, then training.
+1. **Pipeline LLM = a background Claude Code session**, NOT the Anthropic API. Headless
+   `claude -p` transforms the paste → JSON. Joseph's CC auth, full Claude quality. Perception
+   step; the local oracle *learns* from its output (no degenerate loop). The SAME pattern
+   drives the north-star revalidation pass (code + note → aligned? → healed note).
+2. ~~Curated promotion~~ → **SUPERSEDED by the north star.** Ingest everything; validation-
+   against-code is the gate; training promotion is automatic on validation.
+3. **Repo/project tag on every note** — validation must know WHICH codebase is truth
+   (khimaira vs jeevy). Also resolves the "notes are global, not project-scoped" flag.
+4. **Full vision** — capture (done) → validate-on-query (the north-star core) → training.
 
 ## Architecture (data flow)
 
@@ -153,16 +174,60 @@ Add a `Notebook` view to `apps/monitor-ui` (research map available). Files:
 - Styling: Tailwind + shadcn primitives in `src/components/ui/`. No build/proxy changes
   needed — `/api/notebook/*` flows through the existing `/api` proxy; `dist/` self-rebuilds.
 
-### Phase 1c — The pipeline (headless `claude -p`)  ◀── MASTER owns the design
+### Phase 1c — The pipeline (headless `claude -p`)  ◀── VALIDATED RECIPE (master de-risked; void-null implements after 1b)
 
-`trigger_pipeline(note_id)` spawns a **headless Claude Code session** to transform the note:
-- `claude -p "<transform prompt>" --output-format json` (print mode returns structured JSON;
-  uses Joseph's CC auth, no API key). Feed the raw_text; constrain output to the `pipeline`
-  schema (summary/technical/plain/organized_md/tags/entities). Run async (don't block the
-  POST); on completion validate against the schema (tollgate — retry on mismatch) and call
-  `notes.set_pipeline(id, ...)`; set `status="processed"`.
-- Spawn via khimaira's process infra (`spawn_process` / the observer) or a plain
-  `asyncio.create_subprocess_exec`. Master to finalize the exact spawn mechanism + prompt.
+`trigger_pipeline(note_id)` spawns a **headless Claude Code session** to transform the note.
+Master validated the exact mechanism live (2026-07-03) — build to THIS recipe, don't re-derive.
+
+**The invocation** (content via STDIN so any text/quotes/size is safe; instruction via system prompt):
+```
+printf '%s' "<raw_text>" | env CLAUDE_CONFIG_DIR="<ISOLATED_CFG>" \
+  claude -p --append-system-prompt "<INSTRUCTION>" \
+    --output-format json --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+    --model claude-sonnet-5
+```
+Run from the daemon via `asyncio.create_subprocess_exec` (async — do NOT block the POST;
+note starts `status="draft"`, pipeline fills it → `"processed"`).
+
+**ISOLATED_CFG (critical — kills stray-session pollution + trims the context load):** a dedicated
+config dir containing ONLY `~/.claude/.credentials.json` (copied, for auth) + `settings.json` = `{}`
+(empty → NO hooks) + NO CLAUDE.md. Create it once (e.g. under the khimaira state dir) and reuse.
+Validated effects: **zero stray session registration** (empty settings = no SessionStart hook = no
+khimaira session dir) + drops the CLAUDE.md/rules from the prompt. Do NOT clobber auth — copy the
+real `.credentials.json`; an empty apiKeyHelper breaks auth (see the apiKeyHelper memory).
+
+**COST — corrected 2026-07-03 (my earlier "$0.02–0.10/note" was WRONG — that was the HAIKU
+number).** Real cost with **claude-sonnet-5 is ~$0.40/call** (notional). The isolation trims the
+project context but NOT the dominant driver: a **~42K base Claude-Code-AGENT system prompt billed
+on every call** (no cross-process prompt-cache reuse; `--disallowedTools` only shaves it to ~42K →
+$0.28, so it's the agent scaffolding itself, inherent to `claude -p`). On Joseph's SUBSCRIPTION
+this is QUOTA consumption, not a dollar bill — and that was his explicit choice (Sonnet quality via
+his Claude sub, NOT the API). The staleness-gate keeps asks cheap when code hasn't moved (heal only
+when needed). If the notebook ever needs to be cheap-at-volume, the API + prompt-caching is ~10×
+cheaper per call and off-quota — but that reverses the "use Claude Code" decision, so it's parked.
+
+**Model = `claude-sonnet-5`** (Joseph's call): Sonnet reliably emits pure JSON; Haiku drifts
+conversational ("I see you landed a fix… is there a follow-up?") and ignores "output only JSON".
+Since notes are training data, reliability > the few cents. ~10–15s/note.
+
+**INSTRUCTION** (via `--append-system-prompt`): "You structure a pasted note (often an AI
+coding-assistant response). Output ONLY a JSON object, no prose, no markdown fence, with keys:
+summary (1-3 sentence string), technical (markdown string), plain (plain-language string),
+organized_md (markdown string), tags (array of strings), entities (array of strings — code
+symbols/files/concepts referenced). The entire user message is the raw note to structure."
+
+**Parse + tollgate (deterministic, per ai-engineering):** the CLI returns a JSON envelope; read
+`.result` (a string), strip an optional ```json fence, `json.loads`, then validate against a
+Pydantic `PipelineOutput{summary,technical,plain,organized_md,tags,entities}`. On parse/validate
+failure → RETRY once (Sonnet is usually clean); on second failure → `status="failed"` + keep
+`raw_text` (never lose it). On success → `notes.set_pipeline(id, ...)` + `status="processed"`.
+Belt-and-suspenders: if a stray session dir ever appears, the envelope's `.session_id` names it
+for cleanup — but with the isolated config it shouldn't.
+
+Module: `packages/khimaira/src/khimaira/monitor/notebook_pipeline.py` (`async def transform_note`
++ `async def trigger_pipeline`); fill the `trigger_pipeline` stub in `api/notebook.py` to call it.
+Tests: mock the subprocess to return a canned envelope; assert parse→set_pipeline on success,
+retry-then-failed on bad JSON, raw_text preserved throughout.
 
 ### Phase 2 — Consolidation ("these two tabs belong together?")
 

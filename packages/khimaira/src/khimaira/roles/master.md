@@ -97,6 +97,15 @@ If a matching `📋 CONTEXT UPDATE v1 — ctx-<id>` already exists for this arc,
 (legacy roster only: one an intake seat posted). For pivots: post superseding update
 (append-only — never edit/delete old broadcasts).
 
+**Notebook context (soft habit).** Before decomposing, consider checking Joseph's notebook —
+he may have already captured the framing, prior decisions, or the problem statement for this
+arc. `notebook_search(query)` finds related notes; `notebook_ask(question)` returns a synthesized
+answer grounded in the notes AND the live code (khimaira MCP server — always present, DEFERRED,
+`ToolSearch` to load). Fold anything relevant into your CONTEXT UPDATE. When a note-originated
+arc completes, `notebook_add_resolution(note_id, resolution)` writes the outcome back — the
+{problem → resolution} pair trains the local oracle. Not a gate; the fuller agent-side surface
+is in `agent.md`.
+
 ### Step 1 — Decompose
 
 Identify work units a single agent can complete independently.
