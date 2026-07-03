@@ -30,6 +30,11 @@ def pipeline(notes_store, monkeypatch):
     from khimaira.monitor import notebook_pipeline as pipeline_mod
 
     importlib.reload(pipeline_mod)
+    # Zero out retry backoff so retry-path tests don't burn real wall-clock
+    # time — this patches the module's own constant, not asyncio.sleep
+    # itself, so it doesn't affect the unrelated asyncio.sleep(0.05) used
+    # elsewhere in this file to let a background task run to completion.
+    monkeypatch.setattr(pipeline_mod, "_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
     yield pipeline_mod
 
 
@@ -101,17 +106,43 @@ async def test_transform_note_retries_once_then_succeeds(pipeline, monkeypatch):
     assert result == _VALID_PAYLOAD
 
 
-async def test_transform_note_fails_after_two_bad_attempts(pipeline, monkeypatch):
+async def test_transform_note_fails_after_max_bad_attempts(pipeline, monkeypatch):
     _queue_responses(
         pipeline,
         monkeypatch,
         [
             _FakeProc(_envelope("not json at all")),
             _FakeProc(_envelope("still not json")),
+            _FakeProc(_envelope("still not json either")),
         ],
     )
     result = await pipeline.transform_note("raw text")
     assert result is None
+
+
+async def test_transform_note_backs_off_between_attempts(pipeline, monkeypatch):
+    """The retry/backoff fix (2026-07-03, superseding the original 'retry
+    once' spec): failed attempts sleep between tries (giving the CLI time
+    to warm up), and there's no trailing sleep after a successful attempt."""
+    monkeypatch.setattr(pipeline, "_RETRY_BACKOFF_SECONDS", (0.1, 0.2, 0.3))
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(pipeline.asyncio, "sleep", fake_sleep)
+    _queue_responses(
+        pipeline,
+        monkeypatch,
+        [
+            _FakeProc(_envelope("bad")),
+            _FakeProc(_envelope("bad again")),
+            _FakeProc(_envelope(json.dumps(_VALID_PAYLOAD))),
+        ],
+    )
+    result = await pipeline.transform_note("raw text")
+    assert result == _VALID_PAYLOAD
+    assert sleep_calls == [0.1, 0.2]
 
 
 async def test_transform_note_validation_failure_retries(pipeline, monkeypatch):
@@ -164,6 +195,7 @@ async def test_trigger_pipeline_failure_marks_failed_and_preserves_raw_text(
         [
             _FakeProc(_envelope("garbage")),
             _FakeProc(_envelope("still garbage")),
+            _FakeProc(_envelope("still garbage too")),
         ],
     )
 
@@ -341,7 +373,11 @@ async def test_revalidate_note_llm_failure_leaves_record_unchanged(
     _queue_responses(
         pipeline,
         monkeypatch,
-        [_FakeProc(_envelope("garbage")), _FakeProc(_envelope("still garbage"))],
+        [
+            _FakeProc(_envelope("garbage")),
+            _FakeProc(_envelope("still garbage")),
+            _FakeProc(_envelope("still garbage too")),
+        ],
     )
     result = await pipeline.revalidate_note(note["id"])
     assert result["pipeline"] == _ANCHORED_PAYLOAD

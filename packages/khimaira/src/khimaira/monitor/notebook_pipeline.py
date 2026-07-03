@@ -41,6 +41,17 @@ _INSTRUCTION = (
 _MODEL = "claude-sonnet-5"
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL)
 
+# Retry/backoff for claude -p invocations. Supersedes the original Phase 1c
+# "retry once" spec — live testing found the first claude -p call after an
+# idle stretch intermittently returns an empty .result on BOTH of the
+# original 2 attempts, while a fresh subsequent call succeeds immediately (a
+# cold-start warmup race, not a content/logic problem — reproduced 3x via
+# the daemon + 1x standalone, ruling out daemon-specific concurrency).
+# master's call (2026-07-03): 3 attempts + backoff between them, giving the
+# CLI time to warm up rather than hammering it back-to-back.
+_MAX_CLAUDE_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = (0.5, 1.5, 3.0)
+
 # Fallback absolute paths when PATH lookup misses. The khimaira-monitor
 # systemd unit's PATH doesn't include ~/.local/bin (confirmed live 2026-07-03
 # — bare "claude" raised FileNotFoundError under the daemon, though it
@@ -174,17 +185,20 @@ async def _run_once(content: str, *, instruction: str = _INSTRUCTION) -> Pipelin
 async def transform_note(
     raw_text: str, *, instruction: str = _INSTRUCTION
 ) -> dict[str, Any] | None:
-    """Run the transform, retrying once on parse/validate failure.
+    """Run the transform, retrying up to _MAX_CLAUDE_ATTEMPTS with backoff
+    between attempts on parse/validate failure.
 
-    Returns the validated pipeline dict on success, None if both attempts
+    Returns the validated pipeline dict on success, None if every attempt
     failed — the caller marks the note status="failed" and keeps raw_text.
     """
-    for attempt in (1, 2):
+    for attempt in range(1, _MAX_CLAUDE_ATTEMPTS + 1):
         try:
             output = await _run_once(raw_text, instruction=instruction)
             return output.model_dump()
         except (json.JSONDecodeError, ValidationError, ValueError, RuntimeError, OSError) as exc:
             log.warning("notebook_pipeline: attempt %d failed: %s", attempt, exc)
+            if attempt < _MAX_CLAUDE_ATTEMPTS:
+                await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt - 1])
     return None
 
 
@@ -438,17 +452,17 @@ _ASK_INSTRUCTION_TEMPLATE = (
     "invent an answer.\n\nNOTES:\n{notes}"
 )
 
-# Free-form prose, not the PipelineOutput schema — retry once on subprocess
-# failure, same discipline as transform_note, but no JSON parse/validate.
-_ASK_RETRY_ATTEMPTS = (1, 2)
-
 
 async def _synthesize_answer(question: str, instruction: str) -> str | None:
-    for attempt in _ASK_RETRY_ATTEMPTS:
+    """Free-form prose, not the PipelineOutput schema — same retry/backoff
+    discipline as transform_note, but no JSON parse/validate."""
+    for attempt in range(1, _MAX_CLAUDE_ATTEMPTS + 1):
         try:
             return (await _invoke_claude(question, instruction)).strip()
         except (RuntimeError, ValueError, OSError) as exc:
             log.warning("notebook_pipeline: answer synthesis attempt %d failed: %s", attempt, exc)
+            if attempt < _MAX_CLAUDE_ATTEMPTS:
+                await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt - 1])
     return None
 
 
