@@ -431,3 +431,133 @@ def test_single_session_per_window_noop(gc_mod, monkeypatch):
     )
     res = gc.reap_stale_window_duplicates()
     assert res["reaped"] == 0 and deleted == [], "no shared window → nothing to dedup"
+
+
+# --- chat-membership migration on /clear-orphan reap (2026-07-02) ----------------
+# Root-cause completion for the chat↔registry id desync: before reaping the orphan,
+# its ACCEPTED chat memberships transfer to the live heir, so the session the
+# operator /cleared into keeps roster-chat access instead of the reap silently
+# dropping it. Migration is best-effort and runs AFTER all reap guards pass.
+
+
+def _chats_env(monkeypatch, rooms_for, transfers=None, raises=False):
+    """Wire the chats primitives _migrate_chat_memberships reads (imported lazily,
+    so patching the module object reaches the call site). `rooms_for` maps
+    session_id → the my_chats() list; `raises=True` makes every transfer fail."""
+    from khimaira.monitor import chats as chats_mod
+
+    monkeypatch.setattr(chats_mod, "my_chats", lambda sid: rooms_for.get(sid, []))
+
+    def _xfer(chat_id, frm, to, **k):
+        if raises:
+            raise ValueError(f"{to!r} already accepted in {chat_id!r}")  # simulate 409
+        if transfers is not None:
+            transfers.append((chat_id, frm, to))
+        return {"transferred": True}
+
+    monkeypatch.setattr(chats_mod, "transfer_membership", _xfer)
+    return chats_mod
+
+
+def test_migrates_orphan_memberships_before_reap(gc_mod, monkeypatch):
+    gc, sess = gc_mod
+    deleted, transfers = [], []
+    _dup_env(
+        monkeypatch,
+        sess,
+        rows=_rows(("heir", "agent-1", 90), ("orphan", "agent-1", 99999)),
+        windows={"heir": 62, "orphan": 62},
+        fresh={"heir": 2000.0, "orphan": 1000.0},
+        deleted=deleted,
+    )
+    _chats_env(
+        monkeypatch,
+        rooms_for={
+            "orphan": [
+                {"chat_id": "chat-a", "my_state": "accepted"},
+                {"chat_id": "chat-b", "my_state": "accepted"},
+            ],
+        },
+        transfers=transfers,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 1 and deleted == ["orphan"]
+    assert transfers == [
+        ("chat-a", "orphan", "heir"),
+        ("chat-b", "orphan", "heir"),
+    ], "orphan's ACCEPTED memberships transfer to the heir before the reap"
+
+
+def test_migration_skips_pending_memberships(gc_mod, monkeypatch):
+    gc, sess = gc_mod
+    deleted, transfers = [], []
+    _dup_env(
+        monkeypatch,
+        sess,
+        rows=_rows(("heir", "agent-1", 90), ("orphan", "agent-1", 99999)),
+        windows={"heir": 62, "orphan": 62},
+        fresh={"heir": 2000.0, "orphan": 1000.0},
+        deleted=deleted,
+    )
+    _chats_env(
+        monkeypatch,
+        rooms_for={
+            "orphan": [
+                {"chat_id": "chat-acc", "my_state": "accepted"},
+                {"chat_id": "chat-pend", "my_state": "pending"},
+            ],
+        },
+        transfers=transfers,
+    )
+    gc.reap_stale_window_duplicates()
+    assert transfers == [("chat-acc", "orphan", "heir")], (
+        "only ACCEPTED memberships migrate; pending is skipped (transfer would 403)"
+    )
+    assert deleted == ["orphan"]
+
+
+def test_migration_failure_does_not_block_reap(gc_mod, monkeypatch):
+    """A per-chat transfer failure (e.g. heir already a member → 409) is skipped;
+    the reap still proceeds. Migration is best-effort and must never block a reap."""
+    gc, sess = gc_mod
+    deleted = []
+    _dup_env(
+        monkeypatch,
+        sess,
+        rows=_rows(("heir", "agent-1", 90), ("orphan", "agent-1", 99999)),
+        windows={"heir": 62, "orphan": 62},
+        fresh={"heir": 2000.0, "orphan": 1000.0},
+        deleted=deleted,
+    )
+    _chats_env(
+        monkeypatch,
+        rooms_for={"orphan": [{"chat_id": "chat-x", "my_state": "accepted"}]},
+        raises=True,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 1 and deleted == ["orphan"], "transfer failure must not block the reap"
+
+
+def test_no_migration_when_guard_skips_reap(gc_mod, monkeypatch):
+    """Migration runs only for a session that PASSES all reap guards. A mid-turn
+    duplicate is skipped before migration — its memberships are NOT touched."""
+    gc, sess = gc_mod
+    deleted, transfers = [], []
+    _dup_env(
+        monkeypatch,
+        sess,
+        rows=_rows(("heir", "agent-1", 90), ("busy", "agent-1", 99999)),
+        windows={"heir": 62, "busy": 62},
+        fresh={"heir": 2000.0, "busy": 1000.0},
+        mid=("busy",),
+        deleted=deleted,
+    )
+    _chats_env(
+        monkeypatch,
+        rooms_for={"busy": [{"chat_id": "chat-x", "my_state": "accepted"}]},
+        transfers=transfers,
+    )
+    res = gc.reap_stale_window_duplicates()
+    assert res["reaped"] == 0 and deleted == [] and transfers == [], (
+        "a guard-skipped session's memberships are never migrated"
+    )

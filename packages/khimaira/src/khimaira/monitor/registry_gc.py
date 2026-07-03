@@ -199,6 +199,63 @@ def reap_windowless_sessions() -> dict:
     return {"reaped": reaped, "live_titles": len(live)}
 
 
+def _migrate_chat_memberships(orphan_sid: str, heir_sid: str) -> list[str]:
+    """Hand the orphan's ACCEPTED chat memberships to the heir (the live co-window
+    session) BEFORE the orphan is reaped.
+
+    Root fix for the chat↔registry id desync (griffin-agent-1, 2026-07-02). `/clear`
+    mints a fresh session (heir) in the same kitty window; the operator renames it
+    back, and the previous record (orphan) lingers. The chat store still keys the
+    roster membership on the ORPHAN's id while the monitor registry now names the
+    HEIR — the two stores disagree. When the orphan is reaped, delete_session marks
+    it LEFT in every chat, so the heir — the session the operator actually /cleared
+    into — inherits NOTHING and silently loses roster-chat access.
+
+    Migrating the memberships first closes the desync at its root: the heir becomes
+    the ACCEPTED chat member (and inherits the master role if the orphan was creator,
+    via transfer_membership's creator-propagation), so both id-stores agree post-reap.
+    After a successful transfer the orphan is TRANSFERRED_OUT, so delete_session's
+    leave-cascade skips that chat — no double-handling.
+
+    Per-chat failures are non-fatal and skipped (the reap's leave-cascade cleans up
+    whatever didn't transfer):
+      - heir already ACCEPTED in the chat → 409 (nothing to migrate; heir's already in)
+      - orphan not ACCEPTED (pending/left) → 403 (nothing load-bearing to move)
+      - heir unresolvable → 404 (shouldn't happen — heir is a live registry record)
+
+    Returns the chat_ids successfully migrated (for the reap log). Fail-open: any
+    setup error (chats import, my_chats read) returns an empty list — migration is
+    best-effort and must NEVER block the reap it precedes.
+    """
+    migrated: list[str] = []
+    try:
+        from khimaira.monitor import chats as chats_mod
+    except Exception:
+        return migrated
+    try:
+        rooms = chats_mod.my_chats(orphan_sid)
+    except Exception:
+        return migrated
+    for c in rooms:
+        if c.get("my_state") != chats_mod.ACCEPTED:
+            continue  # only ACCEPTED memberships transfer (transfer_membership 403s otherwise)
+        chat_id = c.get("chat_id")
+        if not chat_id:
+            continue
+        try:
+            chats_mod.transfer_membership(chat_id, orphan_sid, heir_sid)
+            migrated.append(chat_id)
+        except Exception as exc:
+            log.debug(
+                "registry_gc: membership migrate skip %s (%s→%s): %s",
+                chat_id,
+                orphan_sid[:8],
+                heir_sid[:8],
+                exc,
+            )
+    return migrated
+
+
 def reap_stale_window_duplicates() -> dict:
     """Reap /clear-orphans: 2+ sessions sharing one kitty window_id where the
     older one is a leftover.
@@ -309,18 +366,26 @@ def reap_stale_window_duplicates() -> dict:
                     continue  # never reap an actively-working session
             except Exception:
                 continue  # can't confirm not-mid-turn → skip (conservative)
+            # MEMBERSHIP MIGRATION (2026-07-02): hand the orphan's chat memberships
+            # to the live heir BEFORE the reap, so the session the operator /cleared
+            # into inherits roster-chat access instead of the reap silently dropping
+            # it. Closes the chat↔registry id desync at its root. Best-effort — never
+            # blocks the reap.
+            migrated = _migrate_chat_memberships(m["sid"], keep["sid"])
             try:
                 res = sessions_mod.delete_session(m["sid"], force=True, reap=True)
                 if res.get("deleted"):
                     reaped += 1
                     log.info(
                         "registry_gc: reaped /clear-orphan %s (name=%r, idle=%.0fs) "
-                        "— window %d now owned by live session %s",
+                        "— window %d now owned by live session %s; migrated %d chat(s): %s",
                         m["sid"][:8],
                         m["name"] or "(unnamed)",
                         m["age"],
                         wid,
                         keep["sid"][:8],
+                        len(migrated),
+                        migrated or "none",
                     )
             except Exception as exc:
                 log.debug("registry_gc: dup-reap %s failed: %s", m["sid"][:8], exc)
