@@ -1,8 +1,9 @@
-"""`/api/notes`, `/api/tabs` — AI-notebook backend (Phase 1a-2a).
+"""`/api/notes`, `/api/tabs` — AI-notebook backend (Phase 1a-2b).
 
 Endpoints:
   POST   /notes                 — create a draft note; kicks off the (stub) pipeline
   GET    /notes?tab_id=         — list notes, optionally filtered by tab
+  GET    /notes/search?q=       — Phase 2b: semantic search over embedded notes
   GET    /notes/{id}            — one note
   PATCH  /notes/{id}            — edit title/tab/raw_text/status/links/repo/pipeline-patch
   DELETE /notes/{id}            — delete a note
@@ -18,13 +19,17 @@ note flips to processed/failed once notebook_pipeline.trigger_pipeline
 completes. `revalidate_note` is awaited directly (not backgrounded) — it's a
 manual on-demand user action ("re-check vs code" button), not a write path
 that needs to return instantly.
+
+Note-content embedding (notebook_retrieval) is fire-and-forget on create/
+delete (never blocks the response) and re-runs on structuring completion /
+heal from inside notebook_pipeline itself.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel
 
-from khimaira.monitor import notebook_pipeline, notes
+from khimaira.monitor import notebook_pipeline, notebook_retrieval, notes
 
 from .._optional import require
 
@@ -67,11 +72,20 @@ def build_router():
     async def create_note(req: CreateNoteReq) -> dict:
         record = notes.add_note(req.raw_text, tab_id=req.tab_id, title=req.title, repo=req.repo)
         trigger_pipeline(record["id"])
+        notebook_retrieval.schedule_upsert(record)
         return record
 
     @router.get("/notes")
     async def list_notes_endpoint(tab_id: str | None = None) -> dict:
         return {"notes": notes.list_notes(tab_id=tab_id)}
+
+    @router.get("/notes/search")
+    async def search_notes(q: str, top_k: int = notebook_retrieval.DEFAULT_TOP_K) -> dict:
+        """Phase 2b: semantic search over embedded notes. [] on no hits / qdrant
+        down / RAG disabled — never errors. Registered BEFORE /notes/{note_id}
+        so "search" doesn't get swallowed as a note_id path param."""
+        hits = await notebook_retrieval.search_notes_async(q, top_k=top_k)
+        return {"hits": hits}
 
     @router.get("/notes/{note_id}")
     async def get_note(note_id: str) -> dict:
@@ -93,9 +107,11 @@ def build_router():
     @router.delete("/notes/{note_id}")
     async def delete_note(note_id: str) -> dict:
         try:
-            return notes.delete_note(note_id)
+            result = notes.delete_note(note_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e))
+        notebook_retrieval.schedule_delete(note_id)
+        return result
 
     @router.post("/notes/{note_id}/promote")
     async def promote_note(note_id: str) -> dict:

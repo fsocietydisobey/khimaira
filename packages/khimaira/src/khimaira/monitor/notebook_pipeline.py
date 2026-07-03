@@ -25,7 +25,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from khimaira.log import get_logger
-from khimaira.monitor import notes
+from khimaira.monitor import notebook_retrieval, notes
 
 log = get_logger("monitor.notebook_pipeline")
 
@@ -199,9 +199,12 @@ async def trigger_pipeline(note_id: str) -> None:
         return
 
     try:
-        notes.set_pipeline(note_id, result)
+        updated = notes.set_pipeline(note_id, result)
     except ValueError:
         log.warning("notebook_pipeline: note %s deleted before pipeline completed", note_id)
+        return
+
+    await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
 
 
 def schedule_pipeline(note_id: str) -> None:
@@ -401,4 +404,9 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
         return record
 
     new_pipeline = None if result == pipeline else result
-    return notes.apply_validation(note_id, git_sha=current_sha, new_pipeline=new_pipeline)
+    updated = notes.apply_validation(note_id, git_sha=current_sha, new_pipeline=new_pipeline)
+    if new_pipeline is not None:
+        # Only re-embed on an actual heal — content is identical otherwise,
+        # so re-embedding would just waste an embed+upsert call.
+        await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
+    return updated

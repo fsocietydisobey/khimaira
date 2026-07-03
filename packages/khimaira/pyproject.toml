@@ -33,13 +33,26 @@ dependencies = [
     # was wrong — monitor's threads endpoint 500s without it for any project
     # using the AsyncPostgresSaver.
     "psycopg[binary]>=3.1",
+    # Notebook Phase 2b (self-healing KB retrieval): local embedding + vector
+    # search, mirroring mnemosyne's hippocampus pattern. qdrant-client was
+    # already present transitively via khimaira-seance; declaring it directly
+    # since notebook_pipeline imports it itself now, not just through Séance.
+    "qdrant-client>=1.10",
+    "fastembed>=0.8.0",
     "khimaira-types",
     "khimaira-transport",
+    # khimaira-themis was a workspace member (packages/*) but never a declared
+    # dependency of any package — plain `uv sync` (unlike the documented
+    # `uv sync --all-packages`) silently uninstalled it, disabling Themis role
+    # enforcement daemon-wide for every active session. Declaring it here
+    # closes that gap for good, matching how khimaira-chat was integrated.
+    "khimaira-themis",
 ]
 
 [tool.uv.sources]
 khimaira-types = { workspace = true }
 khimaira-transport = { workspace = true }
+khimaira-themis = { workspace = true }
 
 [project.optional-dependencies]
 # `pip install khimaira[all]` pulls every sibling on PyPI. Resolves to
