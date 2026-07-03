@@ -9,6 +9,8 @@ Endpoints:
   PATCH  /notes/{id}            — edit title/tab/raw_text/status/links/repo/pipeline-patch
   DELETE /notes/{id}            — delete a note
   POST   /notes/{id}/promote    — curated promotion (training.promoted=True)
+  POST   /notes/{id}/resolution — v2: attach a resolution (roster-loop write-back);
+                                   schedules a fire-and-forget mnemosyne distill
   POST   /notes/{id}/revalidate — Phase 2a north-star: re-ground vs current code
   GET    /tabs                  — list tabs (note_ids derived from live notes)
   POST   /tabs                  — create a tab
@@ -30,7 +32,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from khimaira.monitor import notebook_pipeline, notebook_retrieval, notes
+from khimaira.monitor import notebook_pipeline, notebook_retrieval, notebook_training, notes
 
 from .._optional import require
 
@@ -50,6 +52,11 @@ class UpdateNoteReq(BaseModel):
     links: list[str] | None = None
     repo: str | None = None
     pipeline: dict | None = None
+
+
+class AddResolutionReq(BaseModel):
+    resolution: str
+    resolved_by: str = ""
 
 
 class AskReq(BaseModel):
@@ -97,11 +104,17 @@ def build_router():
         return {"notes": notes.list_notes(tab_id=tab_id, repo=repo)}
 
     @router.get("/notes/search")
-    async def search_notes(q: str, top_k: int = notebook_retrieval.DEFAULT_TOP_K) -> dict:
+    async def search_notes(
+        q: str, top_k: int = notebook_retrieval.DEFAULT_TOP_K, repo: str | None = None
+    ) -> dict:
         """Phase 2b: semantic search over embedded notes. [] on no hits / qdrant
         down / RAG disabled — never errors. Registered BEFORE /notes/{note_id}
-        so "search" doesn't get swallowed as a note_id path param."""
-        hits = await notebook_retrieval.search_notes_async(q, top_k=top_k)
+        so "search" doesn't get swallowed as a note_id path param.
+
+        `repo`: optional scope to one repo's notes (mirrors /notes/ask's repo
+        filter) — notebook_retrieval.search_notes_async already supports this;
+        v1 just never exposed it as a query param here."""
+        hits = await notebook_retrieval.search_notes_async(q, top_k=top_k, repo=repo)
         return {"hits": hits}
 
     @router.post("/notes/ask")
@@ -147,6 +160,23 @@ def build_router():
             return notes.promote_note(note_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e))
+
+    @router.post("/notes/{note_id}/resolution")
+    async def add_resolution(note_id: str, req: AddResolutionReq) -> dict:
+        """v2 roster-loop write-back: attach a resolution to a note.
+
+        Schedules a fire-and-forget mnemosyne distill of the {problem,
+        resolution} pair when a non-empty resolution lands — never blocks
+        the response, and mnemosyne being unreachable never fails this
+        request (see notebook_training.promote_resolved's fail-open contract).
+        """
+        try:
+            updated = notes.add_resolution(note_id, req.resolution, resolved_by=req.resolved_by)
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e))
+        if updated.get("resolution"):
+            notebook_training.schedule_promote(updated)
+        return updated
 
     @router.post("/notes/{note_id}/revalidate")
     async def revalidate_note(note_id: str) -> dict:

@@ -1720,6 +1720,7 @@ async def _cleanup():
 # ---------------------------------------------------------------------------
 
 from khimaira.server import monitor_tools as _monitor_tools
+from khimaira.server import notebook_tools as _notebook_tools
 
 
 @mcp.tool()
@@ -2801,6 +2802,137 @@ async def kg_scopes(project: str = "") -> str:
             common single-adapter deployment case).
     """
     return await _monitor_tools.kg_scopes(project)
+
+
+# ---------------------------------------------------------------------------
+# Notebook tools — the "roster loop" shared knowledge/task surface. Joseph
+# pastes a note (often a problem/task); master + the agent roster read it,
+# work it, and write a RESOLUTION back. The resolution is the training-
+# quality gate — a note only feeds the mnemosyne oracle re-bake once it's
+# been worked to completion. Thin HTTP wrappers over the daemon's
+# /api/notes* routes (see notebook_tools.py's docstring for why this is
+# HTTP, not in-process — the daemon is the single writer against the
+# shared notes JSONL store; the MCP layer is N concurrent subprocesses).
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@logged_tool("notebook_list")
+async def notebook_list(project: str = "", tab: str = "") -> str:
+    """List notebook notes — read this for context before starting work.
+
+    Each note carries a lifecycle badge: 📝 captured (just pasted) → 👀
+    reviewed (structured by the pipeline) → ✅ resolved (someone finished
+    working it and wrote a resolution back). Use this to see what's open.
+
+    Args:
+        project: optional repo/project filter (e.g. "khimaira", "jeevy_portal").
+            Omit to see notes across all repos.
+        tab: optional tab id filter. Omit to see all tabs.
+    """
+    return await _notebook_tools.notebook_list(project, tab)
+
+
+@mcp.tool()
+@logged_tool("notebook_search")
+async def notebook_search(query: str, project: str = "", top_k: int = 5) -> str:
+    """Semantic search over notebook notes — find candidate notes by meaning,
+    not exact text match.
+
+    Use when you have a topic/symptom/question in mind and want to find
+    which existing notes might already cover it, before starting fresh work
+    or asking `notebook_ask`. Returns note ids + scores; follow up with
+    `notebook_get(note_id)` to read a hit in full.
+
+    Args:
+        query: natural-language search text.
+        project: optional repo/project filter (e.g. "khimaira", "jeevy_portal").
+        top_k: max hits to return (default 5).
+    """
+    return await _notebook_tools.notebook_search(query, project, top_k)
+
+
+@mcp.tool()
+@logged_tool("notebook_get")
+async def notebook_get(note_id: str) -> str:
+    """Read one notebook note in full: the raw paste, the AI-structured
+    summary/organized write-up (if processed), and its resolution (if any).
+
+    Use after `notebook_list`/`notebook_search` point you at a candidate
+    note id, or when you already have the id (e.g. from a handoff).
+
+    Args:
+        note_id: the note id (from notebook_list/notebook_search).
+    """
+    return await _notebook_tools.notebook_get(note_id)
+
+
+@mcp.tool()
+@logged_tool("notebook_ask")
+async def notebook_ask(question: str, project: str = "") -> str:
+    """Ask a code-grounded question against the notebook and get a synthesized
+    ANSWER (not a list of notes).
+
+    Retrieves candidate notes, re-validates each against the CURRENT code
+    (self-healing — corrects a stale note before using it), then answers
+    citing the notes it drew on. Prefer this over `notebook_search` +
+    manual reading when you want a direct answer rather than source material
+    to read yourself. Can take longer than other notebook_* tools (may spawn
+    a headless re-check per stale hit) — don't reach for it in a tight loop.
+
+    Args:
+        question: the question to answer.
+        project: optional repo/project filter, scopes which notes are
+            eligible sources (e.g. "khimaira", "jeevy_portal").
+    """
+    return await _notebook_tools.notebook_ask(question, project)
+
+
+@mcp.tool()
+@logged_tool("notebook_add_resolution")
+async def notebook_add_resolution(note_id: str, resolution: str, resolved_by: str = "") -> str:
+    """Write a resolution back to a note — call this once you've finished
+    working the problem/task it describes.
+
+    This IS the roster loop's write-back step: {problem, resolution} becomes
+    a training pair for the next mnemosyne oracle re-bake (fired automatically,
+    fail-open — this call succeeds even if the distiller is unreachable). The
+    note's lifecycle flips to ✅ resolved. Always pass `resolved_by` as your
+    session name/id so the resolution's provenance is attributable.
+
+    Args:
+        note_id: the note id you were working.
+        resolution: markdown describing what was done / found / decided.
+        resolved_by: your session name or id (attribution).
+    """
+    return await _notebook_tools.notebook_add_resolution(note_id, resolution, resolved_by)
+
+
+@mcp.tool()
+@logged_tool("notebook_update")
+async def notebook_update(
+    note_id: str,
+    title: str = "",
+    tab_id: str = "",
+    raw_text: str = "",
+    status: str = "",
+    repo: str = "",
+) -> str:
+    """Edit a note's title/tab/raw_text/status/repo. Only pass the fields you
+    want to change — omitted args (empty string) are left untouched.
+
+    For writing a resolution, use `notebook_add_resolution` instead — it's a
+    dedicated endpoint that also fires the mnemosyne training write-back.
+
+    Args:
+        note_id: the note id to edit.
+        title: new title, if changing.
+        tab_id: new tab id, if moving it to a different tab.
+        raw_text: new raw text, if editing the original paste.
+        status: new pipeline status (draft/processed/promoted/failed).
+        repo: new repo tag, if re-scoping which codebase it's validated against.
+    """
+    return await _notebook_tools.notebook_update(note_id, title, tab_id, raw_text, status, repo)
 
 
 @mcp.tool()

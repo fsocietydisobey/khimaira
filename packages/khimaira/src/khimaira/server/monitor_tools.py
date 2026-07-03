@@ -117,6 +117,51 @@ def _post(
         return f"khimaira-monitor query failed ({url}): {exc}"
 
 
+def _patch(
+    path: str,
+    body: dict[str, Any],
+    *,
+    base: str = _DEFAULT_BASE,
+    timeout: float = 5.0,
+) -> dict[str, Any] | str:
+    """PATCH request → parsed JSON, or friendly error string. Mirrors _post
+    exactly — same error mapping, different HTTP verb (partial-update routes,
+    e.g. /api/notes/{id})."""
+    url = f"{base}{path}"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="PATCH",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            payload = e.read().decode("utf-8")
+            try:
+                detail = json.loads(payload).get("detail", payload)
+            except (json.JSONDecodeError, AttributeError):
+                detail = payload
+            return f"khimaira-monitor {url} → HTTP {e.code}: {detail[:400]}"
+        except Exception:
+            return f"khimaira-monitor {url} → HTTP {e.code}"
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, ConnectionRefusedError):
+            return _DAEMON_DOWN_HINT.format(base=base)
+        return (
+            f"khimaira-monitor {url} → transient connection error: {reason or e}. "
+            "Retry once; if it persists, check `khimaira monitor status`."
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return f"khimaira-monitor returned non-JSON from {url}: {exc}"
+    except Exception as exc:
+        return f"khimaira-monitor query failed ({url}): {exc}"
+
+
 def _delete(
     path: str,
     *,
@@ -2394,7 +2439,6 @@ async def kg_scopes(project: str = "") -> str:
     for s in scopes:
         label_part = f" · {s['label']}" if s.get("label") else ""
         lines.append(
-            f"  {s.get('scope')} · {s.get('nodes')} nodes · "
-            f"{s.get('edges')} edges{label_part}"
+            f"  {s.get('scope')} · {s.get('nodes')} nodes · {s.get('edges')} edges{label_part}"
         )
     return "\n".join(lines)
