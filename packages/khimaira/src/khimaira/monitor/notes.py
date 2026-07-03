@@ -70,6 +70,20 @@ def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def derive_lifecycle(record: dict[str, Any]) -> str:
+    """captured -> reviewed -> resolved, derived (not stored). A note is
+    "resolved" once a resolution has been attached (see `add_resolution`) —
+    that's the training-quality gate: a problem earns training status by
+    being worked to completion, not by being merely structured. "reviewed"
+    means the structuring pipeline ran (status processed/promoted) but no
+    resolution has landed yet; anything else (draft/failed) is "captured"."""
+    if record.get("resolution"):
+        return "resolved"
+    if record.get("status") in ("processed", "promoted"):
+        return "reviewed"
+    return "captured"
+
+
 def _derive_title(raw_text: str) -> str:
     first_line = raw_text.strip().splitlines()[0] if raw_text.strip() else ""
     first_line = first_line.strip()
@@ -116,6 +130,10 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "last_validated_at": record.get("last_validated_at"),
         "validated_git_sha": record.get("validated_git_sha"),
         "history_count": len(record.get("history") or []),
+        "resolution": record.get("resolution", ""),
+        "resolved_by": record.get("resolved_by", ""),
+        "resolved_at": record.get("resolved_at"),
+        "lifecycle": derive_lifecycle(record),
         "deleted": deleted,
     }
 
@@ -179,6 +197,9 @@ def add_note(raw_text: str, tab_id: str = "", title: str = "", repo: str = "") -
         "history": [],
         "last_validated_at": None,
         "validated_git_sha": None,
+        "resolution": "",
+        "resolved_by": "",
+        "resolved_at": None,
     }
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
@@ -273,6 +294,33 @@ def apply_validation(
     record["updated_at"] = now
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
+    return record
+
+
+def add_resolution(note_id: str, resolution: str, resolved_by: str = "") -> dict[str, Any]:
+    """Attach a resolution to a note — the roster-loop write-back.
+
+    A note is the shared problem/task record between Joseph and the agent
+    roster; a resolution is what closes it (worked to completion, written
+    back). This is the notebook's training-quality gate: `resolution != ""`
+    is what promotes a note's lifecycle to "resolved" (see `derive_lifecycle`)
+    and is what makes it eligible to feed the mnemosyne distiller (see
+    khimaira.monitor.notebook_training). Additive only — raw_text and
+    pipeline are untouched, matching apply_validation's "never overwrite the
+    original paste" discipline.
+
+    Passing resolution="" clears resolved_at/resolved_by (explicit un-resolve),
+    mirroring update_note's general edit semantics.
+    """
+    record = get_note(note_id)
+    now = _now_iso()
+    record["resolution"] = resolution
+    record["resolved_by"] = resolved_by if resolution else ""
+    record["resolved_at"] = now if resolution else None
+    record["updated_at"] = now
+    _write_note_atomic(note_id, record)
+    _append_jsonl(_index_path(), _index_stub(record))
+    log.info("notes: resolution added to %s by=%s", note_id, resolved_by or "(unattributed)")
     return record
 
 

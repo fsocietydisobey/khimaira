@@ -228,6 +228,81 @@ def test_set_pipeline_unknown_id_raises(notes_store):
         notes_store.set_pipeline("no-such-note", {})
 
 
+# ---------------------------------------------------------------------------
+# Resolution + lifecycle (v2 roster loop)
+# ---------------------------------------------------------------------------
+
+
+def test_add_note_defaults_resolution_fields(notes_store):
+    note = notes_store.add_note("raw")
+    assert note["resolution"] == ""
+    assert note["resolved_by"] == ""
+    assert note["resolved_at"] is None
+
+
+def test_add_resolution_round_trip(notes_store):
+    note = notes_store.add_note("raw")
+    resolved = notes_store.add_resolution(note["id"], "did the fix", resolved_by="agent-1")
+    assert resolved["resolution"] == "did the fix"
+    assert resolved["resolved_by"] == "agent-1"
+    assert resolved["resolved_at"] is not None
+    refetched = notes_store.get_note(note["id"])
+    assert refetched["resolution"] == "did the fix"
+    assert refetched["resolved_by"] == "agent-1"
+    assert refetched["resolved_at"] is not None
+    # additive-only — raw_text and pipeline untouched
+    assert refetched["raw_text"] == "raw"
+    assert refetched["pipeline"] is None
+
+
+def test_add_resolution_defaults_resolved_by(notes_store):
+    note = notes_store.add_note("raw")
+    resolved = notes_store.add_resolution(note["id"], "fixed it")
+    assert resolved["resolved_by"] == ""
+
+
+def test_add_resolution_empty_string_clears_fields(notes_store):
+    note = notes_store.add_note("raw")
+    notes_store.add_resolution(note["id"], "fixed it", resolved_by="agent-1")
+    cleared = notes_store.add_resolution(note["id"], "", resolved_by="ignored")
+    assert cleared["resolution"] == ""
+    assert cleared["resolved_by"] == ""
+    assert cleared["resolved_at"] is None
+
+
+def test_add_resolution_unknown_id_raises(notes_store):
+    with pytest.raises(ValueError, match="No note with id"):
+        notes_store.add_resolution("no-such-note", "fixed it")
+
+
+def test_derive_lifecycle_captured_by_default(notes_store):
+    note = notes_store.add_note("raw")
+    assert notes_store.derive_lifecycle(note) == "captured"
+
+
+def test_derive_lifecycle_reviewed_after_pipeline(notes_store):
+    note = notes_store.add_note("raw")
+    processed = notes_store.set_pipeline(note["id"], {"summary": "s"})
+    assert notes_store.derive_lifecycle(processed) == "reviewed"
+
+
+def test_derive_lifecycle_resolved_once_resolution_lands(notes_store):
+    note = notes_store.add_note("raw")
+    notes_store.set_pipeline(note["id"], {"summary": "s"})
+    resolved = notes_store.add_resolution(note["id"], "fixed it")
+    assert notes_store.derive_lifecycle(resolved) == "resolved"
+
+
+def test_list_notes_includes_resolution_fields_and_lifecycle(notes_store):
+    note = notes_store.add_note("raw", tab_id="t1")
+    notes_store.add_resolution(note["id"], "fixed it", resolved_by="agent-1")
+    listed = notes_store.list_notes(tab_id="t1")
+    assert listed[0]["resolution"] == "fixed it"
+    assert listed[0]["resolved_by"] == "agent-1"
+    assert listed[0]["resolved_at"] is not None
+    assert listed[0]["lifecycle"] == "resolved"
+
+
 def test_index_survives_corrupt_line(notes_store):
     """A corrupt line in index.jsonl is skipped, not fatal (mirrors
     sessions._read_jsonl's existing corrupt-line tolerance)."""

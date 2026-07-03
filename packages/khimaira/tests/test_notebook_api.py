@@ -12,12 +12,20 @@ def notebook_client(isolated_state, monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from khimaira.monitor import notebook_pipeline as pipeline_mod
+    from khimaira.monitor import notebook_training as training_mod
     from khimaira.monitor import notes as notes_mod
     from khimaira.monitor.api import notebook as notebook_api
 
     importlib.reload(notes_mod)
     importlib.reload(pipeline_mod)
+    importlib.reload(training_mod)
     importlib.reload(notebook_api)
+
+    # Never let a real mnemosyne network call fire during API tests — the
+    # resolution route schedules notebook_training.schedule_promote as a
+    # background task; without this, tests would race a real (or
+    # never-connecting) urllib call.
+    monkeypatch.setattr(notebook_api.notebook_training, "schedule_promote", lambda record: None)
 
     app = FastAPI()
     app.include_router(notebook_api.build_router(), prefix="/api")
@@ -177,3 +185,59 @@ def test_revalidate_note_happy_path(notebook_client, monkeypatch):
 def test_revalidate_note_unknown_id_returns_404(notebook_client):
     r = notebook_client.post("/api/notes/no-such-id/revalidate")
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /notes/{id}/resolution (v2 roster loop)
+# ---------------------------------------------------------------------------
+
+
+def test_add_resolution_happy_path(notebook_client):
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+    r = notebook_client.post(
+        f"/api/notes/{created['id']}/resolution",
+        json={"resolution": "fixed it", "resolved_by": "agent-1"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["resolution"] == "fixed it"
+    assert body["resolved_by"] == "agent-1"
+    assert body["resolved_at"] is not None
+
+    refetched = notebook_client.get(f"/api/notes/{created['id']}").json()
+    assert refetched["resolution"] == "fixed it"
+
+
+def test_add_resolution_unknown_id_returns_404(notebook_client):
+    r = notebook_client.post("/api/notes/no-such-id/resolution", json={"resolution": "fixed it"})
+    assert r.status_code == 404
+    assert "no note with id" in r.json()["detail"].lower()
+
+
+def test_add_resolution_schedules_training_promote(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    scheduled: list[dict] = []
+    monkeypatch.setattr(notebook_api.notebook_training, "schedule_promote", scheduled.append)
+
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+    r = notebook_client.post(
+        f"/api/notes/{created['id']}/resolution", json={"resolution": "fixed it"}
+    )
+    assert r.status_code == 200
+    assert len(scheduled) == 1
+    assert scheduled[0]["id"] == created["id"]
+
+
+def test_add_resolution_empty_string_does_not_schedule_training_promote(
+    notebook_client, monkeypatch
+):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    scheduled: list[dict] = []
+    monkeypatch.setattr(notebook_api.notebook_training, "schedule_promote", scheduled.append)
+
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+    r = notebook_client.post(f"/api/notes/{created['id']}/resolution", json={"resolution": ""})
+    assert r.status_code == 200
+    assert scheduled == []
