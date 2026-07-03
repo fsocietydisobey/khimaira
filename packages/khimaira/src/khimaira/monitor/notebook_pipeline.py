@@ -32,10 +32,13 @@ log = get_logger("monitor.notebook_pipeline")
 _INSTRUCTION = (
     "You structure a pasted note (often an AI coding-assistant response). "
     "Output ONLY a JSON object, no prose, no markdown fence, with keys: "
-    "summary (1-3 sentence string), technical (markdown string), plain "
-    "(plain-language string), organized_md (markdown string), tags (array "
-    "of strings), entities (array of strings — code symbols/files/concepts "
-    "referenced). The entire user message is the raw note to structure."
+    "title (a short, descriptive 3-8 word label capturing what the note is "
+    "about — e.g. 'Person-identity migration blocked on perception-shop', "
+    "NOT a truncated first line), summary (1-3 sentence string), technical "
+    "(markdown string), plain (plain-language string), organized_md "
+    "(markdown string), tags (array of strings), entities (array of "
+    "strings — code symbols/files/concepts referenced). The entire user "
+    "message is the raw note to structure."
 )
 
 _MODEL = "claude-sonnet-5"
@@ -90,6 +93,7 @@ _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
 class PipelineOutput(BaseModel):
+    title: str
     summary: str
     technical: str
     plain: str
@@ -240,8 +244,12 @@ async def trigger_pipeline(note_id: str) -> None:
         log.warning("notebook_pipeline: note %s failed to structure after retry", note_id)
         return
 
+    # `title` is promoted to the note's top-level display title (list rows,
+    # grid cards, reader header, @-mention label) — not kept in the stored
+    # pipeline dict, which only carries the structured-section fields.
+    title = result.pop("title", None)
     try:
-        updated = notes.set_pipeline(note_id, result)
+        updated = notes.set_pipeline(note_id, result, title=title)
     except ValueError:
         log.warning("notebook_pipeline: note %s deleted before pipeline completed", note_id)
         return
@@ -284,15 +292,18 @@ _MAX_ANCHOR_FILE_CHARS = 20_000  # per-file cap fed into the revalidation prompt
 _REVALIDATE_INSTRUCTION_TEMPLATE = (
     "You are checking whether a previously-structured note is still accurate against "
     "the CURRENT source code below. The user message contains the EXISTING NOTE as a "
-    "JSON object with keys summary/technical/plain/organized_md/tags/entities. "
-    "Output a JSON object with those SAME keys plus one extra boolean key `unchanged`. "
-    "Judge by SUBSTANCE, not exact wording — minor rephrasing is not a change. Set "
-    "unchanged=true if the note's existing conclusions are still accurate given the "
-    "current code (you may echo the existing field values back, they will be "
-    "discarded either way). Set unchanged=false and provide CORRECTED values for "
-    "summary/technical/plain/organized_md/tags/entities if the note is stale or wrong "
-    "given the current code. Output ONLY the JSON object, no prose, no markdown "
-    "fence.\n\nCURRENT CODE:\n{code}"
+    "JSON object with keys summary/technical/plain/organized_md/tags/entities (no "
+    "title — generate one fresh). Output a JSON object with keys title/summary/"
+    "technical/plain/organized_md/tags/entities plus one extra boolean key "
+    "`unchanged`. ALWAYS provide title (a short, descriptive 3-8 word label) — it is "
+    "applied either way, regardless of `unchanged`. Judge `unchanged` by SUBSTANCE of "
+    "summary/technical/plain/organized_md/tags/entities, not exact wording — minor "
+    "rephrasing is not a change. Set unchanged=true if the note's existing "
+    "conclusions are still accurate given the current code (you may echo those field "
+    "values back, they will be discarded either way — title is NOT discarded). Set "
+    "unchanged=false and provide CORRECTED values for summary/technical/plain/"
+    "organized_md/tags/entities if the note is stale or wrong given the current code. "
+    "Output ONLY the JSON object, no prose, no markdown fence.\n\nCURRENT CODE:\n{code}"
 )
 
 
@@ -454,8 +465,14 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
     # Explicit model judgment, not equality-diffing its own regenerated JSON —
     # see RevalidationOutput's docstring for why that was the actual bug.
     unchanged = result.pop("unchanged")
+    # Title backfill (Joseph, 2026-07-03): applied on every revalidate pass
+    # that reaches the LLM, independent of `unchanged` — a note's title
+    # deserves fixing even on a "still accurate" check, not just a heal.
+    title = result.pop("title", None)
     new_pipeline = None if unchanged else result
-    updated = notes.apply_validation(note_id, git_sha=current_sha, new_pipeline=new_pipeline)
+    updated = notes.apply_validation(
+        note_id, git_sha=current_sha, new_pipeline=new_pipeline, title=title
+    )
     if new_pipeline is not None:
         # Only re-embed on an actual heal — content is identical otherwise,
         # so re-embedding would just waste an embed+upsert call.
@@ -470,14 +487,122 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
 # (cheap when the code hasn't moved, heals it when it has) → synthesize an
 # answer from the now-code-current note bodies. Every note the answer draws
 # on has just been re-grounded against the actual code, not a stale cache.
+#
+# Phase 2c-v2 (ask-layer v2): also grounds the answer in a live semantic
+# search of the actual codebase (Séance), not just the notes — "notes are
+# framing, code is ground truth" made visible in the answer itself.
 # ---------------------------------------------------------------------------
 
 _ASK_INSTRUCTION_TEMPLATE = (
-    "Answer the question using ONLY the notes below, which have just been "
-    "re-validated against the current code. Cite the note titles you drew "
-    "on. If the notes don't cover the question, say so plainly — do not "
-    "invent an answer.\n\nNOTES:\n{notes}"
+    "Answer the question using the notes below (just re-validated against "
+    "the current code) plus the RELEVANT CODE section if present (a fresh "
+    "semantic search of the live codebase — treat it as ground truth over "
+    "a note if the two conflict). Cite the note titles AND any code "
+    "file:line references you drew on. If nothing below covers the "
+    "question, say so plainly — do not invent an answer.\n\nNOTES:\n"
+    "{notes}\n{code}"
 )
+
+_SEANCE_CODE_TOP_K = 8
+
+
+def _seance_code_search(
+    repo: str, question: str, top_k: int = _SEANCE_CODE_TOP_K
+) -> tuple[list[dict[str, Any]], bool, bool]:
+    """Semantic code search on `repo` via Séance's in-process search core —
+    same pattern as api/oracle.py's `_seance_search` (proven prod code path,
+    not new integration surface): asyncio.to_thread around a sync
+    SearchEngine.search() call.
+
+    Returns (chunks, indexed, errored):
+      chunks:  Séance SearchResult dicts (raw — no `repo` key yet, caller adds it)
+      indexed: whether `repo` has a real (non-empty) Séance collection. Séance
+               auto-creates an EMPTY collection on a miss, so an empty-results
+               check alone can't distinguish "not indexed" from "indexed but
+               no match" — checked explicitly via VectorStore.list_projects()
+               so callers know whether to trust an empty result or fall back.
+      errored: True only on an actual exception (import fail, embed API
+               error). NOTE: load_config() raises SystemExit (not Exception)
+               when GOOGLE_AI_API_KEY is unset — a BaseException, so it must
+               be caught explicitly alongside Exception (a real gap present
+               in oracle.py's own version of this function; flagged, not
+               fixed there — out of this task's scope).
+    """
+    try:
+        from seance.config import load_config
+        from seance.search.engine import SearchEngine
+        from seance.storage.vectordb import VectorStore
+
+        config = load_config()
+        safe_name = repo.replace("-", "_").replace(".", "_")[:63]
+        indexed = any(
+            p.get("name") == safe_name and p.get("chunks", 0) > 0
+            for p in VectorStore(config).list_projects()
+        )
+        if not indexed:
+            return [], False, False
+
+        engine = SearchEngine(config)
+        results = engine.search(project_name=repo, query=question, top_k=top_k)
+        return [r.to_dict() for r in results], True, False
+    except (Exception, SystemExit) as exc:
+        log.warning("notebook_pipeline: seance code search failed for repo=%r: %s", repo, exc)
+        return [], False, True
+
+
+def _grep_code_fallback(repo_root: Path, question: str) -> list[dict[str, Any]]:
+    """Deterministic keyword-grep fallback when `repo` isn't Séance-indexed.
+
+    Reuses khimaira.context.resolver's keyword-extraction + ripgrep utility
+    (the same mechanism already used for agent-dispatch context resolution)
+    rather than inventing a second grep-scoring scheme."""
+    from khimaira.context.resolver import _grep_keywords
+
+    hits = _grep_keywords(question, repo_root)
+    hits.sort(key=lambda h: h[1], reverse=True)
+    chunks: list[dict[str, Any]] = []
+    for path, _score, snippet, line_range, _reason in hits[:_SEANCE_CODE_TOP_K]:
+        start, end = line_range if line_range else (1, 1)
+        chunks.append(
+            {
+                "file_path": path,
+                "start_line": start,
+                "end_line": end,
+                "symbol_name": "",
+                "text": snippet,
+            }
+        )
+    return chunks
+
+
+async def _code_grounding_for_repo(repo: str, question: str) -> tuple[list[dict[str, Any]], bool]:
+    """Returns (chunks, unavailable). Trusts an indexed Séance search even
+    when it returns zero chunks (a valid "no match", not unavailable — same
+    semantics as oracle.py). Falls back to grep only when `repo` isn't
+    indexed or Séance errored; `unavailable=True` only when that fallback
+    ALSO can't resolve anything (repo root unresolvable, or grep found
+    nothing) — never hard-fails the ask, just degrades to notes-only."""
+    chunks, indexed, _errored = await asyncio.to_thread(_seance_code_search, repo, question)
+    if indexed:
+        return [dict(c, repo=repo) for c in chunks], False
+
+    repo_root = _repo_root(repo)
+    if repo_root is None:
+        return [], True
+
+    grep_chunks = await asyncio.to_thread(_grep_code_fallback, repo_root, question)
+    return [dict(c, repo=repo) for c in grep_chunks], not bool(grep_chunks)
+
+
+def _format_code_section(chunks: list[dict[str, Any]]) -> str:
+    if not chunks:
+        return ""
+    lines = ["---", "", "RELEVANT CODE (live search, current as of this ask):", ""]
+    for c in chunks:
+        ref = f"{c['repo']}/{c['file_path']}:{c['start_line']}-{c['end_line']}"
+        symbol = f" ({c['symbol_name']})" if c.get("symbol_name") else ""
+        lines += [f"### `{ref}`{symbol}", "", c["text"], ""]
+    return "\n".join(lines)
 
 
 async def _synthesize_answer(question: str, instruction: str) -> str | None:
@@ -496,23 +621,55 @@ async def _synthesize_answer(question: str, instruction: str) -> str | None:
 _NO_NOTES_ANSWER = "No relevant notes found."
 
 
-async def answer_question(question: str, *, repo: str | None = None) -> dict[str, Any]:
-    """ask → retrieve → heal-against-code → answer.
+_EMPTY_ANSWER: dict[str, Any] = {
+    "answer": _NO_NOTES_ANSWER,
+    "sources": [],
+    "healed": [],
+    "code_sources": [],
+    "code_unavailable": [],
+}
 
-    Returns {answer, sources: [note_id, ...], healed: [note_id, ...]}.
+
+async def answer_question(
+    question: str,
+    *,
+    repo: str | None = None,
+    mentioned_note_ids: list[str] | None = None,
+    exclusive: bool = False,
+) -> dict[str, Any]:
+    """ask → retrieve → heal-against-code → ground-in-live-code → answer.
+
+    `mentioned_note_ids` are @-referenced notes from the ask bar. Default
+    (`exclusive=False`, "prioritized"): mentioned notes always join the
+    answer's sources, in addition to the normal semantic-retrieval hits
+    (deduped, mentioned-first). `exclusive=True`: skip retrieval entirely
+    and answer from ONLY the mentioned notes — same downstream code, one
+    conditional, so flipping the default later is a one-line change.
+
+    Returns {answer, sources, healed, code_sources, code_unavailable}.
     `sources` is every note the answer drew on (post-revalidation); `healed`
-    is the subset that actually changed during this call — a note passing
-    its staleness gate unchanged is a source but not "healed".
+    is the subset that actually changed during this call. `code_sources` is
+    every code chunk (Séance or grep-fallback) fed into the synthesis;
+    `code_unavailable` lists repos where NEITHER Séance nor grep could
+    ground anything (not indexed / not resolvable) — a degrade, not a
+    failure.
     """
-    hits = await notebook_retrieval.search_notes_async(question, repo=repo)
-    if not hits:
-        return {"answer": _NO_NOTES_ANSWER, "sources": [], "healed": []}
+    mentioned_note_ids = mentioned_note_ids or []
+
+    if exclusive and mentioned_note_ids:
+        note_ids = list(dict.fromkeys(mentioned_note_ids))
+    else:
+        hits = await notebook_retrieval.search_notes_async(question, repo=repo)
+        note_ids = list(dict.fromkeys([*mentioned_note_ids, *(h["note_id"] for h in hits)]))
+
+    if not note_ids:
+        return dict(_EMPTY_ANSWER)
 
     sources: list[str] = []
     healed: list[str] = []
     note_sections: list[str] = []
-    for hit in hits:
-        note_id = hit["note_id"]
+    repos_seen: set[str] = set()
+    for note_id in note_ids:
         try:
             before = notes.get_note(note_id)
         except ValueError:
@@ -535,15 +692,41 @@ async def answer_question(question: str, *, repo: str | None = None) -> dict[str
             continue
         sources.append(note_id)
         note_sections.append(f"### {updated.get('title', note_id)}\n\n{body}")
+        repos_seen.add(updated["repo"])
 
     if not note_sections:
-        return {"answer": _NO_NOTES_ANSWER, "sources": [], "healed": healed}
+        return {**_EMPTY_ANSWER, "healed": healed}
 
-    instruction = _ASK_INSTRUCTION_TEMPLATE.format(notes="\n\n---\n\n".join(note_sections))
+    code_chunks: list[dict[str, Any]] = []
+    code_unavailable: list[str] = []
+    for r in sorted(repos_seen):
+        chunks, unavailable = await _code_grounding_for_repo(r, question)
+        code_chunks.extend(chunks)
+        if unavailable:
+            code_unavailable.append(r)
+
+    instruction = _ASK_INSTRUCTION_TEMPLATE.format(
+        notes="\n\n---\n\n".join(note_sections), code=_format_code_section(code_chunks)
+    )
     answer = await _synthesize_answer(question, instruction)
     if answer is None:
         answer = (
             "Found relevant notes but couldn't synthesize an answer right now — "
             "see the cited sources below."
         )
-    return {"answer": answer, "sources": sources, "healed": healed}
+    code_sources = [
+        {
+            "repo": c["repo"],
+            "file_path": c["file_path"],
+            "start_line": c["start_line"],
+            "end_line": c["end_line"],
+        }
+        for c in code_chunks
+    ]
+    return {
+        "answer": answer,
+        "sources": sources,
+        "healed": healed,
+        "code_sources": code_sources,
+        "code_unavailable": code_unavailable,
+    }

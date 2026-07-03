@@ -59,6 +59,14 @@ export interface NotebookTab {
   note_ids: string[];
 }
 
+/** A code chunk (Séance semantic search, or a grep fallback) cited in an ask answer. */
+export interface CodeSource {
+  repo: string;
+  file_path: string;
+  start_line: number;
+  end_line: number;
+}
+
 /** Phase 2c capstone — POST /notes/ask response. */
 export interface AskAnswer {
   answer: string;
@@ -66,4 +74,10 @@ export interface AskAnswer {
   sources: string[];
   /** Subset of `sources` that actually changed (healed) during this ask. */
   healed: string[];
+  /** Ask-layer v2: code chunks (from each source note's repo) fed into the synthesis. */
+  code_sources: CodeSource[];
+  /** Repos where neither Séance nor the grep fallback could ground anything —
+   *  a degrade, not a failure; surfaced so the answer doesn't look like it
+   *  silently skipped checking the code. */
+  code_unavailable: string[];
 }

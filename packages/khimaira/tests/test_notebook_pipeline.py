@@ -35,6 +35,18 @@ def pipeline(notes_store, monkeypatch):
     # itself, so it doesn't affect the unrelated asyncio.sleep(0.05) used
     # elsewhere in this file to let a background task run to completion.
     monkeypatch.setattr(pipeline_mod, "_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    # Default the LEAF dependencies of answer_question's code-grounding step
+    # to "nothing available" — most tests in this file default a note's repo
+    # to "khimaira" (notes.py's _DEFAULT_REPO), which is the REAL monorepo
+    # this test suite runs inside. Without this, every answer_question test
+    # would hit a real Séance import/API call (or, on failure, a real
+    # ripgrep subprocess against this actual repo) — slow, network-
+    # dependent, non-deterministic. Patching the leaves (not
+    # _code_grounding_for_repo itself) keeps that function's own real logic
+    # exercised by every test, and lets the tests that exercise it directly
+    # override these two per-test as needed.
+    monkeypatch.setattr(pipeline_mod, "_seance_code_search", lambda repo, question: ([], False, False))
+    monkeypatch.setattr(pipeline_mod, "_repo_root", lambda repo: None)
     yield pipeline_mod
 
 
@@ -67,6 +79,7 @@ def _queue_responses(pipeline, monkeypatch, responses: list[_FakeProc]):
 
 
 _VALID_PAYLOAD = {
+    "title": "A test note title",
     "summary": "a summary",
     "technical": "tech details",
     "plain": "plain english",
@@ -181,7 +194,10 @@ async def test_trigger_pipeline_success_sets_processed(notes_store, pipeline, mo
 
     updated = notes_store.get_note(note["id"])
     assert updated["status"] == "processed"
-    assert updated["pipeline"] == _VALID_PAYLOAD
+    # title is popped out of the stored pipeline and promoted to the note's
+    # top-level display title — see trigger_pipeline.
+    assert updated["pipeline"] == {k: v for k, v in _VALID_PAYLOAD.items() if k != "title"}
+    assert updated["title"] == _VALID_PAYLOAD["title"]
     assert updated["raw_text"] == "some raw content"
 
 
@@ -349,6 +365,41 @@ async def test_revalidate_note_llm_confirms_unchanged_skips_history(
     assert result["validated_git_sha"] == new_sha
 
 
+async def test_revalidate_note_backfills_title_even_when_unchanged(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    """Title backfill (Joseph, 2026-07-03) applies on ANY revalidate pass
+    that reaches the LLM, independent of the unchanged/healed decision —
+    unlike the rest of the pipeline fields, which are discarded when
+    unchanged=true."""
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    note = notes_store.add_note("raw", repo="testrepo", title="old truncated title")
+    notes_store.set_pipeline(note["id"], _ANCHORED_PAYLOAD)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(note["id"], git_sha=initial_sha, new_pipeline=None)
+
+    (git_repo / "sessions.py").write_text("def foo():\n    pass  # cosmetic\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "cosmetic")
+
+    _queue_responses(
+        pipeline,
+        monkeypatch,
+        [
+            _FakeProc(
+                _envelope(
+                    json.dumps({**_ANCHORED_PAYLOAD, "title": "Fresh backfilled title", "unchanged": True})
+                )
+            )
+        ],
+    )
+
+    result = await pipeline.revalidate_note(note["id"])
+    assert result["title"] == "Fresh backfilled title"
+    assert result["history"] == []  # still a no-op on content — just the title moved
+    assert result["pipeline"] == _ANCHORED_PAYLOAD  # title never lands inside pipeline
+
+
 async def test_revalidate_note_unchanged_true_skips_history_despite_reworded_text(
     notes_store, pipeline, monkeypatch, git_repo
 ):
@@ -439,9 +490,14 @@ def test_repo_root_resolves_via_real_project_registry(pipeline):
     """Regression: _repo_root's internal import path was wrong (khimaira.discovery
     vs the real khimaira.monitor.discovery) and every other revalidate_note test
     mocks _repo_root itself, so none of them would have caught it. This test
-    exercises the REAL function against the REAL registry — no mocking."""
+    exercises the REAL function against the REAL registry — no mocking.
+
+    The `pipeline` fixture stubs _repo_root to None by default (a safety net
+    for answer_question's code-grounding step, see the fixture), so this
+    test reloads the module fresh to get the real, unpatched function back."""
     from pathlib import Path
 
+    importlib.reload(pipeline)
     root = pipeline._repo_root("khimaira")
     assert root is not None
     assert Path(root) == Path(__file__).resolve().parents[3]
@@ -481,7 +537,13 @@ async def test_answer_question_no_hits_returns_no_notes_found(pipeline, notes_st
     monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
 
     result = await pipeline.answer_question("anything")
-    assert result == {"answer": "No relevant notes found.", "sources": [], "healed": []}
+    assert result == {
+        "answer": "No relevant notes found.",
+        "sources": [],
+        "healed": [],
+        "code_sources": [],
+        "code_unavailable": [],
+    }
 
 
 async def test_answer_question_orchestrates_retrieve_revalidate_synth(
@@ -572,7 +634,13 @@ async def test_answer_question_skips_hit_whose_note_vanished(pipeline, notes_sto
     monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
 
     result = await pipeline.answer_question("q")
-    assert result == {"answer": "No relevant notes found.", "sources": [], "healed": []}
+    assert result == {
+        "answer": "No relevant notes found.",
+        "sources": [],
+        "healed": [],
+        "code_sources": [],
+        "code_unavailable": [],
+    }
 
 
 async def test_answer_question_synthesis_failure_still_returns_sources(
@@ -610,3 +678,278 @@ async def test_answer_question_repo_filter_passed_through(pipeline, notes_store,
 
     await pipeline.answer_question("q", repo="jeevy_portal")
     assert captured_kwargs.get("repo") == "jeevy_portal"
+
+
+# ---------------------------------------------------------------------------
+# ask-layer v2: Séance code-grounding + grep fallback + @-mention plumbing
+#
+# _seance_code_search tests patch the seance package's own symbols (its
+# imports are local/lazy inside the function, so patching e.g.
+# "seance.config.load_config" before the call is correctly picked up by the
+# fresh `from seance.config import load_config` at call time).
+# ---------------------------------------------------------------------------
+
+
+class _FakeSearchResult:
+    def __init__(self, **kwargs):
+        self._data = kwargs
+
+    def to_dict(self):
+        return dict(self._data)
+
+
+def test_seance_code_search_not_indexed_skips_the_embed_call(pipeline, monkeypatch):
+    """A not-indexed repo must short-circuit before SearchEngine.search() —
+    that call hits a real embedding API, so paying for it on a guaranteed
+    miss would be wasteful.
+
+    Reloads first: the `pipeline` fixture stubs _seance_code_search itself
+    (a safety net for other tests, see the fixture) — this test exercises
+    the REAL function, so it needs that stub undone first."""
+    importlib.reload(pipeline)
+    search_called = []
+
+    class _FakeVectorStore:
+        def __init__(self, config):
+            pass
+
+        def list_projects(self):
+            return [{"name": "some_other_repo", "chunks": 10}]
+
+    class _FakeSearchEngine:
+        def __init__(self, config):
+            pass
+
+        def search(self, **kwargs):
+            search_called.append(kwargs)
+            return []
+
+    monkeypatch.setattr("seance.config.load_config", lambda: object())
+    monkeypatch.setattr("seance.storage.vectordb.VectorStore", _FakeVectorStore)
+    monkeypatch.setattr("seance.search.engine.SearchEngine", _FakeSearchEngine)
+
+    chunks, indexed, errored = pipeline._seance_code_search("my-repo", "question")
+    assert chunks == []
+    assert indexed is False
+    assert errored is False
+    assert search_called == []
+
+
+def test_seance_code_search_indexed_returns_results(pipeline, monkeypatch):
+    importlib.reload(pipeline)  # undo the fixture's _seance_code_search stub — see above
+
+    class _FakeVectorStore:
+        def __init__(self, config):
+            pass
+
+        def list_projects(self):
+            return [{"name": "my_repo", "chunks": 42}]
+
+    class _FakeSearchEngine:
+        def __init__(self, config):
+            pass
+
+        def search(self, *, project_name, query, top_k):
+            return [
+                _FakeSearchResult(
+                    file_path="foo.py",
+                    symbol_name="bar",
+                    chunk_type="function",
+                    language="python",
+                    start_line=1,
+                    end_line=5,
+                    score=0.1,
+                    text="def bar(): pass",
+                )
+            ]
+
+    monkeypatch.setattr("seance.config.load_config", lambda: object())
+    monkeypatch.setattr("seance.storage.vectordb.VectorStore", _FakeVectorStore)
+    monkeypatch.setattr("seance.search.engine.SearchEngine", _FakeSearchEngine)
+
+    chunks, indexed, errored = pipeline._seance_code_search("my_repo", "question")
+    assert indexed is True
+    assert errored is False
+    assert chunks[0]["file_path"] == "foo.py"
+
+
+def test_seance_code_search_missing_api_key_systemexit_is_caught(pipeline, monkeypatch):
+    """Regression: seance.config.load_config() raises SystemExit (a
+    BaseException, not Exception) when GOOGLE_AI_API_KEY is unset — must be
+    caught explicitly, not propagate and break the whole ask."""
+    importlib.reload(pipeline)  # undo the fixture's _seance_code_search stub — see above
+
+    def _raise_system_exit():
+        raise SystemExit("GOOGLE_AI_API_KEY is not set.")
+
+    monkeypatch.setattr("seance.config.load_config", _raise_system_exit)
+
+    chunks, indexed, errored = pipeline._seance_code_search("any-repo", "question")
+    assert chunks == []
+    assert indexed is False
+    assert errored is True
+
+
+def test_grep_code_fallback_finds_matching_files(pipeline, tmp_path):
+    (tmp_path / "widget.py").write_text("def frobnicate_widget():\n    return 42\n")
+    (tmp_path / "unrelated.py").write_text("def other():\n    pass\n")
+
+    chunks = pipeline._grep_code_fallback(tmp_path, "how does frobnicate widget work")
+    assert any("widget.py" in c["file_path"] for c in chunks)
+    assert not any("unrelated.py" in c["file_path"] for c in chunks)
+
+
+async def test_code_grounding_trusts_indexed_seance_even_when_empty(pipeline, monkeypatch):
+    """Indexed-but-zero-hits is a valid 'no match', not 'unavailable' — must
+    not trigger a grep fallback."""
+    monkeypatch.setattr(pipeline, "_seance_code_search", lambda repo, question: ([], True, False))
+
+    chunks, unavailable = await pipeline._code_grounding_for_repo("my-repo", "q")
+    assert chunks == []
+    assert unavailable is False
+
+
+async def test_code_grounding_falls_back_to_grep_when_not_indexed(pipeline, monkeypatch, tmp_path):
+    (tmp_path / "widget.py").write_text("def frobnicate_widget():\n    return 42\n")
+    monkeypatch.setattr(pipeline, "_seance_code_search", lambda repo, question: ([], False, False))
+    monkeypatch.setattr(pipeline, "_repo_root", lambda repo: tmp_path)
+
+    chunks, unavailable = await pipeline._code_grounding_for_repo("my-repo", "frobnicate widget")
+    assert unavailable is False
+    assert any("widget.py" in c["file_path"] for c in chunks)
+    assert all(c["repo"] == "my-repo" for c in chunks)
+
+
+async def test_code_grounding_unavailable_when_repo_root_unresolvable(pipeline, monkeypatch):
+    monkeypatch.setattr(pipeline, "_seance_code_search", lambda repo, question: ([], False, True))
+    monkeypatch.setattr(pipeline, "_repo_root", lambda repo: None)
+
+    chunks, unavailable = await pipeline._code_grounding_for_repo("no-such-repo", "q")
+    assert chunks == []
+    assert unavailable is True
+
+
+async def test_code_grounding_unavailable_when_grep_finds_nothing(pipeline, monkeypatch, tmp_path):
+    monkeypatch.setattr(pipeline, "_seance_code_search", lambda repo, question: ([], False, False))
+    monkeypatch.setattr(pipeline, "_repo_root", lambda repo: tmp_path)
+
+    chunks, unavailable = await pipeline._code_grounding_for_repo("my-repo", "zzzznomatchzzzz")
+    assert chunks == []
+    assert unavailable is True
+
+
+async def test_answer_question_mentioned_notes_prioritized_and_deduped(
+    pipeline, notes_store, monkeypatch
+):
+    mentioned = notes_store.add_note("mentioned raw", tab_id="t1")
+    notes_store.set_pipeline(mentioned["id"], _VALID_PAYLOAD)
+    retrieved = notes_store.add_note("retrieved raw", tab_id="t1")
+    notes_store.set_pipeline(retrieved["id"], _VALID_PAYLOAD)
+
+    async def fake_search(query, **kwargs):
+        # Retrieval also surfaces the mentioned note again — must dedup.
+        return [
+            {"note_id": mentioned["id"], "score": 0.5},
+            {"note_id": retrieved["id"], "score": 0.4},
+        ]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope("answer"))])
+
+    result = await pipeline.answer_question("q", mentioned_note_ids=[mentioned["id"]])
+    assert result["sources"] == [mentioned["id"], retrieved["id"]]
+
+
+async def test_answer_question_exclusive_skips_retrieval(pipeline, notes_store, monkeypatch):
+    mentioned = notes_store.add_note("raw", tab_id="t1")
+    notes_store.set_pipeline(mentioned["id"], _VALID_PAYLOAD)
+
+    search_called: list[str] = []
+
+    async def fake_search(query, **kwargs):
+        search_called.append(query)
+        return [{"note_id": "should-not-be-used", "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope("answer"))])
+
+    result = await pipeline.answer_question(
+        "q", mentioned_note_ids=[mentioned["id"]], exclusive=True
+    )
+    assert result["sources"] == [mentioned["id"]]
+    assert search_called == []
+
+
+async def test_answer_question_includes_code_section_and_sources(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_note("raw", tab_id="t1")
+    notes_store.set_pipeline(note["id"], _VALID_PAYLOAD)
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)
+
+    async def fake_grounding(repo, question):
+        return [
+            {
+                "repo": repo,
+                "file_path": "foo.py",
+                "start_line": 1,
+                "end_line": 3,
+                "symbol_name": "bar",
+                "text": "def bar(): ...",
+            }
+        ], False
+
+    captured: dict[str, str] = {}
+
+    async def fake_invoke(content, instruction):
+        captured["instruction"] = instruction
+        return "final answer"
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+    monkeypatch.setattr(pipeline, "_code_grounding_for_repo", fake_grounding)
+    monkeypatch.setattr(pipeline, "_invoke_claude", fake_invoke)
+
+    result = await pipeline.answer_question("q")
+    assert result["code_sources"] == [
+        {"repo": "khimaira", "file_path": "foo.py", "start_line": 1, "end_line": 3}
+    ]
+    assert result["code_unavailable"] == []
+    assert "foo.py" in captured["instruction"]
+    assert "RELEVANT CODE" in captured["instruction"]
+
+
+async def test_answer_question_code_unavailable_surfaced(pipeline, notes_store, monkeypatch):
+    note = notes_store.add_note("raw", tab_id="t1")
+    notes_store.set_pipeline(note["id"], _VALID_PAYLOAD)
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)
+
+    async def fake_grounding(repo, question):
+        return [], True
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+    monkeypatch.setattr(pipeline, "_code_grounding_for_repo", fake_grounding)
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope("answer"))])
+
+    result = await pipeline.answer_question("q")
+    assert result["code_unavailable"] == ["khimaira"]
+    assert result["code_sources"] == []

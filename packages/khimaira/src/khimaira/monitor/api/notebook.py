@@ -55,6 +55,8 @@ class UpdateNoteReq(BaseModel):
 class AskReq(BaseModel):
     question: str
     repo: str | None = None
+    note_ids: list[str] = []
+    exclusive: bool = False
 
 
 class CreateTabReq(BaseModel):
@@ -95,11 +97,14 @@ def build_router():
 
     @router.post("/notes/ask")
     async def ask(req: AskReq) -> dict:
-        """Phase 2c capstone: retrieve candidate notes, staleness-gated
-        revalidate (heals stale ones) each hit, synthesize an answer from
-        the now-code-current bodies. Awaited directly — an on-demand ask,
-        not a write path."""
-        return await notebook_pipeline.answer_question(req.question, repo=req.repo)
+        """Phase 2c capstone (v2): retrieve candidate notes (+ any @-mentioned
+        note_ids), staleness-gated revalidate (heals stale ones) each hit,
+        ground the answer in a live Séance/grep search of each note's repo,
+        synthesize an answer citing both notes and code. Awaited directly —
+        an on-demand ask, not a write path."""
+        return await notebook_pipeline.answer_question(
+            req.question, repo=req.repo, mentioned_note_ids=req.note_ids, exclusive=req.exclusive
+        )
 
     @router.get("/notes/{note_id}")
     async def get_note(note_id: str) -> dict:

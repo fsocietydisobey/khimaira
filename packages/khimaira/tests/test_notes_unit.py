@@ -189,6 +189,42 @@ def test_set_pipeline_round_trip_marks_processed(notes_store):
     assert refetched["status"] == "processed"
 
 
+def test_set_pipeline_promotes_title_when_given(notes_store):
+    note = notes_store.add_note("raw", title="truncated first line")
+    pipeline = {
+        "summary": "TL;DR",
+        "technical": "tech",
+        "plain": "plain",
+        "organized_md": "# md",
+        "tags": ["x"],
+        "entities": ["y"],
+    }
+    updated = notes_store.set_pipeline(note["id"], pipeline, title="A proper generated title")
+    assert updated["title"] == "A proper generated title"
+    assert updated["pipeline"] == pipeline  # title never lands inside the pipeline dict
+
+
+def test_set_pipeline_keeps_existing_title_when_none_given(notes_store):
+    note = notes_store.add_note("raw", title="keep me")
+    updated = notes_store.set_pipeline(note["id"], {})
+    assert updated["title"] == "keep me"
+
+
+def test_apply_validation_backfills_title_independent_of_new_pipeline(notes_store):
+    """title is applied whenever given, regardless of whether new_pipeline
+    is None (unchanged) or a real heal — the two are independent knobs."""
+    note = notes_store.add_note("raw", title="old title")
+    unchanged = notes_store.apply_validation(note["id"], git_sha="sha1", title="fresh title 1")
+    assert unchanged["title"] == "fresh title 1"
+    assert unchanged["history"] == []
+
+    healed = notes_store.apply_validation(
+        note["id"], git_sha="sha2", new_pipeline={"summary": "new"}, title="fresh title 2"
+    )
+    assert healed["title"] == "fresh title 2"
+    assert len(healed["history"]) == 1
+
+
 def test_promote_note_round_trip(notes_store):
     note = notes_store.add_note("raw")
     promoted = notes_store.promote_note(note["id"])

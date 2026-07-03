@@ -231,11 +231,18 @@ def update_note(note_id: str, **fields: Any) -> dict[str, Any]:
     return record
 
 
-def set_pipeline(note_id: str, pipeline: dict[str, Any]) -> dict[str, Any]:
+def set_pipeline(
+    note_id: str, pipeline: dict[str, Any], *, title: str | None = None
+) -> dict[str, Any]:
     """Full replace of the pipeline dict (called by the Phase 1c transform
-    on completion) and marks the note processed."""
+    on completion) and marks the note processed. `title` (LLM-generated,
+    Joseph 2026-07-03) replaces the raw-text-derived placeholder title when
+    given — the display title everywhere (list rows, grid cards, reader
+    header, @-mention label)."""
     record = get_note(note_id)
     record["pipeline"] = pipeline
+    if title:
+        record["title"] = title
     record["status"] = "processed"
     record["updated_at"] = _now_iso()
     _write_note_atomic(note_id, record)
@@ -244,7 +251,11 @@ def set_pipeline(note_id: str, pipeline: dict[str, Any]) -> dict[str, Any]:
 
 
 def apply_validation(
-    note_id: str, *, git_sha: str, new_pipeline: dict[str, Any] | None = None
+    note_id: str,
+    *,
+    git_sha: str,
+    new_pipeline: dict[str, Any] | None = None,
+    title: str | None = None,
 ) -> dict[str, Any]:
     """Record a revalidate_note() pass (north-star self-healing core).
 
@@ -256,6 +267,10 @@ def apply_validation(
     the validation stamp it was checked under) is pushed to `history` before
     the new one replaces it, so prior versions are never lost. `raw_text` is
     never touched either way — it's the immutable original paste.
+
+    `title`, when given, replaces the note's display title regardless of
+    `new_pipeline` — a title backfill happens on ANY revalidate pass that
+    reaches the LLM, not just a heal (Joseph, 2026-07-03).
     """
     record = get_note(note_id)
     now = _now_iso()
@@ -268,6 +283,8 @@ def apply_validation(
         record.setdefault("history", []).append(history_entry)
         record["pipeline"] = new_pipeline
         record["status"] = "processed"
+    if title:
+        record["title"] = title
     record["last_validated_at"] = now
     record["validated_git_sha"] = git_sha
     record["updated_at"] = now

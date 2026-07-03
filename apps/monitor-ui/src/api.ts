@@ -311,7 +311,10 @@ export const monitorApi = createApi({
       query: (id) => ({ url: `/notes/${encodeURIComponent(id)}/revalidate`, method: "POST" }),
       invalidatesTags: (_r, _e, id) => [{ type: "Notes", id }, { type: "Notes", id: "LIST" }],
     }),
-    askNotebook: build.mutation<AskAnswer, { question: string; repo?: string }>({
+    askNotebook: build.mutation<
+      AskAnswer,
+      { question: string; repo?: string; note_ids?: string[]; exclusive?: boolean }
+    >({
       query: (body) => ({ url: "/notes/ask", method: "POST", body }),
       // A heal during ask() changes the cited notes' pipeline — refresh the list
       // so their cards show the corrected content next render.

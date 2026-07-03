@@ -33,6 +33,7 @@ import {
   Search,
   Trash2,
   Upload,
+  X,
 } from "lucide-react";
 
 import {
@@ -317,8 +318,8 @@ export function Notebook() {
     setCenterView({ kind: "note", noteId: id });
   };
 
-  const handleAsk = async (question: string) => {
-    const result = await askNotebook({ question }).unwrap();
+  const handleAsk = async (question: string, noteIds: string[]) => {
+    const result = await askNotebook({ question, note_ids: noteIds }).unwrap();
     setViewMode("reader");
     setCenterView({ kind: "answer", data: result, question });
   };
@@ -397,7 +398,7 @@ export function Notebook() {
         </div>
       </header>
 
-      <AskBar onAsk={handleAsk} asking={asking} />
+      <AskBar onAsk={handleAsk} asking={asking} notes={notes} />
 
       {viewMode === "grid" ? (
         <div className="flex flex-1 overflow-hidden">
@@ -480,45 +481,146 @@ export function Notebook() {
   );
 }
 
-/** Persistent ask bar — always visible above the panels. Shows a few
- *  suggested-question chips when idle to nudge first-time use. */
-function AskBar({ onAsk, asking }: { onAsk: (question: string) => void; asking: boolean }) {
+type Mention = { id: string; title: string };
+
+/** Persistent ask bar — always visible above the panels. Type `@` to reference
+ *  a specific note (autocomplete over the already-loaded notes list, modeled
+ *  on Claude Code's @-file mentions) — @-referenced notes always join the
+ *  answer's sources (prioritized default; see answer_question's `exclusive`
+ *  param for the future flip). Shows a few suggested-question chips when
+ *  idle to nudge first-time use. */
+function AskBar({
+  onAsk,
+  asking,
+  notes,
+}: {
+  onAsk: (question: string, noteIds: string[]) => void;
+  asking: boolean;
+  notes: Note[];
+}) {
   const [question, setQuestion] = useState("");
+  const [mentions, setMentions] = useState<Mention[]>([]);
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [mentionMatchStart, setMentionMatchStart] = useState<number | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const mentionMatches =
+    mentionQuery !== null
+      ? notes
+          .filter((n) => n.title.toLowerCase().includes(mentionQuery.toLowerCase()))
+          .slice(0, 6)
+      : [];
+
+  const updateMentionState = (value: string, cursorPos: number) => {
+    const match = /@([^\s@]*)$/.exec(value.slice(0, cursorPos));
+    if (match) {
+      setMentionQuery(match[1]);
+      setMentionMatchStart(cursorPos - match[0].length);
+    } else {
+      setMentionQuery(null);
+      setMentionMatchStart(null);
+    }
+  };
+
+  const selectMention = (note: Note) => {
+    if (mentionMatchStart === null || mentionQuery === null) return;
+    const before = question.slice(0, mentionMatchStart);
+    const after = question.slice(mentionMatchStart + 1 + mentionQuery.length);
+    setQuestion(`${before}${after}`);
+    setMentions((prev) => (prev.some((m) => m.id === note.id) ? prev : [...prev, { id: note.id, title: note.title }]));
+    setMentionQuery(null);
+    setMentionMatchStart(null);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
+  const removeMention = (id: string) => setMentions((prev) => prev.filter((m) => m.id !== id));
 
   const submit = (text?: string) => {
     const q = (text ?? question).trim();
     if (!q || asking) return;
-    onAsk(q);
-    if (text) setQuestion("");
+    onAsk(
+      q,
+      mentions.map((m) => m.id),
+    );
+    if (text) {
+      setQuestion("");
+      setMentions([]);
+    }
   };
 
   return (
     <div className="shrink-0 border-b border-border bg-card/20 px-4 py-3">
-      <div className="mx-auto flex w-full max-w-3xl items-center gap-2 rounded-full border border-input bg-background py-1 pl-3 pr-1 shadow-sm focus-within:ring-1 focus-within:ring-ring">
-        <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <input
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              submit();
-            }
-          }}
-          placeholder="Ask a question — answered from your notes, self-healed against the live code…"
-          className="h-7 flex-1 bg-transparent text-xs focus:outline-none"
-        />
-        <Button
-          type="button"
-          size="sm"
-          className="h-7 rounded-full px-3 text-[11px]"
-          disabled={!question.trim() || asking}
-          onClick={() => submit()}
-        >
-          {asking ? "asking…" : "ask"}
-        </Button>
+      <div className="relative mx-auto w-full max-w-3xl">
+        {mentions.length > 0 ? (
+          <div className="mb-1.5 flex flex-wrap gap-1">
+            {mentions.map((m) => (
+              <Badge key={m.id} variant="secondary" className="gap-1 py-0.5 pr-1 text-[10px]">
+                <span className="max-w-[180px] truncate">@{m.title}</span>
+                <button
+                  type="button"
+                  onClick={() => removeMention(m.id)}
+                  title="Remove mention"
+                  className="rounded-full p-0.5 hover:bg-background/60"
+                >
+                  <X className="h-2.5 w-2.5" />
+                </button>
+              </Badge>
+            ))}
+          </div>
+        ) : null}
+        <div className="flex items-center gap-2 rounded-full border border-input bg-background py-1 pl-3 pr-1 shadow-sm focus-within:ring-1 focus-within:ring-ring">
+          <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <input
+            ref={inputRef}
+            value={question}
+            onChange={(e) => {
+              setQuestion(e.target.value);
+              updateMentionState(e.target.value, e.target.selectionStart ?? e.target.value.length);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                if (mentionQuery !== null && mentionMatches.length > 0) {
+                  e.preventDefault();
+                  selectMention(mentionMatches[0]);
+                } else if (mentionQuery === null) {
+                  e.preventDefault();
+                  submit();
+                }
+              }
+              if (e.key === "Escape" && mentionQuery !== null) {
+                setMentionQuery(null);
+                setMentionMatchStart(null);
+              }
+            }}
+            placeholder="Ask a question, or type @ to reference a note — self-healed against the live code…"
+            className="h-7 flex-1 bg-transparent text-xs focus:outline-none"
+          />
+          <Button
+            type="button"
+            size="sm"
+            className="h-7 rounded-full px-3 text-[11px]"
+            disabled={!question.trim() || asking}
+            onClick={() => submit()}
+          >
+            {asking ? "asking…" : "ask"}
+          </Button>
+        </div>
+        {mentionQuery !== null && mentionMatches.length > 0 ? (
+          <div className="absolute left-0 right-16 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-card shadow-lg">
+            {mentionMatches.map((n) => (
+              <button
+                key={n.id}
+                type="button"
+                onClick={() => selectMention(n)}
+                className="block w-full truncate px-3 py-1.5 text-left text-xs hover:bg-accent"
+              >
+                {n.title}
+              </button>
+            ))}
+          </div>
+        ) : null}
       </div>
-      {!question && !asking ? (
+      {!question && !asking && mentions.length === 0 ? (
         <div className="mx-auto mt-1.5 flex w-full max-w-3xl flex-wrap gap-1.5">
           {SUGGESTED_QUESTIONS.map((q) => (
             <button
@@ -993,6 +1095,25 @@ function CenterReaderPanel({
                 </Badge>
               ) : null}
             </div>
+          ) : null}
+          {data.code_sources.length > 0 ? (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              {data.code_sources.map((c, i) => (
+                <Badge
+                  key={`${c.repo}/${c.file_path}:${c.start_line}-${i}`}
+                  variant="outline"
+                  className="font-mono text-[10px] text-sky-300/90"
+                  title={`${c.repo}/${c.file_path}:${c.start_line}-${c.end_line}`}
+                >
+                  {c.file_path}:{c.start_line}-{c.end_line}
+                </Badge>
+              ))}
+            </div>
+          ) : null}
+          {data.code_unavailable.length > 0 ? (
+            <p className="mt-2 text-[10px] text-muted-foreground/70">
+              code-grounding unavailable for: {data.code_unavailable.join(", ")}
+            </p>
           ) : null}
         </div>
       </div>
