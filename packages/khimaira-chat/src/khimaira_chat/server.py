@@ -276,6 +276,39 @@ def _acquire_session_claim(session_id: str) -> bool:
         return True
 
 
+def _release_session_claim(session_id: str) -> None:
+    """Release this subprocess's SSE claim for session_id, if we own it.
+
+    `_acquire_session_claim` only releases its own claim at process exit
+    (via the `atexit`-registered closure captured at claim time). That's
+    fine for the normal one-id-per-lifetime case, but on a /clear re-bind
+    (`_SubprocessState._rebind`) the OLD session_id is dead well before
+    process exit — Claude Code minted a new one and re-fired SessionStart.
+    Leaving the old claim file behind would keep it "live-claimed by our
+    PID" indefinitely: harmless in the common case (the old session_id is
+    never reused), but it's an unbounded leak of claim files and, if a
+    session_id were ever reused, a permanent false-fence against whichever
+    subprocess legitimately claims it next. Best-effort cleanup — never
+    raises, since releasing a claim is never load-bearing enough to fail
+    the re-bind over.
+    """
+    try:
+        claim_path = _SSE_CLAIM_DIR / f"{session_id}.pid"
+        if not claim_path.exists():
+            return
+        raw = claim_path.read_text().strip()
+        prior_pid = int(raw.split(":", 1)[0])
+        if prior_pid == _MY_PID:
+            claim_path.unlink(missing_ok=True)
+            log.info(
+                "khimaira-chat: session-entanglement: released stale claim for "
+                "session_id=%s (superseded by /clear re-bind)",
+                session_id,
+            )
+    except (OSError, ValueError, IndexError):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Per-subprocess state — bound on first tool call
 # ---------------------------------------------------------------------------
@@ -284,17 +317,27 @@ def _acquire_session_claim(session_id: str) -> bool:
 class _SubprocessState:
     """Holds the session_id (lazy-registered) + SSE subscriber task.
 
-    **One subprocess = one session, for its lifetime.** This is load-bearing:
-    Claude Code's channel-notification routing is per-stdio-pipe (the
-    notification only reaches the agent that spawned this subprocess).
-    Sharing a subprocess across sessions would break that routing — the
-    daemon would push events for session B's chats to a subprocess that
-    actually serves session A, and the agent never sees them.
+    **One subprocess = one session, for its lifetime — MODULO a legitimate
+    /clear re-bind.** This is load-bearing: Claude Code's channel-notification
+    routing is per-stdio-pipe (the notification only reaches the agent that
+    spawned this subprocess). Sharing a subprocess across UNRELATED sessions
+    would break that routing — the daemon would push events for session B's
+    chats to a subprocess that actually serves session A, and the agent
+    never sees them.
 
     `register()` enforces this by raising if a tool call arrives bearing a
-    different session_id after the first one is bound. The raise is
-    visible in the agent's tool-call result, so a misconfigured caller
-    fails loudly rather than silently rewriting our identity.
+    different session_id, UNLESS that session_id is the daemon-confirmed
+    /clear identity for THIS physical process (see `_rebind` +
+    `_find_legitimate_rebind_ppid`). Claude Code re-fires SessionStart with a
+    freshly-minted session_id after `/clear` but REUSES the same MCP
+    subprocess — without the re-bind path, the subprocess stays frozen on the
+    pre-/clear id forever and every chat tool call from the new id is
+    refused. The ppid-registry check is what keeps this safe: a genuinely
+    foreign session runs in a DIFFERENT process (different ancestor ppid
+    chain), so it can never satisfy the check — only Claude Code re-firing
+    SessionStart for OUR OWN ancestor chain can. Any other mismatch still
+    raises, visible in the agent's tool-call result, so a misconfigured
+    caller fails loudly rather than silently rewriting our identity.
     """
 
     # Capacity of the seen-event dedup set. LRU OrderedDict pops oldest on overflow.
@@ -355,14 +398,130 @@ class _SubprocessState:
             # Bridge Claude Code's `-n <name>` flag → khimaira friendly name.
             _maybe_register_display_name(session_id)
         elif self.session_id != session_id:
-            raise ValueError(
-                f"This subprocess is bound to session {self.session_id!r}; "
-                f"refusing tool call from session {session_id!r}. "
-                f"One subprocess = one session for its lifetime."
+            via_ppid = _find_legitimate_rebind_ppid(session_id)
+            if via_ppid is not None:
+                self._rebind(session_id, via_ppid)
+            else:
+                raise ValueError(
+                    f"This subprocess is bound to session {self.session_id!r}; "
+                    f"refusing tool call from session {session_id!r}. "
+                    f"One subprocess = one session for its lifetime."
+                )
+
+    def _rebind(self, new_session_id: str, via_ppid: int) -> None:
+        """Follow this subprocess's binding to new_session_id after a /clear.
+
+        Caller (`register`) has already confirmed via `_find_legitimate_rebind_ppid`
+        that new_session_id is the daemon-confirmed identity for one of this
+        process's ancestors — SessionStart re-posted the {ppid: session_id}
+        mapping for OUR OWN ancestor chain, which only happens on a genuine
+        /clear re-fire, never a foreign session.
+
+        Advancing `session_id` alone is not enough: Claude Code's channel
+        notifications are routed by the CURRENT session_id, so the SSE
+        subscriber must also be torn down and restarted under the new
+        identity, or the agent goes SSE-deaf immediately after /clear even
+        though tool calls succeed. This mirrors the ordering `register()`
+        uses for first-bind (claim → reslot → display-name) plus the
+        subscriber-restart step, reusing the same watchdog
+        cancel/reincarnate pattern as `_subscriber_watchdog` /
+        `_dispatch_tool`'s force-resubscribe (bump `subscriber_restart_count`,
+        `create_task(_proactive_sse_loop())`) rather than inventing a new one.
+        """
+        old_session_id = self.session_id
+        log.warning(
+            "khimaira-chat: /clear re-bind: session_id %s -> %s (confirmed via ancestor ppid=%d)",
+            old_session_id,
+            new_session_id,
+            via_ppid,
+        )
+        self.session_id = new_session_id
+        # Ensure the daemon-auth header uses the khimaira session ID, not
+        # CLAUDE_CODE_SESSION_ID (which may differ after a session restart).
+        daemon_client.set_caller_session_id(new_session_id)
+
+        # Entanglement claim handoff: the OLD id is dead (Claude Code minted
+        # a new one on /clear) — release its claim so it doesn't linger and
+        # falsely appear "live-claimed" forever. Then acquire the new id's
+        # claim exactly as first-bind does; sse_fenced is re-derived (not
+        # just set-on-failure) since a prior fenced state must be able to
+        # clear on rebind, and vice versa.
+        if old_session_id is not None:
+            _release_session_claim(old_session_id)
+        self.sse_fenced = not _acquire_session_claim(new_session_id)
+        log.info(
+            "khimaira-chat: /clear re-bind claim handoff complete for "
+            "session_id=%s (sse_fenced=%s)",
+            new_session_id,
+            self.sse_fenced,
+        )
+
+        # Re-slot + display-name bridge, same as first-bind. Gated on
+        # sse_fenced internally (_maybe_reslot checks it itself).
+        _maybe_reslot(new_session_id)
+        _maybe_register_display_name(new_session_id)
+
+        # Restart the SSE subscriber under new_session_id. The cursor state
+        # (last_event_id, seen_event_ids) belonged to the OLD session's
+        # stream — reset it so the new subscriber starts clean rather than
+        # replaying a Last-Event-ID the daemon has no record of for this id.
+        old_task = self.subscriber_task
+        self.subscriber_task = None
+        self.last_event_id = None
+        self.seen_event_ids.clear()
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        if not self.sse_fenced and self.write_stream is not None:
+            self.subscriber_restart_count += 1
+            self.subscriber_task = asyncio.create_task(_proactive_sse_loop())
+            log.info(
+                "khimaira-chat: /clear re-bind — subscriber restarted for "
+                "session_id=%s (restart #%d)",
+                new_session_id,
+                self.subscriber_restart_count,
+            )
+        else:
+            log.info(
+                "khimaira-chat: /clear re-bind — subscriber restart skipped "
+                "(sse_fenced=%s, write_stream_up=%s)",
+                self.sse_fenced,
+                self.write_stream is not None,
             )
 
 
 _state = _SubprocessState()
+
+
+def _find_legitimate_rebind_ppid(new_session_id: str) -> int | None:
+    """The /clear re-bind legitimacy guard — ppid-based, not trust-the-caller.
+
+    Walks the same ancestor chain the boot-time ppid-bridge uses
+    (`_ancestor_pids`) and asks the daemon what session_id each ancestor ppid
+    currently maps to. SessionStart posts the {ppid: session_id} mapping on
+    every boot, INCLUDING a /clear re-fire — so if Claude Code genuinely
+    re-fired SessionStart for THIS process's ancestor chain with
+    new_session_id, the daemon's registry reflects it. No backoff/retry here
+    (unlike `_async_try_auto_register_from_ppid`'s boot-time budget): by the
+    time an agent issues a tool call bearing new_session_id, SessionStart
+    has already run synchronously and posted the mapping — if it hasn't,
+    this is correctly treated as not-yet-legitimate and the caller raises
+    (the agent's next tool call, after SessionStart lands, succeeds).
+
+    A genuinely foreign session runs in a DIFFERENT process — its ppid chain
+    can never contain one of OUR ancestors — so it can never satisfy this by
+    construction. That's the safety property the whole re-bind rests on.
+
+    Returns the matching ancestor ppid (for logging) or None if no ancestor
+    maps to new_session_id.
+    """
+    for ppid in _ancestor_pids(max_depth=6):
+        try:
+            sid = daemon_client.lookup_session_by_ppid(ppid)
+        except Exception:
+            continue
+        if sid == new_session_id:
+            return ppid
+    return None
 
 
 def _maybe_reslot(session_id: str) -> None:

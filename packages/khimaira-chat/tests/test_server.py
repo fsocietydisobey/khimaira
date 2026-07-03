@@ -1014,3 +1014,252 @@ def test_task_verdict_skipped_for_author():
         "by_name": "me",
     }
     assert _route_record(record, MY_SID) is None
+
+
+# ---------------------------------------------------------------------------
+# /clear re-bind — the frozen-subprocess bug
+#
+# Bug: the MCP subprocess froze `session_id` at first-bind and hard-refused
+# any other id. After /clear, Claude Code mints a new session_id and
+# re-fires SessionStart with it but REUSES the same subprocess (same ppid
+# chain) — so the subprocess stayed frozen on the pre-/clear id and every
+# chat tool call from the new id was refused.
+#
+# Fix: `register()`'s mismatch branch checks `_find_legitimate_rebind_ppid`
+# — a ppid-registry lookup (never trust-the-caller) — before re-binding.
+# Only a session_id that the daemon confirms as the CURRENT identity for
+# one of THIS process's ancestors is treated as a legitimate /clear
+# re-fire; anything else still raises (foreign-session protection intact).
+# ---------------------------------------------------------------------------
+
+
+class TestClearRebind:
+    def _fresh_state(self, monkeypatch, initial_session_id: str = "sid-old"):
+        """A brand-new _SubprocessState, isolated from the module-level
+        singleton, with an active subscriber_task + write_stream so the
+        rebind path has something realistic to tear down/restart."""
+        from khimaira_chat import server as srv
+
+        state = srv._SubprocessState()
+        state.session_id = initial_session_id
+        state.write_stream = object()  # non-None → transport "up"
+        state.last_event_id = "evt-old-999"
+        state.seen_event_ids["evt-old-999"] = None
+
+        async def _never_ending():
+            await asyncio.sleep(60)
+
+        state.subscriber_task = asyncio.create_task(_never_ending())
+        return state
+
+    def test_register_same_id_twice_is_noop(self, monkeypatch):
+        """register() called twice with the SAME id must not touch anything
+        second-bind-related — no rebind, no claim churn, no subscriber
+        restart. Locks in the pre-existing first-bind behavior."""
+        from khimaira_chat import server as srv
+
+        state = srv._SubprocessState()
+        state.session_id = "sid-steady"
+        original_task = object()  # sentinel — must be untouched
+        state.subscriber_task = original_task
+
+        def _boom(*a, **kw):
+            raise AssertionError("_rebind must not be called for a same-id register()")
+
+        monkeypatch.setattr(srv._SubprocessState, "_rebind", _boom)
+
+        state.register("sid-steady")
+
+        assert state.session_id == "sid-steady"
+        assert state.subscriber_task is original_task
+
+    @pytest.mark.asyncio
+    async def test_register_different_id_ppid_confirmed_rebinds(self, monkeypatch):
+        """A different session_id whose daemon-confirmed ancestor mapping
+        matches must trigger a full rebind: session_id advances,
+        set_caller_session_id is called with the NEW id, reslot fires, and
+        the subscriber is restarted (new task object, restart count bumped).
+        No raise."""
+        import contextlib
+
+        from khimaira_chat import server as srv
+
+        new_id = "sid-new-after-clear"
+        state = self._fresh_state(monkeypatch, initial_session_id="sid-old")
+        old_task = state.subscriber_task
+
+        monkeypatch.setattr(srv, "_ancestor_pids", lambda max_depth=6: [4242])
+        monkeypatch.setattr(
+            srv.daemon_client,
+            "lookup_session_by_ppid",
+            lambda ppid: new_id if ppid == 4242 else None,
+        )
+
+        caller_id_calls = []
+        monkeypatch.setattr(
+            srv.daemon_client, "set_caller_session_id", lambda sid: caller_id_calls.append(sid)
+        )
+        monkeypatch.setattr(srv, "_acquire_session_claim", lambda sid: True)
+        released = []
+        monkeypatch.setattr(srv, "_release_session_claim", lambda sid: released.append(sid))
+        reslot_calls = []
+        monkeypatch.setattr(srv, "_maybe_reslot", lambda sid: reslot_calls.append(sid))
+        monkeypatch.setattr(srv, "_maybe_register_display_name", lambda sid: None)
+
+        async def stub_subscriber():
+            await asyncio.sleep(60)
+
+        monkeypatch.setattr(srv, "_proactive_sse_loop", stub_subscriber)
+
+        try:
+            state.register(new_id)  # must not raise
+
+            assert state.session_id == new_id
+            assert caller_id_calls == [new_id], (
+                "set_caller_session_id must be called with the NEW id"
+            )
+            assert released == ["sid-old"], "the OLD id's claim must be released"
+            assert reslot_calls == [new_id], "_maybe_reslot must fire for the NEW id"
+            assert state.sse_fenced is False
+
+            new_task = state.subscriber_task
+            assert new_task is not old_task, "subscriber must restart under the new id"
+            await asyncio.sleep(0.01)  # let the cancellation + new task actually run
+            assert old_task.cancelled(), "the OLD subscriber task must be cancelled"
+            assert not new_task.done()
+            assert state.subscriber_restart_count == 1
+
+            # Cursor state from the OLD session's stream must not leak into
+            # the new subscriber.
+            assert state.last_event_id is None
+            assert "evt-old-999" not in state.seen_event_ids
+        finally:
+            for t in (old_task, state.subscriber_task):
+                if t is not None and not t.done():
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+
+    def test_register_different_id_not_ppid_confirmed_still_raises(self, monkeypatch):
+        """Foreign-session protection: a different session_id that NO
+        ancestor's daemon mapping confirms must still raise, exactly as
+        before this fix. This is the load-bearing test — it proves the
+        ppid guard, not a blanket allow-any-different-id rebind."""
+        from khimaira_chat import server as srv
+
+        state = srv._SubprocessState()
+        state.session_id = "sid-old"
+        state.write_stream = object()
+
+        monkeypatch.setattr(srv, "_ancestor_pids", lambda max_depth=6: [4242, 5252])
+        # Neither ancestor maps to the foreign id — one returns None, one
+        # returns some UNRELATED session that happens to be registered.
+        monkeypatch.setattr(
+            srv.daemon_client,
+            "lookup_session_by_ppid",
+            lambda ppid: {4242: None, 5252: "some-other-unrelated-session"}.get(ppid),
+        )
+
+        def _boom(*a, **kw):
+            raise AssertionError("_rebind must not be called when ppid confirmation fails")
+
+        monkeypatch.setattr(srv._SubprocessState, "_rebind", _boom)
+
+        with pytest.raises(ValueError, match="bound to session"):
+            state.register("sid-foreign-hijack-attempt")
+
+        # Original binding must be untouched.
+        assert state.session_id == "sid-old"
+
+    @pytest.mark.asyncio
+    async def test_rebind_fences_when_new_id_already_live_claimed(self, monkeypatch):
+        """If the new id's claim is already live-owned by another process
+        (edge case — e.g. a race with a genuinely duplicate subprocess),
+        `_acquire_session_claim` returns False and the rebind must fence:
+        sse_fenced=True and the subscriber must NOT be restarted."""
+        import contextlib
+
+        from khimaira_chat import server as srv
+
+        new_id = "sid-new-but-contested"
+        state = self._fresh_state(monkeypatch, initial_session_id="sid-old")
+        old_task = state.subscriber_task
+
+        monkeypatch.setattr(srv, "_ancestor_pids", lambda max_depth=6: [7777])
+        monkeypatch.setattr(srv.daemon_client, "lookup_session_by_ppid", lambda ppid: new_id)
+        monkeypatch.setattr(srv.daemon_client, "set_caller_session_id", lambda sid: None)
+        monkeypatch.setattr(srv, "_release_session_claim", lambda sid: None)
+        monkeypatch.setattr(srv, "_acquire_session_claim", lambda sid: False)  # contested
+        monkeypatch.setattr(srv, "_maybe_reslot", lambda sid: None)
+        monkeypatch.setattr(srv, "_maybe_register_display_name", lambda sid: None)
+
+        try:
+            state.register(new_id)
+
+            assert state.session_id == new_id
+            assert state.sse_fenced is True
+            # Old task still cancelled (identity always follows the fresh
+            # session), but no new subscriber spawned while fenced.
+            assert state.subscriber_task is None
+            assert state.subscriber_restart_count == 0
+        finally:
+            if old_task is not None and not old_task.done():
+                old_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await old_task
+
+    def test_release_session_claim_removes_own_claim_file(self, tmp_path, monkeypatch):
+        """`_release_session_claim` deletes the claim file when it holds
+        OUR pid, and is a no-op otherwise (missing file, or owned by a
+        different pid)."""
+        from khimaira_chat import server as srv
+
+        monkeypatch.setattr(srv, "_SSE_CLAIM_DIR", tmp_path)
+        monkeypatch.setattr(srv, "_MY_PID", 13131)
+
+        # No-op: no claim file at all.
+        srv._release_session_claim("sid-no-claim")
+
+        # Owns the claim → deleted.
+        own_claim = tmp_path / "sid-owned.pid"
+        own_claim.write_text("13131:12345")
+        srv._release_session_claim("sid-owned")
+        assert not own_claim.exists()
+
+        # Does NOT own the claim → left alone.
+        other_claim = tmp_path / "sid-other.pid"
+        other_claim.write_text("99999:54321")
+        srv._release_session_claim("sid-other")
+        assert other_claim.exists()
+
+    def test_find_legitimate_rebind_ppid_returns_matching_ancestor(self, monkeypatch):
+        from khimaira_chat import server as srv
+
+        monkeypatch.setattr(srv, "_ancestor_pids", lambda max_depth=6: [111, 222, 333])
+        monkeypatch.setattr(
+            srv.daemon_client,
+            "lookup_session_by_ppid",
+            lambda ppid: {111: "other", 222: "target-sid", 333: None}.get(ppid),
+        )
+        assert srv._find_legitimate_rebind_ppid("target-sid") == 222
+
+    def test_find_legitimate_rebind_ppid_none_when_no_ancestor_matches(self, monkeypatch):
+        from khimaira_chat import server as srv
+
+        monkeypatch.setattr(srv, "_ancestor_pids", lambda max_depth=6: [111, 222])
+        monkeypatch.setattr(srv.daemon_client, "lookup_session_by_ppid", lambda ppid: None)
+        assert srv._find_legitimate_rebind_ppid("target-sid") is None
+
+    def test_find_legitimate_rebind_ppid_tolerates_lookup_exceptions(self, monkeypatch):
+        """A daemon-unreachable exception on one ancestor must not abort
+        the whole walk — later ancestors still get checked."""
+        from khimaira_chat import server as srv
+
+        def flaky_lookup(ppid):
+            if ppid == 111:
+                raise ConnectionError("daemon down")
+            return "target-sid" if ppid == 222 else None
+
+        monkeypatch.setattr(srv, "_ancestor_pids", lambda max_depth=6: [111, 222])
+        monkeypatch.setattr(srv.daemon_client, "lookup_session_by_ppid", flaky_lookup)
+        assert srv._find_legitimate_rebind_ppid("target-sid") == 222
