@@ -102,6 +102,7 @@ def build_app():
     from .api import graph as graph_api
     from .api import heartbeats as heartbeats_api
     from .api import mcp_calls as mcp_calls_api
+    from .api import notebook as notebook_api
     from .api import processes as processes_api
     from .api import projects as projects_api
     from .api import scheduled_tasks as scheduled_tasks_api
@@ -111,13 +112,9 @@ def build_app():
     from .api import topology as topology_api
     from .api import usage as usage_api
 
-    app.include_router(
-        projects_api.build_router(projects, connections_by_project), prefix="/api"
-    )
+    app.include_router(projects_api.build_router(projects, connections_by_project), prefix="/api")
     app.include_router(topology_api.build_router(projects), prefix="/api")
-    app.include_router(
-        threads_api.build_router(connections_by_project, projects), prefix="/api"
-    )
+    app.include_router(threads_api.build_router(connections_by_project, projects), prefix="/api")
     app.include_router(api_routes_api.build_router(projects), prefix="/api")
     app.include_router(fc_api.build_router(projects), prefix="/api")
     app.include_router(drift_api.build_router(projects), prefix="/api")
@@ -132,6 +129,7 @@ def build_app():
     app.include_router(themis_api.build_router(), prefix="/api")
     app.include_router(oracle_api.build_router(), prefix="/api")
     app.include_router(graph_api.build_router(), prefix="/api")
+    app.include_router(notebook_api.build_router(), prefix="/api")
 
     # SSE delivery cursor persistence — load cursors from disk at startup
     # so reconnecting subscribers resume from their last yielded position.
@@ -239,7 +237,10 @@ def build_app():
             tasks = list(asyncio.all_tasks(loop))
             log.warning(
                 "TASKDUMP: serving-loop id=%s repr=%r uvloop=%s tasks=%d",
-                id(loop), loop, uv, len(tasks),
+                id(loop),
+                loop,
+                uv,
+                len(tasks),
             )
             saw_ad = False
             for t in tasks:
@@ -258,8 +259,12 @@ def build_app():
                     tloop_id = None
                 log.warning(
                     "TASKDUMP task name=%s coro=%s done=%s loop_id=%s same_loop=%s\n%s",
-                    t.get_name(), name, t.done(), tloop_id,
-                    tloop_id == id(loop), buf.getvalue(),
+                    t.get_name(),
+                    name,
+                    t.done(),
+                    tloop_id,
+                    tloop_id == id(loop),
+                    buf.getvalue(),
                 )
             if not saw_ad:
                 log.warning(
@@ -584,10 +589,6 @@ def serve(*, port: int = DEFAULT_PORT, host: str = DEFAULT_HOST) -> None:
     loop = os.environ.get("KHIMAIRA_UVICORN_LOOP", "asyncio")
     import logging as _logging
 
-    _logging.getLogger("khimaira.monitor.server").info(
-        "serve: event loop=%s, port=%d", loop, port
-    )
+    _logging.getLogger("khimaira.monitor.server").info("serve: event loop=%s, port=%d", loop, port)
 
-    uvicorn.run(
-        app, host=host, port=port, log_level="info", access_log=False, loop=loop
-    )
+    uvicorn.run(app, host=host, port=port, log_level="info", access_log=False, loop=loop)
