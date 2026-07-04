@@ -226,7 +226,7 @@ async def test_run_chat_turn_answer_only_does_not_touch_raw_text(chat, notes_sto
     raw = "# G\n\nbody\n"
     guide = notes_store.add_study_guide(raw)
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
         assert content == "what is this?"
         assert schema is chat.ChatTurnOutput
         return _grounded(answer="It's a guide about X.")
@@ -245,11 +245,28 @@ async def test_run_chat_turn_answer_only_does_not_touch_raw_text(chat, notes_sto
     assert history[1]["edit"] is None
 
 
+async def test_run_chat_turn_threads_guide_own_repo_as_target_repo(chat, notes_store, monkeypatch):
+    """Personal-context repo-scoping (2026-07-04,
+    tasks/grimoire/PERSONAL-CONTEXT-SCOPING.md item 4): chat's target_repo
+    must be the GUIDE's own repo, not hardcoded/omitted."""
+    guide = notes_store.add_study_guide("# G\n\nbody\n", repo="jeevy_portal")
+    captured = {}
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
+        captured["target_repo"] = kwargs.get("target_repo")
+        return _grounded()
+
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+
+    await chat.run_chat_turn(guide["id"], "hello")
+    assert captured["target_repo"] == "jeevy_portal"
+
+
 async def test_run_chat_turn_edit_auto_applies_and_records_diff(chat, notes_store, monkeypatch):
     raw = "# G\n\nold body\n"
     guide = notes_store.add_study_guide(raw)
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
         return _grounded(
             answer="Updated it.", edit={"section_anchor": None, "new_text": "# G\n\nnew body\n"}
         )
@@ -277,7 +294,7 @@ async def test_run_chat_turn_sensitive_note_suppresses_proposed_edit(
     raw = f"# G\n\nAPI_KEY={secret}\n"
     guide = notes_store.add_study_guide(raw, sensitive=True)
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
         return _grounded(
             answer="Updated it (but shouldn't have).",
             edit={"section_anchor": None, "new_text": "# G\n\nreplaced\n"},
@@ -298,7 +315,7 @@ async def test_run_chat_turn_sensitive_note_instruction_carries_addendum_and_red
     guide = notes_store.add_study_guide(f"# G\n\nAPI_KEY={secret}\n", sensitive=True)
     seen_instructions: list[str] = []
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
         seen_instructions.append(instruction)
         return _grounded(answer="hi")
 
@@ -314,7 +331,7 @@ async def test_run_chat_turn_non_sensitive_note_no_addendum(chat, notes_store, m
     guide = notes_store.add_study_guide("# G\n\nbody\n")
     seen_instructions: list[str] = []
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
         seen_instructions.append(instruction)
         return _grounded(answer="hi")
 
@@ -328,7 +345,7 @@ async def test_run_chat_turn_bad_edit_falls_back_to_answer_only(chat, notes_stor
     raw = "# G\n\nbody\n"
     guide = notes_store.add_study_guide(raw)
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
         return _grounded(
             answer="Tried to update.",
             edit={"section_anchor": "nonexistent", "new_text": "whatever"},
@@ -351,7 +368,7 @@ async def test_run_chat_turn_passes_history_and_guide_into_instruction(
     )
     seen_instructions = []
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
         seen_instructions.append(instruction)
         return _grounded()
 
@@ -365,7 +382,7 @@ async def test_run_chat_turn_passes_history_and_guide_into_instruction(
 async def test_run_chat_turn_returns_grounding_shape(chat, notes_store, monkeypatch):
     guide = notes_store.add_study_guide("# G\n\nbody\n")
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
         return _grounded(web_grounded=True, code_citations=["a.py:1"], web_citations=["http://x"])
 
     monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
@@ -473,7 +490,7 @@ async def test_compact_above_threshold_summarizes_and_keeps_tail(chat, notes_sto
             guide["id"], {"role": "user", "content": f"msg{i}", "ts": f"t{i}"}
         )
 
-    async def fake_invoke_claude(content, instruction):
+    async def fake_invoke_claude(content, instruction, **kwargs):
         assert "msg0" in content
         return "Summary of the early conversation."
 
@@ -488,6 +505,27 @@ async def test_compact_above_threshold_summarizes_and_keeps_tail(chat, notes_sto
     assert "Summary of the early conversation." in new_history[0]["content"]
     # last _COMPACT_KEEP_TAIL (4) messages kept verbatim
     assert [m["content"] for m in new_history[1:]] == ["msg2", "msg3", "msg4", "msg5"]
+
+
+async def test_compact_threads_guide_own_repo_as_target_repo(chat, notes_store, monkeypatch):
+    """Personal-context repo-scoping (2026-07-04): compact's summarization
+    call is a caller of _invoke_claude too — must thread the guide's own
+    repo rather than silently reverting to global-only."""
+    guide = notes_store.add_study_guide("# G\n\nbody\n", repo="jeevy_portal")
+    for i in range(6):
+        chat.append_chat_messages(
+            guide["id"], {"role": "user", "content": f"msg{i}", "ts": f"t{i}"}
+        )
+    captured = {}
+
+    async def fake_invoke_claude(content, instruction, **kwargs):
+        captured["target_repo"] = kwargs.get("target_repo")
+        return "summary"
+
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_claude", fake_invoke_claude)
+
+    await chat.compact_chat_history(guide["id"])
+    assert captured["target_repo"] == "jeevy_portal"
 
 
 async def test_compact_unknown_note_raises(chat):

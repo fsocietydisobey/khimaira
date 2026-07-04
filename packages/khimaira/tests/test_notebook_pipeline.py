@@ -501,6 +501,33 @@ async def test_revalidate_note_heals_when_anchor_file_changed(
     assert result["raw_text"] == "raw"
 
 
+async def test_revalidate_note_threads_own_repo_as_target_repo(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    """Personal-context repo-scoping (2026-07-04): revalidate_note's LLM
+    re-check call must thread the note's own repo through, so a domain
+    personal note only rides revalidation for notes tagged with that repo."""
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    note = notes_store.add_note("raw", repo="testrepo")
+    notes_store.set_pipeline(note["id"], _ANCHORED_PAYLOAD)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(note["id"], git_sha=initial_sha, new_pipeline=None)
+
+    (git_repo / "sessions.py").write_text("def foo():\n    return 42\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "change")
+
+    captured = {}
+
+    async def fake_transform_note(content, *, instruction=None, schema=None, target_repo=None):
+        captured["target_repo"] = target_repo
+        return {**_ANCHORED_PAYLOAD, "unchanged": True}
+
+    monkeypatch.setattr(pipeline, "transform_note", fake_transform_note)
+    await pipeline.revalidate_note(note["id"])
+    assert captured["target_repo"] == "testrepo"
+
+
 async def test_revalidate_note_llm_confirms_unchanged_skips_history(
     notes_store, pipeline, monkeypatch, git_repo
 ):
@@ -945,7 +972,7 @@ async def test_answer_question_uses_healed_content_in_synthesis(pipeline, notes_
 
     captured: dict[str, str] = {}
 
-    async def fake_invoke(content, instruction):
+    async def fake_invoke(content, instruction, **kwargs):
         captured["instruction"] = instruction
         return "final answer"
 
@@ -987,7 +1014,7 @@ async def test_answer_question_synthesis_failure_still_returns_sources(
     async def fake_revalidate(note_id):
         return notes_store.get_note(note_id)
 
-    async def fake_invoke(content, instruction):
+    async def fake_invoke(content, instruction, **kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
@@ -1246,7 +1273,7 @@ async def test_answer_question_includes_code_section_and_sources(
 
     captured: dict[str, str] = {}
 
-    async def fake_invoke(content, instruction):
+    async def fake_invoke(content, instruction, **kwargs):
         captured["instruction"] = instruction
         return "final answer"
 
@@ -1332,8 +1359,17 @@ def test_personal_context_empty_when_no_personal_notes(pipeline, notes_store):
 
 
 def test_personal_context_concatenates_raw_text(pipeline, notes_store):
-    notes_store.add_note("Rule one.", tab_id=notes_store.PERSONAL_TAB_ID)
-    notes_store.add_note("Rule two.", tab_id=notes_store.PERSONAL_TAB_ID)
+    # Explicit repo=GENERAL_REPO (2026-07-04, repo-scoping): add_note's own
+    # default ("" -> notes._DEFAULT_REPO == "khimaira", NOT GENERAL_REPO)
+    # would otherwise stamp these as domain-scoped to "khimaira" specifically
+    # — these tests model "a personal note that should always inject",
+    # which is GENERAL_REPO's job, not the default.
+    notes_store.add_note(
+        "Rule one.", tab_id=notes_store.PERSONAL_TAB_ID, repo=notes_store.GENERAL_REPO
+    )
+    notes_store.add_note(
+        "Rule two.", tab_id=notes_store.PERSONAL_TAB_ID, repo=notes_store.GENERAL_REPO
+    )
     # A regular note must not leak into the personal context.
     notes_store.add_note("Not a behavioral rule.", tab_id="default")
 
@@ -1345,7 +1381,9 @@ def test_personal_context_concatenates_raw_text(pipeline, notes_store):
 
 def test_personal_context_bounded(pipeline, notes_store, monkeypatch):
     monkeypatch.setattr(pipeline, "_MAX_PERSONAL_CONTEXT_CHARS", 20)
-    notes_store.add_note("x" * 100, tab_id=notes_store.PERSONAL_TAB_ID)
+    notes_store.add_note(
+        "x" * 100, tab_id=notes_store.PERSONAL_TAB_ID, repo=notes_store.GENERAL_REPO
+    )
     assert len(pipeline._personal_context()) == 20
 
 
@@ -1354,7 +1392,9 @@ def test_prepend_personal_context_noop_when_empty(pipeline, notes_store):
 
 
 def test_prepend_personal_context_prepends_when_present(pipeline, notes_store):
-    notes_store.add_note("Always be terse.", tab_id=notes_store.PERSONAL_TAB_ID)
+    notes_store.add_note(
+        "Always be terse.", tab_id=notes_store.PERSONAL_TAB_ID, repo=notes_store.GENERAL_REPO
+    )
     result = pipeline._prepend_personal_context("base instruction")
     assert "Always be terse." in result
     assert result.endswith("base instruction")
@@ -1366,7 +1406,10 @@ def test_personal_context_sensitive_note_never_leaks_real_secret(pipeline, notes
     LLM call via this concatenation — the redacted twin goes in instead."""
     secret = "sk-ant-" + "n" * 30
     notes_store.add_note(
-        f"Remember this key: {secret}", tab_id=notes_store.PERSONAL_TAB_ID, sensitive=True
+        f"Remember this key: {secret}",
+        tab_id=notes_store.PERSONAL_TAB_ID,
+        repo=notes_store.GENERAL_REPO,
+        sensitive=True,
     )
     result = pipeline._personal_context()
     assert secret not in result
@@ -1374,8 +1417,15 @@ def test_personal_context_sensitive_note_never_leaks_real_secret(pipeline, notes
 
 def test_personal_context_mixes_sensitive_and_normal_notes_correctly(pipeline, notes_store):
     secret = "sk-ant-" + "o" * 30
-    notes_store.add_note("Always be terse.", tab_id=notes_store.PERSONAL_TAB_ID)
-    notes_store.add_note(f"key: {secret}", tab_id=notes_store.PERSONAL_TAB_ID, sensitive=True)
+    notes_store.add_note(
+        "Always be terse.", tab_id=notes_store.PERSONAL_TAB_ID, repo=notes_store.GENERAL_REPO
+    )
+    notes_store.add_note(
+        f"key: {secret}",
+        tab_id=notes_store.PERSONAL_TAB_ID,
+        repo=notes_store.GENERAL_REPO,
+        sensitive=True,
+    )
     result = pipeline._personal_context()
     assert "Always be terse." in result  # normal note's real content still flows through
     assert secret not in result  # sensitive note's real secret does not
@@ -1386,7 +1436,9 @@ async def test_invoke_claude_includes_personal_context_in_system_prompt(
 ):
     """End-to-end through the real choke point — not just the helper
     functions in isolation."""
-    notes_store.add_note("Write like a pirate.", tab_id=notes_store.PERSONAL_TAB_ID)
+    notes_store.add_note(
+        "Write like a pirate.", tab_id=notes_store.PERSONAL_TAB_ID, repo=notes_store.GENERAL_REPO
+    )
     captured_args = []
 
     async def fake_exec(*args, **kwargs):
@@ -1399,6 +1451,143 @@ async def test_invoke_claude_includes_personal_context_in_system_prompt(
     assert len(captured_args) == 1
     system_prompt_idx = captured_args[0].index("--append-system-prompt") + 1
     assert "Write like a pirate." in captured_args[0][system_prompt_idx]
+
+
+# ---------------------------------------------------------------------------
+# Repo-scoped personal context (2026-07-04,
+# tasks/grimoire/PERSONAL-CONTEXT-SCOPING.md): a global personal note
+# (repo==GENERAL_REPO, or untagged) always injects; a domain personal note
+# (repo=="<real tag>") injects only for a matching target_repo.
+# ---------------------------------------------------------------------------
+
+
+def test_personal_context_global_note_injects_for_any_target_repo(pipeline, notes_store):
+    notes_store.add_note(
+        "Global rule.", tab_id=notes_store.PERSONAL_TAB_ID, repo=notes_store.GENERAL_REPO
+    )
+    assert "Global rule." in pipeline._personal_context(None)
+    assert "Global rule." in pipeline._personal_context("khimaira")
+    assert "Global rule." in pipeline._personal_context("jeevy_portal")
+
+
+def test_personal_context_domain_note_injects_only_for_matching_target_repo(pipeline, notes_store):
+    notes_store.add_note(
+        "Jeevy-only rule.", tab_id=notes_store.PERSONAL_TAB_ID, repo="jeevy_portal"
+    )
+    assert "Jeevy-only rule." in pipeline._personal_context("jeevy_portal")
+    assert "Jeevy-only rule." not in pipeline._personal_context("khimaira")
+    assert "Jeevy-only rule." not in pipeline._personal_context(None)
+
+
+def test_is_global_personal_repo_treats_blank_as_global(pipeline):
+    """Defense-in-depth (2026-07-04): add_note itself always coalesces an
+    unspecified repo to notes._DEFAULT_REPO ("khimaira", a real domain tag —
+    NOT blank), so this scenario can't arise through note creation. But
+    update_note's `repo` field is NOT coalesced (a PATCH can set repo="" or
+    repo=None verbatim) — a genuinely blank repo must still be treated as
+    global rather than silently excluded from every call, matching the
+    intent of 'no domain was ever chosen' over 'belongs to no one'."""
+    assert pipeline._is_global_personal_repo("") is True
+    assert pipeline._is_global_personal_repo(None) is True
+    assert pipeline._is_global_personal_repo(pipeline.notes.GENERAL_REPO) is True
+    assert pipeline._is_global_personal_repo("jeevy_portal") is False
+    assert pipeline._is_global_personal_repo("khimaira") is False
+
+
+def test_personal_context_global_notes_ordered_before_domain_notes(pipeline, notes_store):
+    notes_store.add_note("Domain rule.", tab_id=notes_store.PERSONAL_TAB_ID, repo="jeevy_portal")
+    notes_store.add_note(
+        "Global rule.", tab_id=notes_store.PERSONAL_TAB_ID, repo=notes_store.GENERAL_REPO
+    )
+    context = pipeline._personal_context("jeevy_portal")
+    assert context.index("Global rule.") < context.index("Domain rule.")
+
+
+def test_personal_context_bounded_applies_after_filtering(pipeline, notes_store, monkeypatch):
+    """The char cap applies to the SCOPED (filtered) set, not the whole
+    personal folder — a domain note excluded by target_repo must not count
+    against another repo's budget."""
+    monkeypatch.setattr(pipeline, "_MAX_PERSONAL_CONTEXT_CHARS", 20)
+    notes_store.add_note(
+        "x" * 100, tab_id=notes_store.PERSONAL_TAB_ID, repo=notes_store.GENERAL_REPO
+    )
+    notes_store.add_note("y" * 100, tab_id=notes_store.PERSONAL_TAB_ID, repo="jeevy_portal")
+    assert pipeline._personal_context("khimaira") == "x" * 20
+
+
+def test_prepend_personal_context_forwards_target_repo(pipeline, notes_store):
+    notes_store.add_note(
+        "Jeevy-only rule.", tab_id=notes_store.PERSONAL_TAB_ID, repo="jeevy_portal"
+    )
+    assert "Jeevy-only rule." in pipeline._prepend_personal_context(
+        "base instruction", "jeevy_portal"
+    )
+    assert pipeline._prepend_personal_context("base instruction", "khimaira") == "base instruction"
+
+
+async def test_trigger_pipeline_threads_note_own_repo_for_personal_context(
+    notes_store, pipeline, monkeypatch
+):
+    """End-to-end: trigger_pipeline must pass the STRUCTURED note's own repo
+    as target_repo, so a domain personal note only rides structuring calls
+    for notes tagged with that same repo."""
+    _stub_organize_after_structuring(monkeypatch)
+    notes_store.add_note(
+        "Jeevy-only rule.", tab_id=notes_store.PERSONAL_TAB_ID, repo="jeevy_portal"
+    )
+    khimaira_note = notes_store.add_note("some raw content", repo="khimaira")
+    captured_args = []
+
+    async def fake_exec(*args, **kwargs):
+        captured_args.append(args)
+        return _FakeProc(_envelope(json.dumps(_VALID_PAYLOAD)))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+    await pipeline.trigger_pipeline(khimaira_note["id"])
+
+    system_prompt_idx = captured_args[0].index("--append-system-prompt") + 1
+    assert "Jeevy-only rule." not in captured_args[0][system_prompt_idx]
+
+
+async def test_answer_question_personal_context_uses_asking_repo(
+    pipeline, notes_store, monkeypatch
+):
+    """answer_question's `repo` param (the asking context's repo, not any
+    single source note's) is what scopes personal context for the synthesis
+    call — per PERSONAL-CONTEXT-SCOPING.md item 3. Goes through the real
+    _invoke_claude (subprocess-level fake), not a stubbed _invoke_claude —
+    personal-context prepending happens INSIDE that function, so stubbing
+    it out would bypass the very code under test."""
+    notes_store.add_note(
+        "Jeevy-only rule.", tab_id=notes_store.PERSONAL_TAB_ID, repo="jeevy_portal"
+    )
+    note = notes_store.add_note("raw", tab_id="t1")
+    notes_store.set_pipeline(note["id"], _VALID_PAYLOAD)
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+
+    captured_args = []
+
+    async def fake_exec(*args, **kwargs):
+        captured_args.append(args)
+        return _FakeProc(_envelope("final answer"))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+
+    await pipeline.answer_question("question?", repo="jeevy_portal")
+    system_prompt_idx = captured_args[-1].index("--append-system-prompt") + 1
+    assert "Jeevy-only rule." in captured_args[-1][system_prompt_idx]
+
+    await pipeline.answer_question("question?", repo="khimaira")
+    system_prompt_idx = captured_args[-1].index("--append-system-prompt") + 1
+    assert "Jeevy-only rule." not in captured_args[-1][system_prompt_idx]
 
 
 def test_seed_personal_context_if_empty_seeds_once(pipeline, notes_store):
@@ -1978,7 +2167,7 @@ _GROUNDED_EMPTY = {
 
 
 async def test_invoke_agentic_grounded_returns_parsed_result_when_grounded(pipeline, monkeypatch):
-    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         return {"result": json.dumps(_GROUNDED_TRUE), "web_grounded": True, "total_cost_usd": 0.5}
 
     monkeypatch.setattr(pipeline, "_invoke_claude_agentic", fake_invoke)
@@ -1995,7 +2184,7 @@ async def test_invoke_agentic_grounded_retries_once_when_citations_but_ungrounde
 ):
     calls: list[str] = []
 
-    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         calls.append(instruction)
         if len(calls) == 1:
             return {
@@ -2020,7 +2209,7 @@ async def test_invoke_agentic_grounded_flags_unverified_when_retry_also_fails(
 ):
     calls: list[str] = []
 
-    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         calls.append(instruction)
         return {"result": json.dumps(_GROUNDED_TRUE), "web_grounded": False, "total_cost_usd": 0.3}
 
@@ -2034,7 +2223,7 @@ async def test_invoke_agentic_grounded_flags_unverified_when_retry_also_fails(
 async def test_invoke_agentic_grounded_no_retry_when_no_citations_claimed(pipeline, monkeypatch):
     calls: list[str] = []
 
-    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         calls.append(instruction)
         return {"result": json.dumps(_GROUNDED_EMPTY), "web_grounded": False, "total_cost_usd": 0.1}
 
@@ -2046,7 +2235,7 @@ async def test_invoke_agentic_grounded_no_retry_when_no_citations_claimed(pipeli
 
 
 async def test_invoke_agentic_grounded_handles_invocation_error(pipeline, monkeypatch):
-    async def failing_invoke(content, instruction, *, repo_root, max_budget_usd):
+    async def failing_invoke(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(pipeline, "_invoke_claude_agentic", failing_invoke)
@@ -2057,7 +2246,7 @@ async def test_invoke_agentic_grounded_handles_invocation_error(pipeline, monkey
 
 
 async def test_invoke_agentic_grounded_handles_unparseable_response(pipeline, monkeypatch):
-    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         return {"result": "not json", "web_grounded": True, "total_cost_usd": 0.1}
 
     monkeypatch.setattr(pipeline, "_invoke_claude_agentic", fake_invoke)
@@ -2078,7 +2267,7 @@ async def test_research_answer_general_repo_skips_repo_root(pipeline, notes_stor
     note = notes_store.add_study_guide("# G\n\nbody", repo=notes_store.GENERAL_REPO)
     seen: list = []
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         seen.append(repo_root)
         return {
             **_GROUNDED_EMPTY,
@@ -2102,7 +2291,7 @@ async def test_research_answer_sensitive_guide_feeds_redacted_text(
     guide = notes_store.add_study_guide(f"# G\n\nAPI_KEY={secret}", sensitive=True)
     seen_instructions: list[str] = []
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         seen_instructions.append(instruction)
         return {**_GROUNDED_EMPTY, "web_grounding_unverified": False, "total_cost_usd": 0.1}
 
@@ -2119,7 +2308,7 @@ async def test_research_answer_resolves_repo_root_and_passes_question(
     note = notes_store.add_study_guide("# G\n\nbody", repo="testrepo")
     seen: list = []
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         seen.append((content, repo_root))
         return {
             **_GROUNDED_EMPTY,
@@ -2132,6 +2321,51 @@ async def test_research_answer_resolves_repo_root_and_passes_question(
     await pipeline.research_answer(note["id"], "my question")
 
     assert seen[0] == ("my question", git_repo)
+
+
+async def test_research_answer_threads_guide_own_repo_as_target_repo(
+    pipeline, notes_store, monkeypatch, git_repo
+):
+    """Personal-context repo-scoping (2026-07-04): research_answer must
+    thread the guide's own repo through to _invoke_agentic_grounded."""
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    note = notes_store.add_study_guide("# G\n\nbody", repo="testrepo")
+    captured = {}
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, **kwargs):
+        captured["target_repo"] = kwargs.get("target_repo")
+        return {**_GROUNDED_EMPTY, "web_grounded": False, "web_grounding_unverified": False}
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    await pipeline.research_answer(note["id"], "my question")
+
+    assert captured["target_repo"] == "testrepo"
+
+
+async def test_research_revise_threads_guide_own_repo_as_target_repo(
+    pipeline, notes_store, monkeypatch
+):
+    """Personal-context repo-scoping (2026-07-04): research_revise must
+    thread the guide's own repo through to _invoke_agentic_grounded."""
+    note = notes_store.add_study_guide("# Title\n\nbody\n", repo="jeevy_portal")
+    captured = {}
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, **kwargs):
+        captured["target_repo"] = kwargs.get("target_repo")
+        return {
+            "answer": "ok",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": None,
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.1,
+        }
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    await pipeline.research_revise(note["id"], "make it better")
+
+    assert captured["target_repo"] == "jeevy_portal"
 
 
 # --- splice_section (deterministic REVISE apply helper) ---
@@ -2215,7 +2449,7 @@ async def test_research_revise_sensitive_guide_feeds_redacted_text_but_splices_r
     guide = notes_store.add_study_guide(raw, sensitive=True)
     seen_instructions: list[str] = []
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         seen_instructions.append(instruction)
         return {
             "answer": "rewrote it",
@@ -2239,7 +2473,7 @@ async def test_research_revise_whole_guide_splices_full_replacement(
 ):
     note = notes_store.add_study_guide("# Title\n\nold body\n")
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         assert "WHOLE guide" in instruction
         return {
             "answer": "rewrote it",
@@ -2265,7 +2499,7 @@ async def test_research_revise_section_scoped_splices_into_original(
     raw = "# Title\n\n## A\n\nold a\n\n## B\n\nold b\n"
     note = notes_store.add_study_guide(raw)
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         assert "ONE section" in instruction
         return {
             "answer": "revised A",
@@ -2290,7 +2524,7 @@ async def test_research_revise_no_proposed_patch_leaves_proposed_raw_text_none(
 ):
     note = notes_store.add_study_guide("# Title\n\nbody\n")
 
-    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, **kwargs):
         return {
             "answer": "found nothing to change",
             "code_citations": [],

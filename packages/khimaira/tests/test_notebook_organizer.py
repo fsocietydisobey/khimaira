@@ -8,9 +8,24 @@ a plain unit test, no mocking of claude -p needed.
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 import pytest
+
+
+class _FakeProc:
+    def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
+        self._stdout = stdout
+        self._stderr = stderr
+        self.returncode = returncode
+
+    async def communicate(self, input=None):
+        return self._stdout, self._stderr
+
+
+def _envelope(result_str: str) -> bytes:
+    return json.dumps({"result": result_str, "session_id": "irrelevant"}).encode("utf-8")
 
 
 @pytest.fixture
@@ -157,6 +172,36 @@ async def test_organize_library_places_guide_into_matching_existing_collection(
     updated = notes_store.get_note(guide["id"])
     assert updated["tab_id"] == existing["id"]
     assert updated["organized_at"] is not None
+
+
+async def test_organize_library_personal_context_stays_global_only(
+    organizer_llm, notes_store, monkeypatch
+):
+    """Personal-context repo-scoping (2026-07-04,
+    tasks/grimoire/PERSONAL-CONTEXT-SCOPING.md): organize_library's batch
+    call spans potentially many repos at once — there is no single
+    target_repo to scope to, so it deliberately passes NONE (global-only),
+    even when an item in the batch shares a domain personal note's repo
+    tag. This is a documented design choice, not a missed call site."""
+    notes_store.add_note(
+        "Jeevy-only rule.", tab_id=notes_store.PERSONAL_TAB_ID, repo="jeevy_portal"
+    )
+    guide = _guide_with_abstract(notes_store, "Jeevy Guide", "About jeevy.", tab_id="")
+    notes_store.update_note(guide["id"], repo="jeevy_portal")
+    captured_args = []
+
+    async def fake_exec(*args, **kwargs):
+        captured_args.append(args)
+        return _FakeProc(_envelope(json.dumps({"placements": []})))
+
+    from khimaira.monitor import notebook_pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod.asyncio, "create_subprocess_exec", fake_exec)
+    await organizer_llm[0].organize_library()
+
+    assert len(captured_args) == 1
+    system_prompt_idx = captured_args[0].index("--append-system-prompt") + 1
+    assert "Jeevy-only rule." not in captured_args[0][system_prompt_idx]
 
 
 async def test_organize_library_creates_new_collection_when_llm_proposes_one(

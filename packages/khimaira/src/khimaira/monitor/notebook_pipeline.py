@@ -328,25 +328,59 @@ def _strip_fence(text: str) -> str:
 _MAX_PERSONAL_CONTEXT_CHARS = 6000
 
 
-def _personal_context() -> str:
-    """Concatenated llm_view() of every Personal/Behavior note, bounded —
-    this rides every LLM call (structuring, revalidation, ask-synthesis), so
-    it must stay small. Fail-open: any error returns "" (no context, not a
-    crash) — a missing/broken personal folder must never break the ask.
+def _is_global_personal_repo(note_repo: str | None) -> bool:
+    """A personal note counts as GLOBAL if it's explicitly tagged
+    notes.GENERAL_REPO, OR has no repo tag at all (empty string/None) — the
+    default for add_note/create_note when a caller doesn't pass one. An
+    untagged note is "no domain was ever chosen", not "belongs to some
+    domain nobody named" — treating it as global (over-inclusion, the
+    recoverable direction) is what preserves today's blanket-inject
+    behavior for every already-existing personal note, rather than
+    silently dropping any note that predates repo-scoping out of every LLM
+    call the moment this ships."""
+    return not note_repo or note_repo == notes.GENERAL_REPO
+
+
+def _personal_context(target_repo: str | None = None) -> str:
+    """Concatenated llm_view() of every IN-SCOPE Personal/Behavior note,
+    bounded — this rides every LLM call (structuring, revalidation,
+    ask-synthesis, chat), so it must stay small. Fail-open: any error
+    returns "" (no context, not a crash) — a missing/broken personal folder
+    must never break the ask.
+
+    Repo-scoping (2026-07-04, tasks/grimoire/PERSONAL-CONTEXT-SCOPING.md): a
+    GLOBAL personal note (repo == notes.GENERAL_REPO, OR unset/"" — see
+    `_is_global_personal_repo`) always injects, regardless of `target_repo`.
+    A DOMAIN personal note (repo == a real repo tag) injects ONLY when it
+    matches `target_repo` — a jeevy-specific voice/behavior rule shouldn't
+    ride a khimaira guide's structuring call. `target_repo=None` means
+    global-only. Global notes are concatenated first, domain notes after,
+    so global voice always leads.
 
     Sensitive notes (2026-07-04, CRITICAL cross-note leak this closes): a
     sensitive note filed into the Personal folder must never inject its
     real secrets into EVERY other LLM call via this concatenation. Routes
     through notes.llm_view(), which needs the FULL record (llm_text isn't
     carried on the list_notes() index stub — only single-note reads have
-    it) — an N+1 get_note() per personal note, acceptable since this folder
-    is small by nature."""
+    it) — an N+1 get_note() per IN-SCOPE personal note (out-of-scope domain
+    notes are filtered before the fetch, so a large personal folder with
+    many domains doesn't pay for notes outside this call's scope)."""
     try:
         personal_notes = notes.list_notes(tab_id=notes.PERSONAL_TAB_ID)
     except Exception:
         return ""
+
+    global_stubs = [s for s in personal_notes if _is_global_personal_repo(s.get("repo"))]
+    domain_stubs = [
+        s
+        for s in personal_notes
+        if not _is_global_personal_repo(s.get("repo"))
+        and target_repo is not None
+        and s.get("repo") == target_repo
+    ]
+
     parts: list[str] = []
-    for stub in personal_notes:
+    for stub in (*global_stubs, *domain_stubs):
         try:
             record = notes.get_note(stub["id"])
         except ValueError:
@@ -359,8 +393,8 @@ def _personal_context() -> str:
     return "\n\n---\n\n".join(parts)[:_MAX_PERSONAL_CONTEXT_CHARS]
 
 
-def _prepend_personal_context(instruction: str) -> str:
-    personal = _personal_context()
+def _prepend_personal_context(instruction: str, target_repo: str | None = None) -> str:
+    personal = _personal_context(target_repo)
     if not personal:
         return instruction
     return (
@@ -397,7 +431,7 @@ def seed_personal_context_if_empty() -> bool:
     return True
 
 
-async def _invoke_claude(content: str, instruction: str) -> str:
+async def _invoke_claude(content: str, instruction: str, *, target_repo: str | None = None) -> str:
     """Single headless-claude invocation. Returns the raw `.result` string.
     Raises on subprocess failure or a malformed envelope.
 
@@ -411,6 +445,10 @@ async def _invoke_claude(content: str, instruction: str) -> str:
 
     Personal/Behavior context is prepended here — the one choke point every
     caller already funnels through — rather than at each call site.
+    `target_repo` (2026-07-04): the repo tag of the note/guide/question this
+    call is FOR — threaded to _prepend_personal_context so a domain personal
+    note only rides a call for its own repo (global personal notes always
+    ride every call regardless). None means global-only.
 
     The actual subprocess spawn is gated by `_STRUCTURE_SEMAPHORE` (bound
     `_STRUCTURE_CONCURRENCY`, default 3, env `KHIMAIRA_NOTEBOOK_STRUCTURE_
@@ -418,7 +456,7 @@ async def _invoke_claude(content: str, instruction: str) -> str:
     communicate is inside the gate, not the (cheap, non-subprocess) isolated
     config dir setup above.
     """
-    instruction = _prepend_personal_context(instruction)
+    instruction = _prepend_personal_context(instruction, target_repo)
     cfg_dir = _isolated_config_dir()
     try:
         env = dict(os.environ)
@@ -503,11 +541,17 @@ async def _invoke_claude_agentic(
     *,
     repo_root: Path | None = None,
     max_budget_usd: float = _AGENTIC_DEFAULT_BUDGET_USD,
+    target_repo: str | None = None,
 ) -> dict[str, Any]:
     """Headless, read-only-tool-enabled claude -p invocation. `content` goes
     via stdin, `instruction` via --append-system-prompt (the same recipe as
     _invoke_claude), plus --allowedTools/--add-dir/--max-budget-usd and
     --output-format stream-json so the transcript can be inspected.
+
+    `target_repo` (2026-07-04): repo tag for personal-context scoping — see
+    _invoke_claude's docstring. Distinct from `repo_root` (the resolved
+    filesystem path passed to --add-dir); most callers already have the
+    same repo string on hand for both.
 
     Returns {"result": <final text>, "web_grounded": bool, "total_cost_usd":
     float | None}. Raises RuntimeError/ValueError on subprocess failure or a
@@ -515,7 +559,7 @@ async def _invoke_claude_agentic(
     retry policy, NOT this function (a single call runs ~$0.5-0.65 —
     silently retrying here would double that on every failure).
     """
-    instruction = _prepend_personal_context(instruction)
+    instruction = _prepend_personal_context(instruction, target_repo)
     cfg_dir = _isolated_config_dir()
     try:
         env = dict(os.environ)
@@ -584,12 +628,16 @@ async def _invoke_claude_agentic(
 
 
 async def _run_once(
-    content: str, *, instruction: str = _INSTRUCTION, schema: type[BaseModel] = PipelineOutput
+    content: str,
+    *,
+    instruction: str = _INSTRUCTION,
+    schema: type[BaseModel] = PipelineOutput,
+    target_repo: str | None = None,
 ) -> BaseModel:
     """Structuring/revalidation invocation — parses+validates the result
     against `schema` (PipelineOutput for structuring, RevalidationOutput for
     revalidate_note's re-check pass). Raises on any parse/validate failure."""
-    result_text = await _invoke_claude(content, instruction)
+    result_text = await _invoke_claude(content, instruction, target_repo=target_repo)
     payload = json.loads(_strip_fence(result_text))
     return schema.model_validate(payload)
 
@@ -599,9 +647,15 @@ async def transform_note(
     *,
     instruction: str = _INSTRUCTION,
     schema: type[BaseModel] = PipelineOutput,
+    target_repo: str | None = None,
 ) -> dict[str, Any] | None:
     """Run the transform, retrying up to _MAX_CLAUDE_ATTEMPTS with backoff
     between attempts on parse/validate failure.
+
+    `target_repo` (2026-07-04): threaded to _invoke_claude for personal-
+    context repo-scoping — the repo tag of the note/guide being transformed.
+    None means global-only (e.g. the organizer's batch call, which spans
+    multiple notes/repos at once and has no single repo to scope to).
 
     Returns the validated dict on success (shaped per `schema`), None if
     every attempt failed — the caller marks the note status="failed" and
@@ -609,7 +663,9 @@ async def transform_note(
     """
     for attempt in range(1, _MAX_CLAUDE_ATTEMPTS + 1):
         try:
-            output = await _run_once(raw_text, instruction=instruction, schema=schema)
+            output = await _run_once(
+                raw_text, instruction=instruction, schema=schema, target_repo=target_repo
+            )
             return output.model_dump()
         except (json.JSONDecodeError, ValidationError, ValueError, RuntimeError, OSError) as exc:
             log.warning("notebook_pipeline: attempt %d failed: %s", attempt, exc)
@@ -635,7 +691,7 @@ async def trigger_pipeline(note_id: str, *, skip_organize: bool = False) -> None
         log.warning("notebook_pipeline: note %s vanished before transform", note_id)
         return
 
-    result = await transform_note(notes.llm_view(record))
+    result = await transform_note(notes.llm_view(record), target_repo=record.get("repo"))
     if result is None:
         with contextlib.suppress(ValueError):
             notes.update_note(note_id, status="failed")
@@ -697,7 +753,10 @@ async def trigger_study_guide_pipeline(note_id: str, *, skip_organize: bool = Fa
         return
 
     result = await transform_note(
-        notes.llm_view(record), instruction=_STUDY_GUIDE_INSTRUCTION, schema=StudyGuideOutput
+        notes.llm_view(record),
+        instruction=_STUDY_GUIDE_INSTRUCTION,
+        schema=StudyGuideOutput,
+        target_repo=record.get("repo"),
     )
     if result is None:
         with contextlib.suppress(ValueError):
@@ -940,7 +999,12 @@ class GuideDriftOutput(BaseModel):
 
 
 async def _revalidate_guide_drift(
-    note_id: str, pipeline: dict[str, Any] | None, code_blob: str, current_sha: str
+    note_id: str,
+    pipeline: dict[str, Any] | None,
+    code_blob: str,
+    current_sha: str,
+    *,
+    target_repo: str | None = None,
 ) -> dict[str, Any]:
     """Guide currency = a DRIFT REPORT, not a heal-and-overwrite (Grimoire
     Phase 2, the load-bearing invariant carried into revalidation): only
@@ -952,7 +1016,9 @@ async def _revalidate_guide_drift(
     """
     instruction = _GUIDE_DRIFT_INSTRUCTION_TEMPLATE.format(code=code_blob)
     content = (pipeline or {}).get("abstract", "")
-    result = await transform_note(content, instruction=instruction, schema=GuideDriftOutput)
+    result = await transform_note(
+        content, instruction=instruction, schema=GuideDriftOutput, target_repo=target_repo
+    )
 
     if result is None:
         log.warning(
@@ -1044,11 +1110,16 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
     code_blob = "\n\n---\n\n".join(code_sections) if code_sections else "(no anchor files resolved)"
 
     if is_guide:
-        return await _revalidate_guide_drift(note_id, pipeline, code_blob, current_sha)
+        return await _revalidate_guide_drift(
+            note_id, pipeline, code_blob, current_sha, target_repo=repo
+        )
 
     instruction = _REVALIDATE_INSTRUCTION_TEMPLATE.format(code=code_blob)
     result = await transform_note(
-        json.dumps(pipeline or {}, indent=2), instruction=instruction, schema=RevalidationOutput
+        json.dumps(pipeline or {}, indent=2),
+        instruction=instruction,
+        schema=RevalidationOutput,
+        target_repo=repo,
     )
 
     if result is None:
@@ -1202,12 +1273,14 @@ def _format_code_section(chunks: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-async def _synthesize_answer(question: str, instruction: str) -> str | None:
+async def _synthesize_answer(
+    question: str, instruction: str, *, target_repo: str | None = None
+) -> str | None:
     """Free-form prose, not the PipelineOutput schema — same retry/backoff
     discipline as transform_note, but no JSON parse/validate."""
     for attempt in range(1, _MAX_CLAUDE_ATTEMPTS + 1):
         try:
-            return (await _invoke_claude(question, instruction)).strip()
+            return (await _invoke_claude(question, instruction, target_repo=target_repo)).strip()
         except (RuntimeError, ValueError, OSError) as exc:
             log.warning("notebook_pipeline: answer synthesis attempt %d failed: %s", attempt, exc)
             if attempt < _MAX_CLAUDE_ATTEMPTS:
@@ -1309,7 +1382,7 @@ async def answer_question(
     instruction = _ASK_INSTRUCTION_TEMPLATE.format(
         notes="\n\n---\n\n".join(note_sections), code=_format_code_section(code_chunks)
     )
-    answer = await _synthesize_answer(question, instruction)
+    answer = await _synthesize_answer(question, instruction, target_repo=repo)
     if answer is None:
         answer = (
             "Found relevant notes but couldn't synthesize an answer right now — "
@@ -1394,6 +1467,7 @@ async def _invoke_agentic_grounded(
     repo_root: Path | None,
     max_budget_usd: float,
     schema: type[BaseModel] = ResearchOutput,
+    target_repo: str | None = None,
 ) -> dict[str, Any]:
     """Shared ANSWER/REVISE/chat invocation against `schema` (ResearchOutput
     by default; the chat turn passes ChatTurnOutput — see notebook_chat.py).
@@ -1417,7 +1491,11 @@ async def _invoke_agentic_grounded(
     async def _attempt(extra: str = "") -> dict[str, Any] | None:
         try:
             invoked = await _invoke_claude_agentic(
-                content, instruction + extra, repo_root=repo_root, max_budget_usd=max_budget_usd
+                content,
+                instruction + extra,
+                repo_root=repo_root,
+                max_budget_usd=max_budget_usd,
+                target_repo=target_repo,
             )
         except (RuntimeError, ValueError, OSError) as exc:
             log.warning("notebook_pipeline: agentic invocation failed: %s", exc)
@@ -1475,7 +1553,7 @@ async def research_answer(
         guide=notes.llm_view(record),
     )
     return await _invoke_agentic_grounded(
-        question, instruction, repo_root=repo_root, max_budget_usd=max_budget_usd
+        question, instruction, repo_root=repo_root, max_budget_usd=max_budget_usd, target_repo=repo
     )
 
 
@@ -1539,7 +1617,7 @@ async def research_revise(
         guide=notes.llm_view(record),
     )
     result = await _invoke_agentic_grounded(
-        directive, instruction, repo_root=repo_root, max_budget_usd=max_budget_usd
+        directive, instruction, repo_root=repo_root, max_budget_usd=max_budget_usd, target_repo=repo
     )
 
     proposed_raw_text = None
