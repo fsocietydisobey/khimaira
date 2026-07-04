@@ -2681,3 +2681,110 @@ async def test_schedule_research_revise_job_reports_error_on_exception(
 def test_get_research_job_unknown_id_raises(pipeline):
     with pytest.raises(ValueError, match="No research job with id"):
         pipeline.get_research_job("no-such-job")
+
+
+# ---------------------------------------------------------------------------
+# CHAT-UNIFY §2 MVP — notebook-wide chat (schedule_notebook_chat)
+# ---------------------------------------------------------------------------
+
+
+async def test_schedule_notebook_chat_job_completes_and_is_pollable(
+    pipeline, notes_store, monkeypatch
+):
+    captured = {}
+
+    async def fake_answer_question(message, *, mentioned_note_ids=None, **kwargs):
+        captured["message"] = message
+        captured["mentioned_note_ids"] = mentioned_note_ids
+        return {
+            "answer": "notebook-wide answer",
+            "sources": ["n1"],
+            "healed": [],
+            "code_sources": [],
+            "code_unavailable": [],
+        }
+
+    monkeypatch.setattr(pipeline, "answer_question", fake_answer_question)
+    job_id = pipeline.schedule_notebook_chat("what changed recently?", ["n1"])
+
+    assert pipeline.get_research_job(job_id)["status"] == "pending"
+    await asyncio.sleep(0.05)
+
+    job = pipeline.get_research_job(job_id)
+    assert job["status"] == "done"
+    assert job["kind"] == "notebook_chat"
+    assert job["answer"] == "notebook-wide answer"
+    assert captured["message"] == "what changed recently?"
+    assert captured["mentioned_note_ids"] == ["n1"]
+
+
+async def test_schedule_notebook_chat_no_refs_defaults_to_empty_list(
+    pipeline, notes_store, monkeypatch
+):
+    captured = {}
+
+    async def fake_answer_question(message, *, mentioned_note_ids=None, **kwargs):
+        captured["mentioned_note_ids"] = mentioned_note_ids
+        return dict(pipeline._EMPTY_ANSWER)
+
+    monkeypatch.setattr(pipeline, "answer_question", fake_answer_question)
+    pipeline.schedule_notebook_chat("anything")
+    await asyncio.sleep(0.05)
+
+    assert captured["mentioned_note_ids"] == []
+
+
+async def test_schedule_notebook_chat_job_reports_error_on_exception(
+    pipeline, notes_store, monkeypatch
+):
+    async def failing_answer_question(message, *, mentioned_note_ids=None, **kwargs):
+        raise RuntimeError("retrieval blew up")
+
+    monkeypatch.setattr(pipeline, "answer_question", failing_answer_question)
+    job_id = pipeline.schedule_notebook_chat("q")
+    await asyncio.sleep(0.05)
+
+    job = pipeline.get_research_job(job_id)
+    assert job["status"] == "error"
+    assert job["kind"] == "notebook_chat"
+    assert "retrieval blew up" in job["error"]
+
+
+async def test_schedule_notebook_chat_sensitive_note_stays_redacted(
+    pipeline, notes_store, monkeypatch
+):
+    """Master's safety check (2026-07-04): notebook-wide chat is a THIN
+    wrapper around the real answer_question — not a sibling that could
+    bypass its llm_view redaction. Proven end-to-end through
+    schedule_notebook_chat/get_research_job (the actual §2 code path), not
+    by re-testing answer_question in isolation."""
+    secret = "sk-ant-" + "t" * 30
+    note = notes_store.add_note(f"key: {secret}", tab_id="t1", sensitive=True)
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+
+    captured_args = []
+
+    async def fake_exec(*args, **kwargs):
+        captured_args.append(args)
+        return _FakeProc(_envelope("some notebook-wide answer"))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+
+    job_id = pipeline.schedule_notebook_chat("what is the key?")
+    await asyncio.sleep(0.05)
+
+    job = pipeline.get_research_job(job_id)
+    assert job["status"] == "done"
+    assert job["sources"] == [note["id"]]
+    assert len(captured_args) == 1
+    system_prompt_idx = captured_args[0].index("--append-system-prompt") + 1
+    assert secret not in captured_args[0][system_prompt_idx]
+    assert secret not in job["answer"]

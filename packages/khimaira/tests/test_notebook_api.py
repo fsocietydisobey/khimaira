@@ -529,6 +529,67 @@ def test_get_research_job_unknown_id_returns_404(notebook_client, monkeypatch):
     assert r.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# CHAT-UNIFY §2 MVP — POST /notes/chat (notebook-wide chat)
+# ---------------------------------------------------------------------------
+
+
+def test_notebook_chat_route_schedules_job_and_returns_job_id(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    seen = {}
+
+    def fake_schedule(message, mentioned_note_ids=None):
+        seen["message"] = message
+        seen["refs"] = mentioned_note_ids
+        return "nb-job-1"
+
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "schedule_notebook_chat", fake_schedule)
+    r = notebook_client.post(
+        "/api/notes/chat", json={"message": "what changed?", "refs": ["n1", "n2"]}
+    )
+
+    assert r.status_code == 200
+    assert r.json() == {"job_id": "nb-job-1", "status": "pending"}
+    assert seen == {"message": "what changed?", "refs": ["n1", "n2"]}
+
+
+def test_notebook_chat_route_defaults_refs_to_empty_list(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    seen = {}
+
+    def fake_schedule(message, mentioned_note_ids=None):
+        seen["refs"] = mentioned_note_ids
+        return "nb-job-2"
+
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "schedule_notebook_chat", fake_schedule)
+    r = notebook_client.post("/api/notes/chat", json={"message": "anything"})
+
+    assert r.status_code == 200
+    assert seen["refs"] == []
+
+
+def test_notebook_chat_route_is_pollable_via_shared_job_route(notebook_client, monkeypatch):
+    """The whole point of reusing the shared job store: a job scheduled by
+    POST /notes/chat is pollable at the SAME GET /notes/research/{job_id}
+    route research/per-record chat already use."""
+    from khimaira.monitor.api import notebook as notebook_api
+
+    monkeypatch.setattr(
+        notebook_api.notebook_pipeline, "schedule_notebook_chat", lambda message, refs=None: "nb-1"
+    )
+    r = notebook_client.post("/api/notes/chat", json={"message": "hi"})
+    job_id = r.json()["job_id"]
+
+    done = {"status": "done", "kind": "notebook_chat", "answer": "the answer", "sources": []}
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "get_research_job", lambda jid: done)
+    poll = notebook_client.get(f"/api/notes/research/{job_id}")
+
+    assert poll.status_code == 200
+    assert poll.json() == done
+
+
 def test_export_note_route_happy_path(notebook_client, tmp_path):
     src = tmp_path / "guide.md"
     src.write_text("original")
@@ -744,19 +805,24 @@ def test_chat_route_schedules_job_and_returns_job_id(notebook_client, monkeypatc
     assert seen == {"note_id": note["id"], "message": "what is this?"}
 
 
-def test_chat_route_non_guide_returns_404(notebook_client, monkeypatch):
+def test_chat_route_works_for_regular_notes(notebook_client, monkeypatch):
+    """CHAT-UNIFY (2026-07-04): chat is no longer guide-only — a regular
+    note schedules a chat job exactly like a guide does."""
     from khimaira.monitor.api import notebook as notebook_api
 
     note = notebook_client.post("/api/notes", json={"raw_text": "just a note"}).json()
+    seen = {}
 
     def fake_schedule(note_id, message, *, max_budget_usd):
-        raise ValueError(
-            f"Note {note_id!r} is not a study guide (kind='note') — chat is guide-only."
-        )
+        seen["note_id"] = note_id
+        return "chat-job-2"
 
     monkeypatch.setattr(notebook_api.notebook_chat, "schedule_chat_turn", fake_schedule)
     r = notebook_client.post(f"/api/notes/{note['id']}/chat", json={"message": "hi"})
-    assert r.status_code == 404
+
+    assert r.status_code == 200
+    assert r.json() == {"job_id": "chat-job-2", "status": "pending"}
+    assert seen == {"note_id": note["id"]}
 
 
 def test_chat_route_unknown_note_returns_404(notebook_client, monkeypatch):

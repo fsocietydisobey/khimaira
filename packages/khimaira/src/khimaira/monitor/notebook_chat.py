@@ -1,19 +1,20 @@
-"""Grimoire chat-model backend — per-guide persistent conversational chat.
+"""Grimoire chat-model backend — per-record persistent conversational chat.
 
 Replaces the two-button ANSWER/REVISE toolbar (Phase 3) with one persistent
-chat per study guide: research + answer by default, and when the user asks
-for a change, the agent produces an edit that AUTO-APPLIES (no confirm
-click — undo is via the version-history snapshot every raw_text write
-already gets, per Phase 4). Locked design: Joseph, decision e2fba504.
+chat per record (a study guide OR a regular note — see CHAT-UNIFY, 2026-07-04):
+research + answer by default, and when the user asks for a change, the agent
+produces an edit that AUTO-APPLIES (no confirm click — undo is via the
+version-history snapshot every raw_text write already gets, per Phase 4).
+Locked design: Joseph, decision e2fba504.
 
-Storage: a JSON sidecar per guide (`notebook/chats/<note_id>.json`), atomic
+Storage: a JSON sidecar per record (`notebook/chats/<note_id>.json`), atomic
 tmp+rename overwrite per mutation — mirroring notes.py's OWN note-body
 storage convention (`_write_note_atomic`/`_read_note_file`) rather than
 inventing a new append-only convention. A sidecar (NOT a `chat_history`
 field on the note record itself) keeps every OTHER note-record read
 (list_notes, get_note, the MCP notebook_get tool) from carrying a full chat
 transcript it doesn't need — chat is a genuinely separate concern from the
-guide's own content/pipeline.
+record's own content/pipeline.
 
 Reuses everything Phase 3/4 built: the async job+poll infra
 (notebook_pipeline.create_job/complete_job/fail_job/track_job_task),
@@ -143,26 +144,28 @@ class ChatTurnOutput(BaseModel):
 
 _CHAT_INSTRUCTION_TEMPLATE = (
     notebook_pipeline._GROUNDING_IMPERATIVE + " "
-    "You are a conversational assistant scoped to ONE study guide — a chat "
-    "session about this document, like Claude Code scoped to a single file. "
-    "Research the ACTUAL codebase (Read/Grep/Glob under {repo_root}) and "
-    "the live web (WebSearch/WebFetch) to ground your answers; verify "
-    "anything checkable rather than trusting the guide's existing prose.\n\n"
+    "You are a conversational assistant scoped to ONE document (a study "
+    "guide or a note) — a chat session about it, like Claude Code scoped to "
+    "a single file. Research the ACTUAL codebase (Read/Grep/Glob under "
+    "{repo_root}) and the live web (WebSearch/WebFetch) to ground your "
+    "answers; verify anything checkable rather than trusting the "
+    "document's existing prose.\n\n"
     "By default, just ANSWER the user's message — leave edit null. ONLY "
     "when the user explicitly asks you to change, fix, update, add to, or "
-    "rewrite the guide (or a specific section of it), populate edit with "
+    "rewrite the document (or a specific section of it), populate edit with "
     "section_anchor and new_text: section_anchor names an EXISTING section "
-    "from the guide's own headings if the change is scoped to one section "
-    "(must match a real heading's anchor — check the guide below), or null "
-    "for a whole-guide rewrite; new_text is the FULL replacement text for "
-    "that scope (the section including its own heading line, or the entire "
-    "guide). Edits auto-apply immediately — do not propose a change unless "
-    "the user actually asked for one.\n\n"
+    "from the document's own headings if the change is scoped to one "
+    "section (must match a real heading's anchor — check the document "
+    "below), or null for a whole-document rewrite (also use null if the "
+    "document has no headings at all). new_text is the FULL replacement "
+    "text for that scope (the section including its own heading line, or "
+    "the entire document). Edits auto-apply immediately — do not propose a "
+    "change unless the user actually asked for one.\n\n"
     "Output ONLY a JSON object, no prose, no markdown fence, with keys: "
     "answer (string — your reply to show the user), code_citations (array "
     'of "file:line" strings), web_citations (array of URL strings), edit '
     "(null, or an object with section_anchor and new_text).\n\n"
-    "GUIDE:\n{guide}\n\n"
+    "DOCUMENT:\n{guide}\n\n"
     "CONVERSATION SO FAR:\n{history}"
 )
 
@@ -244,18 +247,16 @@ async def run_chat_turn(
     max_budget_usd: float = notebook_pipeline._AGENTIC_DEFAULT_BUDGET_USD,
 ) -> dict[str, Any]:
     """One chat turn: load history, run the agentic call grounded in the
-    guide + codebase + web, auto-apply an edit if the agent proposed one,
-    append both messages to the persistent history.
+    record (guide or note) + codebase + web, auto-apply an edit if the agent
+    proposed one, append both messages to the persistent history.
 
-    Raises ValueError if note_id doesn't exist or isn't a study guide (chat
-    is guide-only — mirrors export_note's own kind guard).
+    CHAT-UNIFY (2026-07-04): chat is no longer guide-only — any note kind
+    works (a note is just a shorter, less-structured record than a guide;
+    the chat loop already operates on llm_view(record) + the sidecar store +
+    _invoke_agentic_grounded, none of which are guide-specific). Raises
+    ValueError only if note_id doesn't exist (mirrors get_note).
     """
     record = notes.get_note(note_id)
-    if record.get("kind") != "study_guide":
-        raise ValueError(
-            f"Note {note_id!r} is not a study guide (kind={record.get('kind')!r}) — "
-            "chat is guide-only."
-        )
 
     repo = record.get("repo") or "khimaira"
     repo_root = None if repo == notes.GENERAL_REPO else notebook_pipeline._repo_root(repo)
@@ -275,6 +276,7 @@ async def run_chat_turn(
         repo_root=repo_root,
         max_budget_usd=max_budget_usd,
         schema=ChatTurnOutput,
+        target_repo=repo,
     )
 
     applied_edit: dict[str, Any] | None = None
@@ -340,16 +342,12 @@ def schedule_chat_turn(
     generic job store) — returns a job_id immediately; poll via
     notebook_pipeline.get_research_job(job_id) (kind="chat").
 
-    Validates note_id exists AND is a study guide BEFORE scheduling — fails
-    fast with the same contract schedule_research_answer/revise already
-    have, rather than handing back a job_id guaranteed to error.
+    Validates note_id exists BEFORE scheduling — fails fast with the same
+    contract schedule_research_answer/revise already have, rather than
+    handing back a job_id guaranteed to error. CHAT-UNIFY (2026-07-04): no
+    longer guide-only — any note kind is a valid chat target.
     """
-    record = notes.get_note(note_id)
-    if record.get("kind") != "study_guide":
-        raise ValueError(
-            f"Note {note_id!r} is not a study guide (kind={record.get('kind')!r}) — "
-            "chat is guide-only."
-        )
+    notes.get_note(note_id)  # fail fast on an unknown note_id
     job_id = notebook_pipeline.create_job("chat")
     task = asyncio.create_task(_run_chat_turn_job(job_id, note_id, message, max_budget_usd))
     notebook_pipeline.track_job_task(task)
@@ -380,7 +378,7 @@ async def compact_chat_history(note_id: str) -> dict[str, Any]:
     _COMPACT_KEEP_TAIL messages verbatim. Raises ValueError if note_id
     doesn't exist. A no-op (compacted=False) if there's nothing to compact
     yet."""
-    notes.get_note(note_id)  # fail fast on an unknown note_id
+    record = notes.get_note(note_id)  # fail fast on an unknown note_id
     history = get_chat_history(note_id)
     if len(history) <= _COMPACT_KEEP_TAIL:
         return {"compacted": False, "message_count": len(history)}
@@ -389,7 +387,9 @@ async def compact_chat_history(note_id: str) -> dict[str, Any]:
     tail = history[-_COMPACT_KEEP_TAIL:]
     transcript = _format_chat_history_for_prompt(to_summarize)
 
-    summary_text = await notebook_pipeline._invoke_claude(transcript, _COMPACT_INSTRUCTION)
+    summary_text = await notebook_pipeline._invoke_claude(
+        transcript, _COMPACT_INSTRUCTION, target_repo=record.get("repo")
+    )
     summary_message = _new_system_message(
         f"[Earlier conversation summarized] {summary_text.strip()}"
     )

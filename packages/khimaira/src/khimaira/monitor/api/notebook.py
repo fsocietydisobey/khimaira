@@ -11,6 +11,11 @@ Endpoints:
   POST   /notes/research        — grimoire Phase 3 ANSWER: schedules a research-grounded
                                    Q&A job (code + web), read-only; returns {job_id}
   GET    /notes/research/{job_id} — poll an ANSWER or REVISE job's status/result
+  POST   /notes/chat             — CHAT-UNIFY §2 MVP: notebook-wide chat for the
+                                   "nothing open" case; thin wrapper around
+                                   answer_question, schedules a job, returns
+                                   {job_id} — poll GET /notes/research/{job_id}
+                                   (kind:"notebook_chat"). NOT true multi-turn.
   GET    /notes/{id}            — one note
   PATCH  /notes/{id}            — edit title/tab/raw_text/status/links/repo/pipeline-patch
   DELETE /notes/{id}            — delete a note
@@ -25,13 +30,14 @@ Endpoints:
                                    /notes/{id} after human review
   POST   /notes/{id}/export     — grimoire Phase 4: write a guide's raw_text back
                                    to its source_path (or a given path)
-  POST   /notes/{id}/chat       — grimoire chat model: one turn of a guide's
-                                   persistent conversation; schedules a job,
-                                   returns {job_id} — poll GET /notes/research/{job_id}
-                                   (kind:"chat"). Answer-vs-edit is the agent's own
-                                   routing; edits AUTO-APPLY (undo via version history)
-  GET    /notes/{id}/chat       — load a guide's persistent chat history
-  POST   /notes/{id}/chat/clear — wipe a guide's chat history
+  POST   /notes/{id}/chat       — grimoire chat model: one turn of a record's
+                                   (guide or note — CHAT-UNIFY, 2026-07-04) persistent
+                                   conversation; schedules a job, returns {job_id} —
+                                   poll GET /notes/research/{job_id} (kind:"chat").
+                                   Answer-vs-edit is the agent's own routing; edits
+                                   AUTO-APPLY (undo via version history)
+  GET    /notes/{id}/chat       — load a record's persistent chat history
+  POST   /notes/{id}/chat/clear — wipe a record's chat history
   POST   /notes/{id}/chat/compact — summarize older chat turns into one message,
                                    keeping the tail verbatim (cost control — every
                                    turn passes the full history into the agentic call)
@@ -140,6 +146,11 @@ class ExportNoteReq(BaseModel):
 class ChatMessageReq(BaseModel):
     message: str
     max_budget_usd: float = notebook_pipeline._AGENTIC_DEFAULT_BUDGET_USD
+
+
+class NotebookChatReq(BaseModel):
+    message: str
+    refs: list[str] = []
 
 
 class CreateTabReq(BaseModel):
@@ -296,6 +307,20 @@ def build_router():
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 
+    @router.post("/notes/chat")
+    async def notebook_chat_route(req: NotebookChatReq) -> dict:
+        """CHAT-UNIFY §2 MVP (2026-07-04): notebook-wide chat for the
+        "nothing open" case — a thin wrapper around answer_question,
+        scheduled as a background job on the SAME shared job store as
+        per-record chat/research, polled at GET /notes/research/{job_id}
+        (kind="notebook_chat"). NOT true multi-turn: each call is a
+        stateless ask (no persisted server-side history) — `refs` map 1:1
+        onto answer_question's mentioned_note_ids; the frontend accumulates
+        the conversational feel client-side. Registered BEFORE
+        /notes/{note_id} so "chat" doesn't get swallowed as a note_id."""
+        job_id = notebook_pipeline.schedule_notebook_chat(req.message, req.refs)
+        return {"job_id": job_id, "status": "pending"}
+
     @router.get("/notes/{note_id}")
     async def get_note(note_id: str) -> dict:
         try:
@@ -403,12 +428,13 @@ def build_router():
 
     @router.post("/notes/{note_id}/chat")
     async def chat(note_id: str, req: ChatMessageReq) -> dict:
-        """Grimoire chat model: one turn of a guide's persistent
-        conversation. ASYNC (reuses the research job+poll infra) — schedules
-        a background job and returns {job_id} immediately; poll GET
-        /notes/research/{job_id} (kind:"chat"). Answer-vs-edit is the
-        agent's own structured-output routing, not a separate endpoint —
-        an edit AUTO-APPLIES (version history is the undo mechanism)."""
+        """Grimoire chat model: one turn of a record's (guide or note —
+        CHAT-UNIFY, 2026-07-04) persistent conversation. ASYNC (reuses the
+        research job+poll infra) — schedules a background job and returns
+        {job_id} immediately; poll GET /notes/research/{job_id} (kind:"chat").
+        Answer-vs-edit is the agent's own structured-output routing, not a
+        separate endpoint — an edit AUTO-APPLIES (version history is the
+        undo mechanism)."""
         try:
             job_id = notebook_chat.schedule_chat_turn(
                 note_id, req.message, max_budget_usd=req.max_budget_usd
@@ -419,7 +445,7 @@ def build_router():
 
     @router.get("/notes/{note_id}/chat")
     async def get_chat(note_id: str) -> dict:
-        """Load a guide's persistent chat history — the frontend calls this
+        """Load a record's persistent chat history — the frontend calls this
         on open so the conversation survives reopen."""
         try:
             notes.get_note(note_id)

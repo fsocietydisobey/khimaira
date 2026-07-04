@@ -211,10 +211,22 @@ def _grounded(answer="hi", edit=None, web_grounded=False, code_citations=None, w
     }
 
 
-async def test_run_chat_turn_rejects_non_guide_notes(chat, notes_store):
-    note = notes_store.add_note("just a note")
-    with pytest.raises(ValueError, match="not a study guide"):
-        await chat.run_chat_turn(note["id"], "hello")
+async def test_run_chat_turn_works_on_regular_notes(chat, notes_store, monkeypatch):
+    """CHAT-UNIFY (2026-07-04): chat is no longer guide-only — a regular
+    note is a valid chat target too, grounded in its own content + repo."""
+    note = notes_store.add_note("just a note", repo="khimaira")
+    captured = {}
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
+        captured["instruction"] = instruction
+        return _grounded(answer="It's just a note.")
+
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+
+    result = await chat.run_chat_turn(note["id"], "what is this?")
+
+    assert result["message"]["content"] == "It's just a note."
+    assert "just a note" in captured["instruction"]
 
 
 async def test_run_chat_turn_unknown_note_raises(chat):
@@ -327,6 +339,35 @@ async def test_run_chat_turn_sensitive_note_instruction_carries_addendum_and_red
     assert "MUST NOT propose an edit" in seen_instructions[0]
 
 
+async def test_run_chat_turn_sensitive_regular_note_answer_only_and_redacted(
+    chat, notes_store, monkeypatch
+):
+    """CHAT-UNIFY (2026-07-04): the sensitive-note answer-only + redaction
+    guard must hold on the NOTE path too, not just guides — verified via a
+    real add_note(sensitive=True) record, not inferred from code reading
+    alone (record.get("sensitive") is kind-agnostic, but audit beats
+    inspection — see bug-class-enumeration.md)."""
+    secret = "sk-ant-" + "s" * 30
+    raw = f"API_KEY={secret}"
+    note = notes_store.add_note(raw, sensitive=True)
+    seen_instructions: list[str] = []
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
+        seen_instructions.append(instruction)
+        return _grounded(
+            answer="Updated it (but shouldn't have).",
+            edit={"section_anchor": None, "new_text": "replaced"},
+        )
+
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+    result = await chat.run_chat_turn(note["id"], "what's the key?")
+
+    assert secret not in seen_instructions[0]
+    assert "SENSITIVE" in seen_instructions[0]
+    assert result["message"]["edit"] is None  # suppressed, not applied
+    assert notes_store.get_note(note["id"])["raw_text"] == raw  # untouched
+
+
 async def test_run_chat_turn_non_sensitive_note_no_addendum(chat, notes_store, monkeypatch):
     guide = notes_store.add_study_guide("# G\n\nbody\n")
     seen_instructions: list[str] = []
@@ -399,22 +440,37 @@ async def test_run_chat_turn_returns_grounding_shape(chat, notes_store, monkeypa
 # ---------------------------------------------------------------------------
 
 
-async def test_schedule_chat_turn_rejects_non_guide_before_scheduling(
-    chat, notes_store, monkeypatch
-):
-    note = notes_store.add_note("just a note")
-    called = []
-
-    async def fake_run(note_id, message, *, max_budget_usd):
-        called.append(1)
-
-    monkeypatch.setattr(chat, "run_chat_turn", fake_run)
-    with pytest.raises(ValueError, match="not a study guide"):
-        chat.schedule_chat_turn(note["id"], "hello")
+async def test_schedule_chat_turn_works_on_regular_notes(chat, notes_store, monkeypatch):
+    """CHAT-UNIFY (2026-07-04): schedule_chat_turn no longer rejects a
+    non-guide note — it only fails fast on an UNKNOWN note_id."""
     import asyncio
 
+    from khimaira.monitor import notebook_pipeline
+
+    note = notes_store.add_note("just a note")
+
+    async def fake_run(note_id, message, *, max_budget_usd):
+        return {
+            "message": {"content": "hi", "edit": None},
+            "grounding": {
+                "web_grounded": False,
+                "web_grounding_unverified": False,
+                "code_citations": [],
+                "web_citations": [],
+            },
+            "total_cost_usd": 0.1,
+        }
+
+    monkeypatch.setattr(chat, "run_chat_turn", fake_run)
+    job_id = chat.schedule_chat_turn(note["id"], "hello")
     await asyncio.sleep(0.05)
-    assert called == []
+
+    assert notebook_pipeline.get_research_job(job_id)["status"] == "done"
+
+
+async def test_schedule_chat_turn_unknown_note_raises(chat):
+    with pytest.raises(ValueError, match="No note with id"):
+        chat.schedule_chat_turn("no-such-note", "hello")
 
 
 async def test_schedule_chat_turn_completes_and_is_pollable(chat, notes_store, monkeypatch):

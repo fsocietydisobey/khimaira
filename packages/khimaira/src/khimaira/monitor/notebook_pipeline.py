@@ -1775,6 +1775,49 @@ def schedule_research_revise(
     return job_id
 
 
+# ---------------------------------------------------------------------------
+# CHAT-UNIFY §2 MVP (2026-07-04): notebook-wide chat for the "nothing open"
+# case — a THIN wrapper around answer_question, not a new grounding path.
+# `refs` map 1:1 onto answer_question's own mentioned_note_ids param, so
+# this inherits every egress fix already made there (sensitive notes route
+# through notes.llm_view() at both the pipeline-body and raw_text-fallback
+# sites — see answer_question's own docstring/tests) for free — there is no
+# separate code path here that could bypass it. NOT true multi-turn: each
+# call is a stateless ask (no persisted server-side history); the frontend
+# accumulates the conversational feel client-side. Reuses the SAME job
+# store as research/chat so the client polls one shared route regardless
+# of which kind of turn it fired.
+# ---------------------------------------------------------------------------
+
+
+async def _run_notebook_chat_job(
+    job_id: str, message: str, mentioned_note_ids: list[str] | None
+) -> None:
+    try:
+        result = await answer_question(message, mentioned_note_ids=mentioned_note_ids or [])
+        _RESEARCH_JOBS[job_id] = {"status": "done", "kind": "notebook_chat", **result}
+    except Exception as exc:
+        log.exception("notebook_pipeline: notebook chat job %s crashed", job_id)
+        _RESEARCH_JOBS[job_id] = {"status": "error", "kind": "notebook_chat", "error": str(exc)}
+
+
+def schedule_notebook_chat(message: str, mentioned_note_ids: list[str] | None = None) -> str:
+    """Fire a notebook-wide chat turn as a background job — returns a job_id
+    immediately; poll get_research_job(job_id) (kind="notebook_chat").
+
+    No upfront validation needed (unlike schedule_research_answer/revise) —
+    answer_question has no single note_id to fail fast on; an unresolvable
+    mentioned_note_id is silently skipped by answer_question itself, same
+    as any other retrieval miss.
+    """
+    job_id = _new_job_id()
+    _RESEARCH_JOBS[job_id] = {"status": "pending", "kind": "notebook_chat"}
+    task = asyncio.create_task(_run_notebook_chat_job(job_id, message, mentioned_note_ids))
+    _RESEARCH_JOB_TASKS.add(task)
+    task.add_done_callback(_RESEARCH_JOB_TASKS.discard)
+    return job_id
+
+
 def get_research_job(job_id: str) -> dict[str, Any]:
     """Poll a research job's status. Returns {"status": "pending"} while in
     flight, or {"status": "done"|"error", "kind": "answer"|"revise", ...}
