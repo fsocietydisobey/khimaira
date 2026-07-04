@@ -16,6 +16,7 @@ import { useRef, useState } from "react";
 import { ChevronLeft, Search } from "lucide-react";
 
 import { useListNotesQuery, useListTabsQuery } from "@/api";
+import { IdChip } from "@/components/notebook/IdChip";
 import {
   GuideChatBody,
   GuideChatHeaderControls,
@@ -31,7 +32,6 @@ import { cn } from "@/lib/utils";
 
 const READER_TOC_WIDTH = 240;
 const READER_CHAT_WIDTH = 380;
-const READER_RAW_WIDTH = 320;
 
 export function Library() {
   const [selectedGuideId, setSelectedGuideId] = useState<string | null>(null);
@@ -204,7 +204,10 @@ function GuideCard({ guide, onOpen }: { guide: Note; onOpen: () => void }) {
         <h4 className="min-w-0 truncate text-xs font-medium" title={guide.title}>
           {guide.title}
         </h4>
-        <GuideStatusBadge guide={guide} />
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          <IdChip id={guide.id} />
+          <GuideStatusBadge guide={guide} />
+        </div>
       </CardHeader>
       <CardContent className="p-3 pt-0">
         {pipeline ? (
@@ -230,13 +233,13 @@ function GuideCard({ guide, onOpen }: { guide: Note; onOpen: () => void }) {
 
 /** The guide detail read — clickable TOC (left), the full guide (center),
  *  the per-guide research chat (right, expanded by default — it's the
- *  primary interaction now per the Phase 3 chat redesign), raw source in a
- *  4th panel COLLAPSED by default (the guide IS the deliverable; raw
- *  source is a rarely-needed escape hatch, not the main view). */
+ *  primary interaction now per the Phase 3 chat redesign). No raw-source
+ *  panel here (unlike the note reader) — the guide IS the deliverable;
+ *  Joseph only needs raw/original for NOTES, where comparing structured-
+ *  vs-original matters. */
 function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
   const [tocCollapsed, setTocCollapsed] = usePersistedBoolean("library-toc-collapsed", false);
   const [chatCollapsed, setChatCollapsed] = usePersistedBoolean("library-chat-collapsed", false);
-  const [rawCollapsed, setRawCollapsed] = usePersistedBoolean("library-raw-collapsed", true);
   const pipeline = isStudyGuidePipeline(guide.pipeline) ? guide.pipeline : null;
   const contentRef = useRef<HTMLDivElement>(null);
   const chat = useGuideChat(guide.id);
@@ -307,7 +310,10 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
               </div>
             ) : null}
           </div>
-          <GuideStatusBadge guide={guide} />
+          <div className="flex shrink-0 flex-col items-end gap-1">
+            <IdChip id={guide.id} />
+            <GuideStatusBadge guide={guide} />
+          </div>
         </div>
         <div ref={contentRef} className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
           {pipeline ? (
@@ -328,19 +334,6 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
         extraHeader={<GuideChatHeaderControls state={chat} />}
       >
         <GuideChatBody state={chat} />
-      </SidePanelShell>
-
-      <SidePanelShell
-        side="right"
-        label="raw source"
-        width={READER_RAW_WIDTH}
-        collapsed={rawCollapsed}
-        onToggleCollapsed={() => setRawCollapsed(!rawCollapsed)}
-        resizable={false}
-      >
-        <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[10px] text-muted-foreground [overflow-wrap:anywhere]">
-          {guide.raw_text}
-        </pre>
       </SidePanelShell>
     </div>
   );

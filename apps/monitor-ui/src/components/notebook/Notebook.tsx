@@ -49,6 +49,7 @@ import {
   useRevalidateNoteMutation,
   useUpdateNoteMutation,
 } from "@/api";
+import { IdChip } from "@/components/notebook/IdChip";
 import { Library } from "@/components/notebook/LibraryView";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
 import { isStudyGuidePipeline, type AskAnswer, type Note } from "@/components/notebook/notebookTypes";
@@ -446,7 +447,7 @@ export function Notebook() {
 
   const notesListWithPersonal = (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="min-h-0 flex-1 overflow-hidden">{notesListPanel}</div>
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{notesListPanel}</div>
       <PersonalFolderSection
         notes={personalNotes}
         selectedNoteId={viewMode === "reader" && centerView?.kind === "note" ? centerView.noteId : null}
@@ -1093,7 +1094,7 @@ function NotesListPanel({
         )}
       </div>
 
-      <div className="flex-1 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto">
         {notesLoading ? (
           <p className="p-3 text-[11px] text-muted-foreground">loading…</p>
         ) : notes.length === 0 ? (
@@ -1170,7 +1171,7 @@ function GridView({
   onChangeRepo: (noteId: string, repo: string) => void;
 }) {
   return (
-    <div className="min-w-0 flex-1 overflow-y-auto p-4">
+    <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
       {notesLoading ? (
         <p className="text-xs text-muted-foreground">loading notes…</p>
       ) : notes.length === 0 ? (
@@ -1250,6 +1251,7 @@ function NoteCard({
           </p>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
+          <IdChip id={note.id} />
           <Badge variant={badge.variant} className="text-[10px]">
             {badge.label}
           </Badge>
@@ -1401,7 +1403,7 @@ function CenterReaderPanel({
             </Button>
           ) : null}
         </div>
-        <div className="min-w-0 flex-1 overflow-y-auto p-4">
+        <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
           <MarkdownView content={data.answer} />
           {hasSources || data.healed.length > 0 ? (
             <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-border/50 pt-3">
@@ -1553,6 +1555,7 @@ function NoteStructuredReader({
           ) : null}
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
+          <IdChip id={note.id} />
           {reprocessing ? (
             <Badge
               variant="outline"
@@ -1581,7 +1584,7 @@ function NoteStructuredReader({
         </div>
       </div>
 
-      <div className="min-w-0 flex-1 overflow-y-auto p-4">
+      <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
         {pipeline ? (
           <>
             <div className="mb-3 flex gap-1">
@@ -1681,7 +1684,7 @@ function NoteStructuredReader({
 function OriginalPanel({ note, rawMode }: { note: Note | null; rawMode: boolean }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="min-w-0 flex-1 overflow-y-auto p-4">
+      <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
         {note ? (
           rawMode ? (
             <pre className="min-w-0 overflow-x-auto whitespace-pre-wrap break-words text-[11px] text-muted-foreground [overflow-wrap:anywhere]">
