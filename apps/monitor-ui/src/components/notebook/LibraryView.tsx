@@ -16,6 +16,11 @@ import { useRef, useState } from "react";
 import { ChevronLeft, Search } from "lucide-react";
 
 import { useListNotesQuery, useListTabsQuery } from "@/api";
+import {
+  GuideChatBody,
+  GuideChatHeaderControls,
+  useGuideChat,
+} from "@/components/notebook/GuideChatPanel";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
 import { SidePanelShell, usePersistedBoolean } from "@/components/notebook/Notebook";
 import { isStudyGuidePipeline, type Note, type NotebookTab } from "@/components/notebook/notebookTypes";
@@ -25,7 +30,8 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
 const READER_TOC_WIDTH = 240;
-const READER_RAW_WIDTH = 360;
+const READER_CHAT_WIDTH = 380;
+const READER_RAW_WIDTH = 320;
 
 export function Library() {
   const [selectedGuideId, setSelectedGuideId] = useState<string | null>(null);
@@ -222,15 +228,18 @@ function GuideCard({ guide, onOpen }: { guide: Note; onOpen: () => void }) {
   );
 }
 
-/** The guide detail read — clickable TOC (left) + the full guide (center),
- *  raw source available in a right panel COLLAPSED by default: the guide
- *  IS the deliverable, so unlike a note's original/structured split, the
- *  rendered view is the primary (and usually only) thing anyone wants. */
+/** The guide detail read — clickable TOC (left), the full guide (center),
+ *  the per-guide research chat (right, expanded by default — it's the
+ *  primary interaction now per the Phase 3 chat redesign), raw source in a
+ *  4th panel COLLAPSED by default (the guide IS the deliverable; raw
+ *  source is a rarely-needed escape hatch, not the main view). */
 function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
   const [tocCollapsed, setTocCollapsed] = usePersistedBoolean("library-toc-collapsed", false);
+  const [chatCollapsed, setChatCollapsed] = usePersistedBoolean("library-chat-collapsed", false);
   const [rawCollapsed, setRawCollapsed] = usePersistedBoolean("library-raw-collapsed", true);
   const pipeline = isStudyGuidePipeline(guide.pipeline) ? guide.pipeline : null;
   const contentRef = useRef<HTMLDivElement>(null);
+  const chat = useGuideChat(guide.id);
 
   const handleTocClick = (anchor: string) => {
     const el = contentRef.current?.querySelector(`#${CSS.escape(anchor)}`);
@@ -300,7 +309,7 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
           </div>
           <GuideStatusBadge guide={guide} />
         </div>
-        <div ref={contentRef} className="min-w-0 flex-1 overflow-y-auto p-4">
+        <div ref={contentRef} className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
           {pipeline ? (
             <MarkdownView content={guide.raw_text} slugHeadings />
           ) : (
@@ -308,6 +317,18 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
           )}
         </div>
       </div>
+
+      <SidePanelShell
+        side="right"
+        label="chat"
+        width={READER_CHAT_WIDTH}
+        collapsed={chatCollapsed}
+        onToggleCollapsed={() => setChatCollapsed(!chatCollapsed)}
+        resizable={false}
+        extraHeader={<GuideChatHeaderControls state={chat} />}
+      >
+        <GuideChatBody state={chat} />
+      </SidePanelShell>
 
       <SidePanelShell
         side="right"

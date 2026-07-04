@@ -139,3 +139,41 @@ export interface AskAnswer {
    *  silently skipped checking the code. */
   code_unavailable: string[];
 }
+
+/** Grimoire (Phase 3 chat redesign) — grounding metadata on a chat message.
+ *  `code_citations`/`web_citations` are plain strings, NOT objects — the
+ *  same shape already byte-verified on the (now-retired) research toolbar
+ *  (`"file_path:line"` for code, bare URLs for web). Carrying that forward
+ *  rather than re-guessing an object shape. */
+export interface ChatGrounding {
+  web_grounded: boolean;
+  web_grounding_unverified: boolean;
+  code_citations: string[];
+  web_citations: string[];
+}
+
+/** An edit a chat turn auto-applied to the guide's raw_text. `diff` is a
+ *  single pre-formatted string from the backend (NOT a {before, after} pair
+ *  — unlike the retired toolbar's REVISE proposal, there is no separate
+ *  Accept step to diff against, since chat edits auto-apply). UNVERIFIED:
+ *  the exact text format of `diff` (assumed unified-diff, +/- line prefixes)
+ *  hasn't been confirmed against a live call yet — confirm before trusting
+ *  the color-coding in ChatEditDiff renders it meaningfully. */
+export interface ChatEdit {
+  section_anchor?: string;
+  diff: string;
+  applied_at?: string;
+}
+
+/** One turn in a guide's persistent chat (`GET/POST /notes/{id}/chat`).
+ *  Only assistant messages carry `edit`/`cost`/`grounding`; `system` is
+ *  compact's summary message replacing older turns. */
+export interface ChatMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+  ts?: string;
+  edit?: ChatEdit;
+  cost?: number | null;
+  grounding?: ChatGrounding;
+}
+

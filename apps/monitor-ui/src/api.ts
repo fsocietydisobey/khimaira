@@ -2,6 +2,7 @@ import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
 
 import type {
   AskAnswer,
+  ChatMessage,
   Note,
   NotebookTab,
   NoteKind,
@@ -217,7 +218,7 @@ export interface CorrelationResponse {
 export const monitorApi = createApi({
   reducerPath: "monitorApi",
   baseQuery: fetchBaseQuery({ baseUrl: "/api" }),
-  tagTypes: ["Projects", "Topology", "Threads", "Notes", "Tabs"],
+  tagTypes: ["Projects", "Topology", "Threads", "Notes", "Tabs", "ChatHistory"],
   endpoints: (build) => ({
     listProjects: build.query<Project[], void>({
       query: () => "/projects",
@@ -313,7 +314,16 @@ export const monitorApi = createApi({
     }),
     updateNote: build.mutation<
       Note,
-      { id: string; title?: string; tab_id?: string; status?: NoteStatus; repo?: string }
+      {
+        id: string;
+        title?: string;
+        tab_id?: string;
+        status?: NoteStatus;
+        repo?: string;
+        /** Grimoire (Phase 3): applying a REVISE proposal is a plain raw_text
+         *  PATCH — never auto-applied, always the result of an explicit Accept. */
+        raw_text?: string;
+      }
     >({
       query: ({ id, ...body }) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "PATCH", body }),
       invalidatesTags: (_r, _e, { id }) => [
@@ -344,6 +354,45 @@ export const monitorApi = createApi({
               { type: "Notes" as const, id: "LIST" },
             ]
           : [],
+    }),
+    // Grimoire (Phase 3 chat redesign, tasks/grimoire/CHAT-MODEL.md): a
+    // per-guide persistent chat. Sending a turn is async (job+poll, reused
+    // from the retired toolbar's engine) since every turn is a slow
+    // agentic call — sendChatMessage only kicks off the job; pollChatJob
+    // is the caller's own polling loop against it.
+    getChatHistory: build.query<{ history: ChatMessage[] }, string>({
+      query: (id) => `/notes/${encodeURIComponent(id)}/chat`,
+      providesTags: (_r, _e, id) => [{ type: "ChatHistory", id }],
+    }),
+    sendChatMessage: build.mutation<
+      { job_id: string; status: string },
+      { id: string; message: string; max_budget_usd?: number }
+    >({
+      query: ({ id, ...body }) => ({
+        url: `/notes/${encodeURIComponent(id)}/chat`,
+        method: "POST",
+        body,
+      }),
+    }),
+    pollChatJob: build.query<
+      {
+        status: "pending" | "done" | "error";
+        message?: { content: string; edit?: ChatMessage["edit"] };
+        grounding?: ChatMessage["grounding"];
+        total_cost_usd?: number | null;
+        error?: string;
+      },
+      string
+    >({
+      query: (jobId) => `/notes/research/${encodeURIComponent(jobId)}`,
+    }),
+    clearChat: build.mutation<{ cleared: boolean }, string>({
+      query: (id) => ({ url: `/notes/${encodeURIComponent(id)}/chat/clear`, method: "POST" }),
+      invalidatesTags: (_r, _e, id) => [{ type: "ChatHistory", id }],
+    }),
+    compactChat: build.mutation<{ compacted: boolean; message_count: number }, string>({
+      query: (id) => ({ url: `/notes/${encodeURIComponent(id)}/chat/compact`, method: "POST" }),
+      invalidatesTags: (_r, _e, id) => [{ type: "ChatHistory", id }],
     }),
     deleteNote: build.mutation<{ id: string; deleted: boolean }, string>({
       query: (id) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "DELETE" }),
@@ -390,6 +439,11 @@ export const {
   usePromoteNoteMutation,
   useRevalidateNoteMutation,
   useAskNotebookMutation,
+  useGetChatHistoryQuery,
+  useSendChatMessageMutation,
+  usePollChatJobQuery,
+  useClearChatMutation,
+  useCompactChatMutation,
   useDeleteNoteMutation,
   useListTabsQuery,
   useCreateTabMutation,
