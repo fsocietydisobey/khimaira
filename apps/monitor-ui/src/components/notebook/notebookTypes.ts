@@ -149,21 +149,6 @@ export interface CodeSource {
   end_line: number;
 }
 
-/** Phase 2c capstone — POST /notes/ask response. */
-export interface AskAnswer {
-  answer: string;
-  /** Every note the answer drew on, post-revalidation. */
-  sources: string[];
-  /** Subset of `sources` that actually changed (healed) during this ask. */
-  healed: string[];
-  /** Ask-layer v2: code chunks (from each source note's repo) fed into the synthesis. */
-  code_sources: CodeSource[];
-  /** Repos where neither Séance nor the grep fallback could ground anything —
-   *  a degrade, not a failure; surfaced so the answer doesn't look like it
-   *  silently skipped checking the code. */
-  code_unavailable: string[];
-}
-
 /** Grimoire (Phase 3 chat redesign) — grounding metadata on a chat message.
  *  `code_citations`/`web_citations` are plain strings, NOT objects — the
  *  same shape already byte-verified on the (now-retired) research toolbar
@@ -189,15 +174,40 @@ export interface ChatEdit {
   applied_at?: string;
 }
 
-/** One turn in a guide's persistent chat (`GET/POST /notes/{id}/chat`).
- *  Only assistant messages carry `edit`/`cost`/`grounding`; `system` is
- *  compact's summary message replacing older turns. */
+/** One turn in the unified chat sidebar (Grimoire, tasks/grimoire/CHAT-
+ *  UNIFY.md) — renders TWO distinct backend shapes through one type:
+ *
+ *  - **Per-record** (guide or note, `POST/GET /notes/{id}/chat`, persistent):
+ *    `edit`/`cost`/`grounding` — agentic, may auto-apply an edit.
+ *  - **Notebook-wide** (`POST /notes/chat`, one-shot, client-accumulated
+ *    only — no server history): `sources`/`healed`/`codeSources`/
+ *    `codeUnavailable` — `answer_question`'s retrieval shape, converted at
+ *    the integration boundary (`useNotebookChat`) so `ChatBubble` doesn't
+ *    need to know which backend produced a message. No `edit`, no
+ *    `grounding` (that's an agentic-only concept) on this path.
+ *
+ *  `system` is compact's summary message (per-record only — notebook-wide
+ *  has no compact). */
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
   ts?: string;
+  /** Per-record only. */
   edit?: ChatEdit;
+  /** Per-record only. */
   cost?: number | null;
+  /** Per-record only. */
   grounding?: ChatGrounding;
+  /** Notebook-wide only — note ids the answer drew on. */
+  sources?: string[];
+  /** Notebook-wide only — subset of `sources` that were healed (revalidated
+   *  and found stale) during this ask. */
+  healed?: string[];
+  /** Notebook-wide only — code chunks, pre-formatted as "file_path:start-end"
+   *  (converted from `CodeSource[]` at the integration boundary, same
+   *  plain-string convention as `ChatGrounding.code_citations`). */
+  codeSources?: string[];
+  /** Notebook-wide only — repos where no code-grounding was available. */
+  codeUnavailable?: string[];
 }
 

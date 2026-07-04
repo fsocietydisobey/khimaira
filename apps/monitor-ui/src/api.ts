@@ -1,8 +1,8 @@
 import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
 
 import type {
-  AskAnswer,
   ChatMessage,
+  CodeSource,
   Note,
   NotebookTab,
   NoteKind,
@@ -370,26 +370,11 @@ export const monitorApi = createApi({
       query: (id) => ({ url: `/notes/${encodeURIComponent(id)}/revalidate`, method: "POST" }),
       invalidatesTags: (_r, _e, id) => [{ type: "Notes", id }, { type: "Notes", id: "LIST" }],
     }),
-    askNotebook: build.mutation<
-      AskAnswer,
-      { question: string; repo?: string; note_ids?: string[]; exclusive?: boolean }
-    >({
-      query: (body) => ({ url: "/notes/ask", method: "POST", body }),
-      // A heal during ask() changes the cited notes' pipeline — refresh the list
-      // so their cards show the corrected content next render.
-      invalidatesTags: (result) =>
-        result && result.healed.length > 0
-          ? [
-              ...result.healed.map((id) => ({ type: "Notes" as const, id })),
-              { type: "Notes" as const, id: "LIST" },
-            ]
-          : [],
-    }),
-    // Grimoire (Phase 3 chat redesign, tasks/grimoire/CHAT-MODEL.md): a
-    // per-guide persistent chat. Sending a turn is async (job+poll, reused
-    // from the retired toolbar's engine) since every turn is a slow
-    // agentic call — sendChatMessage only kicks off the job; pollChatJob
-    // is the caller's own polling loop against it.
+    // Grimoire (Phase 3 chat redesign + CHAT-UNIFY): one persistent per-
+    // record chat (guide OR note — the guide-only 404 was lifted) + one
+    // one-shot notebook-wide chat (nothing open). Both are async (job+poll)
+    // since every turn is a slow agentic/retrieval call — the send
+    // mutations only kick off the job; pollChatJob is the shared poll loop.
     getChatHistory: build.query<{ history: ChatMessage[] }, string>({
       query: (id) => `/notes/${encodeURIComponent(id)}/chat`,
       providesTags: (_r, _e, id) => [{ type: "ChatHistory", id }],
@@ -404,12 +389,33 @@ export const monitorApi = createApi({
         body,
       }),
     }),
+    // Notebook-wide (nothing open) — one-shot, no server-side history
+    // (MVP per CHAT-UNIFY.md); `refs` = @-referenced note ids.
+    sendNotebookChat: build.mutation<
+      { job_id: string; status: string },
+      { message: string; refs?: string[]; max_budget_usd?: number }
+    >({
+      query: (body) => ({ url: "/notes/chat", method: "POST", body }),
+    }),
+    // Same poll route for both kinds ("chat" = per-record, "notebook_chat" =
+    // notebook-wide) — the two response shapes are genuinely different
+    // (per-record nests under `message`/`grounding`; notebook-wide is
+    // answer_question's flat {answer, sources, ...}), so every field below
+    // is optional and each caller destructures only the fields its own kind
+    // produces.
     pollChatJob: build.query<
       {
         status: "pending" | "done" | "error";
+        // per-record (guide/note) chat shape:
         message?: { content: string; edit?: ChatMessage["edit"] };
         grounding?: ChatMessage["grounding"];
         total_cost_usd?: number | null;
+        // notebook-wide shape (answer_question's):
+        answer?: string;
+        sources?: string[];
+        healed?: string[];
+        code_sources?: CodeSource[];
+        code_unavailable?: string[];
         error?: string;
       },
       string
@@ -468,9 +474,9 @@ export const {
   useUpdateNoteMutation,
   usePromoteNoteMutation,
   useRevalidateNoteMutation,
-  useAskNotebookMutation,
   useGetChatHistoryQuery,
   useSendChatMessageMutation,
+  useSendNotebookChatMutation,
   usePollChatJobQuery,
   useClearChatMutation,
   useCompactChatMutation,

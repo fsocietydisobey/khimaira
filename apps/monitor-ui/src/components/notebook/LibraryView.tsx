@@ -17,11 +17,7 @@ import { ChevronLeft, Search } from "lucide-react";
 
 import { useListNotesQuery, useListTabsQuery, useUpdateNoteMutation } from "@/api";
 import { IdChip } from "@/components/notebook/IdChip";
-import {
-  GuideChatBody,
-  GuideChatHeaderControls,
-  useGuideChat,
-} from "@/components/notebook/GuideChatPanel";
+import { ChatBody, ChatHeaderControls, useRecordChat } from "@/components/notebook/ChatPanel";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
 import { SidePanelShell, usePersistedBoolean } from "@/components/notebook/Notebook";
 import {
@@ -273,7 +269,7 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
   const [chatCollapsed, setChatCollapsed] = usePersistedBoolean("library-chat-collapsed", false);
   const pipeline = isStudyGuidePipeline(guide.pipeline) ? guide.pipeline : null;
   const contentRef = useRef<HTMLDivElement>(null);
-  const chat = useGuideChat(guide.id);
+  const chat = useRecordChat(guide.id);
   const [updateNote] = useUpdateNoteMutation();
 
   const handleTocClick = (anchor: string) => {
@@ -373,9 +369,9 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
         collapsed={chatCollapsed}
         onToggleCollapsed={() => setChatCollapsed(!chatCollapsed)}
         resizable={false}
-        extraHeader={<GuideChatHeaderControls state={chat} />}
+        extraHeader={<ChatHeaderControls state={chat} />}
       >
-        <GuideChatBody state={chat} sensitive={!!guide.sensitive} />
+        <ChatBody state={chat} mode="record" sensitive={!!guide.sensitive} />
       </SidePanelShell>
     </div>
   );

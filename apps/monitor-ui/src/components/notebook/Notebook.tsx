@@ -32,14 +32,11 @@ import {
   LayoutGrid,
   Plus,
   RefreshCw,
-  Search,
   Trash2,
   Upload,
-  X,
 } from "lucide-react";
 
 import {
-  useAskNotebookMutation,
   useCreateNoteMutation,
   useCreateTabMutation,
   useDeleteNoteMutation,
@@ -51,12 +48,12 @@ import {
   useRevalidateNoteMutation,
   useUpdateNoteMutation,
 } from "@/api";
+import { ChatBody, ChatHeaderControls, useNotebookChat, useRecordChat } from "@/components/notebook/ChatPanel";
 import { IdChip } from "@/components/notebook/IdChip";
 import { Library } from "@/components/notebook/LibraryView";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
 import {
   isStudyGuidePipeline,
-  type AskAnswer,
   type Note,
   type NotePriority,
 } from "@/components/notebook/notebookTypes";
@@ -70,6 +67,7 @@ import { cn } from "@/lib/utils";
 
 const ALL_TABS = "__all__";
 const GRID_LEFT_WIDTH = 240;
+const CHAT_WIDTH = 380;
 /** Mirrors notes.GENERAL_REPO — a repo value meaning "no codebase", for
  *  cross-cutting notes. Always in scope alongside whichever project the
  *  left list / ask are currently scoped to. */
@@ -80,12 +78,6 @@ const GENERAL_REPO = "general";
  *  call (structuring, revalidation, ask-synthesis). */
 const PERSONAL_TAB_ID = "personal";
 
-const SUGGESTED_QUESTIONS = [
-  "What's changed recently in the code this notebook tracks?",
-  "Summarize everything tagged as a bug or incident.",
-  "What's still unresolved or open?",
-];
-
 type ViewMode = "grid" | "reader";
 
 /** Grimoire (Phase 1f): top-level note⇄guide switch, independent of ViewMode
@@ -93,10 +85,10 @@ type ViewMode = "grid" | "reader";
  *  of the whole notes grid/reader area. */
 type NotebookSection = "notes" | "library";
 
-type CenterView =
-  | { kind: "note"; noteId: string }
-  | { kind: "answer"; data: AskAnswer; question: string }
-  | null;
+// CHAT-UNIFY: answers used to be a special CenterView kind rendered by
+// CenterReaderPanel; they're chat bubbles in the sidebar now, so this is
+// just "which note is open".
+type CenterView = { kind: "note"; noteId: string } | null;
 
 // ---------------------------------------------------------------------------
 // Persisted layout preferences — lazy-init from localStorage, guarded against
@@ -313,7 +305,6 @@ export function Notebook() {
   const [creatingTab, setCreatingTab] = useState(false);
   const [newTabTitle, setNewTabTitle] = useState("");
   const [centerView, setCenterView] = useState<CenterView>(null);
-  const [savedAnswerRef, setSavedAnswerRef] = useState<AskAnswer | null>(null);
   const [originalRawMode, setOriginalRawMode] = useState(false);
 
   const [leftCollapsed, setLeftCollapsed] = usePersistedBoolean("notebook-left-collapsed", false);
@@ -323,6 +314,7 @@ export function Notebook() {
   );
   const [leftWidth, resizeLeft] = useResizableWidth("notebook-left-width", 256, 200, 480, 1);
   const [rightWidth, resizeRight] = useResizableWidth("notebook-right-width", 420, 280, 720, -1);
+  const [chatCollapsed, setChatCollapsed] = usePersistedBoolean("notebook-chat-collapsed", false);
   // "All projects" — default OFF (scoped to the current project + General).
   // Doesn't hard-hide anything; it's a toggle, not a filter you can't undo.
   const [allProjects, setAllProjects] = usePersistedBoolean("notebook-all-projects", false);
@@ -347,13 +339,11 @@ export function Notebook() {
   );
   const { data: projectsData } = useListProjectsQuery();
   const [createNote, { isLoading: creatingNote }] = useCreateNoteMutation();
-  const [saveAnswerAsNote, { isLoading: savingAnswer }] = useCreateNoteMutation();
   const [createTab] = useCreateTabMutation();
   const [promoteNote] = usePromoteNoteMutation();
   const [deleteNote] = useDeleteNoteMutation();
   const [updateNote] = useUpdateNoteMutation();
   const [revalidateNote, { isLoading: revalidating }] = useRevalidateNoteMutation();
-  const [askNotebook, { isLoading: asking }] = useAskNotebookMutation();
 
   const tabs = tabsData?.tabs ?? [];
   // Personal/Behavior notes are a distinct section (below) — never mixed
@@ -375,6 +365,17 @@ export function Notebook() {
       ? (notes.find((n) => n.id === centerView.noteId) ?? null)
       : null;
 
+  // CHAT-UNIFY: scope follows what's open — a note open scopes the sidebar
+  // to that note (per-record chat, same route as guide chat); nothing open
+  // is the notebook-wide ask. Both hooks are always called (never behind a
+  // conditional) so the rules of hooks hold regardless of which is active —
+  // useRecordChat(null) is inert (skipToken on every query).
+  const chatNoteId = selectedNote?.id ?? null;
+  const recordChat = useRecordChat(chatNoteId);
+  const notebookChat = useNotebookChat();
+  const activeChat = chatNoteId ? recordChat : notebookChat;
+  const chatMode: "record" | "notebook" = chatNoteId ? "record" : "notebook";
+
   // Shared across both modes — a click on a card, a list row, or a cited
   // source always opens that note in the deep-read Reader.
   const handleSelectNote = (id: string) => {
@@ -382,22 +383,9 @@ export function Notebook() {
     setCenterView({ kind: "note", noteId: id });
   };
 
-  const handleAsk = async (question: string, noteIds: string[]) => {
-    const result = await askNotebook({ question, note_ids: noteIds, repo: repoScope }).unwrap();
-    setViewMode("reader");
-    setCenterView({ kind: "answer", data: result, question });
-  };
-
   const handleChangeRepo = (noteId: string, repo: string) => updateNote({ id: noteId, repo });
   const handleChangePriority = (noteId: string, priority: NotePriority) =>
     updateNote({ id: noteId, priority });
-
-  const handleSaveAnswer = async () => {
-    if (centerView?.kind !== "answer") return;
-    const { data, question } = centerView;
-    await saveAnswerAsNote({ raw_text: data.answer, title: `Answer: ${question}` }).unwrap();
-    setSavedAnswerRef(data);
-  };
 
   const handleAddNote = async () => {
     const text = draft.trim();
@@ -508,11 +496,7 @@ export function Notebook() {
 
       {section === "library" ? (
         <Library />
-      ) : (
-        <>
-          <AskBar onAsk={handleAsk} asking={asking} notes={mentionableNotes} />
-
-          {viewMode === "grid" ? (
+      ) : viewMode === "grid" ? (
         <div className="flex flex-1 overflow-hidden">
           <SidePanelShell
             side="left"
@@ -535,6 +519,17 @@ export function Notebook() {
             onChangeRepo={handleChangeRepo}
             onChangePriority={handleChangePriority}
           />
+          <SidePanelShell
+            side="right"
+            label="chat"
+            width={CHAT_WIDTH}
+            collapsed={chatCollapsed}
+            onToggleCollapsed={() => setChatCollapsed(!chatCollapsed)}
+            resizable={false}
+            extraHeader={<ChatHeaderControls state={activeChat} />}
+          >
+            <ChatBody state={activeChat} mode={chatMode} notes={mentionableNotes} />
+          </SidePanelShell>
         </div>
       ) : (
         <div className="flex flex-1 overflow-hidden">
@@ -551,7 +546,6 @@ export function Notebook() {
           </SidePanelShell>
           <CenterReaderPanel
             view={centerView}
-            onSelectSource={handleSelectNote}
             onPromote={selectedNote ? () => promoteNote(selectedNote.id) : undefined}
             onDelete={
               selectedNote
@@ -563,9 +557,6 @@ export function Notebook() {
             }
             onRevalidate={selectedNote ? () => revalidateNote(selectedNote.id) : undefined}
             revalidating={revalidating}
-            onSaveAnswer={handleSaveAnswer}
-            savingAnswer={savingAnswer}
-            answerSaved={centerView?.kind === "answer" && savedAnswerRef === centerView.data}
             repoOptions={repoOptions}
             onChangeRepo={handleChangeRepo}
             onChangePriority={handleChangePriority}
@@ -593,9 +584,23 @@ export function Notebook() {
           >
             <OriginalPanel noteId={selectedNote?.id ?? null} rawMode={originalRawMode} />
           </SidePanelShell>
+          <SidePanelShell
+            side="right"
+            label="chat"
+            width={CHAT_WIDTH}
+            collapsed={chatCollapsed}
+            onToggleCollapsed={() => setChatCollapsed(!chatCollapsed)}
+            resizable={false}
+            extraHeader={<ChatHeaderControls state={activeChat} />}
+          >
+            <ChatBody
+              state={activeChat}
+              mode={chatMode}
+              notes={mentionableNotes}
+              sensitive={!!selectedNote?.sensitive}
+            />
+          </SidePanelShell>
         </div>
-      )}
-        </>
       )}
     </div>
   );
@@ -630,182 +635,6 @@ function NotebookSectionToggle({
           {label}
         </button>
       ))}
-    </div>
-  );
-}
-
-type Mention = { id: string; title: string };
-
-/** Persistent ask bar — always visible above the panels. Type `@` to reference
- *  a specific note (autocomplete over the already-loaded notes list, modeled
- *  on Claude Code's @-file mentions) — @-referenced notes always join the
- *  answer's sources (prioritized default; see answer_question's `exclusive`
- *  param for the future flip). Shows a few suggested-question chips when
- *  idle to nudge first-time use. */
-function AskBar({
-  onAsk,
-  asking,
-  notes,
-}: {
-  onAsk: (question: string, noteIds: string[]) => void;
-  asking: boolean;
-  notes: Note[];
-}) {
-  const [question, setQuestion] = useState("");
-  const [mentions, setMentions] = useState<Mention[]>([]);
-  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
-  const [mentionMatchStart, setMentionMatchStart] = useState<number | null>(null);
-  const [highlightedIndex, setHighlightedIndex] = useState(0);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  const mentionMatches =
-    mentionQuery !== null
-      ? notes
-          .filter((n) => n.title.toLowerCase().includes(mentionQuery.toLowerCase()))
-          .slice(0, 6)
-      : [];
-  const highlighted = Math.min(highlightedIndex, Math.max(mentionMatches.length - 1, 0));
-
-  const updateMentionState = (value: string, cursorPos: number) => {
-    const match = /@([^\s@]*)$/.exec(value.slice(0, cursorPos));
-    if (match) {
-      setMentionQuery(match[1]);
-      setMentionMatchStart(cursorPos - match[0].length);
-      setHighlightedIndex(0);
-    } else {
-      setMentionQuery(null);
-      setMentionMatchStart(null);
-    }
-  };
-
-  const selectMention = (note: Note) => {
-    if (mentionMatchStart === null || mentionQuery === null) return;
-    const before = question.slice(0, mentionMatchStart);
-    const after = question.slice(mentionMatchStart + 1 + mentionQuery.length);
-    setQuestion(`${before}${after}`);
-    setMentions((prev) => (prev.some((m) => m.id === note.id) ? prev : [...prev, { id: note.id, title: note.title }]));
-    setMentionQuery(null);
-    setMentionMatchStart(null);
-    requestAnimationFrame(() => inputRef.current?.focus());
-  };
-
-  const removeMention = (id: string) => setMentions((prev) => prev.filter((m) => m.id !== id));
-
-  const submit = (text?: string) => {
-    const q = (text ?? question).trim();
-    if (!q || asking) return;
-    onAsk(
-      q,
-      mentions.map((m) => m.id),
-    );
-    if (text) {
-      setQuestion("");
-      setMentions([]);
-    }
-  };
-
-  return (
-    <div className="shrink-0 border-b border-border bg-card/20 px-4 py-3">
-      <div className="relative mx-auto w-full max-w-3xl">
-        {mentions.length > 0 ? (
-          <div className="mb-1.5 flex flex-wrap gap-1">
-            {mentions.map((m) => (
-              <Badge key={m.id} variant="secondary" className="gap-1 py-0.5 pr-1 text-[10px]">
-                <span className="max-w-[180px] truncate">@{m.title}</span>
-                <button
-                  type="button"
-                  onClick={() => removeMention(m.id)}
-                  title="Remove mention"
-                  className="rounded-full p-0.5 hover:bg-background/60"
-                >
-                  <X className="h-2.5 w-2.5" />
-                </button>
-              </Badge>
-            ))}
-          </div>
-        ) : null}
-        <div className="flex items-center gap-2 rounded-full border border-input bg-background py-1 pl-3 pr-1 shadow-sm focus-within:ring-1 focus-within:ring-ring">
-          <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          <input
-            ref={inputRef}
-            value={question}
-            onChange={(e) => {
-              setQuestion(e.target.value);
-              updateMentionState(e.target.value, e.target.selectionStart ?? e.target.value.length);
-            }}
-            onKeyDown={(e) => {
-              const dropdownOpen = mentionQuery !== null && mentionMatches.length > 0;
-              if (dropdownOpen && e.key === "ArrowDown") {
-                e.preventDefault();
-                setHighlightedIndex((i) => (i + 1) % mentionMatches.length);
-                return;
-              }
-              if (dropdownOpen && e.key === "ArrowUp") {
-                e.preventDefault();
-                setHighlightedIndex((i) => (i - 1 + mentionMatches.length) % mentionMatches.length);
-                return;
-              }
-              if (e.key === "Enter") {
-                if (dropdownOpen) {
-                  e.preventDefault();
-                  selectMention(mentionMatches[highlighted]);
-                } else if (mentionQuery === null) {
-                  e.preventDefault();
-                  submit();
-                }
-              }
-              if (e.key === "Escape" && mentionQuery !== null) {
-                e.preventDefault();
-                setMentionQuery(null);
-                setMentionMatchStart(null);
-              }
-            }}
-            placeholder="Ask a question, or type @ to reference a note — self-healed against the live code…"
-            className="h-7 flex-1 bg-transparent text-xs focus:outline-none"
-          />
-          <Button
-            type="button"
-            size="sm"
-            className="h-7 rounded-full px-3 text-[11px]"
-            disabled={!question.trim() || asking}
-            onClick={() => submit()}
-          >
-            {asking ? "asking…" : "ask"}
-          </Button>
-        </div>
-        {mentionQuery !== null && mentionMatches.length > 0 ? (
-          <div className="absolute left-0 right-16 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-card shadow-lg">
-            {mentionMatches.map((n, i) => (
-              <button
-                key={n.id}
-                type="button"
-                onClick={() => selectMention(n)}
-                onMouseEnter={() => setHighlightedIndex(i)}
-                className={cn(
-                  "block w-full truncate px-3 py-1.5 text-left text-xs",
-                  i === highlighted ? "bg-accent" : "hover:bg-accent/50",
-                )}
-              >
-                {n.title}
-              </button>
-            ))}
-          </div>
-        ) : null}
-      </div>
-      {!question && !asking && mentions.length === 0 ? (
-        <div className="mx-auto mt-1.5 flex w-full max-w-3xl flex-wrap gap-1.5">
-          {SUGGESTED_QUESTIONS.map((q) => (
-            <button
-              key={q}
-              type="button"
-              onClick={() => submit(q)}
-              className="rounded-full border border-border/70 px-2.5 py-1 text-[10px] text-muted-foreground transition-colors hover:border-accent-foreground/30 hover:bg-accent/40 hover:text-foreground"
-            >
-              {q}
-            </button>
-          ))}
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -1398,27 +1227,19 @@ function NoteCard({
 /** CENTER (Reader mode) — either the selected note's structured read, or the latest ask answer. */
 function CenterReaderPanel({
   view,
-  onSelectSource,
   onPromote,
   onDelete,
   onRevalidate,
   revalidating,
-  onSaveAnswer,
-  savingAnswer,
-  answerSaved,
   repoOptions,
   onChangeRepo,
   onChangePriority,
 }: {
   view: CenterView;
-  onSelectSource: (id: string) => void;
   onPromote?: () => void;
   onDelete?: () => void;
   onRevalidate?: () => void;
   revalidating: boolean;
-  onSaveAnswer: () => void;
-  savingAnswer: boolean;
-  answerSaved: boolean;
   repoOptions: string[];
   onChangeRepo: (noteId: string, repo: string) => void;
   onChangePriority: (noteId: string, priority: NotePriority) => void;
@@ -1428,75 +1249,7 @@ function CenterReaderPanel({
   if (!view) {
     return (
       <div className="flex flex-1 items-center justify-center text-xs text-muted-foreground">
-        Select a note from the left, or ask a question above.
-      </div>
-    );
-  }
-
-  if (view.kind === "answer") {
-    const { data } = view;
-    const hasSources = data.sources.length > 0;
-    return (
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border/70 px-4 py-2.5">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            answer
-          </h3>
-          {hasSources ? (
-            <Button type="button"
-              size="sm"
-              variant="ghost"
-              className="h-6 px-2 text-[10px]"
-              disabled={savingAnswer || answerSaved}
-              onClick={onSaveAnswer}
-            >
-              <BookMarked className="mr-1 h-3 w-3" />
-              {answerSaved ? "saved as note" : savingAnswer ? "saving…" : "save as note"}
-            </Button>
-          ) : null}
-        </div>
-        <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
-          <MarkdownView content={data.answer} />
-          {hasSources || data.healed.length > 0 ? (
-            <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-border/50 pt-3">
-              {data.sources.map((id) => (
-                <button key={id} type="button" onClick={() => onSelectSource(id)}>
-                  <Badge
-                    variant="outline"
-                    className="cursor-pointer text-[10px] hover:bg-accent/50"
-                  >
-                    {id}
-                  </Badge>
-                </button>
-              ))}
-              {data.healed.length > 0 ? (
-                <Badge variant="warning" className="text-[10px]">
-                  healed {data.healed.length} note{data.healed.length === 1 ? "" : "s"} vs current
-                  code
-                </Badge>
-              ) : null}
-            </div>
-          ) : null}
-          {data.code_sources.length > 0 ? (
-            <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              {data.code_sources.map((c, i) => (
-                <Badge
-                  key={`${c.repo}/${c.file_path}:${c.start_line}-${i}`}
-                  variant="outline"
-                  className="font-mono text-[10px] text-sky-300/90"
-                  title={`${c.repo}/${c.file_path}:${c.start_line}-${c.end_line}`}
-                >
-                  {c.file_path}:{c.start_line}-{c.end_line}
-                </Badge>
-              ))}
-            </div>
-          ) : null}
-          {data.code_unavailable.length > 0 ? (
-            <p className="mt-2 text-[10px] text-muted-foreground/70">
-              code-grounding unavailable for: {data.code_unavailable.join(", ")}
-            </p>
-          ) : null}
-        </div>
+        Select a note from the left, or ask in the chat sidebar.
       </div>
     );
   }
