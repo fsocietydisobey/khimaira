@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
@@ -126,6 +127,111 @@ def _now_iso() -> str:
     from datetime import datetime
 
     return datetime.now(UTC).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# status.json — centralized atomic read-modify-write
+#
+# Bug class this closes: every status.json writer used to do its own
+# `existing = json.loads(...) except (OSError, JSONDecodeError): existing = {}`
+# followed by a bare `path.write_text(...)`. write_text() truncates the file
+# THEN writes — a non-atomic two-step. A concurrent reader (including another
+# writer's read-modify-write, or a torn read from a completely different OS
+# process such as the PostToolUse hook) hitting the file mid-write sees an
+# empty/partial file, which the `except` fallback silently treats as "no
+# existing record" — dropping every field the file previously held (most
+# visibly `name`, which lives ONLY in status.json). SessionStart re-fires
+# (compact/clear/resume) trigger a burst of concurrent writers — daemon
+# slot/window/ppid writers plus the hook's heartbeat writer — which is the
+# multi-writer moment that reproduces the drop.
+#
+# The fix: route every status.json write through _atomic_merge_status, whose
+# write is tmp-file + os.replace() (same idiom already used by the JSONL
+# writers in this module, e.g. log_tool_call's ring-buffer compaction and the
+# inbox/handoff rewrites). os.replace() is an atomic rename on POSIX for a
+# same-directory destination, so a reader always observes either the fully
+# old or fully new file — never a torn one. Reader-side tolerance (torn read
+# -> {} / None) is left untouched; the fix is entirely on the write side.
+# ---------------------------------------------------------------------------
+
+
+def _read_status_tolerant(path: Path) -> dict[str, Any]:
+    """Read status.json, tolerating absence or a torn/corrupt read.
+
+    Returns {} rather than raising — this is the "existing" half of every
+    status.json read-modify-write. Kept identical to the try/except each
+    writer used to inline, so torn-read behavior is unchanged; only the
+    WRITE side of the race is fixed (see module note above).
+    """
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Persist `data` as JSON to `path` atomically (unique tmp + rename).
+
+    The general-purpose primitive underlying every JSON read-modify-write in
+    this module that's shared across concurrent writers — both the
+    per-session status.json (`_write_status_atomic`) and the cross-session
+    slot-registry.json (`_write_slot_registry`). Never truncate-then-write
+    the live file directly — that's the non-atomic pattern that lets a
+    concurrent reader observe a torn/empty file.
+
+    The staging filename MUST be unique per call (pid + thread id + a random
+    suffix), not a fixed name like "<file>.tmp". Multiple concurrent writers
+    (different processes/threads targeting the SAME file) sharing one tmp
+    filename race on THAT file: one writer's `open(mode="w")` truncates the
+    inode the other is still writing into, producing a corrupt/torn staging
+    file. `.replace()` is still an atomic RENAME, but it then atomically
+    promotes that corrupted content into the real file — the next reader's
+    `json.loads()` fails, falls through to the empty-dict fallback, and a
+    dropped-field bug reappears via a second mechanism (write-write
+    collision on the tmp file, instead of the original write-read collision
+    on the real file). Confirmed via the class-invariant test: a shared tmp
+    name still reliably dropped `name` from status.json under concurrent
+    writers even with `.replace()` in place; per-call unique tmp names
+    close it.
+    """
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
+    )
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _write_status_atomic(path: Path, record: dict[str, Any]) -> None:
+    """Persist `record` as status.json atomically. Thin status.json-flavored
+    alias over `_atomic_write_json` — kept as a separate name so callers and
+    the class-invariant test read clearly at the status.json call sites.
+    """
+    _atomic_write_json(path, record)
+
+
+def _atomic_merge_status(
+    session_id: str,
+    *,
+    defaults: dict[str, Any] | None = None,
+    **fields: Any,
+) -> dict[str, Any]:
+    """Read-modify-write session_id's status.json, atomically.
+
+    Merges `fields` over the existing record (fields always win), then
+    applies `defaults` via setdefault (only fills keys absent from both the
+    existing record and `fields`) — mirroring the `record.setdefault(...)`
+    calls each writer used to do inline before persisting. Returns the
+    merged record that was written.
+    """
+    path = _session_dir(session_id) / "status.json"
+    existing = _read_status_tolerant(path)
+    record = {**existing, **fields}
+    for key, value in (defaults or {}).items():
+        record.setdefault(key, value)
+    _write_status_atomic(path, record)
+    return record
 
 
 _AGENT_TAG_RE = re.compile(
@@ -237,15 +343,7 @@ def set_session_ppid(session_id: str, ppid: int) -> None:
     """
     _session_ppid[session_id] = ppid
     try:
-        path = _session_dir(session_id) / "status.json"
-        existing: dict = {}
-        if path.is_file():
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-        existing["ppid"] = ppid
-        path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        _atomic_merge_status(session_id, ppid=ppid)
         _invalidate_list_sessions_cache()
     except Exception:
         pass
@@ -287,15 +385,7 @@ def set_session_window(session_id: str, window_id: int) -> None:
     Fail-open: persistence errors are swallowed.
     """
     try:
-        path = _session_dir(session_id) / "status.json"
-        existing: dict = {}
-        if path.is_file():
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-        existing["window_id"] = int(window_id)
-        path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        _atomic_merge_status(session_id, window_id=int(window_id))
         _invalidate_list_sessions_cache()
     except Exception:
         pass
@@ -663,15 +753,7 @@ def write_sse_heartbeat(session_id: str) -> None:
 
     Cheap: one status.json read + write per tool call. Idempotent.
     """
-    path = _session_dir(session_id) / "status.json"
-    existing: dict = {}
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            existing = {}
-    existing["last_sse_heartbeat"] = _now_iso()
-    path.write_text(json.dumps(existing, indent=2))
+    _atomic_merge_status(session_id, last_sse_heartbeat=_now_iso())
     _invalidate_list_sessions_cache()
 
 
@@ -786,21 +868,7 @@ def set_status(session_id: str, status: str, detail: str = "") -> dict:
 
     Preserves any existing `name` field — use `set_name()` to change that.
     """
-    path = _session_dir(session_id) / "status.json"
-    # Preserve name (and other future metadata) on status updates
-    existing: dict[str, Any] = {}
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            existing = {}
-    record = {
-        **existing,
-        "status": status,
-        "detail": detail,
-        "updated_at": _now_iso(),
-    }
-    path.write_text(json.dumps(record, indent=2))
+    record = _atomic_merge_status(session_id, status=status, detail=detail, updated_at=_now_iso())
     _invalidate_list_sessions_cache()
     return record
 
@@ -860,9 +928,7 @@ def _find_active_session_with_name(name: str, exclude_session_id: str) -> dict |
             mtime = 0.0
         decisions_path = d / "decisions.jsonl"
         decisions = (
-            sum(1 for ln in decisions_path.open() if ln.strip())
-            if decisions_path.exists()
-            else 0
+            sum(1 for ln in decisions_path.open() if ln.strip()) if decisions_path.exists() else 0
         )
         has_heartbeat = 1 if s.get("last_sse_heartbeat") else 0
         candidates.append((has_heartbeat, decisions, mtime, d.name))
@@ -888,17 +954,12 @@ def set_name(session_id: str, name: str) -> dict:
     (>30 min idle) are silently recyclable, preserving the existing
     "two sessions can share a name" affordance for legitimate re-use.
     """
-    path = _session_dir(session_id) / "status.json"
-    existing: dict[str, Any] = {}
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            existing = {}
-    record = {**existing, "name": name, "updated_at": _now_iso()}
-    record.setdefault("status", "idle")
-    record.setdefault("detail", "")
-    path.write_text(json.dumps(record, indent=2))
+    record = _atomic_merge_status(
+        session_id,
+        defaults={"status": "idle", "detail": ""},
+        name=name,
+        updated_at=_now_iso(),
+    )
     _invalidate_list_sessions_cache()
     log.info("session %s: named %r", session_id, name)
 
@@ -946,17 +1007,12 @@ def set_workspace(session_id: str, workspace: str) -> dict:
             f"workspace {workspace!r} invalid — must match "
             f"^[a-z0-9][a-z0-9-]{{0,39}}$ (kebab-case, max 40 chars)."
         )
-    path = _session_dir(session_id) / "status.json"
-    existing: dict[str, Any] = {}
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            existing = {}
-    record = {**existing, "workspace": workspace, "updated_at": _now_iso()}
-    record.setdefault("status", "idle")
-    record.setdefault("detail", "")
-    path.write_text(json.dumps(record, indent=2))
+    record = _atomic_merge_status(
+        session_id,
+        defaults={"status": "idle", "detail": ""},
+        workspace=workspace,
+        updated_at=_now_iso(),
+    )
     _invalidate_list_sessions_cache()
     log.info("session %s: workspace=%r", session_id, workspace)
     return record
@@ -977,17 +1033,12 @@ def set_session_slot(session_id: str, slot: str) -> dict:
         raise ValueError(
             f"slot {slot!r} must be '<instance_id>:<name>' format (e.g. '<uuid>:agent-1')"
         )
-    path = _session_dir(session_id) / "status.json"
-    existing: dict[str, Any] = {}
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            existing = {}
-    record = {**existing, "roster_slot": slot, "updated_at": _now_iso()}
-    record.setdefault("status", "idle")
-    record.setdefault("detail", "")
-    path.write_text(json.dumps(record, indent=2))
+    record = _atomic_merge_status(
+        session_id,
+        defaults={"status": "idle", "detail": ""},
+        roster_slot=slot,
+        updated_at=_now_iso(),
+    )
     _invalidate_list_sessions_cache()
     # Update shared slot registry (bounded prior-sid history for slot_resolve)
     _update_slot_registry(slot, session_id)
@@ -1023,13 +1074,18 @@ def _read_slot_registry() -> "dict[str, dict]":
 
 
 def _write_slot_registry(registry: "dict[str, dict]") -> None:
-    path = _slot_registry_path()
-    path.write_text(json.dumps(registry, indent=2))
+    """Persist the shared slot registry atomically.
+
+    This file is written by EVERY session's set_session_slot() call — a
+    genuinely cross-session shared file, so it's exactly as exposed to the
+    torn-write class as status.json was. Routed through the same
+    _atomic_write_json primitive (unique tmp + os.replace) rather than the
+    bare write_text() this used to do.
+    """
+    _atomic_write_json(_slot_registry_path(), registry)
 
 
-def _get_registry_sids_by_status() -> (
-    "tuple[frozenset[str], frozenset[str], frozenset[str]]"
-):
+def _get_registry_sids_by_status() -> "tuple[frozenset[str], frozenset[str], frozenset[str]]":
     """Return (current_sids, prior_sids, revoked_sids) derived from the slot registry.
 
     Single source of truth for supersede-state — derived at read-time from the
@@ -1072,7 +1128,7 @@ def _update_slot_registry(slot: str, new_sid: str) -> None:
         old_prior = [s for s in entry.get("prior_sids", []) if s != new_sid]
         new_prior = ([old_current] + old_prior)[:_SLOT_REGISTRY_MAX_PRIOR]
         # Sids displaced from prior_sids (beyond the bound) move to revoked_sids.
-        displaced = old_prior[_SLOT_REGISTRY_MAX_PRIOR - 1:]
+        displaced = old_prior[_SLOT_REGISTRY_MAX_PRIOR - 1 :]
         revoked = list({*entry.get("revoked_sids", []), *displaced} - {new_sid})
         entry["prior_sids"] = new_prior
         entry["revoked_sids"] = revoked
@@ -1264,10 +1320,7 @@ def _find_by_name_in_candidates(
 
     # ≥2 matches — instance-awareness disambiguates when caller_instance is known.
     if caller_instance is not None:
-        inst_matches = [
-            m for m in matches
-            if get_session_slot(m) == f"{caller_instance}:{name}"
-        ]
+        inst_matches = [m for m in matches if get_session_slot(m) == f"{caller_instance}:{name}"]
         if len(inst_matches) == 1:
             return inst_matches[0]
         if len(inst_matches) > 1:
@@ -1374,8 +1427,7 @@ def _resolve_name_global_legacy(name: str, *, caller_instance: str | None = None
     # Instance-awareness: disambiguate ≥2 UUID matches when caller_instance is known.
     if len(uuid_matches) > 1 and caller_instance is not None:
         inst_matches = [
-            m for m in uuid_matches
-            if get_session_slot(m) == f"{caller_instance}:{name}"
+            m for m in uuid_matches if get_session_slot(m) == f"{caller_instance}:{name}"
         ]
         if len(inst_matches) == 1:
             return inst_matches[0]
@@ -1491,9 +1543,7 @@ def resolve_session_id(
             if member.get("state") in ("accepted", "pending")
         }
         try:
-            return _find_by_name_in_candidates(
-                query, chat_members, caller_instance=caller_instance
-            )
+            return _find_by_name_in_candidates(query, chat_members, caller_instance=caller_instance)
         except ValueError as exc:
             if "Ambiguous" in str(exc):
                 raise ValueError(f"In chat {chat_id!r}: {exc}") from exc
@@ -1505,9 +1555,7 @@ def resolve_session_id(
     roster, roster_had_error = _active_roster_for_resolution()
     if roster:
         try:
-            return _find_by_name_in_candidates(
-                query, roster, caller_instance=caller_instance
-            )
+            return _find_by_name_in_candidates(query, roster, caller_instance=caller_instance)
         except ValueError as exc:
             err_str = str(exc)
             if "Ambiguous" in err_str:
@@ -1559,8 +1607,7 @@ def post_answer(
     # Part F path-11 write-time: resolve target → current slot sid.
     _slot_reg2 = _read_slot_registry()
     _is_revoked2 = any(
-        target_session_id in entry.get("revoked_sids", [])
-        for entry in _slot_reg2.values()
+        target_session_id in entry.get("revoked_sids", []) for entry in _slot_reg2.values()
     )
     if _is_revoked2:
         log.info(
@@ -1611,9 +1658,7 @@ def post_answer(
         "surface_count": 0,
     }
     _append_jsonl(_session_dir(target_session_id) / "inbox.jsonl", note)
-    desktop_notify.notify_answer(
-        target_session_id, from_session_id, matched.get("text", "")
-    )
+    desktop_notify.notify_answer(target_session_id, from_session_id, matched.get("text", ""))
     log.info(
         "session %s: answer posted by %s for q=%s",
         target_session_id,
@@ -1628,9 +1673,7 @@ def post_answer(
 # ---------------------------------------------------------------------------
 
 
-_USABLE_STATUSES = frozenset(
-    {"listening", "working", "idle", "researching", "implementing"}
-)
+_USABLE_STATUSES = frozenset({"listening", "working", "idle", "researching", "implementing"})
 
 
 # Status strings that imply the session is ACTIVELY computing. If one of these
@@ -1740,9 +1783,7 @@ def _compute_effective_status(
     last_hb_ts: float | None = None
     if last_hb_iso:
         try:
-            last_hb_ts = datetime.fromisoformat(
-                last_hb_iso.replace("Z", "+00:00")
-            ).timestamp()
+            last_hb_ts = datetime.fromisoformat(last_hb_iso.replace("Z", "+00:00")).timestamp()
         except (ValueError, AttributeError):
             pass
 
@@ -1753,9 +1794,7 @@ def _compute_effective_status(
     if most_recent is None or (inactive_s is not None and inactive_s > demote_threshold_s):
         out["effective_status"] = "unreachable"
         out["demoted_at"] = _now_iso()
-        out["demoted_reason"] = (
-            f"no SSE heartbeat or tool activity in last {demote_threshold_s}s"
-        )
+        out["demoted_reason"] = f"no SSE heartbeat or tool activity in last {demote_threshold_s}s"
     elif (
         inactive_s is not None
         and inactive_s > busy_stale_s
@@ -1805,9 +1844,7 @@ def state(session_id: str, recent: int = 10, *, workspace: str | None = None) ->
             ).timestamp()
         except (ValueError, KeyError):
             pass
-    status = _compute_effective_status(
-        status_raw, last_tool_ts, mid_turn=is_mid_turn(session_id)
-    )
+    status = _compute_effective_status(status_raw, last_tool_ts, mid_turn=is_mid_turn(session_id))
 
     return {
         "session_id": session_id,
@@ -1817,9 +1854,7 @@ def state(session_id: str, recent: int = 10, *, workspace: str | None = None) ->
         "recent_files": files[-recent:],
         "file_touch_count": len(files),
         "open_questions": [q for q in questions if q.get("status") == "open"],
-        "answered_questions": [q for q in questions if q.get("status") == "answered"][
-            -recent:
-        ],
+        "answered_questions": [q for q in questions if q.get("status") == "answered"][-recent:],
     }
 
 
@@ -1840,9 +1875,7 @@ def summary(session_id: str) -> dict:
     decisions_path = sd / "decisions.jsonl"
     files_path = sd / "files_touched.jsonl"
     decision_count = (
-        sum(1 for ln in decisions_path.open() if ln.strip())
-        if decisions_path.exists()
-        else 0
+        sum(1 for ln in decisions_path.open() if ln.strip()) if decisions_path.exists() else 0
     )
     file_touch_count = (
         sum(1 for ln in files_path.open() if ln.strip()) if files_path.exists() else 0
@@ -1855,9 +1888,7 @@ def summary(session_id: str) -> dict:
     # (muther GAP symptom 1). last_mtime is the most-recent activity timestamp.
     # Preserve None when there's no status.json (don't synthesize a dict).
     status = (
-        _compute_effective_status(
-            status_raw, last_mtime or None, mid_turn=is_mid_turn(session_id)
-        )
+        _compute_effective_status(status_raw, last_mtime or None, mid_turn=is_mid_turn(session_id))
         if status_raw
         else None
     )
@@ -2022,9 +2053,7 @@ def _extract_text_from_message(msg: Any) -> str:
             tname = msg.get("name", "?")
             args = msg.get("input", {})
             if isinstance(args, dict):
-                arg_summary = ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items())[
-                    :300
-                ]
+                arg_summary = ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items())[:300]
             else:
                 arg_summary = str(args)[:300]
             return f"[tool_use {tname}({arg_summary})]"
@@ -2111,8 +2140,7 @@ def query_transcript(
                         else None
                     ),
                     "is_match": j == idx,
-                    "text_preview": t["_text"][:500]
-                    + ("…" if len(t["_text"]) > 500 else ""),
+                    "text_preview": t["_text"][:500] + ("…" if len(t["_text"]) > 500 else ""),
                 }
             )
         matches.append(
@@ -2668,9 +2696,7 @@ def _broadcast_to_handoff_subscribers(
         handoffs_snapshot = _read_jsonl(_HANDOFFS_PATH)
     except OSError:
         return
-    owned = [
-        h for h in handoffs_snapshot if h.get("owner_session_id") == owner_session_id
-    ]
+    owned = [h for h in handoffs_snapshot if h.get("owner_session_id") == owner_session_id]
     if not owned:
         return
 
@@ -2831,9 +2857,7 @@ def consume_handoffs(
                     f.write(json.dumps(h, separators=(",", ":")) + "\n")
             tmp.replace(_HANDOFFS_PATH)
         except OSError:
-            log.warning(
-                "failed to rewrite handoffs.jsonl; read state may double-surface"
-            )
+            log.warning("failed to rewrite handoffs.jsonl; read state may double-surface")
 
     return matched
 
@@ -2875,8 +2899,7 @@ def post_notice(
     # Distinguish "not in registry" (deliver) from "revoked beyond bound" (deny).
     _slot_reg = _read_slot_registry()
     _is_revoked = any(
-        target_session_id in entry.get("revoked_sids", [])
-        for entry in _slot_reg.values()
+        target_session_id in entry.get("revoked_sids", []) for entry in _slot_reg.values()
     )
     if _is_revoked:
         log.info(
@@ -2911,13 +2934,13 @@ def post_notice(
         effective = target_status.get("effective_status", "unknown")
         # A mid-turn seat is alive-busy → reachable, even if its raw work-status
         # (reviewing/debugging/orchestrating) isn't in _USABLE_STATUSES.
-        note["target_reachable"] = (
-            effective in _USABLE_STATUSES or bool(target_status.get("mid_turn"))
+        note["target_reachable"] = effective in _USABLE_STATUSES or bool(
+            target_status.get("mid_turn")
         )
         note["target_status"] = effective
-        note["target_last_active_iso"] = target_status.get(
-            "updated_at"
-        ) or target_status.get("last_sse_heartbeat")
+        note["target_last_active_iso"] = target_status.get("updated_at") or target_status.get(
+            "last_sse_heartbeat"
+        )
         if not note["target_reachable"]:
             note["reason_if_not_ok"] = target_status.get("demoted_reason") or (
                 f"target status: {effective}"
@@ -2987,9 +3010,7 @@ def surface_inbox_for_hook(
         # scope_cwd filter: leave note untouched if cwd doesn't match.
         note_scope = n.get("scope_cwd") or ""
         if note_scope and cwd_abs:
-            if cwd_abs != note_scope and not cwd_abs.startswith(
-                note_scope.rstrip("/") + "/"
-            ):
+            if cwd_abs != note_scope and not cwd_abs.startswith(note_scope.rstrip("/") + "/"):
                 remaining.append(n)
                 continue
 
@@ -3005,9 +3026,7 @@ def surface_inbox_for_hook(
             remaining.append(n)
 
         copy = dict(n)
-        copy["_remaining_surfaces"] = max(
-            0, _HOOK_AUTO_EXPIRE_AFTER - n["surface_count"]
-        )
+        copy["_remaining_surfaces"] = max(0, _HOOK_AUTO_EXPIRE_AFTER - n["surface_count"])
         surfaced.append(copy)
 
     if modified:
@@ -3154,9 +3173,7 @@ async def wait_for_answer(
             if status == "answered":
                 return q
             if status == "withdrawn":
-                raise ValueError(
-                    f"Question {question_id} was withdrawn before being answered."
-                )
+                raise ValueError(f"Question {question_id} was withdrawn before being answered.")
             break  # found the question but not yet answered; keep polling
         await asyncio.sleep(poll_interval)
 
@@ -3328,9 +3345,7 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
             questions = _read_jsonl(sd / "questions.jsonl")
             open_q = sum(1 for q in questions if q.get("status") == "open")
             status_path = sd / "status.json"
-            status_raw = (
-                json.loads(status_path.read_text()) if status_path.exists() else None
-            )
+            status_raw = json.loads(status_path.read_text()) if status_path.exists() else None
 
             # Compute effective_status for this row (lazy demote).
             recent_calls = recent_tool_calls(sd.name, limit=1)
@@ -3365,14 +3380,10 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
             out.append(
                 {
                     "session_id": sd.name,
-                    "name": (
-                        status_raw.get("name") if isinstance(status_raw, dict) else None
-                    ),
+                    "name": (status_raw.get("name") if isinstance(status_raw, dict) else None),
                     "workspace": ws_value,
                     "last_active": last_mtime,
-                    "last_active_age_s": (
-                        time.time() - last_mtime if last_mtime else None
-                    ),
+                    "last_active_age_s": (time.time() - last_mtime if last_mtime else None),
                     "status": status,
                     "decision_count": decisions,
                     "file_touch_count": files,
@@ -3389,9 +3400,7 @@ def list_sessions(use_cache: bool = True, workspace: str | None = None) -> list[
         return _filter_sessions_by_workspace(out, workspace)
 
 
-def _filter_sessions_by_workspace(
-    rows: list[dict], workspace: str | None
-) -> list[dict]:
+def _filter_sessions_by_workspace(rows: list[dict], workspace: str | None) -> list[dict]:
     """Apply workspace filter to a list_sessions result.
 
     None or "*" returns the full list (no filter). A concrete name
@@ -3417,9 +3426,7 @@ def _invalidate_list_sessions_cache() -> None:
 _ARCHIVE_DIR = _BASE_DIR.parent / "sessions_archive"
 
 
-def delete_session(
-    session_id: str, force: bool = False, reap: bool = False
-) -> dict:
+def delete_session(session_id: str, force: bool = False, reap: bool = False) -> dict:
     """Remove a session from the registry.
 
     Guards:
@@ -3570,9 +3577,7 @@ def delete_session(
         shutil.rmtree(session_dir, ignore_errors=True)
 
     _invalidate_list_sessions_cache()
-    log.info(
-        "session %s (%s) deleted (had_decisions=%s)", resolved, name, decision_count > 0
-    )
+    log.info("session %s (%s) deleted (had_decisions=%s)", resolved, name, decision_count > 0)
 
     return {
         "deleted": True,

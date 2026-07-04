@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -76,18 +77,43 @@ def _write_sse_heartbeat(session_id: str) -> None:
 
     Writes last_sse_heartbeat timestamp into status.json so daemon can detect
     subscribers whose subprocess is alive but SSE connection died.
+
+    This hook runs as its OWN OS process, concurrently with the daemon (which
+    also read-modify-writes this same status.json for name/status/window_id/
+    ppid/roster_slot). The write MUST be atomic (tmp + os.replace) — a plain
+    truncate-then-write here is exactly the non-atomic half of the
+    cross-process race that used to drop `name` (and other fields) from
+    status.json: a daemon writer reading this file mid-truncate sees an
+    empty file, treats it as "no existing record," and persists a record
+    missing everything but its own field. os.replace() is atomic on POSIX
+    for a same-directory rename, so any concurrent reader always sees either
+    the fully old or fully new file.
+
+    The staging filename is unique per call (pid + a random suffix), NOT a
+    fixed "status.json.tmp" — two concurrent writers sharing one tmp
+    filename race on THAT file (one's truncate-open clobbers the other's
+    in-progress write), producing corrupt tmp content that the atomic rename
+    then faithfully promotes into status.json; the next reader's json.loads
+    fails and falls back to {}, reproducing the exact same drop via a
+    different mechanism. Confirmed empirically while building the class-
+    invariant test in sessions.py's test suite.
+
+    Still wrapped fail-open — per the hard rule at the top of this file, ANY
+    failure here must not raise out of the hook.
     """
-    d = _session_dir(session_id)
-    status_path = d / "status.json"
-    existing: dict = {}
-    if status_path.exists():
-        try:
-            existing = json.loads(status_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            existing = {}
-    existing["last_sse_heartbeat"] = datetime.now(timezone.utc).isoformat()
     try:
-        status_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        d = _session_dir(session_id)
+        status_path = d / "status.json"
+        existing: dict = {}
+        if status_path.exists():
+            try:
+                existing = json.loads(status_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+        existing["last_sse_heartbeat"] = datetime.now(timezone.utc).isoformat()
+        tmp = status_path.with_name(f"{status_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        tmp.replace(status_path)
     except OSError:
         pass
 
