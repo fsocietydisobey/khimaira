@@ -48,6 +48,14 @@ export interface Note {
    *  only the count — full version bodies are on the note's `history` array,
    *  fetched via GET /notes/{id} if ever needed). */
   history_count: number;
+  /** v2 roster-loop write-back: the outcome written when a note is resolved
+   *  (`notebook_add_resolution`). Empty string until resolved — its presence
+   *  is what flips the note's lifecycle to "resolved" in the UI. */
+  resolution: string;
+  /** Session name/id that attached the resolution; "" if unattributed. */
+  resolved_by: string;
+  /** When the resolution was attached; null until resolved. */
+  resolved_at: string | null;
 }
 
 export interface NotebookTab {

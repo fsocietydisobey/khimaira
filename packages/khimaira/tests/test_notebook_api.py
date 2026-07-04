@@ -117,6 +117,54 @@ def test_patch_note_invalid_status_returns_422(notebook_client):
     assert r.status_code == 422
 
 
+def test_patch_raw_text_reprocesses_pipeline(notebook_client, monkeypatch):
+    """A raw_text edit invalidates the derived summary/technical/plain tabs, so
+    PATCH must re-trigger the structuring pipeline (they'd go silently stale
+    otherwise). Regression for the notebook_update-doesn't-reprocess footgun."""
+    from khimaira.monitor.api import notebook as notebook_api
+
+    calls: list[str] = []
+    monkeypatch.setattr(notebook_api, "trigger_pipeline", lambda nid: calls.append(nid))
+    created = notebook_client.post("/api/notes", json={"raw_text": "original"}).json()
+    calls.clear()  # ignore the create-time trigger; we're testing the PATCH path
+
+    r = notebook_client.patch(f"/api/notes/{created['id']}", json={"raw_text": "edited body"})
+    assert r.status_code == 200
+    assert calls == [created["id"]]
+
+
+def test_patch_metadata_only_does_not_reprocess(notebook_client, monkeypatch):
+    """Title/tab/repo/status edits don't touch the structured content, so they
+    must NOT fire an (expensive) reprocess."""
+    from khimaira.monitor.api import notebook as notebook_api
+
+    calls: list[str] = []
+    monkeypatch.setattr(notebook_api, "trigger_pipeline", lambda nid: calls.append(nid))
+    created = notebook_client.post("/api/notes", json={"raw_text": "original"}).json()
+    calls.clear()
+
+    r = notebook_client.patch(f"/api/notes/{created['id']}", json={"title": "renamed"})
+    assert r.status_code == 200
+    assert calls == []
+
+
+def test_patch_raw_text_on_personal_note_does_not_reprocess(notebook_client, monkeypatch):
+    """Personal-tab notes are read raw (never structured), mirroring create —
+    a raw_text edit on one must not schedule a pipeline run."""
+    from khimaira.monitor.api import notebook as notebook_api
+
+    calls: list[str] = []
+    monkeypatch.setattr(notebook_api, "trigger_pipeline", lambda nid: calls.append(nid))
+    created = notebook_client.post(
+        "/api/notes", json={"raw_text": "x", "tab_id": "personal"}
+    ).json()
+    calls.clear()
+
+    r = notebook_client.patch(f"/api/notes/{created['id']}", json={"raw_text": "edited"})
+    assert r.status_code == 200
+    assert calls == []
+
+
 def test_delete_note_happy_path(notebook_client):
     created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
     r = notebook_client.delete(f"/api/notes/{created['id']}")

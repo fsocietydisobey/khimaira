@@ -25,6 +25,7 @@ import { useParams } from "react-router-dom";
 import {
   BookMarked,
   BookOpen,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   LayoutGrid,
@@ -1191,6 +1192,14 @@ function NoteCard({
           <Badge variant={badge.variant} className="text-[10px]">
             {badge.label}
           </Badge>
+          {note.resolution ? (
+            <Badge
+              variant="outline"
+              className="border-emerald-500/40 text-[10px] text-emerald-400"
+            >
+              ✅ resolved
+            </Badge>
+          ) : null}
           <RepoSelector repo={note.repo} options={repoOptions} onChange={onChangeRepo} />
         </div>
       </CardHeader>
@@ -1459,6 +1468,14 @@ function NoteStructuredReader({
           <Badge variant={badge.variant} className="text-[10px]">
             {badge.label}
           </Badge>
+          {note.resolution ? (
+            <Badge
+              variant="outline"
+              className="border-emerald-500/40 text-[10px] text-emerald-400"
+            >
+              ✅ resolved
+            </Badge>
+          ) : null}
           <RepoSelector
             repo={note.repo}
             options={repoOptions}
@@ -1509,6 +1526,19 @@ function NoteStructuredReader({
             structuring completes.
           </p>
         )}
+        {note.resolution ? (
+          <div className="mt-4 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3">
+            <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-emerald-400">
+              <CheckCircle2 className="h-3.5 w-3.5" />
+              Resolution
+            </div>
+            <MarkdownView content={note.resolution} />
+            <p className="mt-2 text-[10px] text-muted-foreground/70">
+              resolved by {note.resolved_by || "(unattributed)"}
+              {note.resolved_at ? ` · ${new Date(note.resolved_at).toLocaleString()}` : ""}
+            </p>
+          </div>
+        ) : null}
       </div>
 
       <div className="flex shrink-0 items-center justify-end gap-1 border-t border-border/50 px-3 py-1.5">

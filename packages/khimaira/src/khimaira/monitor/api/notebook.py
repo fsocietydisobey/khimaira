@@ -139,11 +139,22 @@ def build_router():
     async def update_note(note_id: str, req: UpdateNoteReq) -> dict:
         fields = req.model_dump(exclude_unset=True)
         try:
-            return notes.update_note(note_id, **fields)
+            record = notes.update_note(note_id, **fields)
         except ValueError as e:
             msg = str(e)
             status = 404 if "No note with id" in msg else 422
             raise fastapi.HTTPException(status, msg)
+        # A raw_text edit invalidates the DERIVED artifacts — the structuring
+        # pipeline (summary/technical/plain tabs) and the search embedding are
+        # both computed from raw_text, so an edit that doesn't reprocess leaves
+        # the tabs silently stale vs the source. Regenerate both, exactly like
+        # a fresh capture (create_note). Title/tab/repo/status-only edits don't
+        # touch the structured content, so they skip reprocessing. Personal-tab
+        # notes are read raw (no pipeline, no embed), mirroring create_note.
+        if "raw_text" in fields and record["tab_id"] != notes.PERSONAL_TAB_ID:
+            trigger_pipeline(record["id"])
+            notebook_retrieval.schedule_upsert(record)
+        return record
 
     @router.delete("/notes/{note_id}")
     async def delete_note(note_id: str) -> dict:
