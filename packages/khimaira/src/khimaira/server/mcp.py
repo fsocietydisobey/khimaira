@@ -2818,7 +2818,7 @@ async def kg_scopes(project: str = "") -> str:
 
 @mcp.tool()
 @logged_tool("notebook_list")
-async def notebook_list(project: str = "", tab: str = "") -> str:
+async def notebook_list(project: str = "", tab: str = "", kind: str = "") -> str:
     """List notebook notes — read this for context before starting work.
 
     Each note carries a lifecycle badge: 📝 captured (just pasted) → 👀
@@ -2829,8 +2829,10 @@ async def notebook_list(project: str = "", tab: str = "") -> str:
         project: optional repo/project filter (e.g. "khimaira", "jeevy_portal").
             Omit to see notes across all repos.
         tab: optional tab id filter. Omit to see all tabs.
+        kind: "" (default) for both, "note" for regular notes only, or
+            "study_guide" for grimoire study guides only.
     """
-    return await _notebook_tools.notebook_list(project, tab)
+    return await _notebook_tools.notebook_list(project, tab, kind)
 
 
 @mcp.tool()
@@ -2921,6 +2923,18 @@ async def notebook_update(
     """Edit a note's title/tab/raw_text/status/repo. Only pass the fields you
     want to change — omitted args (empty string) are left untouched.
 
+    `raw_text` means something DIFFERENT depending on the target's kind — check
+    with `notebook_get`/`notebook_list(kind=...)` first if unsure:
+    - **study_guide**: raw_text you write IS the rendered deliverable — it's
+      shown verbatim to the reader. Only the abstract + TOC regenerate around
+      it; author finished, human-voiced prose, not a rough draft.
+    - **note**: raw_text is raw material — the structuring pipeline restructures
+      it into summary/technical/plain. Rough, unpolished text is fine here.
+
+    Both kinds stay fully editable either way (no guard) — every raw_text
+    change snapshots the prior version into history first, so an edit is
+    always recoverable.
+
     For writing a resolution, use `notebook_add_resolution` instead — it's a
     dedicated endpoint that also fires the mnemosyne training write-back.
 
@@ -2928,7 +2942,8 @@ async def notebook_update(
         note_id: the note id to edit.
         title: new title, if changing.
         tab_id: new tab id, if moving it to a different tab.
-        raw_text: new raw text, if editing the original paste.
+        raw_text: new raw text, if editing the original paste — see the
+            kind-dependent semantics above.
         status: new pipeline status (draft/processed/promoted/failed).
         repo: new repo tag, if re-scoping which codebase it's validated against.
     """
@@ -2951,6 +2966,13 @@ async def notebook_create(
     with `notebook_add_resolution` — promoted to oracle training data. `create`
     captures the problem; `add_resolution` closes it. Returns immediately with
     a draft; the structuring pipeline runs async (same as a UI paste).
+
+    `raw_text` here is RAW MATERIAL — the pipeline restructures it into
+    summary/technical/plain, so rough, unpolished text is fine (that's the
+    whole point of a note). If you've instead finished a long-form, human-
+    voiced deliverable that should be housed and shown VERBATIM, use
+    `notebook_create_study_guide` instead — a study guide's raw_text is never
+    LLM-rewritten.
 
     Args:
         project: repo the note is validated against ("khimaira",
