@@ -20,6 +20,8 @@ Endpoints:
   POST   /notes/{id}/research-revise — grimoire Phase 3 REVISE: proposes a patch
                                    (whole guide or one section); never applies —
                                    apply via PATCH /notes/{id} after human review
+  POST   /notes/{id}/export     — grimoire Phase 4: write a guide's raw_text back
+                                   to its source_path (or a given path)
   GET    /tabs                  — list tabs (note_ids derived from live notes)
   POST   /tabs                  — create a tab
   PATCH  /tabs/{id}             — rename a tab
@@ -37,6 +39,8 @@ heal from inside notebook_pipeline itself.
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from pydantic import BaseModel
 
@@ -99,6 +103,10 @@ class ResearchReviseReq(BaseModel):
     directive: str
     section_anchor: str | None = None
     max_budget_usd: float = notebook_pipeline._AGENTIC_DEFAULT_BUDGET_USD
+
+
+class ExportNoteReq(BaseModel):
+    path: str | None = None
 
 
 class CreateTabReq(BaseModel):
@@ -305,6 +313,18 @@ def build_router():
                 section_anchor=req.section_anchor,
                 max_budget_usd=req.max_budget_usd,
             )
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+
+    @router.post("/notes/{note_id}/export")
+    async def export_note(note_id: str, req: ExportNoteReq) -> dict:
+        """Grimoire Phase 4: write a study guide's raw_text back to disk —
+        the reversibility valve for "notebook is canonical" (keeps the
+        devs' @-ref-a-file habit alive). Guide-only; 404 on an unknown
+        note_id, a non-guide note, or a guide with no source_path and no
+        explicit `path` given."""
+        try:
+            return await asyncio.to_thread(notebook_import.export_note, note_id, req.path)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 

@@ -194,3 +194,70 @@ def test_import_dir_reports_unreadable_file(importer, notes_store, tmp_path, mon
 def test_import_dir_empty_directory_returns_empty_manifest(importer, notes_store, tmp_path):
     result = importer.import_dir(tmp_path, dry_run=True)
     assert result == {"manifest": [], "imported": []}
+
+
+# ---------------------------------------------------------------------------
+# export_note (Grimoire Phase 4) — the reversibility valve back to source_path.
+# ---------------------------------------------------------------------------
+
+
+def test_export_note_writes_to_source_path(importer, notes_store, tmp_path):
+    src = tmp_path / "guide.md"
+    src.write_text("# Original\n\noriginal body\n")
+    guide = notes_store.add_study_guide("# Original\n\noriginal body\n", source_path=str(src))
+    notes_store.update_note(guide["id"], raw_text="# Original\n\nrevised body\n")
+
+    result = importer.export_note(guide["id"])
+
+    assert result["path"] == str(src)
+    assert src.read_text() == "# Original\n\nrevised body\n"
+    assert result["bytes_written"] == len(b"# Original\n\nrevised body\n")
+
+
+def test_export_note_explicit_path_overrides_source_path(importer, notes_store, tmp_path):
+    original_src = tmp_path / "original.md"
+    guide = notes_store.add_study_guide("body", source_path=str(original_src))
+    target = tmp_path / "elsewhere" / "exported.md"
+
+    result = importer.export_note(guide["id"], path=str(target))
+
+    assert result["path"] == str(target)
+    assert target.read_text() == "body"
+    assert not original_src.exists()  # explicit path wins, source_path untouched
+
+
+def test_export_note_creates_missing_parent_directories(importer, notes_store, tmp_path):
+    guide = notes_store.add_study_guide("body")
+    target = tmp_path / "new" / "nested" / "dir" / "guide.md"
+
+    importer.export_note(guide["id"], path=str(target))
+
+    assert target.read_text() == "body"
+
+
+def test_export_note_rejects_non_guide_notes(importer, notes_store):
+    note = notes_store.add_note("just a note")
+    with pytest.raises(ValueError, match="not a study guide"):
+        importer.export_note(note["id"])
+
+
+def test_export_note_requires_source_path_or_explicit_path(importer, notes_store):
+    guide = notes_store.add_study_guide("body")  # no source_path — authored directly
+    with pytest.raises(ValueError, match="no source_path"):
+        importer.export_note(guide["id"])
+
+
+def test_export_note_unknown_note_id_raises(importer):
+    with pytest.raises(ValueError, match="No note with id"):
+        importer.export_note("no-such-note")
+
+
+def test_export_note_is_idempotent(importer, notes_store, tmp_path):
+    src = tmp_path / "guide.md"
+    guide = notes_store.add_study_guide("stable content", source_path=str(src))
+
+    first = importer.export_note(guide["id"])
+    second = importer.export_note(guide["id"])
+
+    assert first == second
+    assert src.read_text() == "stable content"

@@ -375,7 +375,19 @@ def update_note(note_id: str, **fields: Any) -> dict[str, Any]:
     Changing `repo` to a different value re-anchors future validation: the
     old validated_git_sha means nothing against a different repo's git
     history, so it's cleared along with last_validated_at, forcing a full
-    re-check (not a heal-vs-stale-sha comparison) on the next revalidate."""
+    re-check (not a heal-vs-stale-sha comparison) on the next revalidate.
+
+    Grimoire Phase 4 (2026-07-04): any ACTUAL raw_text change (guide or
+    note) snapshots the OUTGOING raw_text into `history` before it's
+    overwritten — a REVISE Apply (or any manual edit) is otherwise a lossy,
+    unrecoverable overwrite of the deliverable. Shape is `{raw_text,
+    replaced_at}` — deliberately a DIFFERENT key shape than
+    apply_validation's pipeline-heal entries (`{pipeline, replaced_at,
+    validated_git_sha}`), so the two kinds coexist in the same list without
+    a schema migration; discriminated by which key is present, not an
+    explicit "kind" tag. See backfill_drop_spurious_heals below for the
+    corresponding read-side fix (it used to assume every history entry has
+    a "pipeline" key)."""
     record = get_note(note_id)
     pipeline_patch = fields.pop("pipeline", None)
     unknown = set(fields) - _NOTE_MUTABLE_FIELDS
@@ -391,6 +403,10 @@ def update_note(note_id: str, **fields: Any) -> dict[str, Any]:
     if "repo" in fields and fields["repo"] != record.get("repo"):
         record["validated_git_sha"] = None
         record["last_validated_at"] = None
+    if "raw_text" in fields and fields["raw_text"] != record.get("raw_text"):
+        record.setdefault("history", []).append(
+            {"raw_text": record["raw_text"], "replaced_at": _now_iso()}
+        )
     record.update(fields)
     if pipeline_patch is not None:
         merged = dict(record.get("pipeline") or {})
@@ -576,7 +592,16 @@ def backfill_drop_spurious_heals(note_id: str) -> dict[str, Any]:
     """Drops any history entry whose archived pipeline differs from the
     NEXT version in the chain (or the current pipeline, for the last
     entry) ONLY in organized_md. Idempotent — a no-op on already-clean
-    history."""
+    history.
+
+    Grimoire Phase 4: `history` can now also carry raw_text-revision
+    entries (see update_note) that have NO "pipeline" key at all — these
+    are never a spurious-heal candidate (a different kind of entry
+    entirely), so they're always kept. When comparing a pipeline-heal entry
+    against "the next version in the chain," any interleaved raw_text
+    entries are skipped over (they carry no pipeline to compare against) —
+    the comparison target is the next entry that DOES carry a pipeline, or
+    the record's current pipeline if none follows."""
     record = get_note(note_id)
     history = record.get("history") or []
     if not history:
@@ -584,9 +609,14 @@ def backfill_drop_spurious_heals(note_id: str) -> dict[str, Any]:
 
     kept = []
     for i, entry in enumerate(history):
-        next_pipeline = (
-            history[i + 1]["pipeline"] if i + 1 < len(history) else record.get("pipeline") or {}
-        )
+        if "pipeline" not in entry:
+            kept.append(entry)  # e.g. a raw_text-revision entry — not a heal candidate
+            continue
+        next_pipeline = record.get("pipeline") or {}
+        for later in history[i + 1 :]:
+            if "pipeline" in later:
+                next_pipeline = later["pipeline"]
+                break
         if _same_substance_different_organized_md(entry.get("pipeline") or {}, next_pipeline):
             continue  # spurious wording-only "heal" — drop
         kept.append(entry)

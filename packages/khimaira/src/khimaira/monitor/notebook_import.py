@@ -168,3 +168,42 @@ def import_dir(root: str | Path, *, repo: str = "", dry_run: bool = True) -> dic
         dry_run,
     )
     return {"manifest": manifest, "imported": imported}
+
+
+def export_note(note_id: str, path: str | None = None) -> dict[str, Any]:
+    """Grimoire Phase 4: write a study guide's raw_text back to disk — the
+    reversibility valve for "the notebook is canonical" (keeps devs' @-ref-
+    a-file habit alive rather than trapping guide content inside the
+    notebook store). Writes to `path` if given, else the guide's own
+    source_path (set at import time — see import_dir).
+
+    Guide-only: regular notes were never files, so "export" has no meaning
+    for them. Idempotent — writing the same raw_text twice just overwrites
+    with the same bytes; no dedup logic needed since this is a plain file
+    write, not an import.
+
+    Raises ValueError if note_id doesn't exist, isn't a study guide, or
+    (when `path` is omitted) has no source_path to export to.
+    """
+    record = notes.get_note(note_id)
+    if record.get("kind") != "study_guide":
+        raise ValueError(
+            f"Note {note_id!r} is not a study guide (kind={record.get('kind')!r}) — "
+            "export is guide-only."
+        )
+    target = path or record.get("source_path")
+    if not target:
+        raise ValueError(
+            f"Guide {note_id!r} has no source_path and no explicit path was given — "
+            "nothing to export to."
+        )
+    target_path = Path(target).expanduser()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_text = record.get("raw_text", "")
+    target_path.write_text(raw_text, encoding="utf-8")
+    log.info("notebook_import: exported %s -> %s", note_id, target_path)
+    return {
+        "note_id": note_id,
+        "path": str(target_path),
+        "bytes_written": len(raw_text.encode("utf-8")),
+    }

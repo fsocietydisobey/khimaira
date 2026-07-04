@@ -135,6 +135,35 @@ def test_backfill_is_idempotent_on_clean_history(notes_store):
     assert first["history"] == []
 
 
+def test_backfill_handles_raw_text_revision_entries_without_crashing(notes_store):
+    """Grimoire Phase 4 regression: backfill_drop_spurious_heals assumed
+    EVERY history entry has a "pipeline" key (history[i+1]["pipeline"]) —
+    a raw_text-revision entry (update_note's new snapshot) has no such key
+    and must not raise KeyError, must never be treated as a spurious heal,
+    and must not corrupt an adjacent pipeline-heal entry's own evaluation."""
+    note = notes_store.add_note("v1")
+    notes_store.set_pipeline(note["id"], _BASE_PIPELINE)
+    notes_store.apply_validation(note["id"], git_sha="sha1", new_pipeline=None)
+    # A spurious wording-only heal (organized_md only) — should be dropped...
+    notes_store.apply_validation(
+        note["id"],
+        git_sha="sha2",
+        new_pipeline={**_BASE_PIPELINE, "organized_md": "# reworded, same substance"},
+    )
+    # ...followed by a raw_text edit, which appends a DIFFERENT-shaped entry.
+    notes_store.update_note(note["id"], raw_text="v2")
+    before = notes_store.get_note(note["id"])
+    assert len(before["history"]) == 2
+    assert "pipeline" in before["history"][0]
+    assert "raw_text" in before["history"][1]
+
+    cleaned = notes_store.backfill_drop_spurious_heals(note["id"])  # must not raise
+
+    assert len(cleaned["history"]) == 1
+    assert cleaned["history"][0]["raw_text"] == "v1"  # the raw_text entry always kept
+    assert cleaned["raw_text"] == "v2"
+
+
 def test_backfill_all_reports_only_changed_notes(notes_store):
     spurious = notes_store.add_note("raw")
     notes_store.set_pipeline(spurious["id"], _BASE_PIPELINE)
@@ -269,6 +298,68 @@ def test_update_note_round_trip(notes_store):
     refetched = notes_store.get_note(note["id"])
     assert refetched["title"] == "new title"
     assert refetched["tab_id"] == "t2"
+
+
+def test_update_note_raw_text_change_snapshots_prior_version(notes_store):
+    """Grimoire Phase 4: a raw_text-changing edit is otherwise a lossy
+    overwrite of the deliverable — the OUTGOING text must land in history
+    BEFORE it's replaced."""
+    note = notes_store.add_note("original text")
+    updated = notes_store.update_note(note["id"], raw_text="revised text")
+
+    assert updated["raw_text"] == "revised text"
+    assert len(updated["history"]) == 1
+    assert updated["history"][0]["raw_text"] == "original text"
+    assert "replaced_at" in updated["history"][0]
+    # Distinguished from a pipeline-heal entry by key shape, not a "kind" tag.
+    assert "pipeline" not in updated["history"][0]
+
+
+def test_update_note_raw_text_same_value_does_not_snapshot(notes_store):
+    """Resubmitting the SAME raw_text (e.g. a no-op save) must not bloat
+    history with an identical snapshot."""
+    note = notes_store.add_note("same text")
+    updated = notes_store.update_note(note["id"], raw_text="same text")
+    assert updated["history"] == []
+
+
+def test_update_note_raw_text_snapshots_accumulate_across_edits(notes_store):
+    note = notes_store.add_note("v1")
+    notes_store.update_note(note["id"], raw_text="v2")
+    updated = notes_store.update_note(note["id"], raw_text="v3")
+
+    assert updated["raw_text"] == "v3"
+    assert [h["raw_text"] for h in updated["history"]] == ["v1", "v2"]
+
+
+def test_update_note_raw_text_snapshot_applies_to_study_guides_too(notes_store):
+    """The safety net applies to the KIND of note a REVISE Apply targets —
+    a guide's raw_text is exactly what's at risk of a lossy overwrite."""
+    guide = notes_store.add_study_guide("# Guide\n\noriginal body")
+    updated = notes_store.update_note(guide["id"], raw_text="# Guide\n\nrevised body")
+
+    assert updated["raw_text"] == "# Guide\n\nrevised body"
+    assert len(updated["history"]) == 1
+    assert updated["history"][0]["raw_text"] == "# Guide\n\noriginal body"
+
+
+def test_update_note_raw_text_snapshot_and_pipeline_heal_history_coexist(notes_store):
+    """A note with BOTH kinds of history entry (a pipeline heal from
+    apply_validation, then a raw_text edit) must not confuse the two — each
+    keeps its own shape in the same list."""
+    note = notes_store.add_note("v1")
+    notes_store.set_pipeline(note["id"], {"summary": "old summary"})
+    notes_store.apply_validation(note["id"], git_sha="sha1", new_pipeline=None)
+    notes_store.apply_validation(
+        note["id"], git_sha="sha2", new_pipeline={"summary": "new summary"}
+    )
+    updated = notes_store.update_note(note["id"], raw_text="v2")
+
+    assert len(updated["history"]) == 2
+    assert updated["history"][0]["pipeline"] == {"summary": "old summary"}
+    assert "raw_text" not in updated["history"][0]
+    assert updated["history"][1]["raw_text"] == "v1"
+    assert "pipeline" not in updated["history"][1]
 
 
 def test_update_note_rejects_unknown_field(notes_store):

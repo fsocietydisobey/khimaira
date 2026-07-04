@@ -479,6 +479,43 @@ def test_research_revise_route_passes_section_anchor(notebook_client, monkeypatc
     assert seen["section_anchor"] == "a"
 
 
+def test_export_note_route_happy_path(notebook_client, tmp_path):
+    src = tmp_path / "guide.md"
+    src.write_text("original")
+    note = notebook_client.post(
+        "/api/notes",
+        json={"raw_text": "original", "kind": "study_guide", "source_path": str(src)},
+    ).json()
+
+    r = notebook_client.post(f"/api/notes/{note['id']}/export", json={})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["path"] == str(src)
+    assert src.read_text() == "original"
+
+
+def test_export_note_route_explicit_path(notebook_client, tmp_path):
+    note = notebook_client.post(
+        "/api/notes", json={"raw_text": "body", "kind": "study_guide"}
+    ).json()
+    target = tmp_path / "exported.md"
+
+    r = notebook_client.post(f"/api/notes/{note['id']}/export", json={"path": str(target)})
+    assert r.status_code == 200
+    assert target.read_text() == "body"
+
+
+def test_export_note_route_non_guide_returns_404(notebook_client):
+    note = notebook_client.post("/api/notes", json={"raw_text": "just a note"}).json()
+    r = notebook_client.post(f"/api/notes/{note['id']}/export", json={})
+    assert r.status_code == 404
+
+
+def test_export_note_route_unknown_id_returns_404(notebook_client):
+    r = notebook_client.post("/api/notes/no-such-id/export", json={})
+    assert r.status_code == 404
+
+
 def test_research_revise_route_unknown_section_anchor_returns_404(notebook_client, monkeypatch):
     from khimaira.monitor.api import notebook as notebook_api
 
