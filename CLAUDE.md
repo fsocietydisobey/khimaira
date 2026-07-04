@@ -208,6 +208,36 @@ running apps don't pick up the change automatically. They need:
 all attached projects (`khimaira attached` lists them) and remind the
 user the apps need restart for the new code to take effect.
 
+### Deployment matrix — which edit needs which redeploy to go live
+
+Three long-lived runtimes serve khimaira, each loading a different slice
+of the tree at start. Editing the source does **not** take effect until
+that runtime redeploys — and a live test against the edited behavior
+**silently passes/fails against the OLD code** until then. Match the edit
+to its redeploy action:
+
+| Edited code | Runtime | To go live |
+|---|---|---|
+| `khimaira/monitor/**` (daemon: API routes, notebook pipeline, roster, sessions) | the `khimaira-monitor` daemon (systemd, long-lived) | `systemctl --user restart khimaira-monitor` (⚠️ flushes the heartbeat buffer — see below) |
+| `khimaira/server/**`, `khimaira-chat/**` (the MCP stdio servers) | one subprocess **per Claude Code session** | reconnect the MCP (`/mcp` → reconnect) or relaunch the session — no daemon restart |
+| `apps/monitor-ui/**` (frontend) | served from `dist/` (gitignored, auto-built) | `npm run build` in `apps/monitor-ui` (daemon serves the new files live — no restart) |
+
+**The guard against silent staleness:** the daemon exposes
+`GET /api/version` reporting the code-fingerprint it loaded **at boot**
+vs the current source tree. **Before trusting any live-daemon
+verification, check it:**
+
+```bash
+curl -s localhost:8740/api/version | python3 -c 'import sys,json; print("STALE — restart first" if json.load(sys.stdin)["stale"] else "fresh")'
+```
+
+`stale: true` means daemon code was committed or edited since boot without
+a restart — the running process is serving old code. This is the
+mechanical form of "verify the live runtime path": don't infer deployment
+from `git log` or a passing test; ask the daemon what it's actually
+running. (Implemented in `monitor/deploy_fingerprint.py`, mirroring
+mnemosyne's `/health` fingerprint, commit `68bcac6`.)
+
 ### Daemon restart wipes the in-memory heartbeat buffer
 
 `khimaira-monitor` keeps heartbeats in-memory (`_runs: dict[(project,

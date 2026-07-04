@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import UTC
 
 from khimaira.config import ROOTS
 
@@ -92,22 +93,48 @@ def build_app():
         title="Khimaira Monitor", docs_url="/api/docs", openapi_url="/api/openapi.json"
     )
 
+    # Deployment fingerprint, captured ONCE at boot — this is the code the
+    # daemon actually loaded into memory. /api/version compares it to the live
+    # source tree so a verifier can detect the "edited daemon code but didn't
+    # restart" staleness class instead of trusting a false live-test signal.
+    # See deploy_fingerprint's module docstring.
+    from datetime import datetime
+
+    from . import deploy_fingerprint as _deploy_fp
+
+    _boot_fingerprint = _deploy_fp.code_fingerprint()
+    _boot_time = datetime.now(UTC).isoformat()
+
+    @app.get("/api/version")
+    async def version() -> dict:
+        """Daemon code-deployment status. `stale: true` means daemon code was
+        committed or edited since boot without a restart — the running process
+        is serving OLD code, so restart khimaira-monitor before trusting any
+        live-daemon verification."""
+        current = _deploy_fp.code_fingerprint()
+        return {
+            "boot": _boot_fingerprint,
+            "boot_time": _boot_time,
+            "current": current,
+            "stale": _deploy_fp.is_stale(_boot_fingerprint, current),
+        }
+
     # Mount API routers (lazy imports so optional deps don't bite at import time)
     from .api import anomalies as anomalies_api
     from .api import api_routes as api_routes_api
     from .api import chats as chats_api
-    from .api import themis as themis_api
-    from .api import oracle as oracle_api
     from .api import frontend_components as fc_api
     from .api import graph as graph_api
     from .api import heartbeats as heartbeats_api
     from .api import mcp_calls as mcp_calls_api
     from .api import notebook as notebook_api
+    from .api import oracle as oracle_api
     from .api import processes as processes_api
     from .api import projects as projects_api
     from .api import scheduled_tasks as scheduled_tasks_api
     from .api import schema_drift as drift_api
     from .api import sessions as sessions_api
+    from .api import themis as themis_api
     from .api import threads as threads_api
     from .api import topology as topology_api
     from .api import usage as usage_api
