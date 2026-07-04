@@ -37,18 +37,20 @@ function headingText(node: ReactNode): string {
   return "";
 }
 
-/** GitHub-style heading slug (lowercase, strip punctuation, spaces→hyphens,
- *  de-dupe with a -N suffix) — the common convention for a "deterministic
- *  heading parse". Grimoire (Phase 1f): must match whatever anchor scheme
- *  `notebook_pipeline._parse_toc` (backend) produces for a guide's TOC —
- *  if the backend's contract differs, this is the one place to adjust. */
+/** GitHub-style heading slug (lowercase, strip punctuation, spaces AND
+ *  underscores→hyphens, de-dupe with a -N suffix). Byte-verified 2026-07-04
+ *  against `notebook_pipeline._parse_toc`'s real output on two imported
+ *  guides (21/22 headings matched on the first pass; the underscore→hyphen
+ *  rule closed the one miss — `hydrate_neighborhood` → `hydrate-neighborhood`,
+ *  not `hydrate_neighborhood`). If the backend's contract ever changes,
+ *  this is the one place to adjust. */
 function slugifyHeading(text: string, seen: Map<string, number>): string {
   const base =
     text
       .toLowerCase()
       .trim()
       .replace(/[^\w\- ]+/g, "")
-      .replace(/\s+/g, "-") || "section";
+      .replace(/[\s_]+/g, "-") || "section";
   const count = seen.get(base) ?? 0;
   seen.set(base, count + 1);
   return count === 0 ? base : `${base}-${count}`;
