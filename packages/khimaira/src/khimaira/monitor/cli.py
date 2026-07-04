@@ -56,9 +56,7 @@ def _port() -> int:
 def _cmd_start(args: argparse.Namespace) -> int:
     existing = _read_pid()
     if existing and _alive(existing):
-        print(
-            f"khimaira monitor already running (PID {existing}) — http://127.0.0.1:{_port()}"
-        )
+        print(f"khimaira monitor already running (PID {existing}) — http://127.0.0.1:{_port()}")
         if not args.no_browser:
             webbrowser.open(f"http://127.0.0.1:{_port()}")
         return 0
@@ -175,9 +173,7 @@ def _maybe_nudge_about_supervisor() -> None:
         print("tip: `khimaira monitor watch` in a tmux/screen pane for auto-restart")
         return
 
-    print(
-        "tip: `khimaira monitor install-service --enable` to auto-restart on crash + boot"
-    )
+    print("tip: `khimaira monitor install-service --enable` to auto-restart on crash + boot")
 
 
 def _systemd_unit_active() -> bool:
@@ -394,9 +390,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
             return 0
 
         if rc == 0:
-            print(
-                f"khimaira monitor watch: daemon exited cleanly (rc=0); not restarting"
-            )
+            print(f"khimaira monitor watch: daemon exited cleanly (rc=0); not restarting")
             return 0
 
         # Reset backoff if the daemon ran healthy for a while
@@ -545,9 +539,7 @@ def _cmd_install_launchd(args: argparse.Namespace) -> int:
     if plist_path.exists() and not args.force:
         existing = plist_path.read_text(encoding="utf-8")
         if existing == content:
-            print(
-                f"khimaira monitor: plist already installed and current — {plist_path}"
-            )
+            print(f"khimaira monitor: plist already installed and current — {plist_path}")
         else:
             print(
                 f"khimaira monitor: plist exists at {plist_path} but contents differ. "
@@ -640,9 +632,7 @@ def _systemd_unit_content() -> str:
             f"--foreground --no-browser"
         )
     else:
-        exec_start = (
-            f"{sys.executable} -m khimaira.cli monitor start --foreground --no-browser"
-        )
+        exec_start = f"{sys.executable} -m khimaira.cli monitor start --foreground --no-browser"
 
     return f"""[Unit]
 Description=khimaira-monitor — local LangGraph observability daemon
@@ -660,6 +650,19 @@ RestartSec=5
 # `systemctl --user stop` still stops it (systemd distinguishes a requested
 # stop from a process exit), so this doesn't trap the daemon "on".
 # Environment=KHIMAIRA_MONITOR_PORT=8740
+
+# KillMode=mixed (default is control-group): the notebook's headless `claude
+# -p` structuring/organize/revalidate/research subprocesses inherit into this
+# unit's cgroup. Under the default KillMode, ANY `systemctl --user restart|
+# stop khimaira-monitor` (i.e. every redeploy) SIGTERMs the WHOLE cgroup —
+# killing an in-flight claude -p child mid-call, independent of asyncio/
+# uvicorn/the HTTP layer entirely (root-caused 2026-07-04: the notebook
+# research toolbar's "exited 143" failures during active development/
+# redeploy cycles). `mixed` sends SIGTERM to only the main tracked PID first
+# (stopping it from accepting new work), then SIGKILLs the remaining cgroup
+# after TimeoutStopSec — so a redeploy no longer decapitates work already in
+# flight, while still guaranteeing full cleanup.
+KillMode=mixed
 
 # Resource limits (optional; uncomment if you see OOM-related failures)
 # MemoryMax=2G
@@ -828,12 +831,8 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_start = sub.add_parser("start", help="Daemonize the monitor server")
-    p_start.add_argument(
-        "--foreground", action="store_true", help="Run in foreground (no fork)"
-    )
-    p_start.add_argument(
-        "--no-browser", action="store_true", help="Don't open the browser"
-    )
+    p_start.add_argument("--foreground", action="store_true", help="Run in foreground (no fork)")
+    p_start.add_argument("--no-browser", action="store_true", help="Don't open the browser")
     p_start.set_defaults(func=_cmd_start)
 
     p_stop = sub.add_parser("stop", help="Stop the monitor daemon")
@@ -843,12 +842,8 @@ def main() -> None:
     # development when monitor backend changes need a fresh daemon
     # to take effect (e.g. after a `git pull`).
     p_restart = sub.add_parser("restart", help="Stop then start the monitor daemon")
-    p_restart.add_argument(
-        "--foreground", action="store_true", help="Run in foreground (no fork)"
-    )
-    p_restart.add_argument(
-        "--no-browser", action="store_true", help="Don't open the browser"
-    )
+    p_restart.add_argument("--foreground", action="store_true", help="Run in foreground (no fork)")
+    p_restart.add_argument("--no-browser", action="store_true", help="Don't open the browser")
     p_restart.set_defaults(func=_cmd_restart)
 
     p_status = sub.add_parser("status", help="Report daemon status")
@@ -858,9 +853,7 @@ def main() -> None:
         "rescan",
         help="Force a metadata rescan for one project (or all). Manual override.",
     )
-    p_rescan.add_argument(
-        "project", nargs="?", help="Project name to rescan; omit for all"
-    )
+    p_rescan.add_argument("project", nargs="?", help="Project name to rescan; omit for all")
     p_rescan.set_defaults(func=_cmd_rescan)
 
     p_backfill = sub.add_parser(

@@ -8,8 +8,9 @@ Endpoints:
                                    directory (dry_run=True by default — manifest only)
   GET    /notes/search?q=       — Phase 2b: semantic search over embedded notes
   POST   /notes/ask             — Phase 2c capstone: ask -> retrieve -> heal -> answer
-  POST   /notes/research        — grimoire Phase 3 ANSWER: research-grounded Q&A on a
-                                   guide (code + web), read-only
+  POST   /notes/research        — grimoire Phase 3 ANSWER: schedules a research-grounded
+                                   Q&A job (code + web), read-only; returns {job_id}
+  GET    /notes/research/{job_id} — poll an ANSWER or REVISE job's status/result
   GET    /notes/{id}            — one note
   PATCH  /notes/{id}            — edit title/tab/raw_text/status/links/repo/pipeline-patch
   DELETE /notes/{id}            — delete a note
@@ -17,9 +18,11 @@ Endpoints:
   POST   /notes/{id}/resolution — v2: attach a resolution (roster-loop write-back);
                                    schedules a fire-and-forget mnemosyne distill
   POST   /notes/{id}/revalidate — Phase 2a north-star: re-ground vs current code
-  POST   /notes/{id}/research-revise — grimoire Phase 3 REVISE: proposes a patch
-                                   (whole guide or one section); never applies —
-                                   apply via PATCH /notes/{id} after human review
+  POST   /notes/{id}/research-revise — grimoire Phase 3 REVISE: schedules a job
+                                   proposing a patch (whole guide or one section);
+                                   returns {job_id} — never applies; poll GET
+                                   /notes/research/{job_id}, apply via PATCH
+                                   /notes/{id} after human review
   POST   /notes/{id}/export     — grimoire Phase 4: write a guide's raw_text back
                                    to its source_path (or a given path)
   GET    /tabs                  — list tabs (note_ids derived from live notes)
@@ -32,6 +35,14 @@ note flips to processed/failed once notebook_pipeline.trigger_pipeline
 completes. `revalidate_note` is awaited directly (not backgrounded) — it's a
 manual on-demand user action ("re-check vs code" button), not a write path
 that needs to return instantly.
+
+Grimoire Phase 4 addendum (2026-07-04): the research routes are async
+job+poll, NOT awaited-in-request, unlike revalidate_note — a 1-2 minute
+agentic call held the HTTP connection open long enough that any client
+disconnect (or an in-flight `systemctl restart` under the daemon's default
+KillMode) would kill the call outright. POST schedules a background task
+and returns a job_id immediately; the frontend polls GET /notes/research/
+{job_id} until status is "done"/"error".
 
 Note-content embedding (notebook_retrieval) is fire-and-forget on create/
 delete (never blocks the response) and re-runs on structuring completion /
@@ -217,12 +228,26 @@ def build_router():
     async def research(req: ResearchReq) -> dict:
         """Grimoire Phase 3 ANSWER path: research-grounds a question against
         a guide + the live codebase + the web, read-only (never edits the
-        guide). Registered BEFORE /notes/{note_id} so "research" doesn't get
+        guide). ASYNC (Phase 4 addendum): schedules a background job and
+        returns {job_id} immediately — poll GET /notes/research/{job_id}.
+        Registered BEFORE /notes/{note_id} so "research" doesn't get
         swallowed as a note_id path param."""
         try:
-            return await notebook_pipeline.research_answer(
+            job_id = notebook_pipeline.schedule_research_answer(
                 req.note_id, req.question, max_budget_usd=req.max_budget_usd
             )
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+        return {"job_id": job_id, "status": "pending"}
+
+    @router.get("/notes/research/{job_id}")
+    async def get_research_job(job_id: str) -> dict:
+        """Poll an ANSWER or REVISE job scheduled by POST /notes/research or
+        POST /notes/{id}/research-revise. Registered BEFORE /notes/{note_id}
+        (and after /notes/research, matching the literal-path-before-
+        path-param convention) so "research" isn't swallowed as a note_id."""
+        try:
+            return notebook_pipeline.get_research_job(job_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 
@@ -303,11 +328,14 @@ def build_router():
     async def research_revise(note_id: str, req: ResearchReviseReq) -> dict:
         """Grimoire Phase 3 REVISE path: proposes a patch to a guide (whole
         or one section, via `section_anchor`), grounded against the
-        codebase + web. NEVER applies — returns a proposal (including
-        `proposed_raw_text`, ready to diff) for a human to review; applying
-        is the EXISTING PATCH /notes/{note_id} (raw_text=proposed_raw_text)."""
+        codebase + web. NEVER applies — the eventual proposal (including
+        `proposed_raw_text`, ready to diff) is for a human to review;
+        applying is the EXISTING PATCH /notes/{note_id}
+        (raw_text=proposed_raw_text). ASYNC (Phase 4 addendum): schedules a
+        background job and returns {job_id} immediately — poll GET
+        /notes/research/{job_id}."""
         try:
-            return await notebook_pipeline.research_revise(
+            job_id = notebook_pipeline.schedule_research_revise(
                 note_id,
                 req.directive,
                 section_anchor=req.section_anchor,
@@ -315,6 +343,7 @@ def build_router():
             )
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
+        return {"job_id": job_id, "status": "pending"}
 
     @router.post("/notes/{note_id}/export")
     async def export_note(note_id: str, req: ExportNoteReq) -> dict:

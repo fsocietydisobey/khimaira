@@ -24,13 +24,25 @@ def test_unit_content_restart_always():
     assert "Restart=on-failure" not in content
 
 
+def test_unit_content_kill_mode_mixed():
+    """Grimoire (2026-07-04): the default KillMode=control-group SIGTERMs
+    the WHOLE cgroup on any systemctl restart/stop — including in-flight
+    `claude -p` structuring/research children the notebook spawns, killing
+    them mid-call independent of the HTTP layer entirely. KillMode=mixed
+    signals only the tracked main PID first, so a redeploy stops accepting
+    new work without decapitating work already in flight."""
+    content = cli._systemd_unit_content()
+    assert "KillMode=mixed" in content
+
+
 def test_stop_delegates_to_systemd_when_unit_active(monkeypatch):
     """Under Restart=always, SIGTERM-ing the PID just respawns it — stop must
     go through systemctl when the unit is active."""
     monkeypatch.setattr(cli, "_systemd_unit_active", lambda: True)
     calls = []
     monkeypatch.setattr(
-        subprocess, "run",
+        subprocess,
+        "run",
         lambda cmd, *a, **k: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0),
     )
     rc = cli._cmd_stop(argparse.Namespace())
@@ -42,7 +54,8 @@ def test_restart_delegates_to_systemd_when_unit_active(monkeypatch):
     monkeypatch.setattr(cli, "_systemd_unit_active", lambda: True)
     calls = []
     monkeypatch.setattr(
-        subprocess, "run",
+        subprocess,
+        "run",
         lambda cmd, *a, **k: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0),
     )
     rc = cli._cmd_restart(argparse.Namespace())
@@ -56,7 +69,8 @@ def test_stop_uses_pidfile_path_when_unit_inactive(monkeypatch):
     monkeypatch.setattr(cli, "_read_pid", lambda: None)  # nothing running
     sysctl_calls = []
     monkeypatch.setattr(
-        subprocess, "run",
+        subprocess,
+        "run",
         lambda cmd, *a, **k: sysctl_calls.append(cmd) or subprocess.CompletedProcess(cmd, 0),
     )
     rc = cli._cmd_stop(argparse.Namespace())

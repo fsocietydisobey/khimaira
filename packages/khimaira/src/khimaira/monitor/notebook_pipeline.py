@@ -19,6 +19,8 @@ import json
 import os
 import re
 import shutil
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -265,28 +267,49 @@ def splice_section(raw_text: str, anchor: str, new_section_text: str) -> str:
 
 
 def _isolated_config_dir() -> Path:
-    """Dedicated CLAUDE_CONFIG_DIR: credentials only, empty settings (no
-    hooks), no CLAUDE.md. This is what keeps each transform cheap (kills the
-    ~50k context load) and non-polluting (no SessionStart hook == no khimaira
-    session registered for the headless run).
+    """Dedicated, PER-CALL-UNIQUE CLAUDE_CONFIG_DIR: credentials only, empty
+    settings (no hooks), no CLAUDE.md. This is what keeps each transform
+    cheap (kills the ~50k context load) and non-polluting (no SessionStart
+    hook == no khimaira session registered for the headless run).
 
-    Credentials are re-copied every call — cheap, and the real ~/.claude
-    credentials rotate via OAuth refresh independently of this dir, so a
-    one-time copy would eventually go stale and silently break auth.
+    Grimoire Phase 4 addendum (2026-07-04): this used to return a SINGLE
+    SHARED path across every invocation — audited as the mechanism behind
+    an intermittent "no stdin data received in 3s" structuring failure
+    during the bulk import: Claude Code writes shared, backup-rotated state
+    (`.claude.json` + timestamped `backups/`) into its config dir on
+    startup, and concurrent `claude -p` processes racing on that SAME
+    shared file (now that the structuring semaphore allows 3 genuinely
+    concurrent calls) could stall past the CLI's own ~3s stdin-read
+    deadline. Each call now gets its OWN throwaway directory — no shared
+    mutable state between concurrent invocations, by construction. Callers
+    are responsible for removing the returned directory when done (see
+    `_cleanup_config_dir`) — a bulk import shouldn't accumulate hundreds of
+    stale directories.
+
+    Credentials are copied fresh into the new directory every call — cheap,
+    and the real ~/.claude credentials rotate via OAuth refresh
+    independently of this dir, so a one-time copy would eventually go stale
+    and silently break auth.
     """
     xdg = Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
-    cfg_dir = xdg / "khimaira" / "notebook" / "claude-config"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
+    base = xdg / "khimaira" / "notebook" / "claude-config"
+    base.mkdir(parents=True, exist_ok=True)
+    cfg_dir = Path(tempfile.mkdtemp(prefix=f"call-{uuid.uuid4().hex[:8]}-", dir=str(base)))
 
-    settings_path = cfg_dir / "settings.json"
-    if not settings_path.exists():
-        settings_path.write_text("{}", encoding="utf-8")
+    (cfg_dir / "settings.json").write_text("{}", encoding="utf-8")
 
     src_creds = Path(os.path.expanduser("~/.claude/.credentials.json"))
     if src_creds.is_file():
         shutil.copy2(src_creds, cfg_dir / ".credentials.json")
 
     return cfg_dir
+
+
+def _cleanup_config_dir(cfg_dir: Path) -> None:
+    """Remove a per-call config dir after use. Fail-open — a cleanup
+    failure (e.g. a lingering file handle) must never surface as the
+    call's own failure; it just leaves one throwaway directory behind."""
+    shutil.rmtree(cfg_dir, ignore_errors=True)
 
 
 def _strip_fence(text: str) -> str:
@@ -381,28 +404,31 @@ async def _invoke_claude(content: str, instruction: str) -> str:
     """
     instruction = _prepend_personal_context(instruction)
     cfg_dir = _isolated_config_dir()
-    env = dict(os.environ)
-    env["CLAUDE_CONFIG_DIR"] = str(cfg_dir)
+    try:
+        env = dict(os.environ)
+        env["CLAUDE_CONFIG_DIR"] = str(cfg_dir)
 
-    async with _STRUCTURE_SEMAPHORE:
-        proc = await asyncio.create_subprocess_exec(
-            _resolve_claude_cmd(),
-            "-p",
-            "--append-system-prompt",
-            instruction,
-            "--output-format",
-            "json",
-            "--strict-mcp-config",
-            "--mcp-config",
-            '{"mcpServers":{}}',
-            "--model",
-            _MODEL,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout, stderr = await proc.communicate(content.encode("utf-8"))
+        async with _STRUCTURE_SEMAPHORE:
+            proc = await asyncio.create_subprocess_exec(
+                _resolve_claude_cmd(),
+                "-p",
+                "--append-system-prompt",
+                instruction,
+                "--output-format",
+                "json",
+                "--strict-mcp-config",
+                "--mcp-config",
+                '{"mcpServers":{}}',
+                "--model",
+                _MODEL,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await proc.communicate(content.encode("utf-8"))
+    finally:
+        _cleanup_config_dir(cfg_dir)
     if proc.returncode != 0:
         raise RuntimeError(
             f"claude -p exited {proc.returncode}: {stderr.decode('utf-8', 'ignore')[:500]}"
@@ -475,38 +501,41 @@ async def _invoke_claude_agentic(
     """
     instruction = _prepend_personal_context(instruction)
     cfg_dir = _isolated_config_dir()
-    env = dict(os.environ)
-    env["CLAUDE_CONFIG_DIR"] = str(cfg_dir)
+    try:
+        env = dict(os.environ)
+        env["CLAUDE_CONFIG_DIR"] = str(cfg_dir)
 
-    cmd = [
-        _resolve_claude_cmd(),
-        "-p",
-        "--append-system-prompt",
-        instruction,
-        "--allowedTools",
-        _AGENTIC_ALLOWED_TOOLS,
-        "--max-budget-usd",
-        str(max_budget_usd),
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
-        "--model",
-        _AGENTIC_MODEL,
-    ]
-    if repo_root is not None:
-        cmd.extend(["--add-dir", str(repo_root)])
+        cmd = [
+            _resolve_claude_cmd(),
+            "-p",
+            "--append-system-prompt",
+            instruction,
+            "--allowedTools",
+            _AGENTIC_ALLOWED_TOOLS,
+            "--max-budget-usd",
+            str(max_budget_usd),
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--model",
+            _AGENTIC_MODEL,
+        ]
+        if repo_root is not None:
+            cmd.extend(["--add-dir", str(repo_root)])
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
-    stdout, stderr = await proc.communicate(content.encode("utf-8"))
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await proc.communicate(content.encode("utf-8"))
+    finally:
+        _cleanup_config_dir(cfg_dir)
     if proc.returncode != 0:
         raise RuntimeError(
             f"claude -p (agentic) exited {proc.returncode}: {stderr.decode('utf-8', 'ignore')[:500]}"
@@ -1432,3 +1461,126 @@ async def research_revise(
     result["proposed_raw_text"] = proposed_raw_text
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Grimoire Phase 4 addendum (2026-07-04): research jobs run as BACKGROUND
+# TASKS, polled via job_id, rather than held open on the HTTP request.
+#
+# Root cause this fixes: a synchronous 1-2 minute agentic call held the HTTP
+# connection open that long — any genuine client-side disconnect (network
+# blip, tab close) would cancel the request, and (separately, audited live)
+# a `systemctl restart khimaira-monitor` during ANY in-flight call SIGTERMs
+# the whole cgroup (including the claude -p child) under the daemon's
+# default KillMode — neither is fixable from inside a single synchronous
+# request/response cycle. A background job survives a dropped HTTP
+# connection outright (the poll is a NEW, independent request); it does NOT
+# survive the daemon process itself being killed (see monitor/cli.py's
+# KillMode=mixed fix for that half), but a poll for a job_id from before a
+# restart cleanly reports "unknown" rather than a mid-air 143 + a broken
+# response.
+# ---------------------------------------------------------------------------
+
+_RESEARCH_JOBS: dict[str, dict[str, Any]] = {}
+_RESEARCH_JOB_TASKS: set[asyncio.Task] = set()
+
+
+def _new_job_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+async def _run_research_answer_job(
+    job_id: str, note_id: str, question: str, max_budget_usd: float
+) -> None:
+    try:
+        result = await research_answer(note_id, question, max_budget_usd=max_budget_usd)
+        _RESEARCH_JOBS[job_id] = {"status": "done", "kind": "answer", **result}
+    except ValueError as exc:
+        _RESEARCH_JOBS[job_id] = {"status": "error", "kind": "answer", "error": str(exc)}
+    except Exception as exc:
+        log.exception("notebook_pipeline: research_answer job %s crashed", job_id)
+        _RESEARCH_JOBS[job_id] = {"status": "error", "kind": "answer", "error": str(exc)}
+
+
+def schedule_research_answer(
+    note_id: str, question: str, *, max_budget_usd: float = _AGENTIC_DEFAULT_BUDGET_USD
+) -> str:
+    """Fire research_answer as a background job — returns a job_id
+    immediately; poll get_research_job(job_id) for the result.
+
+    Validates note_id exists BEFORE scheduling (fails fast with the same
+    ValueError->404 the synchronous route always had, rather than handing
+    back a job_id that's guaranteed to immediately error).
+    """
+    notes.get_note(note_id)  # fail fast on an unknown note_id
+    job_id = _new_job_id()
+    _RESEARCH_JOBS[job_id] = {"status": "pending", "kind": "answer"}
+    task = asyncio.create_task(_run_research_answer_job(job_id, note_id, question, max_budget_usd))
+    _RESEARCH_JOB_TASKS.add(task)
+    task.add_done_callback(_RESEARCH_JOB_TASKS.discard)
+    return job_id
+
+
+async def _run_research_revise_job(
+    job_id: str,
+    note_id: str,
+    directive: str,
+    section_anchor: str | None,
+    max_budget_usd: float,
+) -> None:
+    try:
+        result = await research_revise(
+            note_id, directive, section_anchor=section_anchor, max_budget_usd=max_budget_usd
+        )
+        _RESEARCH_JOBS[job_id] = {"status": "done", "kind": "revise", **result}
+    except ValueError as exc:
+        _RESEARCH_JOBS[job_id] = {"status": "error", "kind": "revise", "error": str(exc)}
+    except Exception as exc:
+        log.exception("notebook_pipeline: research_revise job %s crashed", job_id)
+        _RESEARCH_JOBS[job_id] = {"status": "error", "kind": "revise", "error": str(exc)}
+
+
+def schedule_research_revise(
+    note_id: str,
+    directive: str,
+    *,
+    section_anchor: str | None = None,
+    max_budget_usd: float = _AGENTIC_DEFAULT_BUDGET_USD,
+) -> str:
+    """Fire research_revise as a background job — returns a job_id
+    immediately; poll get_research_job(job_id) for the proposal.
+
+    Validates note_id AND section_anchor (when given) BEFORE scheduling —
+    same fail-fast contract as schedule_research_answer."""
+    record = notes.get_note(note_id)  # fail fast on an unknown note_id
+    if section_anchor is not None and not any(
+        h["anchor"] == section_anchor for h in _scan_headings(record.get("raw_text", ""))
+    ):
+        raise ValueError(
+            f"No section anchored at {section_anchor!r} in this guide's current raw_text."
+        )
+    job_id = _new_job_id()
+    _RESEARCH_JOBS[job_id] = {"status": "pending", "kind": "revise"}
+    task = asyncio.create_task(
+        _run_research_revise_job(job_id, note_id, directive, section_anchor, max_budget_usd)
+    )
+    _RESEARCH_JOB_TASKS.add(task)
+    task.add_done_callback(_RESEARCH_JOB_TASKS.discard)
+    return job_id
+
+
+def get_research_job(job_id: str) -> dict[str, Any]:
+    """Poll a research job's status. Returns {"status": "pending"} while in
+    flight, or {"status": "done"|"error", "kind": "answer"|"revise", ...}
+    once finished (the ResearchOutput+grounding fields for "done", an
+    "error" string for "error"). Raises ValueError for an unknown job_id —
+    either it never existed, or the daemon restarted since it was scheduled
+    (the job store is in-memory only, same convention as this module's
+    other fire-and-forget task tracking)."""
+    job = _RESEARCH_JOBS.get(job_id)
+    if job is None:
+        raise ValueError(
+            f"No research job with id={job_id!r} — it may have completed and been "
+            "cleared, or the daemon restarted since it was scheduled."
+        )
+    return job

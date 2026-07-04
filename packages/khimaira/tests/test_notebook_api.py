@@ -381,73 +381,64 @@ def test_revalidate_note_unknown_id_returns_404(notebook_client):
 # ---------------------------------------------------------------------------
 
 
-def test_research_route_happy_path(notebook_client, monkeypatch):
+def test_research_route_schedules_job_and_returns_job_id(notebook_client, monkeypatch):
+    """Grimoire Phase 4 addendum: /notes/research is ASYNC — it schedules a
+    background job and returns {job_id} immediately rather than awaiting
+    the (1-2 minute) agentic call inline. See notebook_pipeline's module
+    comment for why (systemd KillMode + client-disconnect resilience)."""
     from khimaira.monitor.api import notebook as notebook_api
 
     note = notebook_client.post(
         "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
     ).json()
+    seen = {}
 
-    async def fake_research_answer(note_id, question, *, max_budget_usd):
-        assert note_id == note["id"]
-        assert question == "what is this?"
-        return {
-            "answer": "the answer",
-            "code_citations": [],
-            "web_citations": [],
-            "proposed_patch": None,
-            "web_grounded": True,
-            "web_grounding_unverified": False,
-            "total_cost_usd": 0.4,
-        }
+    def fake_schedule(note_id, question, *, max_budget_usd):
+        seen["note_id"] = note_id
+        seen["question"] = question
+        return "job-abc123"
 
-    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_answer", fake_research_answer)
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "schedule_research_answer", fake_schedule)
     r = notebook_client.post(
         "/api/notes/research", json={"note_id": note["id"], "question": "what is this?"}
     )
     assert r.status_code == 200
-    assert r.json()["answer"] == "the answer"
+    assert r.json() == {"job_id": "job-abc123", "status": "pending"}
+    assert seen == {"note_id": note["id"], "question": "what is this?"}
 
 
 def test_research_route_unknown_note_returns_404(notebook_client, monkeypatch):
     from khimaira.monitor.api import notebook as notebook_api
 
-    async def fake_research_answer(note_id, question, *, max_budget_usd):
+    def fake_schedule(note_id, question, *, max_budget_usd):
         raise ValueError(f"No note with id={note_id!r}. Use list_notes() to see available notes.")
 
-    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_answer", fake_research_answer)
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "schedule_research_answer", fake_schedule)
     r = notebook_client.post("/api/notes/research", json={"note_id": "nope", "question": "q"})
     assert r.status_code == 404
 
 
-def test_research_revise_route_happy_path(notebook_client, monkeypatch):
+def test_research_revise_route_schedules_job_and_returns_job_id(notebook_client, monkeypatch):
     from khimaira.monitor.api import notebook as notebook_api
 
     note = notebook_client.post(
         "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
     ).json()
+    seen = {}
 
-    async def fake_research_revise(note_id, directive, *, section_anchor, max_budget_usd):
-        assert note_id == note["id"]
-        assert directive == "improve it"
-        assert section_anchor is None
-        return {
-            "answer": "changed it",
-            "code_citations": [],
-            "web_citations": [],
-            "proposed_patch": "new text",
-            "proposed_raw_text": "# G\n\nnew text",
-            "web_grounded": False,
-            "web_grounding_unverified": False,
-            "total_cost_usd": 0.3,
-        }
+    def fake_schedule(note_id, directive, *, section_anchor, max_budget_usd):
+        seen["note_id"] = note_id
+        seen["directive"] = directive
+        seen["section_anchor"] = section_anchor
+        return "job-xyz789"
 
-    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_revise", fake_research_revise)
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "schedule_research_revise", fake_schedule)
     r = notebook_client.post(
         f"/api/notes/{note['id']}/research-revise", json={"directive": "improve it"}
     )
     assert r.status_code == 200
-    assert r.json()["proposed_raw_text"] == "# G\n\nnew text"
+    assert r.json() == {"job_id": "job-xyz789", "status": "pending"}
+    assert seen == {"note_id": note["id"], "directive": "improve it", "section_anchor": None}
 
 
 def test_research_revise_route_passes_section_anchor(notebook_client, monkeypatch):
@@ -458,25 +449,70 @@ def test_research_revise_route_passes_section_anchor(notebook_client, monkeypatc
     ).json()
     seen = {}
 
-    async def fake_research_revise(note_id, directive, *, section_anchor, max_budget_usd):
+    def fake_schedule(note_id, directive, *, section_anchor, max_budget_usd):
         seen["section_anchor"] = section_anchor
-        return {
-            "answer": "x",
-            "code_citations": [],
-            "web_citations": [],
-            "proposed_patch": None,
-            "proposed_raw_text": None,
-            "web_grounded": False,
-            "web_grounding_unverified": False,
-            "total_cost_usd": 0.1,
-        }
+        return "job-1"
 
-    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_revise", fake_research_revise)
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "schedule_research_revise", fake_schedule)
     notebook_client.post(
         f"/api/notes/{note['id']}/research-revise",
         json={"directive": "improve A", "section_anchor": "a"},
     )
     assert seen["section_anchor"] == "a"
+
+
+def test_get_research_job_pending(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    monkeypatch.setattr(
+        notebook_api.notebook_pipeline, "get_research_job", lambda job_id: {"status": "pending"}
+    )
+    r = notebook_client.get("/api/notes/research/job-1")
+    assert r.status_code == 200
+    assert r.json() == {"status": "pending"}
+
+
+def test_get_research_job_done(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    done = {
+        "status": "done",
+        "kind": "answer",
+        "answer": "the answer",
+        "code_citations": [],
+        "web_citations": [],
+        "proposed_patch": None,
+        "web_grounded": True,
+        "web_grounding_unverified": False,
+        "total_cost_usd": 0.4,
+    }
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "get_research_job", lambda job_id: done)
+    r = notebook_client.get("/api/notes/research/job-1")
+    assert r.status_code == 200
+    assert r.json() == done
+
+
+def test_get_research_job_error(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    errored = {"status": "error", "kind": "revise", "error": "boom"}
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "get_research_job", lambda job_id: errored)
+    r = notebook_client.get("/api/notes/research/job-1")
+    assert r.status_code == 200
+    assert r.json() == errored
+
+
+def test_get_research_job_unknown_id_returns_404(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    def fake_get(job_id):
+        raise ValueError(
+            f"No research job with id={job_id!r} — it may have completed and been cleared."
+        )
+
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "get_research_job", fake_get)
+    r = notebook_client.get("/api/notes/research/no-such-job")
+    assert r.status_code == 404
 
 
 def test_export_note_route_happy_path(notebook_client, tmp_path):
@@ -523,12 +559,12 @@ def test_research_revise_route_unknown_section_anchor_returns_404(notebook_clien
         "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
     ).json()
 
-    async def fake_research_revise(note_id, directive, *, section_anchor, max_budget_usd):
+    def fake_schedule(note_id, directive, *, section_anchor, max_budget_usd):
         raise ValueError(
             f"No section anchored at {section_anchor!r} in this guide's current raw_text."
         )
 
-    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_revise", fake_research_revise)
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "schedule_research_revise", fake_schedule)
     r = notebook_client.post(
         f"/api/notes/{note['id']}/research-revise",
         json={"directive": "x", "section_anchor": "nope"},

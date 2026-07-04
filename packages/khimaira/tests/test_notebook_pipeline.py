@@ -1609,6 +1609,100 @@ async def test_invoke_claude_agentic_passes_allowed_tools_and_add_dir(
     assert args[args.index("--output-format") + 1] == "stream-json"
 
 
+# --- per-call-unique CLAUDE_CONFIG_DIR (Grimoire Phase 4 addendum) ---
+
+
+def test_isolated_config_dir_is_unique_per_call(pipeline):
+    first = pipeline._isolated_config_dir()
+    second = pipeline._isolated_config_dir()
+    try:
+        assert first != second
+        assert first.is_dir()
+        assert second.is_dir()
+    finally:
+        pipeline._cleanup_config_dir(first)
+        pipeline._cleanup_config_dir(second)
+
+
+def test_isolated_config_dir_writes_settings_and_no_credentials_when_missing(pipeline, monkeypatch):
+    real_expanduser = os.path.expanduser
+
+    def fake_expanduser(path):
+        if path == "~/.claude/.credentials.json":
+            return "/nonexistent/path/never/here"
+        return real_expanduser(path)
+
+    monkeypatch.setattr(pipeline.os.path, "expanduser", fake_expanduser)
+    cfg_dir = pipeline._isolated_config_dir()
+    try:
+        assert (cfg_dir / "settings.json").read_text() == "{}"
+        assert not (cfg_dir / ".credentials.json").exists()
+    finally:
+        pipeline._cleanup_config_dir(cfg_dir)
+
+
+def test_cleanup_config_dir_removes_the_directory(pipeline):
+    cfg_dir = pipeline._isolated_config_dir()
+    assert cfg_dir.exists()
+    pipeline._cleanup_config_dir(cfg_dir)
+    assert not cfg_dir.exists()
+
+
+def test_cleanup_config_dir_is_fail_open_on_missing_dir(pipeline, tmp_path):
+    already_gone = tmp_path / "never-existed"
+    pipeline._cleanup_config_dir(already_gone)  # must not raise
+
+
+async def test_invoke_claude_cleans_up_config_dir_after_success(pipeline, monkeypatch):
+    seen_cfg_dirs: list = []
+
+    async def fake_exec(*args, **kwargs):
+        seen_cfg_dirs.append(pipeline.Path(kwargs["env"]["CLAUDE_CONFIG_DIR"]))
+        return _FakeProc(_envelope(json.dumps(_VALID_PAYLOAD)))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+    await pipeline._invoke_claude("content", "instruction")
+
+    assert len(seen_cfg_dirs) == 1
+    assert not seen_cfg_dirs[0].exists()  # cleaned up after the call
+
+
+async def test_invoke_claude_cleans_up_config_dir_even_on_failure(pipeline, monkeypatch):
+    seen_cfg_dirs: list = []
+
+    async def fake_exec(*args, **kwargs):
+        seen_cfg_dirs.append(pipeline.Path(kwargs["env"]["CLAUDE_CONFIG_DIR"]))
+        return _FakeProc(b"", stderr=b"boom", returncode=1)
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(RuntimeError):
+        await pipeline._invoke_claude("content", "instruction")
+
+    assert not seen_cfg_dirs[0].exists()  # cleaned up despite the raise
+
+
+async def test_invoke_claude_concurrent_calls_use_different_config_dirs(pipeline, monkeypatch):
+    """The actual property this whole fix exists for: two GENUINELY
+    concurrent calls must never share a CLAUDE_CONFIG_DIR."""
+    seen_cfg_dirs: list = []
+    lock = asyncio.Lock()
+
+    async def fake_exec(*args, **kwargs):
+        async with lock:
+            seen_cfg_dirs.append(kwargs["env"]["CLAUDE_CONFIG_DIR"])
+        await asyncio.sleep(0.02)
+        return _FakeProc(_envelope(json.dumps(_VALID_PAYLOAD)))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+    await asyncio.gather(
+        pipeline._invoke_claude("c1", "i"),
+        pipeline._invoke_claude("c2", "i"),
+        pipeline._invoke_claude("c3", "i"),
+    )
+
+    assert len(set(seen_cfg_dirs)) == 3
+
+
 # --- _invoke_agentic_grounded: the retry-on-unverified-grounding contract ---
 
 _GROUNDED_TRUE = {
@@ -1903,3 +1997,145 @@ async def test_research_revise_no_proposed_patch_leaves_proposed_raw_text_none(
     result = await pipeline.research_revise(note["id"], "directive")
 
     assert result["proposed_raw_text"] is None
+
+
+# ---------------------------------------------------------------------------
+# Grimoire Phase 4 addendum — research jobs (async, polled) instead of an
+# await-in-request. research_answer/research_revise themselves are already
+# covered above; these tests exercise ONLY the job scheduling/store/poll
+# layer, mocking research_answer/research_revise directly.
+# ---------------------------------------------------------------------------
+
+
+async def test_schedule_research_answer_unknown_note_raises_before_scheduling(
+    pipeline, monkeypatch
+):
+    called = []
+
+    async def fake_answer(note_id, question, *, max_budget_usd):
+        called.append(1)
+
+    monkeypatch.setattr(pipeline, "research_answer", fake_answer)
+    with pytest.raises(ValueError, match="No note with id"):
+        pipeline.schedule_research_answer("no-such-note", "question")
+    await asyncio.sleep(0.05)
+    assert called == []  # never scheduled a background task on a bad note_id
+
+
+async def test_schedule_research_answer_job_completes_and_is_pollable(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_study_guide("# G\n\nbody")
+
+    async def fake_answer(note_id, question, *, max_budget_usd):
+        assert note_id == note["id"]
+        assert question == "q"
+        return {
+            "answer": "hi",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": None,
+            "web_grounded": True,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.3,
+        }
+
+    monkeypatch.setattr(pipeline, "research_answer", fake_answer)
+    job_id = pipeline.schedule_research_answer(note["id"], "q")
+
+    assert pipeline.get_research_job(job_id)["status"] == "pending"
+    await asyncio.sleep(0.05)  # let the background task run
+
+    job = pipeline.get_research_job(job_id)
+    assert job["status"] == "done"
+    assert job["kind"] == "answer"
+    assert job["answer"] == "hi"
+
+
+async def test_schedule_research_answer_job_reports_error_on_exception(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_study_guide("# G\n\nbody")
+
+    async def failing_answer(note_id, question, *, max_budget_usd):
+        raise RuntimeError("agentic call blew up")
+
+    monkeypatch.setattr(pipeline, "research_answer", failing_answer)
+    job_id = pipeline.schedule_research_answer(note["id"], "q")
+    await asyncio.sleep(0.05)
+
+    job = pipeline.get_research_job(job_id)
+    assert job["status"] == "error"
+    assert job["kind"] == "answer"
+    assert "agentic call blew up" in job["error"]
+
+
+async def test_schedule_research_revise_unknown_note_raises_before_scheduling(pipeline):
+    with pytest.raises(ValueError, match="No note with id"):
+        pipeline.schedule_research_revise("no-such-note", "directive")
+
+
+async def test_schedule_research_revise_unknown_section_anchor_raises_before_scheduling(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_study_guide("# Title\n\n## A\n\nbody")
+    called = []
+
+    async def fake_revise(note_id, directive, *, section_anchor, max_budget_usd):
+        called.append(1)
+
+    monkeypatch.setattr(pipeline, "research_revise", fake_revise)
+    with pytest.raises(ValueError, match="No section anchored"):
+        pipeline.schedule_research_revise(note["id"], "directive", section_anchor="nonexistent")
+    await asyncio.sleep(0.05)
+    assert called == []
+
+
+async def test_schedule_research_revise_job_completes_and_is_pollable(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_study_guide("# G\n\nbody")
+
+    async def fake_revise(note_id, directive, *, section_anchor, max_budget_usd):
+        return {
+            "answer": "changed it",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": "new text",
+            "proposed_raw_text": "# G\n\nnew text",
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.2,
+        }
+
+    monkeypatch.setattr(pipeline, "research_revise", fake_revise)
+    job_id = pipeline.schedule_research_revise(note["id"], "improve it")
+    await asyncio.sleep(0.05)
+
+    job = pipeline.get_research_job(job_id)
+    assert job["status"] == "done"
+    assert job["kind"] == "revise"
+    assert job["proposed_raw_text"] == "# G\n\nnew text"
+
+
+async def test_schedule_research_revise_job_reports_error_on_exception(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_study_guide("# G\n\nbody")
+
+    async def failing_revise(note_id, directive, *, section_anchor, max_budget_usd):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline, "research_revise", failing_revise)
+    job_id = pipeline.schedule_research_revise(note["id"], "improve it")
+    await asyncio.sleep(0.05)
+
+    job = pipeline.get_research_job(job_id)
+    assert job["status"] == "error"
+    assert job["kind"] == "revise"
+    assert "boom" in job["error"]
+
+
+def test_get_research_job_unknown_id_raises(pipeline):
+    with pytest.raises(ValueError, match="No research job with id"):
+        pipeline.get_research_job("no-such-job")
