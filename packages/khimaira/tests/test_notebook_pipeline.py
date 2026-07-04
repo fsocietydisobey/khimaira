@@ -1427,6 +1427,33 @@ async def test_trigger_study_guide_pipeline_calls_organize_after_structuring(
     assert calls == [guide["id"]]
 
 
+async def test_trigger_study_guide_pipeline_skip_organize_suppresses_the_hook(
+    pipeline, notes_store, monkeypatch
+):
+    """Grimoire chat-model addendum (2026-07-04): skip_organize=True (the
+    chat auto-apply path) must structure normally but NOT fire the
+    organize hook — a chatty edit sequence shouldn't fire N organize
+    calls in a row."""
+    from khimaira.monitor import notebook_organizer
+
+    guide = notes_store.add_study_guide("# Widgets\n\nbody")
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_GUIDE_PAYLOAD)))])
+    calls: list[str] = []
+
+    async def fake_organize_after_structuring(note_id):
+        calls.append(note_id)
+
+    monkeypatch.setattr(
+        notebook_organizer, "organize_after_structuring", fake_organize_after_structuring
+    )
+
+    await pipeline.trigger_study_guide_pipeline(guide["id"], skip_organize=True)
+
+    assert calls == []
+    updated = notes_store.get_note(guide["id"])
+    assert updated["status"] == "processed"  # structuring itself still ran
+
+
 async def test_trigger_study_guide_pipeline_organize_failure_does_not_break_structuring(
     pipeline, notes_store, monkeypatch
 ):
@@ -1461,7 +1488,7 @@ async def test_schedule_pipeline_dispatches_study_guide_to_the_guide_pipeline(
     guide = notes_store.add_study_guide("# G\n\nbody")
     called = {"guide": False, "note": False}
 
-    async def fake_guide_pipeline(note_id):
+    async def fake_guide_pipeline(note_id, **kwargs):
         called["guide"] = True
 
     async def fake_note_pipeline(note_id):
@@ -1495,6 +1522,67 @@ async def test_schedule_pipeline_dispatches_regular_note_to_the_note_pipeline(
     await asyncio.sleep(0.05)
 
     assert called == {"guide": False, "note": True}
+
+
+# ---------------------------------------------------------------------------
+# Grimoire chat-model addendum — reprocess_after_raw_text_change: the shared
+# helper the PATCH route and the chat auto-apply path both call after a
+# raw_text write has already landed. Does NOT itself touch raw_text.
+# ---------------------------------------------------------------------------
+
+
+def test_reprocess_after_raw_text_change_flips_to_draft_and_schedules(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_note("raw")
+    notes_store.update_note(note["id"], status="processed")
+    scheduled: list[tuple] = []
+    upserted: list[dict] = []
+
+    monkeypatch.setattr(
+        pipeline, "schedule_pipeline", lambda nid, **kw: scheduled.append((nid, kw))
+    )
+    monkeypatch.setattr(
+        pipeline.notebook_retrieval, "schedule_upsert", lambda record: upserted.append(record)
+    )
+
+    updated = pipeline.reprocess_after_raw_text_change(note["id"])
+
+    assert updated["status"] == "draft"
+    assert scheduled == [(note["id"], {"skip_organize": False})]
+    assert upserted == [updated]
+
+
+def test_reprocess_after_raw_text_change_forwards_skip_organize(pipeline, notes_store, monkeypatch):
+    note = notes_store.add_note("raw")
+    scheduled: list[tuple] = []
+    monkeypatch.setattr(
+        pipeline, "schedule_pipeline", lambda nid, **kw: scheduled.append((nid, kw))
+    )
+    monkeypatch.setattr(pipeline.notebook_retrieval, "schedule_upsert", lambda record: None)
+
+    pipeline.reprocess_after_raw_text_change(note["id"], skip_organize=True)
+
+    assert scheduled == [(note["id"], {"skip_organize": True})]
+
+
+def test_reprocess_after_raw_text_change_skips_personal_tab_notes(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_note("x", tab_id=notes_store.PERSONAL_TAB_ID)
+    notes_store.update_note(note["id"], status="processed")
+    scheduled: list = []
+    monkeypatch.setattr(pipeline, "schedule_pipeline", lambda nid, **kw: scheduled.append(nid))
+
+    updated = pipeline.reprocess_after_raw_text_change(note["id"])
+
+    assert scheduled == []
+    assert updated["status"] == "processed"  # never flipped to draft
+
+
+def test_reprocess_after_raw_text_change_unknown_id_raises(pipeline):
+    with pytest.raises(ValueError, match="No note with id"):
+        pipeline.reprocess_after_raw_text_change("no-such-note")
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,16 @@ Endpoints:
                                    /notes/{id} after human review
   POST   /notes/{id}/export     — grimoire Phase 4: write a guide's raw_text back
                                    to its source_path (or a given path)
+  POST   /notes/{id}/chat       — grimoire chat model: one turn of a guide's
+                                   persistent conversation; schedules a job,
+                                   returns {job_id} — poll GET /notes/research/{job_id}
+                                   (kind:"chat"). Answer-vs-edit is the agent's own
+                                   routing; edits AUTO-APPLY (undo via version history)
+  GET    /notes/{id}/chat       — load a guide's persistent chat history
+  POST   /notes/{id}/chat/clear — wipe a guide's chat history
+  POST   /notes/{id}/chat/compact — summarize older chat turns into one message,
+                                   keeping the tail verbatim (cost control — every
+                                   turn passes the full history into the agentic call)
   GET    /tabs                  — list tabs (note_ids derived from live notes)
   POST   /tabs                  — create a tab
   PATCH  /tabs/{id}             — rename a tab
@@ -36,13 +46,13 @@ completes. `revalidate_note` is awaited directly (not backgrounded) — it's a
 manual on-demand user action ("re-check vs code" button), not a write path
 that needs to return instantly.
 
-Grimoire Phase 4 addendum (2026-07-04): the research routes are async
-job+poll, NOT awaited-in-request, unlike revalidate_note — a 1-2 minute
-agentic call held the HTTP connection open long enough that any client
-disconnect (or an in-flight `systemctl restart` under the daemon's default
-KillMode) would kill the call outright. POST schedules a background task
-and returns a job_id immediately; the frontend polls GET /notes/research/
-{job_id} until status is "done"/"error".
+Grimoire Phase 4 addendum (2026-07-04): the research AND chat routes are
+async job+poll, NOT awaited-in-request, unlike revalidate_note — a 1-2
+minute agentic call held the HTTP connection open long enough that any
+client disconnect (or an in-flight `systemctl restart` under the daemon's
+default KillMode) would kill the call outright. POST schedules a background
+task and returns a job_id immediately; the frontend polls GET
+/notes/research/{job_id} until status is "done"/"error".
 
 Note-content embedding (notebook_retrieval) is fire-and-forget on create/
 delete (never blocks the response) and re-runs on structuring completion /
@@ -56,6 +66,7 @@ import asyncio
 from pydantic import BaseModel
 
 from khimaira.monitor import (
+    notebook_chat,
     notebook_import,
     notebook_pipeline,
     notebook_retrieval,
@@ -118,6 +129,11 @@ class ResearchReviseReq(BaseModel):
 
 class ExportNoteReq(BaseModel):
     path: str | None = None
+
+
+class ChatMessageReq(BaseModel):
+    message: str
+    max_budget_usd: float = notebook_pipeline._AGENTIC_DEFAULT_BUDGET_USD
 
 
 class CreateTabReq(BaseModel):
@@ -274,14 +290,13 @@ def build_router():
         # a fresh capture (create_note). Title/tab/repo/status-only edits don't
         # touch the structured content, so they skip reprocessing. Personal-tab
         # notes are read raw (no pipeline, no embed), mirroring create_note.
-        if "raw_text" in fields and record["tab_id"] != notes.PERSONAL_TAB_ID:
-            # Flip to draft so the UI shows a "reprocessing" state while the
-            # (async) pipeline runs — set_pipeline flips it back to processed +
-            # stamps structured_at on completion. The old tabs stay visible
-            # meanwhile (pipeline isn't cleared), just badged as reprocessing.
-            record = notes.update_note(record["id"], status="draft")
-            trigger_pipeline(record["id"])
-            notebook_retrieval.schedule_upsert(record)
+        # reprocess_after_raw_text_change flips to draft (so the UI shows a
+        # "reprocessing" state while the async pipeline runs — set_pipeline
+        # flips it back to processed + stamps structured_at on completion;
+        # the old tabs stay visible meanwhile, just badged as reprocessing)
+        # and fires the same sequence the chat auto-apply path uses.
+        if "raw_text" in fields:
+            record = notebook_pipeline.reprocess_after_raw_text_change(record["id"])
         return record
 
     @router.delete("/notes/{note_id}")
@@ -354,6 +369,49 @@ def build_router():
         explicit `path` given."""
         try:
             return await asyncio.to_thread(notebook_import.export_note, note_id, req.path)
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+
+    @router.post("/notes/{note_id}/chat")
+    async def chat(note_id: str, req: ChatMessageReq) -> dict:
+        """Grimoire chat model: one turn of a guide's persistent
+        conversation. ASYNC (reuses the research job+poll infra) — schedules
+        a background job and returns {job_id} immediately; poll GET
+        /notes/research/{job_id} (kind:"chat"). Answer-vs-edit is the
+        agent's own structured-output routing, not a separate endpoint —
+        an edit AUTO-APPLIES (version history is the undo mechanism)."""
+        try:
+            job_id = notebook_chat.schedule_chat_turn(
+                note_id, req.message, max_budget_usd=req.max_budget_usd
+            )
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+        return {"job_id": job_id, "status": "pending"}
+
+    @router.get("/notes/{note_id}/chat")
+    async def get_chat(note_id: str) -> dict:
+        """Load a guide's persistent chat history — the frontend calls this
+        on open so the conversation survives reopen."""
+        try:
+            notes.get_note(note_id)
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+        return {"history": notebook_chat.get_chat_history(note_id)}
+
+    @router.post("/notes/{note_id}/chat/clear")
+    async def chat_clear(note_id: str) -> dict:
+        try:
+            return notebook_chat.clear_chat(note_id)
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+
+    @router.post("/notes/{note_id}/chat/compact")
+    async def chat_compact(note_id: str) -> dict:
+        """Summarize older chat turns into one message, keeping the tail
+        verbatim — cost control, not cosmetic (every turn passes the full
+        history into the agentic call)."""
+        try:
+            return await notebook_chat.compact_chat_history(note_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 

@@ -200,11 +200,19 @@ def test_patch_note_invalid_status_returns_422(notebook_client):
 def test_patch_raw_text_reprocesses_pipeline(notebook_client, monkeypatch):
     """A raw_text edit invalidates the derived summary/technical/plain tabs, so
     PATCH must re-trigger the structuring pipeline (they'd go silently stale
-    otherwise). Regression for the notebook_update-doesn't-reprocess footgun."""
+    otherwise). Regression for the notebook_update-doesn't-reprocess footgun.
+
+    Asserts against notebook_pipeline.schedule_pipeline (what
+    reprocess_after_raw_text_change actually calls) rather than the
+    api-module's own `trigger_pipeline` wrapper — the PATCH route now
+    shares that helper with the chat auto-apply path (Grimoire chat-model,
+    2026-07-04), so `trigger_pipeline` itself is no longer on this call path."""
     from khimaira.monitor.api import notebook as notebook_api
 
     calls: list[str] = []
-    monkeypatch.setattr(notebook_api, "trigger_pipeline", lambda nid: calls.append(nid))
+    monkeypatch.setattr(
+        notebook_api.notebook_pipeline, "schedule_pipeline", lambda nid, **k: calls.append(nid)
+    )
     created = notebook_client.post("/api/notes", json={"raw_text": "original"}).json()
     calls.clear()  # ignore the create-time trigger; we're testing the PATCH path
 
@@ -219,7 +227,9 @@ def test_patch_metadata_only_does_not_reprocess(notebook_client, monkeypatch):
     from khimaira.monitor.api import notebook as notebook_api
 
     calls: list[str] = []
-    monkeypatch.setattr(notebook_api, "trigger_pipeline", lambda nid: calls.append(nid))
+    monkeypatch.setattr(
+        notebook_api.notebook_pipeline, "schedule_pipeline", lambda nid, **k: calls.append(nid)
+    )
     created = notebook_client.post("/api/notes", json={"raw_text": "original"}).json()
     calls.clear()
 
@@ -230,11 +240,15 @@ def test_patch_metadata_only_does_not_reprocess(notebook_client, monkeypatch):
 
 def test_patch_raw_text_on_personal_note_does_not_reprocess(notebook_client, monkeypatch):
     """Personal-tab notes are read raw (never structured), mirroring create —
-    a raw_text edit on one must not schedule a pipeline run."""
+    a raw_text edit on one must not schedule a pipeline run. The exemption
+    now lives inside reprocess_after_raw_text_change itself (shared with the
+    chat auto-apply path), not the route."""
     from khimaira.monitor.api import notebook as notebook_api
 
     calls: list[str] = []
-    monkeypatch.setattr(notebook_api, "trigger_pipeline", lambda nid: calls.append(nid))
+    monkeypatch.setattr(
+        notebook_api.notebook_pipeline, "schedule_pipeline", lambda nid, **k: calls.append(nid)
+    )
     created = notebook_client.post(
         "/api/notes", json={"raw_text": "x", "tab_id": "personal"}
     ).json()
@@ -702,3 +716,131 @@ def test_import_guides_route_real_import(notebook_client, tmp_path, monkeypatch)
     assert len(listed) == 1
     assert listed[0]["repo"] == "jeevy_portal"
     assert listed[0]["organized_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Chat model (Grimoire chat-model addendum, 2026-07-04)
+# ---------------------------------------------------------------------------
+
+
+def test_chat_route_schedules_job_and_returns_job_id(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    note = notebook_client.post(
+        "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
+    ).json()
+    seen = {}
+
+    def fake_schedule(note_id, message, *, max_budget_usd):
+        seen["note_id"] = note_id
+        seen["message"] = message
+        return "chat-job-1"
+
+    monkeypatch.setattr(notebook_api.notebook_chat, "schedule_chat_turn", fake_schedule)
+    r = notebook_client.post(f"/api/notes/{note['id']}/chat", json={"message": "what is this?"})
+
+    assert r.status_code == 200
+    assert r.json() == {"job_id": "chat-job-1", "status": "pending"}
+    assert seen == {"note_id": note["id"], "message": "what is this?"}
+
+
+def test_chat_route_non_guide_returns_404(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    note = notebook_client.post("/api/notes", json={"raw_text": "just a note"}).json()
+
+    def fake_schedule(note_id, message, *, max_budget_usd):
+        raise ValueError(
+            f"Note {note_id!r} is not a study guide (kind='note') — chat is guide-only."
+        )
+
+    monkeypatch.setattr(notebook_api.notebook_chat, "schedule_chat_turn", fake_schedule)
+    r = notebook_client.post(f"/api/notes/{note['id']}/chat", json={"message": "hi"})
+    assert r.status_code == 404
+
+
+def test_chat_route_unknown_note_returns_404(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    def fake_schedule(note_id, message, *, max_budget_usd):
+        raise ValueError(f"No note with id={note_id!r}.")
+
+    monkeypatch.setattr(notebook_api.notebook_chat, "schedule_chat_turn", fake_schedule)
+    r = notebook_client.post("/api/notes/no-such-id/chat", json={"message": "hi"})
+    assert r.status_code == 404
+
+
+def test_get_chat_route_returns_history(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    note = notebook_client.post(
+        "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
+    ).json()
+    history = [{"role": "user", "content": "hi", "ts": "t1"}]
+    monkeypatch.setattr(notebook_api.notebook_chat, "get_chat_history", lambda nid: history)
+
+    r = notebook_client.get(f"/api/notes/{note['id']}/chat")
+    assert r.status_code == 200
+    assert r.json() == {"history": history}
+
+
+def test_get_chat_route_unknown_note_returns_404(notebook_client):
+    r = notebook_client.get("/api/notes/no-such-id/chat")
+    assert r.status_code == 404
+
+
+def test_chat_clear_route(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    note = notebook_client.post(
+        "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
+    ).json()
+    seen = []
+    monkeypatch.setattr(
+        notebook_api.notebook_chat,
+        "clear_chat",
+        lambda nid: seen.append(nid) or {"cleared": True},
+    )
+
+    r = notebook_client.post(f"/api/notes/{note['id']}/chat/clear")
+    assert r.status_code == 200
+    assert r.json() == {"cleared": True}
+    assert seen == [note["id"]]
+
+
+def test_chat_clear_route_unknown_note_returns_404(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    def fake_clear(note_id):
+        raise ValueError(f"No note with id={note_id!r}.")
+
+    monkeypatch.setattr(notebook_api.notebook_chat, "clear_chat", fake_clear)
+    r = notebook_client.post("/api/notes/no-such-id/chat/clear")
+    assert r.status_code == 404
+
+
+def test_chat_compact_route(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    note = notebook_client.post(
+        "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
+    ).json()
+
+    async def fake_compact(note_id):
+        return {"compacted": True, "message_count": 5}
+
+    monkeypatch.setattr(notebook_api.notebook_chat, "compact_chat_history", fake_compact)
+    r = notebook_client.post(f"/api/notes/{note['id']}/chat/compact")
+    assert r.status_code == 200
+    assert r.json() == {"compacted": True, "message_count": 5}
+
+
+def test_chat_compact_route_unknown_note_returns_404(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    async def failing_compact(note_id):
+        raise ValueError(f"No note with id={note_id!r}.")
+
+    monkeypatch.setattr(notebook_api.notebook_chat, "compact_chat_history", failing_compact)
+    r = notebook_client.post("/api/notes/no-such-id/chat/compact")
+    assert r.status_code == 404

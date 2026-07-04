@@ -635,7 +635,7 @@ async def trigger_pipeline(note_id: str) -> None:
     await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
 
 
-async def trigger_study_guide_pipeline(note_id: str) -> None:
+async def trigger_study_guide_pipeline(note_id: str, *, skip_organize: bool = False) -> None:
     """Transform note_id's raw_text into a study-guide pipeline and write it
     back. Same shape as trigger_pipeline, but NEVER touches raw_text — the
     load-bearing invariant — and produces the discriminated pipeline shape
@@ -645,7 +645,17 @@ async def trigger_study_guide_pipeline(note_id: str) -> None:
     `abstract`/`tags`/`entities` come from the LLM (StudyGuideOutput);
     `toc` is a deterministic heading parse (_parse_toc) — never touches the
     LLM, so a guide's navigation structure can't drift from its actual
-    headings."""
+    headings.
+
+    `skip_organize` (Grimoire chat-model addendum, 2026-07-04): the chat
+    auto-apply path re-structures on EVERY edit (correct — content changed,
+    abstract/tags should follow) but must NOT also re-fire a full LLM
+    organize-classification per edit (a chatty back-and-forth would fire N
+    organize calls in a row — the "debounce the re-organize" requirement).
+    Skips ONLY the organize hook below; structuring itself is unaffected.
+    The periodic sweep (`organize_sweep_loop`) still re-checks placement
+    eventually, so this is a cost/frequency tradeoff, not a correctness gap.
+    """
     try:
         record = notes.get_note(note_id)
     except ValueError:
@@ -675,6 +685,9 @@ async def trigger_study_guide_pipeline(note_id: str) -> None:
 
     await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
 
+    if skip_organize:
+        return
+
     # Grimoire Phase 2: give the guide an LLM-judged collection placement
     # right after abstract/tags land (deterministic-only Phase 1 assign has
     # nothing to work with for a guide authored directly, with no source
@@ -686,25 +699,54 @@ async def trigger_study_guide_pipeline(note_id: str) -> None:
     await notebook_organizer.organize_after_structuring(note_id)
 
 
-def schedule_pipeline(note_id: str) -> None:
+def schedule_pipeline(note_id: str, *, skip_organize: bool = False) -> None:
     """Sync entry point for the POST /notes route — fires the right
     structuring pipeline (kind-branched: study guide vs regular note) as a
     background task without blocking the response. The branch lives here,
     not at each call site, so callers (api/notebook.py, notebook_import.py)
-    never need their own kind check to know which pipeline to trigger."""
+    never need their own kind check to know which pipeline to trigger.
+
+    `skip_organize` is forwarded to trigger_study_guide_pipeline only; it's
+    a no-op for regular notes (trigger_pipeline has no organize step)."""
     try:
         record = notes.get_note(note_id)
     except ValueError:
         log.warning("notebook_pipeline: note %s vanished before scheduling", note_id)
         return
     coro = (
-        trigger_study_guide_pipeline(note_id)
+        trigger_study_guide_pipeline(note_id, skip_organize=skip_organize)
         if record.get("kind") == "study_guide"
         else trigger_pipeline(note_id)
     )
     task = asyncio.create_task(coro)
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+def reprocess_after_raw_text_change(note_id: str, *, skip_organize: bool = False) -> dict[str, Any]:
+    """Fire the reprocess sequence a COMMITTED raw_text change requires:
+    flip to draft, re-run structuring, re-embed. Call AFTER the raw_text
+    write itself has already landed (via notes.update_note, which is what
+    snapshots version history) — this function doesn't touch raw_text.
+
+    Grimoire chat-model addendum (2026-07-04): extracted so BOTH the PATCH
+    /notes/{id} route and the chat auto-apply path fire the identical
+    sequence — before this, it lived ONLY inline in api/notebook.py's PATCH
+    handler (notes.update_note itself never reschedules anything), so a
+    second caller (chat) reimplementing it inline would risk drifting out
+    of sync with the route's own behavior. One implementation, two callers.
+
+    Personal-tab notes are skipped (mirrors the PATCH route's existing
+    exemption) — guides/chat never target the personal tab in practice,
+    but this keeps the contract identical either way.
+    """
+    record = notes.get_note(note_id)
+    if record["tab_id"] == notes.PERSONAL_TAB_ID:
+        return record
+    record = notes.update_note(note_id, status="draft")
+    schedule_pipeline(note_id, skip_organize=skip_organize)
+    notebook_retrieval.schedule_upsert(record)
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -1312,17 +1354,25 @@ async def _invoke_agentic_grounded(
     *,
     repo_root: Path | None,
     max_budget_usd: float,
+    schema: type[BaseModel] = ResearchOutput,
 ) -> dict[str, Any]:
-    """Shared ANSWER/REVISE invocation against ResearchOutput. ONE retry
-    (stronger imperative) fires if the result claims web_citations but the
-    transcript shows no real WebSearch/WebFetch tool_use — master's
+    """Shared ANSWER/REVISE/chat invocation against `schema` (ResearchOutput
+    by default; the chat turn passes ChatTurnOutput — see notebook_chat.py).
+    Both schemas share the same required `answer: str` + defaulted
+    `code_citations`/`web_citations` fields, which is what lets the failure
+    fallback below stay schema-agnostic (constructs a valid empty instance
+    of whichever schema was passed, rather than hardcoding ResearchOutput's
+    field names).
+
+    ONE retry (stronger imperative) fires if the result claims web_citations
+    but the transcript shows no real WebSearch/WebFetch tool_use — master's
     refinement (2026-07-04): this reliably flips a silent skip into a real
     call in live testing, rather than surfacing unverified on the first trip.
 
     Never raises — every failure mode (subprocess error, unparseable
     response) returns a result dict with web_grounding_unverified=True and
-    an explanatory `answer`, so research_answer/research_revise don't need
-    their own try/except around this.
+    an explanatory `answer`, so callers don't need their own try/except
+    around this.
     """
 
     async def _attempt(extra: str = "") -> dict[str, Any] | None:
@@ -1335,7 +1385,7 @@ async def _invoke_agentic_grounded(
             return None
         try:
             payload = json.loads(_strip_fence(invoked["result"]))
-            parsed = ResearchOutput.model_validate(payload).model_dump()
+            parsed = schema.model_validate(payload).model_dump()
         except (json.JSONDecodeError, ValidationError) as exc:
             log.warning("notebook_pipeline: agentic response failed to parse: %s", exc)
             return None
@@ -1345,12 +1395,12 @@ async def _invoke_agentic_grounded(
 
     result = await _attempt()
     if result is None:
+        fallback = schema(
+            answer="Research failed — the agentic call errored or returned an "
+            "unparseable response. Try again, or narrow the request."
+        ).model_dump()
         return {
-            "answer": "Research failed — the agentic call errored or returned an "
-            "unparseable response. Try again, or narrow the request.",
-            "code_citations": [],
-            "web_citations": [],
-            "proposed_patch": None,
+            **fallback,
             "web_grounded": False,
             "web_grounding_unverified": True,
             "total_cost_usd": None,
@@ -1487,6 +1537,37 @@ _RESEARCH_JOB_TASKS: set[asyncio.Task] = set()
 
 def _new_job_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+# Generic job-store primitives (Grimoire chat-model addendum, 2026-07-04):
+# schedule_research_answer/schedule_research_revise below manipulate
+# _RESEARCH_JOBS/_RESEARCH_JOB_TASKS directly (unchanged — they're already
+# tested and live-verified; not worth the regression risk of refactoring
+# working code for pure consistency). notebook_chat.py's schedule_chat_turn
+# is NEW code and uses these public wrappers instead of reaching into this
+# module's private job-store internals directly, keeping the encapsulation
+# boundary this codebase otherwise maintains between modules.
+def create_job(kind: str) -> str:
+    """Register a new pending job in the shared job store. Returns its id."""
+    job_id = _new_job_id()
+    _RESEARCH_JOBS[job_id] = {"status": "pending", "kind": kind}
+    return job_id
+
+
+def complete_job(job_id: str, **fields: Any) -> None:
+    _RESEARCH_JOBS[job_id] = {"status": "done", **fields}
+
+
+def fail_job(job_id: str, **fields: Any) -> None:
+    _RESEARCH_JOBS[job_id] = {"status": "error", **fields}
+
+
+def track_job_task(task: asyncio.Task) -> None:
+    """Keep a strong reference to a background job task until it completes
+    (asyncio.create_task() only holds a weak ref — see _BACKGROUND_TASKS'
+    own docstring for the failure mode this guards against)."""
+    _RESEARCH_JOB_TASKS.add(task)
+    task.add_done_callback(_RESEARCH_JOB_TASKS.discard)
 
 
 async def _run_research_answer_job(
