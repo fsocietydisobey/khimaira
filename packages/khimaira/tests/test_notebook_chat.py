@@ -266,6 +266,64 @@ async def test_run_chat_turn_edit_auto_applies_and_records_diff(chat, notes_stor
     assert history[1]["edit"]["section_anchor"] is None
 
 
+async def test_run_chat_turn_sensitive_note_suppresses_proposed_edit(
+    chat, notes_store, monkeypatch
+):
+    """Sensitive notes (2026-07-04): even if the model IGNORES the
+    _SENSITIVE_CHAT_ADDENDUM and proposes an edit anyway, it must never be
+    applied — auto-apply has no human gate, and the model only ever saw a
+    redacted copy of a sensitive guide."""
+    secret = "sk-ant-" + "q" * 30
+    raw = f"# G\n\nAPI_KEY={secret}\n"
+    guide = notes_store.add_study_guide(raw, sensitive=True)
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+        return _grounded(
+            answer="Updated it (but shouldn't have).",
+            edit={"section_anchor": None, "new_text": "# G\n\nreplaced\n"},
+        )
+
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+
+    result = await chat.run_chat_turn(guide["id"], "update the key")
+
+    assert result["message"]["edit"] is None  # suppressed, not applied
+    assert notes_store.get_note(guide["id"])["raw_text"] == raw  # untouched
+
+
+async def test_run_chat_turn_sensitive_note_instruction_carries_addendum_and_redacted_guide(
+    chat, notes_store, monkeypatch
+):
+    secret = "sk-ant-" + "r" * 30
+    guide = notes_store.add_study_guide(f"# G\n\nAPI_KEY={secret}\n", sensitive=True)
+    seen_instructions: list[str] = []
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+        seen_instructions.append(instruction)
+        return _grounded(answer="hi")
+
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+    await chat.run_chat_turn(guide["id"], "what's in here?")
+
+    assert secret not in seen_instructions[0]
+    assert "SENSITIVE" in seen_instructions[0]
+    assert "MUST NOT propose an edit" in seen_instructions[0]
+
+
+async def test_run_chat_turn_non_sensitive_note_no_addendum(chat, notes_store, monkeypatch):
+    guide = notes_store.add_study_guide("# G\n\nbody\n")
+    seen_instructions: list[str] = []
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema):
+        seen_instructions.append(instruction)
+        return _grounded(answer="hi")
+
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+    await chat.run_chat_turn(guide["id"], "what's in here?")
+
+    assert "SENSITIVE" not in seen_instructions[0]
+
+
 async def test_run_chat_turn_bad_edit_falls_back_to_answer_only(chat, notes_store, monkeypatch):
     raw = "# G\n\nbody\n"
     guide = notes_store.add_study_guide(raw)

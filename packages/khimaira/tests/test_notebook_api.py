@@ -844,3 +844,115 @@ def test_chat_compact_route_unknown_note_returns_404(notebook_client, monkeypatc
     monkeypatch.setattr(notebook_api.notebook_chat, "compact_chat_history", failing_compact)
     r = notebook_client.post("/api/notes/no-such-id/chat/compact")
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Sensitive notes + priority flags (2026-07-04)
+# ---------------------------------------------------------------------------
+
+
+def test_create_note_sensitive_computes_redaction(notebook_client):
+    secret = "sk-ant-" + "a" * 30
+    r = notebook_client.post("/api/notes", json={"raw_text": f"key: {secret}", "sensitive": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sensitive"] is True
+    assert secret not in body["llm_text"]
+    assert body["raw_text"] == f"key: {secret}"  # single-note fetch: real content
+
+
+def test_create_note_defaults_not_sensitive(notebook_client):
+    r = notebook_client.post("/api/notes", json={"raw_text": "hello"})
+    assert r.json()["sensitive"] is False
+
+
+def test_create_study_guide_sensitive(notebook_client):
+    secret = "sk-ant-" + "b" * 30
+    r = notebook_client.post(
+        "/api/notes",
+        json={"raw_text": f"# G\n\nkey: {secret}", "kind": "study_guide", "sensitive": True},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sensitive"] is True
+    assert secret not in body["llm_text"]
+
+
+def test_list_notes_masks_raw_text_for_sensitive_notes(notebook_client):
+    secret = "sk-ant-" + "c" * 30
+    notebook_client.post("/api/notes", json={"raw_text": f"key: {secret}", "sensitive": True})
+
+    listed = notebook_client.get("/api/notes").json()["notes"]
+    assert len(listed) == 1
+    assert secret not in listed[0]["raw_text"]
+    assert secret not in listed[0]["title"]  # auto-derived title also safe
+
+
+def test_get_note_returns_real_raw_text_for_sensitive_note(notebook_client):
+    secret = "sk-ant-" + "d" * 30
+    created = notebook_client.post(
+        "/api/notes", json={"raw_text": f"key: {secret}", "sensitive": True}
+    ).json()
+
+    fetched = notebook_client.get(f"/api/notes/{created['id']}").json()
+    assert fetched["raw_text"] == f"key: {secret}"
+
+
+def test_patch_note_can_flip_sensitive_on(notebook_client):
+    secret = "sk-ant-" + "e" * 30
+    created = notebook_client.post("/api/notes", json={"raw_text": f"key: {secret}"}).json()
+    assert created["sensitive"] is False
+
+    r = notebook_client.patch(f"/api/notes/{created['id']}", json={"sensitive": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sensitive"] is True
+    assert secret not in body["llm_text"]
+
+
+def test_patch_note_priority_round_trips(notebook_client):
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+    assert created["priority"] == "normal"
+
+    r = notebook_client.patch(f"/api/notes/{created['id']}", json={"priority": "urgent"})
+    assert r.status_code == 200
+    assert r.json()["priority"] == "urgent"
+
+
+def test_patch_note_invalid_priority_returns_422(notebook_client):
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+    r = notebook_client.patch(f"/api/notes/{created['id']}", json={"priority": "critical"})
+    assert r.status_code == 422
+
+
+def test_list_notes_priority_filter_route(notebook_client):
+    notebook_client.post("/api/notes", json={"raw_text": "a"})
+    urgent = notebook_client.post("/api/notes", json={"raw_text": "b"}).json()
+    notebook_client.patch(f"/api/notes/{urgent['id']}", json={"priority": "urgent"})
+
+    filtered = notebook_client.get("/api/notes", params={"priority": "urgent"}).json()["notes"]
+    assert len(filtered) == 1
+    assert filtered[0]["id"] == urgent["id"]
+
+
+def test_list_notes_sort_by_priority_descending(notebook_client):
+    low = notebook_client.post("/api/notes", json={"raw_text": "low one"}).json()
+    notebook_client.patch(f"/api/notes/{low['id']}", json={"priority": "low"})
+    urgent = notebook_client.post("/api/notes", json={"raw_text": "urgent one"}).json()
+    notebook_client.patch(f"/api/notes/{urgent['id']}", json={"priority": "urgent"})
+    notebook_client.post("/api/notes", json={"raw_text": "normal one"})
+
+    sorted_notes = notebook_client.get("/api/notes", params={"sort": "-priority"}).json()["notes"]
+    priorities = [n["priority"] for n in sorted_notes]
+    assert priorities == ["urgent", "normal", "low"]
+
+    ascending = notebook_client.get("/api/notes", params={"sort": "priority"}).json()["notes"]
+    assert [n["priority"] for n in ascending] == ["low", "normal", "urgent"]
+
+
+def test_promote_note_route_refuses_sensitive_notes(notebook_client):
+    created = notebook_client.post(
+        "/api/notes", json={"raw_text": "secret stuff", "sensitive": True}
+    ).json()
+    r = notebook_client.post(f"/api/notes/{created['id']}/promote")
+    assert r.status_code == 404

@@ -329,15 +329,31 @@ _MAX_PERSONAL_CONTEXT_CHARS = 6000
 
 
 def _personal_context() -> str:
-    """Concatenated raw_text of every Personal/Behavior note, bounded — this
-    rides every LLM call (structuring, revalidation, ask-synthesis), so it
-    must stay small. Fail-open: any error returns "" (no context, not a
-    crash) — a missing/broken personal folder must never break the ask."""
+    """Concatenated llm_view() of every Personal/Behavior note, bounded —
+    this rides every LLM call (structuring, revalidation, ask-synthesis), so
+    it must stay small. Fail-open: any error returns "" (no context, not a
+    crash) — a missing/broken personal folder must never break the ask.
+
+    Sensitive notes (2026-07-04, CRITICAL cross-note leak this closes): a
+    sensitive note filed into the Personal folder must never inject its
+    real secrets into EVERY other LLM call via this concatenation. Routes
+    through notes.llm_view(), which needs the FULL record (llm_text isn't
+    carried on the list_notes() index stub — only single-note reads have
+    it) — an N+1 get_note() per personal note, acceptable since this folder
+    is small by nature."""
     try:
         personal_notes = notes.list_notes(tab_id=notes.PERSONAL_TAB_ID)
     except Exception:
         return ""
-    parts = [n["raw_text"] for n in personal_notes if n.get("raw_text")]
+    parts: list[str] = []
+    for stub in personal_notes:
+        try:
+            record = notes.get_note(stub["id"])
+        except ValueError:
+            continue
+        text = notes.llm_view(record)
+        if text:
+            parts.append(text)
     if not parts:
         return ""
     return "\n\n---\n\n".join(parts)[:_MAX_PERSONAL_CONTEXT_CHARS]
@@ -602,12 +618,16 @@ async def transform_note(
     return None
 
 
-async def trigger_pipeline(note_id: str) -> None:
+async def trigger_pipeline(note_id: str, *, skip_organize: bool = False) -> None:
     """Transform note_id's raw_text and write the result back to the store.
 
     Fire-and-forget worker coroutine — schedule_pipeline() (called from
     api/notebook.py) wraps this in asyncio.create_task so POST /notes
     returns immediately with the note still status="draft".
+
+    `skip_organize` (2026-07-04 addendum — the organizer extended to regular
+    notes, mirroring the guide pipeline's own hook): see
+    trigger_study_guide_pipeline's docstring for why this exists.
     """
     try:
         record = notes.get_note(note_id)
@@ -615,7 +635,7 @@ async def trigger_pipeline(note_id: str) -> None:
         log.warning("notebook_pipeline: note %s vanished before transform", note_id)
         return
 
-    result = await transform_note(record["raw_text"])
+    result = await transform_note(notes.llm_view(record))
     if result is None:
         with contextlib.suppress(ValueError):
             notes.update_note(note_id, status="failed")
@@ -633,6 +653,20 @@ async def trigger_pipeline(note_id: str) -> None:
         return
 
     await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
+
+    if skip_organize:
+        return
+
+    # 2026-07-04: the organizer, originally guide-only, now also organizes
+    # regular notes into folders (mirrors trigger_study_guide_pipeline's own
+    # hook — see notebook_organizer.organize_library's kind-aware rewrite).
+    # Local import for the same reason the guide pipeline's hook uses one:
+    # notebook_organizer imports this module at function scope too
+    # (organize_library needs transform_note), so a module-level import here
+    # would be circular.
+    from khimaira.monitor import notebook_organizer
+
+    await notebook_organizer.organize_after_structuring(note_id)
 
 
 async def trigger_study_guide_pipeline(note_id: str, *, skip_organize: bool = False) -> None:
@@ -663,7 +697,7 @@ async def trigger_study_guide_pipeline(note_id: str, *, skip_organize: bool = Fa
         return
 
     result = await transform_note(
-        record["raw_text"], instruction=_STUDY_GUIDE_INSTRUCTION, schema=StudyGuideOutput
+        notes.llm_view(record), instruction=_STUDY_GUIDE_INSTRUCTION, schema=StudyGuideOutput
     )
     if result is None:
         with contextlib.suppress(ValueError):
@@ -673,6 +707,9 @@ async def trigger_study_guide_pipeline(note_id: str, *, skip_organize: bool = Fa
 
     pipeline = {
         "abstract": result["abstract"],
+        # _parse_toc is deterministic + never leaves this process — runs on
+        # the REAL raw_text (not llm_view) so navigation matches the actual
+        # document, not a redacted twin whose heading text could differ.
         "toc": _parse_toc(record["raw_text"]),
         "tags": result["tags"],
         "entities": result["entities"],
@@ -706,8 +743,8 @@ def schedule_pipeline(note_id: str, *, skip_organize: bool = False) -> None:
     not at each call site, so callers (api/notebook.py, notebook_import.py)
     never need their own kind check to know which pipeline to trigger.
 
-    `skip_organize` is forwarded to trigger_study_guide_pipeline only; it's
-    a no-op for regular notes (trigger_pipeline has no organize step)."""
+    `skip_organize` is forwarded to whichever pipeline runs (both kinds now
+    have an organize hook — 2026-07-04)."""
     try:
         record = notes.get_note(note_id)
     except ValueError:
@@ -716,7 +753,7 @@ def schedule_pipeline(note_id: str, *, skip_organize: bool = False) -> None:
     coro = (
         trigger_study_guide_pipeline(note_id, skip_organize=skip_organize)
         if record.get("kind") == "study_guide"
-        else trigger_pipeline(note_id)
+        else trigger_pipeline(note_id, skip_organize=skip_organize)
     )
     task = asyncio.create_task(coro)
     _BACKGROUND_TASKS.add(task)
@@ -1245,9 +1282,11 @@ async def answer_question(
             healed.append(note_id)
 
         pipeline = updated.get("pipeline") or {}
-        body = (
-            pipeline.get("organized_md") or pipeline.get("summary") or updated.get("raw_text", "")
-        )
+        # raw_text fallback (for a note that hasn't been structured yet, or
+        # a study guide whose pipeline has no organized_md/summary keys at
+        # all) routes through llm_view — a sensitive note's real secrets
+        # must not reach this ask-synthesis LLM call either.
+        body = pipeline.get("organized_md") or pipeline.get("summary") or notes.llm_view(updated)
         if not body:
             continue
         sources.append(note_id)
@@ -1433,7 +1472,7 @@ async def research_answer(
     repo_root = None if repo == notes.GENERAL_REPO else _repo_root(repo)
     instruction = _RESEARCH_ANSWER_INSTRUCTION_TEMPLATE.format(
         repo_root=repo_root or "(no codebase — general/cross-cutting note)",
-        guide=record.get("raw_text", ""),
+        guide=notes.llm_view(record),
     )
     return await _invoke_agentic_grounded(
         question, instruction, repo_root=repo_root, max_budget_usd=max_budget_usd
@@ -1467,6 +1506,14 @@ async def research_revise(
     changed underneath the request).
     """
     record = notes.get_note(note_id)
+    # `raw_text` (REAL content) is used for section_anchor validation (must
+    # match the actual document's headings) and for splicing the model's
+    # proposed patch back into the real document below. `notes.llm_view()`
+    # (possibly redacted) is what actually reaches the LLM in `instruction` —
+    # a sensitive note's real secrets must never appear in that prompt, even
+    # though REVISE's own human-review-before-apply gate is what keeps
+    # splicing a redacted-based patch back into the real text safe from a
+    # data-loss standpoint.
     raw_text = record.get("raw_text", "")
     repo = record.get("repo") or "khimaira"
     repo_root = None if repo == notes.GENERAL_REPO else _repo_root(repo)
@@ -1489,7 +1536,7 @@ async def research_revise(
         scope=scope,
         scope_instruction=scope_instruction,
         repo_root=repo_root or "(no codebase — general/cross-cutting note)",
-        guide=raw_text,
+        guide=notes.llm_view(record),
     )
     result = await _invoke_agentic_grounded(
         directive, instruction, repo_root=repo_root, max_budget_usd=max_budget_usd

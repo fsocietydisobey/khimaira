@@ -70,7 +70,19 @@ def promote_resolved(record: dict[str, Any]) -> dict | None:
     Fail-open on any distill-client failure (mnemosyne_client.distill already
     fails open; the broad except here also covers import/attribute errors so
     this NEVER breaks the resolution write path that calls it).
+
+    Sensitive notes (2026-07-04) are HARD-excluded here — this is the ONE
+    choke point every training-export trigger funnels through (the only
+    other producer, `notes.promote_note`, has its own guard that raises
+    instead of silently skipping, since that's an explicit human action).
+    A sensitive note's content must never bake into oracle training data.
     """
+    if record.get("sensitive"):
+        log.info(
+            "notebook_training: %s is a sensitive note — hard-excluded from training export",
+            record.get("id"),
+        )
+        return None
     if not record.get("resolution"):
         log.info("notebook_training: %s has no resolution yet — skipping distill", record.get("id"))
         return None

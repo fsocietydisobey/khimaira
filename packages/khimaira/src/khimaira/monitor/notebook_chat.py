@@ -166,6 +166,20 @@ _CHAT_INSTRUCTION_TEMPLATE = (
     "CONVERSATION SO FAR:\n{history}"
 )
 
+# Sensitive notes (2026-07-04): appended to the instruction ONLY for a
+# sensitive note's chat turn. Belt (tell the model not to bother proposing
+# an edit it can't safely make) — the suspenders is the structural guard in
+# run_chat_turn below, which never invokes _try_apply_edit for a sensitive
+# note regardless of what the model returns.
+_SENSITIVE_CHAT_ADDENDUM = (
+    " This note is marked SENSITIVE — you are seeing a REDACTED copy with "
+    "real secret values replaced by placeholders like ‹SECRET:kind#N›. "
+    "You MUST NOT propose an edit (leave edit null even if asked to change "
+    "something) — you cannot safely edit content you can't fully see. If "
+    "asked to make a change, explain in your answer that edits are disabled "
+    "for sensitive notes."
+)
+
 
 def _try_apply_edit(
     note_id: str, raw_text: str, edit_payload: dict[str, Any]
@@ -249,9 +263,11 @@ async def run_chat_turn(
 
     instruction = _CHAT_INSTRUCTION_TEMPLATE.format(
         repo_root=repo_root or "(no codebase — general/cross-cutting note)",
-        guide=record.get("raw_text", ""),
+        guide=notes.llm_view(record),
         history=_format_chat_history_for_prompt(history),
     )
+    if record.get("sensitive"):
+        instruction += _SENSITIVE_CHAT_ADDENDUM
 
     result = await notebook_pipeline._invoke_agentic_grounded(
         message,
@@ -263,7 +279,18 @@ async def run_chat_turn(
 
     applied_edit: dict[str, Any] | None = None
     edit_payload = result.get("edit")
-    if edit_payload:
+    if edit_payload and record.get("sensitive"):
+        # Structural guard, not prompt-enforced: even if the model ignores
+        # _SENSITIVE_CHAT_ADDENDUM and proposes an edit anyway, _try_apply_edit
+        # is never invoked for a sensitive note — auto-apply has no human
+        # gate, and the model only ever saw a redacted copy, so any edit it
+        # produced can't safely be spliced back into the real content.
+        log.info(
+            "notebook_chat: chat edit for sensitive note %s was proposed but "
+            "suppressed — auto-apply is disabled on sensitive notes",
+            note_id,
+        )
+    elif edit_payload:
         applied_edit = _try_apply_edit(note_id, record["raw_text"], edit_payload)
 
     grounding = {

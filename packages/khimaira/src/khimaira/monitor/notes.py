@@ -27,14 +27,24 @@ from pathlib import Path
 from typing import Any
 
 from khimaira.log import get_logger
+from khimaira.monitor.notebook_redaction import redact_secrets
 from khimaira.monitor.sessions import _append_jsonl, _read_jsonl
 
 log = get_logger("monitor.notes")
 
 _VALID_STATUSES = frozenset({"draft", "processed", "promoted", "failed"})
-_NOTE_MUTABLE_FIELDS = frozenset({"title", "tab_id", "raw_text", "status", "links", "repo"})
+_NOTE_MUTABLE_FIELDS = frozenset(
+    {"title", "tab_id", "raw_text", "status", "links", "repo", "sensitive", "priority"}
+)
 _DEFAULT_TAB_ID = "default"
 _DEFAULT_REPO = "khimaira"
+
+# Sensitive notes (2026-07-04): user-set priority is INDEPENDENT of status
+# (lifecycle) — importance, not workflow state. Mirrors _VALID_STATUSES
+# exactly. The LLM organizer must never touch this (see notebook_organizer's
+# mark_organized — it only ever sets tab_id/organized_at).
+_VALID_PRIORITIES = frozenset({"low", "normal", "high", "urgent"})
+_DEFAULT_PRIORITY = "normal"
 
 # "General" — a repo value meaning "no codebase to validate against" (cross-
 # cutting notes). revalidate_note() and answer_question()'s code-grounding
@@ -63,6 +73,31 @@ _DEFAULT_KIND = "note"
 # in the Library view. A collection IS a tab — no separate store.
 _VALID_TAB_KINDS = frozenset({"folder", "collection"})
 _DEFAULT_TAB_KIND = "folder"
+
+
+# Sensitive / credential-safe notes (2026-07-04): a place to paste content
+# containing real secrets (API keys, connection strings) that the notebook
+# still summarizes/organizes/embeds/chats-about normally — but no LLM call,
+# embedding, cross-note context blob, or training export may ever see the
+# actual secret VALUES. `raw_text` stays the real content (human-only,
+# readable/copyable in the reader); `llm_text` is a redacted twin computed
+# ONCE at write time (see notebook_redaction.redact_secrets) whenever
+# `sensitive=True`; `redactions` records {placeholder, kind} pairs for the
+# UI's "what got hidden" panel — NEVER the masked value itself.
+#
+# `llm_view` is THE choke point: every egress site that used to read
+# `record["raw_text"]` directly (structuring, organizer, embedding, chat/
+# research, personal-context concatenation, training export) now reads
+# `llm_view(record)` instead — this is what makes the boundary structural
+# (one accessor, audited call sites) rather than prompt-enforced. The model
+# can't leak what it never receives.
+def llm_view(record: dict[str, Any]) -> str:
+    """The text an LLM/embedding/cross-note-context/training call is allowed
+    to see for this note: the redacted twin when sensitive, else the real
+    raw_text unchanged."""
+    if record.get("sensitive"):
+        return record.get("llm_text") or ""
+    return record.get("raw_text", "")
 
 
 def _base_dir() -> Path:
@@ -146,12 +181,21 @@ def _read_note_file(note_id: str) -> dict[str, Any] | None:
         return None
 
 
+_SENSITIVE_LIST_PLACEHOLDER = "[sensitive note — open it to view the real content]"
+
+
 def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, Any]:
     """Listing projection of a note. Carries raw_text + pipeline + training
     (not just id/title/status) so GET /notes can render note cards directly —
     no N+1 get_note() round trip per listed note. history is summarized to a
     count (not the full array) to keep the listing cheap; full history is
-    available via get_note()."""
+    available via get_note().
+
+    Sensitive notes (2026-07-04): `raw_text` is REPLACED with a placeholder
+    here — list/search results must never carry a sensitive note's real
+    content in bulk (get_note(), the single-note reader fetch, still returns
+    the real raw_text unchanged)."""
+    is_sensitive = record.get("sensitive", False)
     return {
         "id": record["id"],
         "tab_id": record["tab_id"],
@@ -159,7 +203,7 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "status": record["status"],
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
-        "raw_text": record["raw_text"],
+        "raw_text": _SENSITIVE_LIST_PLACEHOLDER if is_sensitive else record["raw_text"],
         "pipeline": record["pipeline"],
         "training": record["training"],
         "repo": record.get("repo", _DEFAULT_REPO),
@@ -173,6 +217,9 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "kind": record.get("kind", _DEFAULT_KIND),
         "source_path": record.get("source_path"),
         "organized_at": record.get("organized_at"),
+        "sensitive": is_sensitive,
+        "redactions": record.get("redactions"),
+        "priority": record.get("priority", _DEFAULT_PRIORITY),
         "lifecycle": derive_lifecycle(record),
         "deleted": deleted,
     }
@@ -205,7 +252,24 @@ def _fold_tabs() -> dict[str, dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def add_note(raw_text: str, tab_id: str = "", title: str = "", repo: str = "") -> dict[str, Any]:
+def _compute_llm_fields(
+    raw_text: str, sensitive: bool
+) -> tuple[str | None, list[dict[str, str]] | None]:
+    """(llm_text, redactions) for a note — redact_secrets() when sensitive,
+    else (None, None) since llm_view() falls through to raw_text for
+    non-sensitive notes and these fields have no meaning there."""
+    if not sensitive:
+        return None, None
+    return redact_secrets(raw_text)
+
+
+def add_note(
+    raw_text: str,
+    tab_id: str = "",
+    title: str = "",
+    repo: str = "",
+    sensitive: bool = False,
+) -> dict[str, Any]:
     """Create a draft note. `pipeline` is null until the transform runs (Phase 1c).
 
     `repo`: which codebase this note is validated against (north-star:
@@ -213,14 +277,27 @@ def add_note(raw_text: str, tab_id: str = "", title: str = "", repo: str = "") -
     to _DEFAULT_REPO ("khimaira") — must match a project name khimaira's
     discovery registry resolves to a filesystem path, or revalidate_note()
     can't find anchor files to check against.
+
+    `sensitive`: when True, computes a redacted `llm_text` twin (see
+    notebook_redaction.redact_secrets) — every downstream LLM/embedding/
+    training/cross-note-context egress reads llm_view(record) instead of
+    raw_text, so the note's real secret values never reach a model call.
     """
     note_id = _new_id()
     now = _now_iso()
+    llm_text, redactions = _compute_llm_fields(raw_text, sensitive)
+    # Auto-derived titles take their FIRST LINE verbatim (_derive_title) —
+    # for a sensitive note that line could BE the secret. Derive from the
+    # redacted twin instead when sensitive, so the title itself (used
+    # unredacted in _index_stub/list views, ask-synthesis headers, chat
+    # instructions) never carries a real secret. An EXPLICIT `title` param
+    # is used as-is either way — this only affects auto-derivation.
+    title_source = llm_text if sensitive else raw_text
     record: dict[str, Any] = {
         "id": note_id,
         "created_at": now,
         "updated_at": now,
-        "title": title or _derive_title(raw_text),
+        "title": title or _derive_title(title_source),
         "tab_id": tab_id or _DEFAULT_TAB_ID,
         "raw_text": raw_text,
         "status": "draft",
@@ -247,6 +324,10 @@ def add_note(raw_text: str, tab_id: str = "", title: str = "", repo: str = "") -
         "kind": _DEFAULT_KIND,
         "source_path": None,
         "organized_at": None,
+        "sensitive": sensitive,
+        "llm_text": llm_text,
+        "redactions": redactions,
+        "priority": _DEFAULT_PRIORITY,
     }
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
@@ -261,6 +342,7 @@ def add_study_guide(
     title: str = "",
     repo: str = "",
     source_path: str | None = None,
+    sensitive: bool = False,
 ) -> dict[str, Any]:
     """Create a study guide — a distinct KIND of note: a finished,
     human-authored deliverable to be HOUSED + RENDERED, not re-expressed
@@ -277,14 +359,24 @@ def add_study_guide(
     on this via find_by_source_path to avoid re-importing the same file) +
     the eventual export round-trip target. None for guides authored
     directly (not imported from a file).
+
+    `sensitive`: see add_note's docstring — same redacted-twin contract.
     """
     note_id = _new_id()
     now = _now_iso()
+    llm_text, redactions = _compute_llm_fields(raw_text, sensitive)
+    # Auto-derived titles take their FIRST LINE verbatim (_derive_title) —
+    # for a sensitive note that line could BE the secret. Derive from the
+    # redacted twin instead when sensitive, so the title itself (used
+    # unredacted in _index_stub/list views, ask-synthesis headers, chat
+    # instructions) never carries a real secret. An EXPLICIT `title` param
+    # is used as-is either way — this only affects auto-derivation.
+    title_source = llm_text if sensitive else raw_text
     record: dict[str, Any] = {
         "id": note_id,
         "created_at": now,
         "updated_at": now,
-        "title": title or _derive_title(raw_text),
+        "title": title or _derive_title(title_source),
         "tab_id": tab_id or _DEFAULT_TAB_ID,
         "raw_text": raw_text,
         "status": "draft",
@@ -308,6 +400,10 @@ def add_study_guide(
         "kind": "study_guide",
         "source_path": source_path,
         "organized_at": None,
+        "sensitive": sensitive,
+        "llm_text": llm_text,
+        "redactions": redactions,
+        "priority": _DEFAULT_PRIORITY,
     }
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
@@ -340,7 +436,10 @@ def find_by_source_path(source_path: str) -> dict[str, Any] | None:
 
 
 def list_notes(
-    tab_id: str | None = None, repo: str | None = None, kind: str | None = None
+    tab_id: str | None = None,
+    repo: str | None = None,
+    kind: str | None = None,
+    priority: str | None = None,
 ) -> list[dict[str, Any]]:
     """Newest-created first. Sorted by created_at (not updated_at) so a
     revalidate/heal pass — which only bumps updated_at — doesn't reshuffle
@@ -355,7 +454,10 @@ def list_notes(
     `kind=None` returns both — callers that want notes-only (the existing
     UI) or guides-only (the grimoire Library view) filter explicitly,
     mirroring how personal-tab notes are excluded client-side today rather
-    than hidden by default here."""
+    than hidden by default here.
+
+    `priority`, when given, scopes to that priority ("low"|"normal"|"high"|
+    "urgent"). `priority=None` returns all priorities."""
     stubs = list(_fold_index().values())
     if tab_id is not None:
         stubs = [s for s in stubs if s["tab_id"] == tab_id]
@@ -363,6 +465,8 @@ def list_notes(
         stubs = [s for s in stubs if s.get("repo") in (repo, GENERAL_REPO)]
     if kind is not None:
         stubs = [s for s in stubs if s.get("kind", _DEFAULT_KIND) == kind]
+    if priority is not None:
+        stubs = [s for s in stubs if s.get("priority", _DEFAULT_PRIORITY) == priority]
     stubs.sort(key=lambda s: s["created_at"], reverse=True)
     return stubs
 
@@ -400,14 +504,33 @@ def update_note(note_id: str, **fields: Any) -> dict[str, Any]:
         raise ValueError(
             f"Invalid status {fields['status']!r}; must be one of {sorted(_VALID_STATUSES)}."
         )
+    if "priority" in fields and fields["priority"] not in _VALID_PRIORITIES:
+        raise ValueError(
+            f"Invalid priority {fields['priority']!r}; must be one of {sorted(_VALID_PRIORITIES)}."
+        )
     if "repo" in fields and fields["repo"] != record.get("repo"):
         record["validated_git_sha"] = None
         record["last_validated_at"] = None
-    if "raw_text" in fields and fields["raw_text"] != record.get("raw_text"):
+    raw_text_changed = "raw_text" in fields and fields["raw_text"] != record.get("raw_text")
+    if raw_text_changed:
         record.setdefault("history", []).append(
             {"raw_text": record["raw_text"], "replaced_at": _now_iso()}
         )
+    sensitive_changed = "sensitive" in fields and fields["sensitive"] != record.get(
+        "sensitive", False
+    )
     record.update(fields)
+
+    # Re-derive the redacted twin whenever raw_text actually changed OR the
+    # sensitive flag flipped — whichever affects what llm_view() returns.
+    # Clears llm_text/redactions when sensitive flips off (they're moot once
+    # llm_view() falls through to raw_text directly).
+    if record.get("sensitive") and (raw_text_changed or sensitive_changed):
+        record["llm_text"], record["redactions"] = redact_secrets(record["raw_text"])
+    elif not record.get("sensitive") and sensitive_changed:
+        record["llm_text"] = None
+        record["redactions"] = None
+
     if pipeline_patch is not None:
         merged = dict(record.get("pipeline") or {})
         merged.update(pipeline_patch)
@@ -545,8 +668,17 @@ def add_resolution(note_id: str, resolution: str, resolved_by: str = "") -> dict
 
 def promote_note(note_id: str) -> dict[str, Any]:
     """Curated promotion — mark training.promoted=True. Human gate only;
-    never auto-promoted."""
+    never auto-promoted.
+
+    Sensitive notes are hard-excluded from training (2026-07-04) — raises
+    rather than silently no-op'ing, since promotion is an explicit human
+    action that deserves a loud, explicit rejection, not a confusing no-op."""
     record = get_note(note_id)
+    if record.get("sensitive"):
+        raise ValueError(
+            f"Note {note_id!r} is sensitive — sensitive notes are hard-excluded "
+            "from training/promotion."
+        )
     now = _now_iso()
     record["training"]["promoted"] = True
     record["training"]["promoted_at"] = now
@@ -718,15 +850,29 @@ def _with_note_ids(tab_record: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def get_or_create_collection(title: str) -> dict[str, Any]:
-    """Find an existing tab with kind="collection" matching `title`
+def _get_or_create_tab_by_kind(title: str, kind: str) -> dict[str, Any]:
+    """Find an existing tab of the given `kind` matching `title`
     (case-insensitive), or create one. The deterministic-first primitive
     shared by notebook_import.py and notebook_organizer.py — both need "does
-    a collection named X already exist" before deciding to create a new one
-    vs re-file into an existing one, and must agree on the same lookup or
-    they'd create near-duplicate collections differing only in casing."""
+    a tab named X already exist" before deciding to create a new one vs
+    re-file into an existing one, and must agree on the same lookup or
+    they'd create near-duplicate tabs differing only in casing."""
     title_norm = title.strip().lower()
     for tab in list_tabs():
-        if tab.get("kind") == "collection" and tab["title"].strip().lower() == title_norm:
+        if tab.get("kind") == kind and tab["title"].strip().lower() == title_norm:
             return tab
-    return add_tab(title=title, kind="collection")
+    return add_tab(title=title, kind=kind)
+
+
+def get_or_create_collection(title: str) -> dict[str, Any]:
+    """Get-or-create a `kind="collection"` tab — study guides' organize
+    destination."""
+    return _get_or_create_tab_by_kind(title, "collection")
+
+
+def get_or_create_folder(title: str) -> dict[str, Any]:
+    """Get-or-create a `kind="folder"` tab — regular notes' organize
+    destination (the sibling to get_or_create_collection, added when the
+    organizer was extended to notes — kept in its own namespace so notes
+    and guides never intermix in the tab filter bar)."""
+    return _get_or_create_tab_by_kind(title, "folder")

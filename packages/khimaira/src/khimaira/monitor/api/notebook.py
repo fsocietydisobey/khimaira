@@ -76,6 +76,9 @@ from khimaira.monitor import (
 
 from .._optional import require
 
+# urgent > high > normal > low — the numeric ordering ?sort=-priority uses.
+_PRIORITY_SORT_ORDER = {"urgent": 3, "high": 2, "normal": 1, "low": 0}
+
 
 class CreateNoteReq(BaseModel):
     raw_text: str
@@ -85,6 +88,7 @@ class CreateNoteReq(BaseModel):
     kind: str = "note"
     source_path: str | None = None
     collection: str = ""
+    sensitive: bool = False
 
 
 class ImportGuidesReq(BaseModel):
@@ -101,6 +105,8 @@ class UpdateNoteReq(BaseModel):
     links: list[str] | None = None
     repo: str | None = None
     pipeline: dict | None = None
+    sensitive: bool | None = None
+    priority: str | None = None
 
 
 class AddResolutionReq(BaseModel):
@@ -177,12 +183,19 @@ def build_router():
                 title=req.title,
                 repo=req.repo,
                 source_path=req.source_path,
+                sensitive=req.sensitive,
             )
             trigger_pipeline(record["id"])
             notebook_retrieval.schedule_upsert(record)
             return record
 
-        record = notes.add_note(req.raw_text, tab_id=req.tab_id, title=req.title, repo=req.repo)
+        record = notes.add_note(
+            req.raw_text,
+            tab_id=req.tab_id,
+            title=req.title,
+            repo=req.repo,
+            sensitive=req.sensitive,
+        )
         if record["tab_id"] == notes.PERSONAL_TAB_ID:
             # Personal/Behavior folder notes are read as raw_text directly
             # (notebook_pipeline._personal_context) — no structuring, no
@@ -196,14 +209,30 @@ def build_router():
 
     @router.get("/notes")
     async def list_notes_endpoint(
-        tab_id: str | None = None, repo: str | None = None, kind: str | None = None
+        tab_id: str | None = None,
+        repo: str | None = None,
+        kind: str | None = None,
+        priority: str | None = None,
+        sort: str | None = None,
     ) -> dict:
         """`repo`, when given, scopes to that repo plus the "General" bucket
         (repo=None returns every project's notes — the "All projects" view).
         `kind`, when given, scopes to "note" or "study_guide" (kind=None
         returns both — the existing UI filters personal/guide notes out
-        client-side rather than relying on server-side exclusion)."""
-        return {"notes": notes.list_notes(tab_id=tab_id, repo=repo, kind=kind)}
+        client-side rather than relying on server-side exclusion).
+
+        `priority`, when given, scopes to one priority value. `sort`
+        (`"priority"` or `"-priority"`) orders the result by urgent > high >
+        normal > low (or the reverse) — a presentation concern, so it's
+        applied here rather than inside notes.list_notes."""
+        result = notes.list_notes(tab_id=tab_id, repo=repo, kind=kind, priority=priority)
+        if sort in ("priority", "-priority"):
+            result = sorted(
+                result,
+                key=lambda n: _PRIORITY_SORT_ORDER.get(n.get("priority", "normal"), 1),
+                reverse=(sort == "-priority"),
+            )
+        return {"notes": result}
 
     @router.post("/notes/import")
     async def import_guides(req: ImportGuidesReq) -> dict:

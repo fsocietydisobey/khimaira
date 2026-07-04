@@ -116,6 +116,22 @@ def _guide_with_abstract(notes_store, title, abstract, tags=None, tab_id=""):
     return notes_store.get_note(guide["id"])
 
 
+def _note_with_summary(notes_store, title, summary, tags=None, tab_id=""):
+    note = notes_store.add_note(title, title=title, tab_id=tab_id)
+    notes_store.set_pipeline(
+        note["id"],
+        {
+            "summary": summary,
+            "technical": "",
+            "plain": "",
+            "organized_md": "",
+            "tags": tags or [],
+            "entities": [],
+        },
+    )
+    return notes_store.get_note(note["id"])
+
+
 async def test_organize_library_empty_when_no_guides(organizer_llm):
     organizer, _pipeline_mod = organizer_llm
     result = await organizer.organize_library()
@@ -238,6 +254,145 @@ async def test_organize_library_returns_gracefully_when_llm_fails(
     assert result == {"considered": 1, "reassigned": [], "new_collections": []}
     updated = notes_store.get_note(guide["id"])
     assert updated["organized_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# Kind-aware organize_library (2026-07-04 addendum): notes AND guides in one
+# engine — notes organize into folders, guides into collections, separate
+# namespaces, a note's content signal is `summary` not `abstract`.
+# ---------------------------------------------------------------------------
+
+
+async def test_organize_library_files_a_note_into_a_folder_not_a_collection(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+    note = _note_with_summary(notes_store, "My Note", "A note about widgets.")
+
+    async def fake_transform_note(content, *, instruction, schema):
+        return {"placements": [{"note_id": note["id"], "collection": "Widgets"}]}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert result["reassigned"] == [note["id"]]
+    updated = notes_store.get_note(note["id"])
+    tab = notes_store.get_tab(updated["tab_id"])
+    assert tab["kind"] == "folder"
+    assert tab["title"] == "Widgets"
+
+
+async def test_organize_library_never_touches_priority(organizer_llm, notes_store, monkeypatch):
+    """Priority flags (2026-07-04): user-owned, independent of the
+    organizer's placement decisions — a reassignment must leave priority
+    exactly as the user last set it."""
+    organizer, pipeline_mod = organizer_llm
+    note = _note_with_summary(notes_store, "My Note", "A note about widgets.")
+    notes_store.update_note(note["id"], priority="urgent")
+
+    async def fake_transform_note(content, *, instruction, schema):
+        return {"placements": [{"note_id": note["id"], "collection": "Widgets"}]}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    await organizer.organize_library()
+
+    assert notes_store.get_note(note["id"])["priority"] == "urgent"
+
+
+async def test_organize_library_note_blurb_uses_summary_not_abstract(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+    _note_with_summary(notes_store, "My Note", "THE_SUMMARY_TEXT")
+    seen_content = []
+
+    async def fake_transform_note(content, *, instruction, schema):
+        seen_content.append(content)
+        return {"placements": []}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    await organizer.organize_library()
+
+    assert "THE_SUMMARY_TEXT" in seen_content[0]
+
+
+async def test_organize_library_handles_mixed_notes_and_guides_in_one_call(
+    organizer_llm, notes_store, monkeypatch
+):
+    """ONE batched LLM call covers both kinds — the money-printer guard
+    applies regardless of how many kinds are in the library."""
+    organizer, pipeline_mod = organizer_llm
+    note = _note_with_summary(notes_store, "A Note", "note summary")
+    guide = _guide_with_abstract(notes_store, "A Guide", "guide abstract")
+    call_count = 0
+
+    async def fake_transform_note(content, *, instruction, schema):
+        nonlocal call_count
+        call_count += 1
+        return {
+            "placements": [
+                {"note_id": note["id"], "collection": "Notes Folder"},
+                {"note_id": guide["id"], "collection": "Guides Collection"},
+            ]
+        }
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert call_count == 1  # ONE batched call for both kinds
+    assert result["considered"] == 2
+    assert set(result["reassigned"]) == {note["id"], guide["id"]}
+
+    note_tab = notes_store.get_tab(notes_store.get_note(note["id"])["tab_id"])
+    guide_tab = notes_store.get_tab(notes_store.get_note(guide["id"])["tab_id"])
+    assert note_tab["kind"] == "folder"
+    assert guide_tab["kind"] == "collection"
+
+
+async def test_organize_library_note_and_guide_can_reuse_same_name_in_different_namespaces(
+    organizer_llm, notes_store, monkeypatch
+):
+    """A folder named "Widgets" and a collection named "Widgets" are
+    DIFFERENT tabs — notes and guides never intermix, even on a name clash."""
+    organizer, pipeline_mod = organizer_llm
+    note = _note_with_summary(notes_store, "A Note", "note about widgets")
+    guide = _guide_with_abstract(notes_store, "A Guide", "guide about widgets")
+
+    async def fake_transform_note(content, *, instruction, schema):
+        return {
+            "placements": [
+                {"note_id": note["id"], "collection": "Widgets"},
+                {"note_id": guide["id"], "collection": "Widgets"},
+            ]
+        }
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    await organizer.organize_library()
+
+    note_tab_id = notes_store.get_note(note["id"])["tab_id"]
+    guide_tab_id = notes_store.get_note(guide["id"])["tab_id"]
+    assert note_tab_id != guide_tab_id
+    assert notes_store.get_tab(note_tab_id)["kind"] == "folder"
+    assert notes_store.get_tab(guide_tab_id)["kind"] == "collection"
+
+
+async def test_organize_library_ignores_unstructured_notes(organizer_llm, notes_store, monkeypatch):
+    """A draft note (pipeline=None) has no content signal to organize by —
+    must be excluded from the batch entirely, not sent to the LLM with an
+    empty blurb."""
+    organizer, pipeline_mod = organizer_llm
+    notes_store.add_note("still a draft, never structured")
+    called = []
+
+    async def fake_transform_note(content, *, instruction, schema):
+        called.append(1)
+        return {"placements": []}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert result == {"considered": 0, "reassigned": [], "new_collections": []}
+    assert called == []  # short-circuited before spending an LLM call
 
 
 # ---------------------------------------------------------------------------

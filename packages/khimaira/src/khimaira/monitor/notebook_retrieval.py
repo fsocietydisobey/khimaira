@@ -101,16 +101,23 @@ def _passage_text(record: dict[str, Any]) -> str:
     Study guides (kind="study_guide") embed abstract + raw_text[:N] instead
     — a guide's pipeline has no summary/organized_md (it has abstract/toc),
     and unlike a regular note's unstructured paste, a guide's raw_text IS
-    the finished, retrievable content itself."""
+    the finished, retrievable content itself.
+
+    Sensitive notes (2026-07-04): both raw_text reads route through
+    notes.llm_view() — the embedded vector + the stored retrieval passage
+    (what the ask-path re-surfaces verbatim) must never carry a sensitive
+    note's real secret values."""
+    from khimaira.monitor import notes
+
     if record.get("kind") == "study_guide":
         pipeline = record.get("pipeline") or {}
         abstract = pipeline.get("abstract", "")
-        body = (record.get("raw_text") or "")[:_MAX_GUIDE_EMBED_CHARS]
+        body = notes.llm_view(record)[:_MAX_GUIDE_EMBED_CHARS]
         return f"{abstract}\n\n{body}".strip()
     pipeline = record.get("pipeline")
     if pipeline:
         return f"{pipeline.get('summary', '')}\n\n{pipeline.get('organized_md', '')}".strip()
-    return (record.get("raw_text") or "").strip()
+    return notes.llm_view(record).strip()
 
 
 def upsert_note(record: dict[str, Any]) -> None:

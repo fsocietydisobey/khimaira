@@ -61,6 +61,28 @@ def test_promote_resolved_skips_when_no_resolution(training):
     assert training.promote_resolved(note) is None
 
 
+def test_promote_resolved_hard_excludes_sensitive_notes(training, monkeypatch):
+    """Sensitive notes (2026-07-04): HARD-excluded from training export —
+    even a fully-resolved sensitive note must never reach the distiller."""
+    called = []
+    monkeypatch.setattr(
+        "khimaira.hooks.mnemosyne_client.distill",
+        lambda *a, **kw: called.append(1) or {"ok": True},
+    )
+    note = _resolved_note(sensitive=True)
+
+    result = training.promote_resolved(note)
+
+    assert result is None
+    assert called == []  # distill was never even attempted
+
+
+def test_promote_resolved_still_works_for_non_sensitive_notes(training, monkeypatch):
+    monkeypatch.setattr("khimaira.hooks.mnemosyne_client.distill", lambda *a, **kw: {"ok": True})
+    result = training.promote_resolved(_resolved_note(sensitive=False))
+    assert result == {"ok": True}
+
+
 def test_promote_resolved_calls_distill_with_derived_pair(training, monkeypatch):
     captured = {}
 

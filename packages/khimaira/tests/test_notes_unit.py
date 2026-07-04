@@ -47,6 +47,206 @@ def test_add_note_repo_override(notes_store):
     assert note["repo"] == "jeevy_portal"
 
 
+# ---------------------------------------------------------------------------
+# Sensitive / credential-safe notes (2026-07-04)
+# ---------------------------------------------------------------------------
+
+
+def test_add_note_defaults_not_sensitive(notes_store):
+    note = notes_store.add_note("raw")
+    assert note["sensitive"] is False
+    assert note["llm_text"] is None
+    assert note["redactions"] is None
+
+
+def test_add_note_sensitive_computes_redacted_twin(notes_store):
+    secret = "sk-ant-" + "a" * 30
+    note = notes_store.add_note(f"API_KEY={secret}", sensitive=True)
+    assert note["sensitive"] is True
+    assert note["raw_text"] == f"API_KEY={secret}"  # REAL text unchanged
+    assert secret not in note["llm_text"]
+    assert len(note["redactions"]) >= 1
+    assert all(secret not in r["placeholder"] for r in note["redactions"])
+
+
+def test_add_note_sensitive_auto_derived_title_never_contains_the_secret(notes_store):
+    """Regression: _derive_title takes the literal FIRST LINE of content —
+    when the secret IS the first line, an auto-derived title would leak it
+    verbatim into _index_stub/list views/ask-synthesis headers, all of
+    which read `title` unredacted (title is a display label, not gated by
+    llm_view). Auto-derivation must use the redacted twin when sensitive."""
+    secret = "sk-ant-" + "z" * 30
+    note = notes_store.add_note(f"key: {secret}", sensitive=True)
+    assert secret not in note["title"]
+
+
+def test_add_note_sensitive_explicit_title_is_used_as_is(notes_store):
+    """An EXPLICITLY given title is trusted verbatim regardless of
+    sensitivity — only AUTO-derivation is redirected through the redacted
+    twin; a human typing a title is their own call, same as raw_text."""
+    secret = "sk-ant-" + "y" * 30
+    note = notes_store.add_note(f"key: {secret}", title="My Credential Note", sensitive=True)
+    assert note["title"] == "My Credential Note"
+
+
+def test_add_study_guide_sensitive_computes_redacted_twin(notes_store):
+    secret = "sk-ant-" + "b" * 30
+    guide = notes_store.add_study_guide(f"# Guide\n\nAPI_KEY={secret}", sensitive=True)
+    assert guide["sensitive"] is True
+    assert secret not in guide["llm_text"]
+    assert guide["raw_text"] == f"# Guide\n\nAPI_KEY={secret}"
+
+
+def test_llm_view_returns_raw_text_when_not_sensitive(notes_store):
+    note = notes_store.add_note("hello world")
+    assert notes_store.llm_view(note) == "hello world"
+
+
+def test_llm_view_returns_redacted_twin_when_sensitive(notes_store):
+    secret = "sk-ant-" + "c" * 30
+    note = notes_store.add_note(f"key: {secret}", sensitive=True)
+    view = notes_store.llm_view(note)
+    assert secret not in view
+    assert view == note["llm_text"]
+
+
+def test_llm_view_empty_string_when_sensitive_but_llm_text_missing(notes_store):
+    """Defensive: a malformed/legacy record with sensitive=True but no
+    llm_text must fail SAFE (empty string), never fall through to raw_text."""
+    record = {"sensitive": True, "raw_text": "should never appear", "llm_text": None}
+    assert notes_store.llm_view(record) == ""
+
+
+def test_update_note_raw_text_change_re_redacts_sensitive_note(notes_store):
+    old_secret = "sk-ant-" + "d" * 30
+    new_secret = "sk-ant-" + "e" * 30
+    note = notes_store.add_note(f"key: {old_secret}", sensitive=True)
+
+    updated = notes_store.update_note(note["id"], raw_text=f"key: {new_secret}")
+
+    assert old_secret not in updated["llm_text"]
+    assert new_secret not in updated["llm_text"]  # re-redacted against the NEW text
+
+
+def test_update_note_flipping_sensitive_on_computes_redaction(notes_store):
+    secret = "sk-ant-" + "f" * 30
+    note = notes_store.add_note(f"key: {secret}")
+    assert note["llm_text"] is None
+
+    updated = notes_store.update_note(note["id"], sensitive=True)
+
+    assert updated["sensitive"] is True
+    assert secret not in updated["llm_text"]
+
+
+def test_update_note_flipping_sensitive_off_clears_redaction(notes_store):
+    secret = "sk-ant-" + "g" * 30
+    note = notes_store.add_note(f"key: {secret}", sensitive=True)
+
+    updated = notes_store.update_note(note["id"], sensitive=False)
+
+    assert updated["sensitive"] is False
+    assert updated["llm_text"] is None
+    assert updated["redactions"] is None
+    assert notes_store.llm_view(updated) == f"key: {secret}"  # falls through to raw_text
+
+
+def test_update_note_raw_text_unchanged_does_not_recompute_redaction(notes_store):
+    secret = "sk-ant-" + "h" * 30
+    note = notes_store.add_note(f"key: {secret}", sensitive=True)
+    original_llm_text = note["llm_text"]
+
+    updated = notes_store.update_note(note["id"], title="renamed")
+
+    assert updated["llm_text"] == original_llm_text  # unchanged, not recomputed
+
+
+def test_index_stub_masks_raw_text_for_sensitive_notes(notes_store):
+    secret = "sk-ant-" + "i" * 30
+    notes_store.add_note(f"key: {secret}", sensitive=True)
+
+    listed = notes_store.list_notes()
+    assert len(listed) == 1
+    assert secret not in listed[0]["raw_text"]
+    assert listed[0]["sensitive"] is True
+
+
+def test_index_stub_does_not_mask_raw_text_for_non_sensitive_notes(notes_store):
+    notes_store.add_note("plain content")
+    listed = notes_store.list_notes()
+    assert listed[0]["raw_text"] == "plain content"
+    assert listed[0]["sensitive"] is False
+
+
+def test_get_note_returns_real_raw_text_for_sensitive_note(notes_store):
+    """The single-note reader fetch (get_note, NOT list_notes) always
+    returns the REAL raw_text — only bulk list/search results are masked."""
+    secret = "sk-ant-" + "j" * 30
+    note = notes_store.add_note(f"key: {secret}", sensitive=True)
+    fetched = notes_store.get_note(note["id"])
+    assert fetched["raw_text"] == f"key: {secret}"
+
+
+def test_promote_note_refuses_sensitive_notes(notes_store):
+    note = notes_store.add_note("secret stuff", sensitive=True)
+    with pytest.raises(ValueError, match="sensitive"):
+        notes_store.promote_note(note["id"])
+
+
+def test_promote_note_still_works_for_non_sensitive_notes(notes_store):
+    note = notes_store.add_note("ordinary note")
+    promoted = notes_store.promote_note(note["id"])
+    assert promoted["training"]["promoted"] is True
+
+
+# ---------------------------------------------------------------------------
+# Priority flags (2026-07-04)
+# ---------------------------------------------------------------------------
+
+
+def test_add_note_defaults_priority_normal(notes_store):
+    note = notes_store.add_note("raw")
+    assert note["priority"] == "normal"
+
+
+def test_add_study_guide_defaults_priority_normal(notes_store):
+    guide = notes_store.add_study_guide("# G\n\nbody")
+    assert guide["priority"] == "normal"
+
+
+def test_update_note_priority_round_trips(notes_store):
+    note = notes_store.add_note("raw")
+    updated = notes_store.update_note(note["id"], priority="urgent")
+    assert updated["priority"] == "urgent"
+    assert notes_store.get_note(note["id"])["priority"] == "urgent"
+
+
+def test_update_note_rejects_invalid_priority(notes_store):
+    note = notes_store.add_note("raw")
+    with pytest.raises(ValueError, match="Invalid priority"):
+        notes_store.update_note(note["id"], priority="critical")
+
+
+def test_list_notes_priority_filter(notes_store):
+    notes_store.add_note("a", tab_id="t1")
+    urgent = notes_store.add_note("b", tab_id="t1")
+    notes_store.update_note(urgent["id"], priority="urgent")
+
+    urgent_only = notes_store.list_notes(priority="urgent")
+    assert len(urgent_only) == 1
+    assert urgent_only[0]["id"] == urgent["id"]
+
+    all_notes = notes_store.list_notes()
+    assert len(all_notes) == 2
+
+
+def test_index_stub_carries_priority(notes_store):
+    note = notes_store.add_note("raw")
+    notes_store.update_note(note["id"], priority="high")
+    listed = notes_store.list_notes()
+    assert listed[0]["priority"] == "high"
+
+
 def test_apply_validation_current_no_history_churn(notes_store):
     note = notes_store.add_note("raw")
     notes_store.set_pipeline(note["id"], {"summary": "s1"})
@@ -781,5 +981,26 @@ def test_get_or_create_collection_does_not_match_folders(notes_store):
     notes_store.add_tab(title="Ambiguous Name", kind="folder")
     collection = notes_store.get_or_create_collection("Ambiguous Name")
     assert collection["kind"] == "collection"
+    kinds = {t["kind"] for t in notes_store.list_tabs() if t["title"] == "Ambiguous Name"}
+    assert kinds == {"folder", "collection"}
+
+
+def test_get_or_create_folder_creates_when_absent(notes_store):
+    tab = notes_store.get_or_create_folder("New Folder")
+    assert tab["kind"] == "folder"
+    assert tab["title"] == "New Folder"
+
+
+def test_get_or_create_folder_reuses_existing_case_insensitive(notes_store):
+    first = notes_store.get_or_create_folder("My Folder")
+    second = notes_store.get_or_create_folder("my folder")
+    assert first["id"] == second["id"]
+    assert len([t for t in notes_store.list_tabs() if t["kind"] == "folder"]) == 1
+
+
+def test_get_or_create_folder_does_not_match_collections(notes_store):
+    notes_store.add_tab(title="Ambiguous Name", kind="collection")
+    folder = notes_store.get_or_create_folder("Ambiguous Name")
+    assert folder["kind"] == "folder"
     kinds = {t["kind"] for t in notes_store.list_tabs() if t["title"] == "Ambiguous Name"}
     assert kinds == {"folder", "collection"}

@@ -273,6 +273,7 @@ async def test_transform_note_nonzero_exit_retries(pipeline, monkeypatch):
 
 
 async def test_trigger_pipeline_success_sets_processed(notes_store, pipeline, monkeypatch):
+    _stub_organize_after_structuring(monkeypatch)
     note = notes_store.add_note("some raw content")
     _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_VALID_PAYLOAD)))])
 
@@ -285,6 +286,36 @@ async def test_trigger_pipeline_success_sets_processed(notes_store, pipeline, mo
     assert updated["pipeline"] == {k: v for k, v in _VALID_PAYLOAD.items() if k != "title"}
     assert updated["title"] == _VALID_PAYLOAD["title"]
     assert updated["raw_text"] == "some raw content"
+
+
+async def test_trigger_pipeline_sensitive_note_feeds_redacted_text_not_raw(
+    notes_store, pipeline, monkeypatch
+):
+    """Sensitive notes (2026-07-04): the structuring subprocess must receive
+    llm_view(record) via stdin, never the real raw_text."""
+    _stub_organize_after_structuring(monkeypatch)
+    secret = "sk-ant-" + "a" * 30
+    note = notes_store.add_note(f"API_KEY={secret}", sensitive=True)
+    seen_stdin: list[str] = []
+
+    class _CapturingProc:
+        def __init__(self, stdout):
+            self._stdout = stdout
+            self.returncode = 0
+
+        async def communicate(self, input=None):
+            seen_stdin.append(input.decode("utf-8"))
+            return self._stdout, b""
+
+    async def fake_exec(*args, **kwargs):
+        return _CapturingProc(_envelope(json.dumps(_VALID_PAYLOAD)))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+
+    await pipeline.trigger_pipeline(note["id"])
+
+    assert len(seen_stdin) == 1
+    assert secret not in seen_stdin[0]
 
 
 async def test_trigger_pipeline_failure_marks_failed_and_preserves_raw_text(
@@ -314,6 +345,52 @@ async def test_trigger_pipeline_note_deleted_before_transform_is_a_noop(
 ):
     # No note created — note_id resolves to nothing. Must not raise.
     await pipeline.trigger_pipeline("no-such-note")
+
+
+async def test_trigger_pipeline_calls_organize_after_structuring(
+    pipeline, notes_store, monkeypatch
+):
+    """2026-07-04: the organizer was extended to regular notes — a
+    successful note structuring pass now fires the SAME post-structuring
+    hook the guide pipeline already had."""
+    from khimaira.monitor import notebook_organizer
+
+    note = notes_store.add_note("some raw content")
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_VALID_PAYLOAD)))])
+    calls: list[str] = []
+
+    async def fake_organize_after_structuring(note_id):
+        calls.append(note_id)
+
+    monkeypatch.setattr(
+        notebook_organizer, "organize_after_structuring", fake_organize_after_structuring
+    )
+
+    await pipeline.trigger_pipeline(note["id"])
+
+    assert calls == [note["id"]]
+
+
+async def test_trigger_pipeline_skip_organize_suppresses_the_hook(
+    pipeline, notes_store, monkeypatch
+):
+    from khimaira.monitor import notebook_organizer
+
+    note = notes_store.add_note("some raw content")
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_VALID_PAYLOAD)))])
+    calls: list[str] = []
+
+    async def fake_organize_after_structuring(note_id):
+        calls.append(note_id)
+
+    monkeypatch.setattr(
+        notebook_organizer, "organize_after_structuring", fake_organize_after_structuring
+    )
+
+    await pipeline.trigger_pipeline(note["id"], skip_organize=True)
+
+    assert calls == []
+    assert notes_store.get_note(note["id"])["status"] == "processed"  # structuring still ran
 
 
 async def test_schedule_pipeline_creates_background_task(notes_store, pipeline, monkeypatch):
@@ -787,6 +864,42 @@ async def test_answer_question_orchestrates_retrieve_revalidate_synth(
     assert result["healed"] == []
 
 
+async def test_answer_question_sensitive_unstructured_note_falls_back_to_redacted_text(
+    pipeline, notes_store, monkeypatch
+):
+    """Sensitive notes (2026-07-04): an UNSTRUCTURED sensitive note (no
+    pipeline yet) falls back to raw_text in the ask-synthesis prompt — that
+    fallback must route through llm_view, never the real secret. The note
+    body lands in the --append-system-prompt arg (via _ASK_INSTRUCTION_
+    TEMPLATE), not stdin (which only ever carries the bare question)."""
+    secret = "sk-ant-" + "p" * 30
+    note = notes_store.add_note(f"key: {secret}", tab_id="t1", sensitive=True)
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": note["id"], "score": 0.9}]
+
+    async def fake_revalidate(note_id):
+        return notes_store.get_note(note_id)
+
+    monkeypatch.setattr(pipeline.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+
+    captured_args = []
+
+    async def fake_exec(*args, **kwargs):
+        captured_args.append(args)
+        return _FakeProc(_envelope("some answer"))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await pipeline.answer_question("what is the key?")
+
+    assert result["sources"] == [note["id"]]
+    assert len(captured_args) == 1
+    system_prompt_idx = captured_args[0].index("--append-system-prompt") + 1
+    assert secret not in captured_args[0][system_prompt_idx]
+
+
 async def test_answer_question_tracks_healed_notes(pipeline, notes_store, monkeypatch):
     note = notes_store.add_note("raw", tab_id="t1")
     notes_store.set_pipeline(note["id"], _VALID_PAYLOAD)
@@ -1247,6 +1360,27 @@ def test_prepend_personal_context_prepends_when_present(pipeline, notes_store):
     assert result.endswith("base instruction")
 
 
+def test_personal_context_sensitive_note_never_leaks_real_secret(pipeline, notes_store):
+    """CRITICAL cross-note leak (2026-07-04): a sensitive note filed into
+    the Personal folder must not inject its real secret into EVERY other
+    LLM call via this concatenation — the redacted twin goes in instead."""
+    secret = "sk-ant-" + "n" * 30
+    notes_store.add_note(
+        f"Remember this key: {secret}", tab_id=notes_store.PERSONAL_TAB_ID, sensitive=True
+    )
+    result = pipeline._personal_context()
+    assert secret not in result
+
+
+def test_personal_context_mixes_sensitive_and_normal_notes_correctly(pipeline, notes_store):
+    secret = "sk-ant-" + "o" * 30
+    notes_store.add_note("Always be terse.", tab_id=notes_store.PERSONAL_TAB_ID)
+    notes_store.add_note(f"key: {secret}", tab_id=notes_store.PERSONAL_TAB_ID, sensitive=True)
+    result = pipeline._personal_context()
+    assert "Always be terse." in result  # normal note's real content still flows through
+    assert secret not in result  # sensitive note's real secret does not
+
+
 async def test_invoke_claude_includes_personal_context_in_system_prompt(
     pipeline, notes_store, monkeypatch
 ):
@@ -1380,6 +1514,42 @@ async def test_trigger_study_guide_pipeline_success_never_touches_raw_text(
     assert updated["title"] == "# Widgets"
 
 
+async def test_trigger_study_guide_pipeline_sensitive_guide_feeds_redacted_text(
+    pipeline, notes_store, monkeypatch
+):
+    """Sensitive notes (2026-07-04): a sensitive guide's structuring
+    subprocess receives llm_view(record) — the redacted twin — via stdin,
+    never the real raw_text. _parse_toc (deterministic, local-only) still
+    runs on the REAL raw_text — that's not an LLM egress."""
+    _stub_organize_after_structuring(monkeypatch)
+    secret = "sk-ant-" + "b" * 30
+    guide = notes_store.add_study_guide(f"# Widgets\n\nAPI_KEY={secret}", sensitive=True)
+    seen_stdin: list[str] = []
+
+    class _CapturingProc:
+        def __init__(self, stdout):
+            self._stdout = stdout
+            self.returncode = 0
+
+        async def communicate(self, input=None):
+            seen_stdin.append(input.decode("utf-8"))
+            return self._stdout, b""
+
+    async def fake_exec(*args, **kwargs):
+        return _CapturingProc(_envelope(json.dumps(_GUIDE_PAYLOAD)))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+
+    await pipeline.trigger_study_guide_pipeline(guide["id"])
+
+    assert len(seen_stdin) == 1
+    assert secret not in seen_stdin[0]
+    # toc still reflects the REAL document's headings (deterministic, never
+    # sent to an LLM) — unaffected by redaction.
+    updated = notes_store.get_note(guide["id"])
+    assert updated["pipeline"]["toc"] == [{"title": "Widgets", "anchor": "widgets", "level": 1}]
+
+
 async def test_trigger_study_guide_pipeline_failure_marks_failed(
     pipeline, notes_store, monkeypatch
 ):
@@ -1491,7 +1661,7 @@ async def test_schedule_pipeline_dispatches_study_guide_to_the_guide_pipeline(
     async def fake_guide_pipeline(note_id, **kwargs):
         called["guide"] = True
 
-    async def fake_note_pipeline(note_id):
+    async def fake_note_pipeline(note_id, **kwargs):
         called["note"] = True
 
     monkeypatch.setattr(pipeline, "trigger_study_guide_pipeline", fake_guide_pipeline)
@@ -1512,7 +1682,7 @@ async def test_schedule_pipeline_dispatches_regular_note_to_the_note_pipeline(
     async def fake_guide_pipeline(note_id):
         called["guide"] = True
 
-    async def fake_note_pipeline(note_id):
+    async def fake_note_pipeline(note_id, **kwargs):
         called["note"] = True
 
     monkeypatch.setattr(pipeline, "trigger_study_guide_pipeline", fake_guide_pipeline)
@@ -1923,6 +2093,25 @@ async def test_research_answer_general_repo_skips_repo_root(pipeline, notes_stor
     assert seen == [None]
 
 
+async def test_research_answer_sensitive_guide_feeds_redacted_text(
+    pipeline, notes_store, monkeypatch
+):
+    """Sensitive notes (2026-07-04): research_answer's agentic instruction
+    must carry llm_view(record), never the real raw_text."""
+    secret = "sk-ant-" + "k" * 30
+    guide = notes_store.add_study_guide(f"# G\n\nAPI_KEY={secret}", sensitive=True)
+    seen_instructions: list[str] = []
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+        seen_instructions.append(instruction)
+        return {**_GROUNDED_EMPTY, "web_grounding_unverified": False, "total_cost_usd": 0.1}
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    await pipeline.research_answer(guide["id"], "what does this do?")
+
+    assert secret not in seen_instructions[0]
+
+
 async def test_research_answer_resolves_repo_root_and_passes_question(
     pipeline, notes_store, monkeypatch, git_repo
 ):
@@ -2012,6 +2201,37 @@ async def test_research_revise_unknown_section_anchor_raises_before_invoking(
         await pipeline.research_revise(note["id"], "directive", section_anchor="nonexistent")
 
     assert called == []  # never spent the agentic call on a bad anchor
+
+
+async def test_research_revise_sensitive_guide_feeds_redacted_text_but_splices_real(
+    pipeline, notes_store, monkeypatch
+):
+    """Sensitive notes (2026-07-04): the agentic instruction carries
+    llm_view(record) (redacted), but splice_section still operates on the
+    REAL raw_text — REVISE's human-review-before-apply gate is what keeps
+    that safe from a data-loss standpoint, per the audit."""
+    secret = "sk-ant-" + "m" * 30
+    raw = f"# Title\n\nAPI_KEY={secret}\n"
+    guide = notes_store.add_study_guide(raw, sensitive=True)
+    seen_instructions: list[str] = []
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+        seen_instructions.append(instruction)
+        return {
+            "answer": "rewrote it",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": "# Title\n\nreplacement text\n",
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.2,
+        }
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    result = await pipeline.research_revise(guide["id"], "make it better")
+
+    assert secret not in seen_instructions[0]
+    assert result["proposed_raw_text"] == "# Title\n\nreplacement text\n"
 
 
 async def test_research_revise_whole_guide_splices_full_replacement(
