@@ -19,7 +19,14 @@ from __future__ import annotations
 import urllib.parse
 from typing import Any
 
-from khimaira.server.monitor_tools import _get, _patch, _post
+from khimaira.server.monitor_tools import _delete, _get, _patch, _post
+
+# Mirror of notes.PERSONAL_TAB_ID — deliberately NOT imported. This module is a
+# pure HTTP client to the daemon; importing the monitor's in-process `notes`
+# module here is exactly the coupling the client/daemon split exists to avoid
+# (see this file's header docstring). Kept honest by test_notebook_tools'
+# personal-tab-constant sync assertion.
+_PERSONAL_TAB_ID = "personal"
 
 _LIFECYCLE_BADGE = {
     "captured": "📝",
@@ -226,3 +233,84 @@ async def notebook_update(
     if isinstance(data, str):
         return data
     return f"✅ `{data['id']}` updated — **{data.get('title', '?')}**."
+
+
+async def notebook_create(
+    project: str = "",
+    raw_text: str = "",
+    title: str = "",
+    tab: str = "",
+) -> str:
+    """Capture a NEW note into the notebook — the roster loop's write-IN half.
+
+    Reach for this to persist a finding, design hesitation, bug-class result,
+    or decision produced during work into the durable, code-grounded notebook,
+    where it can later be @-mentioned, asked against (`notebook_ask`), and —
+    once resolved (`notebook_add_resolution`) — promoted to oracle training
+    data. `create` captures the problem; `add_resolution` closes it.
+
+    `project` is the repo the note is validated against (e.g. "khimaira",
+    "jeevy_portal") — pass it EXPLICITLY so the note isn't mis-scoped to the
+    default repo. `tab` is an optional folder; omit for the General bucket.
+    The note returns immediately as a draft — the structuring pipeline
+    (summary / organized / technical / plain + a derived title) runs async,
+    exactly like a UI paste, so this call does not block on the LLM transform.
+    """
+    if not raw_text.strip():
+        return "❌ notebook_create requires non-empty raw_text — the note body to capture."
+    if tab == _PERSONAL_TAB_ID:
+        return (
+            "❌ refusing to create into the 'personal' tab — that's Joseph's "
+            "behavior/voice folder, read verbatim into every notebook LLM call. "
+            "Capture roster notes into the General bucket (omit `tab`) or a "
+            "named tab instead."
+        )
+    body: dict[str, Any] = {"raw_text": raw_text}
+    if title:
+        body["title"] = title
+    if tab:
+        body["tab_id"] = tab
+    if project:
+        body["repo"] = project
+    data = _post("/api/notes", body)
+    if isinstance(data, str):
+        return data
+    return (
+        f"📝 captured `{data['id']}` — **{data.get('title', '?')}** "
+        f"[{data.get('status', 'draft')}]  repo={data.get('repo', '?')} "
+        f"tab={data.get('tab_id', '?')}. Structuring pipeline running async — "
+        f"read it back with `notebook_get(note_id)` shortly, or attach a "
+        f"resolution with `notebook_add_resolution` once you've worked it."
+    )
+
+
+async def notebook_delete(note_id: str) -> str:
+    """Delete a note permanently. DESTRUCTIVE — the note file is removed (a
+    deleted-tombstone remains in the index, but the content is gone; the
+    notebook store has no git-history safety net like the source tree does).
+
+    Guarded: reads the note first (so the confirmation names what was removed)
+    and REFUSES to delete anything in the 'personal' tab — that's Joseph's
+    user-owned behavior/voice folder, not roster-deletable. Move a note out of
+    the personal tab first if deletion is genuinely intended.
+    """
+    if not note_id:
+        return "❌ notebook_delete requires a note_id — get one from notebook_list/notebook_search."
+    quoted = urllib.parse.quote(note_id, safe="")
+    existing = _get(f"/api/notes/{quoted}")
+    if isinstance(existing, str):
+        return existing  # 404 / daemon-down — already a formatted error string
+    if existing.get("tab_id") == _PERSONAL_TAB_ID:
+        return (
+            f"❌ refusing to delete `{note_id}` — it's in the 'personal' tab "
+            "(Joseph's behavior/voice folder, user-owned). Move it out of the "
+            "personal tab first if deletion is really intended."
+        )
+    title = existing.get("title", "?")
+    data = _delete(f"/api/notes/{quoted}")
+    if isinstance(data, str):
+        return data
+    return (
+        f"🗑️ deleted `{note_id}` — **{title}** "
+        f"(repo={existing.get('repo', '?')}, tab={existing.get('tab_id', '?')})."
+    )

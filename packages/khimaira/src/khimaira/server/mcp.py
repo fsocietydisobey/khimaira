@@ -2936,6 +2936,49 @@ async def notebook_update(
 
 
 @mcp.tool()
+@logged_tool("notebook_create")
+async def notebook_create(
+    project: str = "",
+    raw_text: str = "",
+    title: str = "",
+    tab: str = "",
+) -> str:
+    """Capture a NEW note into the notebook — the roster loop's write-IN half.
+
+    Persist a finding, design hesitation, bug-class result, or decision you
+    produced during work into the durable, code-grounded notebook: it can then
+    be @-mentioned, asked against (`notebook_ask`), and — once you resolve it
+    with `notebook_add_resolution` — promoted to oracle training data. `create`
+    captures the problem; `add_resolution` closes it. Returns immediately with
+    a draft; the structuring pipeline runs async (same as a UI paste).
+
+    Args:
+        project: repo the note is validated against ("khimaira",
+            "jeevy_portal", ...). Pass it EXPLICITLY so the note isn't
+            mis-scoped to the default repo.
+        raw_text: the note body to capture (required).
+        title: optional title; the pipeline derives one if omitted.
+        tab: optional folder; omit for the General bucket. The 'personal'
+            tab is rejected — it's the user-owned behavior/voice folder.
+    """
+    return await _notebook_tools.notebook_create(project, raw_text, title, tab)
+
+
+@mcp.tool()
+@logged_tool("notebook_delete")
+async def notebook_delete(note_id: str) -> str:
+    """Delete a note permanently. DESTRUCTIVE — the note content is removed
+    (the notebook store has no git-history safety net). Reads the note first
+    so the confirmation names it, and REFUSES to delete anything in the
+    'personal' tab (the user-owned behavior/voice folder).
+
+    Args:
+        note_id: the note id to delete (from notebook_list/notebook_search).
+    """
+    return await _notebook_tools.notebook_delete(note_id)
+
+
+@mcp.tool()
 @logged_tool("session_wait_for_answer")
 async def session_wait_for_answer(
     session_id: str,

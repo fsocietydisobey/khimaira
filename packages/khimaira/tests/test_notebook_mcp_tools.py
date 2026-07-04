@@ -281,3 +281,124 @@ def test_notebook_update_error_passthrough():
     with patch.object(nt, "_patch", return_value="khimaira-monitor → HTTP 422: Invalid status"):
         out = _run(nt.notebook_update("note-1", status="bogus"))
     assert "HTTP 422" in out
+
+
+# ---------------------------------------------------------------------------
+# notebook_create
+# ---------------------------------------------------------------------------
+
+
+def test_notebook_create_happy_path_returns_draft_and_id():
+    payload = _note(id="new-1", title="Captured finding", status="draft")
+    with patch.object(nt, "_post", return_value=payload) as mock_post:
+        out = _run(nt.notebook_create(project="jeevy_portal", raw_text="a finding"))
+    assert "captured" in out.lower()
+    assert "new-1" in out
+    assert "Captured finding" in out
+    assert mock_post.call_args[0][0] == "/api/notes"
+    # project → repo, raw_text carried; no title/tab keys when omitted
+    assert mock_post.call_args[0][1] == {"raw_text": "a finding", "repo": "jeevy_portal"}
+
+
+def test_notebook_create_all_fields_reach_body():
+    with patch.object(nt, "_post", return_value=_note(id="n")) as mock_post:
+        _run(nt.notebook_create(project="khimaira", raw_text="body", title="T", tab="research"))
+    assert mock_post.call_args[0][1] == {
+        "raw_text": "body",
+        "title": "T",
+        "tab_id": "research",
+        "repo": "khimaira",
+    }
+
+
+def test_notebook_create_rejects_empty_raw_text():
+    with patch.object(nt, "_post") as mock_post:
+        out = _run(nt.notebook_create(project="khimaira", raw_text="   "))
+    assert "❌" in out
+    mock_post.assert_not_called()
+
+
+def test_notebook_create_refuses_personal_tab():
+    with patch.object(nt, "_post") as mock_post:
+        out = _run(nt.notebook_create(raw_text="body", tab="personal"))
+    assert "❌" in out
+    assert "personal" in out.lower()
+    mock_post.assert_not_called()
+
+
+def test_notebook_create_error_passthrough():
+    with patch.object(nt, "_post", return_value="khimaira-monitor → HTTP 500: boom"):
+        out = _run(nt.notebook_create(project="khimaira", raw_text="body"))
+    assert "HTTP 500" in out
+
+
+# ---------------------------------------------------------------------------
+# notebook_delete
+# ---------------------------------------------------------------------------
+
+
+def test_notebook_delete_happy_path_reads_then_deletes():
+    existing = _note(id="del-1", title="Doomed note", tab_id="research")
+    with (
+        patch.object(nt, "_get", return_value=existing) as mock_get,
+        patch.object(nt, "_delete", return_value={"id": "del-1", "deleted": True}) as mock_del,
+    ):
+        out = _run(nt.notebook_delete("del-1"))
+    assert "deleted" in out.lower()
+    assert "Doomed note" in out
+    mock_get.assert_called_once_with("/api/notes/del-1")
+    mock_del.assert_called_once_with("/api/notes/del-1")
+
+
+def test_notebook_delete_refuses_personal_tab_without_deleting():
+    existing = _note(id="p-1", title="Joseph's rule", tab_id="personal")
+    with (
+        patch.object(nt, "_get", return_value=existing),
+        patch.object(nt, "_delete") as mock_del,
+    ):
+        out = _run(nt.notebook_delete("p-1"))
+    assert "❌" in out
+    assert "personal" in out.lower()
+    mock_del.assert_not_called()
+
+
+def test_notebook_delete_rejects_empty_note_id():
+    with patch.object(nt, "_get") as mock_get, patch.object(nt, "_delete") as mock_del:
+        out = _run(nt.notebook_delete(""))
+    assert "❌" in out
+    mock_get.assert_not_called()
+    mock_del.assert_not_called()
+
+
+def test_notebook_delete_missing_note_passes_through_and_skips_delete():
+    with (
+        patch.object(nt, "_get", return_value="khimaira-monitor → HTTP 404: No note with id"),
+        patch.object(nt, "_delete") as mock_del,
+    ):
+        out = _run(nt.notebook_delete("no-such-note"))
+    assert "HTTP 404" in out
+    mock_del.assert_not_called()
+
+
+def test_notebook_delete_error_passthrough_on_delete_call():
+    existing = _note(id="del-1", tab_id="research")
+    with (
+        patch.object(nt, "_get", return_value=existing),
+        patch.object(nt, "_delete", return_value="khimaira-monitor → HTTP 500: boom"),
+    ):
+        out = _run(nt.notebook_delete("del-1"))
+    assert "HTTP 500" in out
+
+
+# ---------------------------------------------------------------------------
+# personal-tab constant stays in sync with the daemon-side notes module
+# ---------------------------------------------------------------------------
+
+
+def test_personal_tab_id_matches_notes_module():
+    """notebook_tools mirrors notes.PERSONAL_TAB_ID as a local constant to
+    stay a pure HTTP client (no monitor import). This guards the mirror from
+    drifting out of sync with the source of truth."""
+    from khimaira.monitor import notes
+
+    assert nt._PERSONAL_TAB_ID == notes.PERSONAL_TAB_ID
