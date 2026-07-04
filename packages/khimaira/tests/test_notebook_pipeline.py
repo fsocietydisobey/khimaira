@@ -160,6 +160,90 @@ async def test_transform_note_backs_off_between_attempts(pipeline, monkeypatch):
     assert sleep_calls == [0.1, 0.2]
 
 
+# ---------------------------------------------------------------------------
+# Grimoire Phase 4 addendum (2026-07-04): bounded structuring concurrency —
+# a bulk import schedules one task per guide with no cap of its own, so the
+# cap must live at _invoke_claude's chokepoint (every structuring/organize/
+# revalidate/ask-synthesis call funnels through it).
+# ---------------------------------------------------------------------------
+
+
+def test_structure_concurrency_defaults_to_three(pipeline):
+    assert pipeline._STRUCTURE_CONCURRENCY == 3
+
+
+def test_structure_concurrency_reads_env_override(notes_store, monkeypatch):
+    from khimaira.monitor import notebook_pipeline as pipeline_mod
+
+    monkeypatch.setenv("KHIMAIRA_NOTEBOOK_STRUCTURE_CONCURRENCY", "7")
+    importlib.reload(pipeline_mod)
+    assert pipeline_mod._STRUCTURE_CONCURRENCY == 7
+
+
+async def test_invoke_claude_concurrency_is_bounded_by_semaphore(pipeline, monkeypatch):
+    """N > bound concurrent _invoke_claude calls must never have more than
+    `bound` subprocess spawns in flight at once — the actual safety property
+    the semaphore exists for."""
+    bound = 2
+    monkeypatch.setattr(pipeline, "_STRUCTURE_SEMAPHORE", asyncio.Semaphore(bound))
+
+    in_flight = 0
+    peak = 0
+    lock = asyncio.Lock()
+
+    async def fake_exec(*args, **kwargs):
+        nonlocal in_flight, peak
+        async with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        await asyncio.sleep(0.05)
+        async with lock:
+            in_flight -= 1
+        return _FakeProc(_envelope(json.dumps(_VALID_PAYLOAD)))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+
+    results = await asyncio.gather(
+        *[pipeline._invoke_claude("content", "instruction") for _ in range(6)]
+    )
+
+    assert peak == bound
+    assert len(results) == 6
+
+
+async def test_invoke_claude_agentic_is_not_gated_by_structure_semaphore(pipeline, monkeypatch):
+    """Research calls are a separate, user-serial code path — they must NOT
+    queue behind the structuring semaphore (that would make an ask wait on
+    an unrelated bulk import draining). Proven by forcing the structuring
+    gate down to bound=1 and confirming two agentic calls STILL overlap —
+    if they were (bugged into) sharing it, peak concurrency would be capped
+    at 1."""
+    monkeypatch.setattr(pipeline, "_STRUCTURE_SEMAPHORE", asyncio.Semaphore(1))
+
+    in_flight = 0
+    peak = 0
+    lock = asyncio.Lock()
+
+    async def fake_exec(*args, **kwargs):
+        nonlocal in_flight, peak
+        async with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        await asyncio.sleep(0.05)
+        async with lock:
+            in_flight -= 1
+        return _FakeProc(_stream_stdout(_result_event('{"answer":"x"}')))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+
+    await asyncio.gather(
+        pipeline._invoke_claude_agentic("q1", "i"),
+        pipeline._invoke_claude_agentic("q2", "i"),
+    )
+
+    assert peak == 2
+
+
 async def test_transform_note_validation_failure_retries(pipeline, monkeypatch):
     """A well-formed JSON object missing required keys must also retry, not crash."""
     incomplete = {"summary": "only this key"}

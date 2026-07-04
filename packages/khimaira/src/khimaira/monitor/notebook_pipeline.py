@@ -91,6 +91,24 @@ def _resolve_claude_cmd() -> str:
 # against for the daemon's other background loops).
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
+# Grimoire Phase 4 addendum (2026-07-04): a bulk import schedules ONE
+# asyncio.create_task per guide (schedule_pipeline/import_dir), with no
+# concurrency cap of its own — Joseph's 202-guide corpus would otherwise
+# spawn 202 concurrent `claude -p` structuring subprocesses at once,
+# swamping the concurrency-proxy's 32-session throttle and starving every
+# other roster session mid-import. Gated at THIS chokepoint (every
+# structuring/organize/revalidate/ask-synthesis call already funnels
+# through _invoke_claude) rather than at each individual call site, so a
+# bulk import's scheduled tasks simply queue behind the semaphore and drain
+# _STRUCTURE_CONCURRENCY-at-a-time instead of flooding.
+#
+# Research calls (_invoke_claude_agentic) are a SEPARATE code path (their
+# own --allowedTools/--add-dir/stream-json subprocess spawn, not this
+# function) and are deliberately NOT gated by this semaphore — they're
+# user-serial (one human, one ask at a time), not a bulk-scheduling risk.
+_STRUCTURE_CONCURRENCY = int(os.environ.get("KHIMAIRA_NOTEBOOK_STRUCTURE_CONCURRENCY", "3"))
+_STRUCTURE_SEMAPHORE = asyncio.Semaphore(_STRUCTURE_CONCURRENCY)
+
 
 class PipelineOutput(BaseModel):
     title: str
@@ -354,30 +372,37 @@ async def _invoke_claude(content: str, instruction: str) -> str:
 
     Personal/Behavior context is prepended here — the one choke point every
     caller already funnels through — rather than at each call site.
+
+    The actual subprocess spawn is gated by `_STRUCTURE_SEMAPHORE` (bound
+    `_STRUCTURE_CONCURRENCY`, default 3, env `KHIMAIRA_NOTEBOOK_STRUCTURE_
+    CONCURRENCY`) — see that constant's comment for why. Only the spawn+
+    communicate is inside the gate, not the (cheap, non-subprocess) isolated
+    config dir setup above.
     """
     instruction = _prepend_personal_context(instruction)
     cfg_dir = _isolated_config_dir()
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(cfg_dir)
 
-    proc = await asyncio.create_subprocess_exec(
-        _resolve_claude_cmd(),
-        "-p",
-        "--append-system-prompt",
-        instruction,
-        "--output-format",
-        "json",
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
-        "--model",
-        _MODEL,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
-    stdout, stderr = await proc.communicate(content.encode("utf-8"))
+    async with _STRUCTURE_SEMAPHORE:
+        proc = await asyncio.create_subprocess_exec(
+            _resolve_claude_cmd(),
+            "-p",
+            "--append-system-prompt",
+            instruction,
+            "--output-format",
+            "json",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--model",
+            _MODEL,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await proc.communicate(content.encode("utf-8"))
     if proc.returncode != 0:
         raise RuntimeError(
             f"claude -p exited {proc.returncode}: {stderr.decode('utf-8', 'ignore')[:500]}"
