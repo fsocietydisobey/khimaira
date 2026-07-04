@@ -1411,3 +1411,411 @@ async def test_schedule_pipeline_dispatches_regular_note_to_the_note_pipeline(
     await asyncio.sleep(0.05)
 
     assert called == {"guide": False, "note": True}
+
+
+# ---------------------------------------------------------------------------
+# Grimoire Phase 3 — the research-scientist toolbar. `claude -p`'s subprocess
+# is mocked via canned stream-json stdout (one JSON object per line, mirroring
+# `--output-format stream-json`'s real shape) for `_invoke_claude_agentic`
+# itself; higher-level tests (`_invoke_agentic_grounded`, `research_answer`,
+# `research_revise`) mock the layer below them directly, same convention as
+# the rest of this file.
+# ---------------------------------------------------------------------------
+
+
+def _stream_line(event: dict) -> bytes:
+    return (json.dumps(event) + "\n").encode("utf-8")
+
+
+def _stream_stdout(*events: dict) -> bytes:
+    return b"".join(_stream_line(e) for e in events)
+
+
+def _assistant_tool_use(name: str, tool_input: dict | None = None) -> dict:
+    return {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": name, "input": tool_input or {}}]},
+    }
+
+
+def _result_event(result: str, total_cost_usd: float = 0.5) -> dict:
+    return {
+        "type": "result",
+        "subtype": "success",
+        "result": result,
+        "total_cost_usd": total_cost_usd,
+    }
+
+
+async def test_invoke_claude_agentic_detects_web_tool_use(pipeline, monkeypatch):
+    stdout = _stream_stdout(
+        {"type": "system", "subtype": "init"},
+        _assistant_tool_use("WebSearch", {"query": "x"}),
+        _result_event('{"answer": "hi"}', total_cost_usd=0.42),
+    )
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(stdout)])
+
+    result = await pipeline._invoke_claude_agentic("question", "instruction")
+
+    assert result["web_grounded"] is True
+    assert result["result"] == '{"answer": "hi"}'
+    assert result["total_cost_usd"] == 0.42
+
+
+async def test_invoke_claude_agentic_webfetch_also_counts(pipeline, monkeypatch):
+    stdout = _stream_stdout(
+        _assistant_tool_use("WebFetch", {"url": "https://x"}),
+        _result_event('{"answer": "hi"}'),
+    )
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(stdout)])
+    result = await pipeline._invoke_claude_agentic("q", "i")
+    assert result["web_grounded"] is True
+
+
+async def test_invoke_claude_agentic_no_web_tool_use_reports_ungrounded(pipeline, monkeypatch):
+    stdout = _stream_stdout(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
+        _result_event('{"answer": "hi"}'),
+    )
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(stdout)])
+
+    result = await pipeline._invoke_claude_agentic("question", "instruction")
+    assert result["web_grounded"] is False
+
+
+async def test_invoke_claude_agentic_ignores_non_web_tool_use(pipeline, monkeypatch):
+    stdout = _stream_stdout(
+        _assistant_tool_use("Read", {"file_path": "/x"}),
+        _result_event('{"answer": "hi"}'),
+    )
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(stdout)])
+    result = await pipeline._invoke_claude_agentic("q", "i")
+    assert result["web_grounded"] is False
+
+
+async def test_invoke_claude_agentic_nonzero_exit_raises(pipeline, monkeypatch):
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(b"", stderr=b"boom", returncode=1)])
+    with pytest.raises(RuntimeError, match="exited 1"):
+        await pipeline._invoke_claude_agentic("q", "i")
+
+
+async def test_invoke_claude_agentic_missing_result_raises(pipeline, monkeypatch):
+    stdout = _stream_stdout({"type": "system", "subtype": "init"})
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(stdout)])
+    with pytest.raises(ValueError, match="no final result"):
+        await pipeline._invoke_claude_agentic("q", "i")
+
+
+async def test_invoke_claude_agentic_passes_allowed_tools_and_add_dir(
+    pipeline, monkeypatch, tmp_path
+):
+    captured: dict = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProc(_stream_stdout(_result_event('{"answer":"x"}')))
+
+    monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+    await pipeline._invoke_claude_agentic("q", "i", repo_root=tmp_path, max_budget_usd=1.0)
+
+    args = captured["args"]
+    assert args[args.index("--allowedTools") + 1] == "Read,Grep,Glob,WebSearch,WebFetch"
+    assert args[args.index("--add-dir") + 1] == str(tmp_path)
+    assert args[args.index("--max-budget-usd") + 1] == "1.0"
+    assert args[args.index("--output-format") + 1] == "stream-json"
+
+
+# --- _invoke_agentic_grounded: the retry-on-unverified-grounding contract ---
+
+_GROUNDED_TRUE = {
+    "answer": "hi",
+    "code_citations": [],
+    "web_citations": ["http://x"],
+    "proposed_patch": None,
+}
+_GROUNDED_EMPTY = {
+    "answer": "hi",
+    "code_citations": [],
+    "web_citations": [],
+    "proposed_patch": None,
+}
+
+
+async def test_invoke_agentic_grounded_returns_parsed_result_when_grounded(pipeline, monkeypatch):
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+        return {"result": json.dumps(_GROUNDED_TRUE), "web_grounded": True, "total_cost_usd": 0.5}
+
+    monkeypatch.setattr(pipeline, "_invoke_claude_agentic", fake_invoke)
+    result = await pipeline._invoke_agentic_grounded("q", "i", repo_root=None, max_budget_usd=1.0)
+
+    assert result["answer"] == "hi"
+    assert result["web_grounded"] is True
+    assert result["web_grounding_unverified"] is False
+    assert result["total_cost_usd"] == 0.5
+
+
+async def test_invoke_agentic_grounded_retries_once_when_citations_but_ungrounded(
+    pipeline, monkeypatch
+):
+    calls: list[str] = []
+
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+        calls.append(instruction)
+        if len(calls) == 1:
+            return {
+                "result": json.dumps(_GROUNDED_TRUE),
+                "web_grounded": False,
+                "total_cost_usd": 0.3,
+            }
+        payload = {**_GROUNDED_TRUE, "answer": "hi2"}
+        return {"result": json.dumps(payload), "web_grounded": True, "total_cost_usd": 0.6}
+
+    monkeypatch.setattr(pipeline, "_invoke_claude_agentic", fake_invoke)
+    result = await pipeline._invoke_agentic_grounded("q", "i", repo_root=None, max_budget_usd=1.0)
+
+    assert len(calls) == 2
+    assert "STRICT" in calls[1]
+    assert result["answer"] == "hi2"
+    assert result["web_grounding_unverified"] is False
+
+
+async def test_invoke_agentic_grounded_flags_unverified_when_retry_also_fails(
+    pipeline, monkeypatch
+):
+    calls: list[str] = []
+
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+        calls.append(instruction)
+        return {"result": json.dumps(_GROUNDED_TRUE), "web_grounded": False, "total_cost_usd": 0.3}
+
+    monkeypatch.setattr(pipeline, "_invoke_claude_agentic", fake_invoke)
+    result = await pipeline._invoke_agentic_grounded("q", "i", repo_root=None, max_budget_usd=1.0)
+
+    assert len(calls) == 2  # one retry, then gives up
+    assert result["web_grounding_unverified"] is True
+
+
+async def test_invoke_agentic_grounded_no_retry_when_no_citations_claimed(pipeline, monkeypatch):
+    calls: list[str] = []
+
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+        calls.append(instruction)
+        return {"result": json.dumps(_GROUNDED_EMPTY), "web_grounded": False, "total_cost_usd": 0.1}
+
+    monkeypatch.setattr(pipeline, "_invoke_claude_agentic", fake_invoke)
+    result = await pipeline._invoke_agentic_grounded("q", "i", repo_root=None, max_budget_usd=1.0)
+
+    assert len(calls) == 1  # nothing to distrust — no citations claimed
+    assert result["web_grounding_unverified"] is False
+
+
+async def test_invoke_agentic_grounded_handles_invocation_error(pipeline, monkeypatch):
+    async def failing_invoke(content, instruction, *, repo_root, max_budget_usd):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline, "_invoke_claude_agentic", failing_invoke)
+    result = await pipeline._invoke_agentic_grounded("q", "i", repo_root=None, max_budget_usd=1.0)
+
+    assert result["web_grounding_unverified"] is True
+    assert "failed" in result["answer"].lower()
+
+
+async def test_invoke_agentic_grounded_handles_unparseable_response(pipeline, monkeypatch):
+    async def fake_invoke(content, instruction, *, repo_root, max_budget_usd):
+        return {"result": "not json", "web_grounded": True, "total_cost_usd": 0.1}
+
+    monkeypatch.setattr(pipeline, "_invoke_claude_agentic", fake_invoke)
+    result = await pipeline._invoke_agentic_grounded("q", "i", repo_root=None, max_budget_usd=1.0)
+
+    assert result["web_grounding_unverified"] is True
+
+
+# --- research_answer (ANSWER path) ---
+
+
+async def test_research_answer_unknown_note_raises(pipeline):
+    with pytest.raises(ValueError, match="No note with id"):
+        await pipeline.research_answer("no-such-note", "question")
+
+
+async def test_research_answer_general_repo_skips_repo_root(pipeline, notes_store, monkeypatch):
+    note = notes_store.add_study_guide("# G\n\nbody", repo=notes_store.GENERAL_REPO)
+    seen: list = []
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+        seen.append(repo_root)
+        return {
+            **_GROUNDED_EMPTY,
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.1,
+        }
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    await pipeline.research_answer(note["id"], "question")
+
+    assert seen == [None]
+
+
+async def test_research_answer_resolves_repo_root_and_passes_question(
+    pipeline, notes_store, monkeypatch, git_repo
+):
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    note = notes_store.add_study_guide("# G\n\nbody", repo="testrepo")
+    seen: list = []
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+        seen.append((content, repo_root))
+        return {
+            **_GROUNDED_EMPTY,
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.1,
+        }
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    await pipeline.research_answer(note["id"], "my question")
+
+    assert seen[0] == ("my question", git_repo)
+
+
+# --- splice_section (deterministic REVISE apply helper) ---
+
+
+def test_splice_section_replaces_middle_section(pipeline):
+    raw = "# Title\n\nintro\n\n## A\n\nold a\n\n## B\n\nold b\n"
+    result = pipeline.splice_section(raw, "a", "## A\n\nNEW A\n")
+    assert "NEW A" in result
+    assert "old a" not in result
+    assert "old b" in result
+    assert "intro" in result
+
+
+def test_splice_section_replaces_last_section(pipeline):
+    raw = "# Title\n\n## A\n\na body\n\n## B\n\nb body\n"
+    result = pipeline.splice_section(raw, "b", "## B\n\nNEW B\n")
+    assert "NEW B" in result
+    assert "b body" not in result
+    assert "## A" in result
+    assert "a body" in result
+
+
+def test_splice_section_consumes_nested_subsections_of_the_replaced_section(pipeline):
+    raw = "# Title\n\n## A\n\n### Sub\n\nsub text\n\n## B\n\nb text\n"
+    result = pipeline.splice_section(raw, "a", "## A\n\nNEW A ONLY\n")
+    assert "NEW A ONLY" in result
+    assert "sub text" not in result
+    assert "## B" in result
+    assert "b text" in result
+
+
+def test_splice_section_unknown_anchor_raises(pipeline):
+    raw = "# Title\n\n## A\n\nbody\n"
+    with pytest.raises(ValueError, match="No section anchored"):
+        pipeline.splice_section(raw, "nonexistent", "new")
+
+
+def test_splice_section_skips_fenced_code_blocks(pipeline):
+    raw = "# Title\n\n## A\n\n```\n# not a heading\n```\n\nbody\n\n## B\n\nb\n"
+    result = pipeline.splice_section(raw, "a", "## A\n\nreplaced\n")
+    assert "replaced" in result
+    assert "not a heading" not in result
+    assert "## B" in result
+
+
+# --- research_revise (REVISE path) ---
+
+
+async def test_research_revise_unknown_note_raises(pipeline):
+    with pytest.raises(ValueError, match="No note with id"):
+        await pipeline.research_revise("no-such-note", "directive")
+
+
+async def test_research_revise_unknown_section_anchor_raises_before_invoking(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_study_guide("# Title\n\n## A\n\nbody\n")
+    called = []
+
+    async def fake_grounded(*args, **kwargs):
+        called.append(1)
+        return {}
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    with pytest.raises(ValueError, match="No section anchored"):
+        await pipeline.research_revise(note["id"], "directive", section_anchor="nonexistent")
+
+    assert called == []  # never spent the agentic call on a bad anchor
+
+
+async def test_research_revise_whole_guide_splices_full_replacement(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_study_guide("# Title\n\nold body\n")
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+        assert "WHOLE guide" in instruction
+        return {
+            "answer": "rewrote it",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": "# Title\n\nNEW body\n",
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.2,
+        }
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    result = await pipeline.research_revise(note["id"], "make it better")
+
+    assert result["proposed_raw_text"] == "# Title\n\nNEW body\n"
+    # REVISE never applies — the note's own raw_text is untouched.
+    assert notes_store.get_note(note["id"])["raw_text"] == "# Title\n\nold body\n"
+
+
+async def test_research_revise_section_scoped_splices_into_original(
+    pipeline, notes_store, monkeypatch
+):
+    raw = "# Title\n\n## A\n\nold a\n\n## B\n\nold b\n"
+    note = notes_store.add_study_guide(raw)
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+        assert "ONE section" in instruction
+        return {
+            "answer": "revised A",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": "## A\n\nNEW A\n",
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.2,
+        }
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    result = await pipeline.research_revise(note["id"], "improve section A", section_anchor="a")
+
+    assert "NEW A" in result["proposed_raw_text"]
+    assert "old b" in result["proposed_raw_text"]
+    assert notes_store.get_note(note["id"])["raw_text"] == raw  # original untouched
+
+
+async def test_research_revise_no_proposed_patch_leaves_proposed_raw_text_none(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_study_guide("# Title\n\nbody\n")
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd):
+        return {
+            "answer": "found nothing to change",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": None,
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.1,
+        }
+
+    monkeypatch.setattr(pipeline, "_invoke_agentic_grounded", fake_grounded)
+    result = await pipeline.research_revise(note["id"], "directive")
+
+    assert result["proposed_raw_text"] is None

@@ -377,6 +377,129 @@ def test_revalidate_note_unknown_id_returns_404(notebook_client):
 
 
 # ---------------------------------------------------------------------------
+# POST /notes/research + POST /notes/{id}/research-revise (Grimoire Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def test_research_route_happy_path(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    note = notebook_client.post(
+        "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
+    ).json()
+
+    async def fake_research_answer(note_id, question, *, max_budget_usd):
+        assert note_id == note["id"]
+        assert question == "what is this?"
+        return {
+            "answer": "the answer",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": None,
+            "web_grounded": True,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.4,
+        }
+
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_answer", fake_research_answer)
+    r = notebook_client.post(
+        "/api/notes/research", json={"note_id": note["id"], "question": "what is this?"}
+    )
+    assert r.status_code == 200
+    assert r.json()["answer"] == "the answer"
+
+
+def test_research_route_unknown_note_returns_404(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    async def fake_research_answer(note_id, question, *, max_budget_usd):
+        raise ValueError(f"No note with id={note_id!r}. Use list_notes() to see available notes.")
+
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_answer", fake_research_answer)
+    r = notebook_client.post("/api/notes/research", json={"note_id": "nope", "question": "q"})
+    assert r.status_code == 404
+
+
+def test_research_revise_route_happy_path(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    note = notebook_client.post(
+        "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
+    ).json()
+
+    async def fake_research_revise(note_id, directive, *, section_anchor, max_budget_usd):
+        assert note_id == note["id"]
+        assert directive == "improve it"
+        assert section_anchor is None
+        return {
+            "answer": "changed it",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": "new text",
+            "proposed_raw_text": "# G\n\nnew text",
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.3,
+        }
+
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_revise", fake_research_revise)
+    r = notebook_client.post(
+        f"/api/notes/{note['id']}/research-revise", json={"directive": "improve it"}
+    )
+    assert r.status_code == 200
+    assert r.json()["proposed_raw_text"] == "# G\n\nnew text"
+
+
+def test_research_revise_route_passes_section_anchor(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    note = notebook_client.post(
+        "/api/notes", json={"raw_text": "# G\n\n## A\n\nbody", "kind": "study_guide"}
+    ).json()
+    seen = {}
+
+    async def fake_research_revise(note_id, directive, *, section_anchor, max_budget_usd):
+        seen["section_anchor"] = section_anchor
+        return {
+            "answer": "x",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": None,
+            "proposed_raw_text": None,
+            "web_grounded": False,
+            "web_grounding_unverified": False,
+            "total_cost_usd": 0.1,
+        }
+
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_revise", fake_research_revise)
+    notebook_client.post(
+        f"/api/notes/{note['id']}/research-revise",
+        json={"directive": "improve A", "section_anchor": "a"},
+    )
+    assert seen["section_anchor"] == "a"
+
+
+def test_research_revise_route_unknown_section_anchor_returns_404(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    note = notebook_client.post(
+        "/api/notes", json={"raw_text": "# G\n\nbody", "kind": "study_guide"}
+    ).json()
+
+    async def fake_research_revise(note_id, directive, *, section_anchor, max_budget_usd):
+        raise ValueError(
+            f"No section anchored at {section_anchor!r} in this guide's current raw_text."
+        )
+
+    monkeypatch.setattr(notebook_api.notebook_pipeline, "research_revise", fake_research_revise)
+    r = notebook_client.post(
+        f"/api/notes/{note['id']}/research-revise",
+        json={"directive": "x", "section_anchor": "nope"},
+    )
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # GET /notes/search (repo filter — v2 addition, needed by notebook_search
 # MCP tool; search_notes_async already supported repo=, the route just
 # never forwarded it)

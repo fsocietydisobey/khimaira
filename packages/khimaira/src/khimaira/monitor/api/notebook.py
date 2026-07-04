@@ -8,6 +8,8 @@ Endpoints:
                                    directory (dry_run=True by default — manifest only)
   GET    /notes/search?q=       — Phase 2b: semantic search over embedded notes
   POST   /notes/ask             — Phase 2c capstone: ask -> retrieve -> heal -> answer
+  POST   /notes/research        — grimoire Phase 3 ANSWER: research-grounded Q&A on a
+                                   guide (code + web), read-only
   GET    /notes/{id}            — one note
   PATCH  /notes/{id}            — edit title/tab/raw_text/status/links/repo/pipeline-patch
   DELETE /notes/{id}            — delete a note
@@ -15,6 +17,9 @@ Endpoints:
   POST   /notes/{id}/resolution — v2: attach a resolution (roster-loop write-back);
                                    schedules a fire-and-forget mnemosyne distill
   POST   /notes/{id}/revalidate — Phase 2a north-star: re-ground vs current code
+  POST   /notes/{id}/research-revise — grimoire Phase 3 REVISE: proposes a patch
+                                   (whole guide or one section); never applies —
+                                   apply via PATCH /notes/{id} after human review
   GET    /tabs                  — list tabs (note_ids derived from live notes)
   POST   /tabs                  — create a tab
   PATCH  /tabs/{id}             — rename a tab
@@ -82,6 +87,18 @@ class AskReq(BaseModel):
     repo: str | None = None
     note_ids: list[str] = []
     exclusive: bool = False
+
+
+class ResearchReq(BaseModel):
+    note_id: str
+    question: str
+    max_budget_usd: float = notebook_pipeline._AGENTIC_DEFAULT_BUDGET_USD
+
+
+class ResearchReviseReq(BaseModel):
+    directive: str
+    section_anchor: str | None = None
+    max_budget_usd: float = notebook_pipeline._AGENTIC_DEFAULT_BUDGET_USD
 
 
 class CreateTabReq(BaseModel):
@@ -188,6 +205,19 @@ def build_router():
             req.question, repo=req.repo, mentioned_note_ids=req.note_ids, exclusive=req.exclusive
         )
 
+    @router.post("/notes/research")
+    async def research(req: ResearchReq) -> dict:
+        """Grimoire Phase 3 ANSWER path: research-grounds a question against
+        a guide + the live codebase + the web, read-only (never edits the
+        guide). Registered BEFORE /notes/{note_id} so "research" doesn't get
+        swallowed as a note_id path param."""
+        try:
+            return await notebook_pipeline.research_answer(
+                req.note_id, req.question, max_budget_usd=req.max_budget_usd
+            )
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+
     @router.get("/notes/{note_id}")
     async def get_note(note_id: str) -> dict:
         try:
@@ -258,6 +288,23 @@ def build_router():
     async def revalidate_note(note_id: str) -> dict:
         try:
             return await notebook_pipeline.revalidate_note(note_id)
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+
+    @router.post("/notes/{note_id}/research-revise")
+    async def research_revise(note_id: str, req: ResearchReviseReq) -> dict:
+        """Grimoire Phase 3 REVISE path: proposes a patch to a guide (whole
+        or one section, via `section_anchor`), grounded against the
+        codebase + web. NEVER applies — returns a proposal (including
+        `proposed_raw_text`, ready to diff) for a human to review; applying
+        is the EXISTING PATCH /notes/{note_id} (raw_text=proposed_raw_text)."""
+        try:
+            return await notebook_pipeline.research_revise(
+                note_id,
+                req.directive,
+                section_anchor=req.section_anchor,
+                max_budget_usd=req.max_budget_usd,
+            )
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 

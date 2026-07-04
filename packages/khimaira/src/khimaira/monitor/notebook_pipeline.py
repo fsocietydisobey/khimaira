@@ -157,21 +157,27 @@ def _slugify_heading(text: str) -> str:
     return slug
 
 
-def _parse_toc(raw_text: str) -> list[dict[str, Any]]:
-    """Deterministic heading parse — NOT an LLM call. Extracts every
-    markdown ATX heading (# through ######) in document order as
-    {title, anchor, level}.
+def _scan_headings(raw_text: str) -> list[dict[str, Any]]:
+    """Single fence-aware ATX heading scan — the one place heading detection
+    happens. Extracts every markdown heading (# through ######) in document
+    order as {title, anchor, level, line} (0-indexed line number).
 
     Skips headings inside fenced code blocks (```/~~~) — these are
     code-grounded guides, so a naive regex would false-positive on a
-    commented-out '# heading' inside a code sample. Disambiguates
-    duplicate heading titles (common in docs — multiple "## Example"
-    sections) with a GFM-style `-1`/`-2` suffix, matching how GitHub
-    itself resolves duplicate anchors."""
-    toc: list[dict[str, Any]] = []
+    commented-out '# heading' inside a code sample. Disambiguates duplicate
+    heading titles (common in docs — multiple "## Example" sections) with a
+    GFM-style `-1`/`-2` suffix, matching how GitHub itself resolves
+    duplicate anchors.
+
+    `_parse_toc` (the stored/rendered shape) and `splice_section` (Grimoire
+    Phase 3's REVISE apply helper) both derive from this single scan, so
+    anchor generation can never disagree between "where a section starts
+    for rendering" and "where a section starts for splicing a rewrite in."
+    """
+    headings: list[dict[str, Any]] = []
     seen_slugs: dict[str, int] = {}
     in_fence = False
-    for line in raw_text.splitlines():
+    for i, line in enumerate(raw_text.splitlines()):
         stripped = line.strip()
         if stripped.startswith("```") or stripped.startswith("~~~"):
             in_fence = not in_fence
@@ -191,8 +197,53 @@ def _parse_toc(raw_text: str) -> list[dict[str, Any]]:
             slug = f"{slug}-{seen_slugs[slug]}"
         else:
             seen_slugs[slug] = 0
-        toc.append({"title": title, "anchor": slug, "level": level})
-    return toc
+        headings.append({"title": title, "anchor": slug, "level": level, "line": i})
+    return headings
+
+
+def _parse_toc(raw_text: str) -> list[dict[str, Any]]:
+    """Deterministic heading parse — NOT an LLM call. Public/stored shape:
+    {title, anchor, level} per heading, in document order (no `line` — that's
+    an internal concern of `splice_section`, not part of the toc contract
+    already shipped to the frontend/MCP layer)."""
+    return [
+        {"title": h["title"], "anchor": h["anchor"], "level": h["level"]}
+        for h in _scan_headings(raw_text)
+    ]
+
+
+def splice_section(raw_text: str, anchor: str, new_section_text: str) -> str:
+    """Deterministically replace ONE section (from its heading line through
+    the line before the next heading of level <= its own, or EOF) with
+    `new_section_text`.
+
+    Pure string splice — the model (research_revise) only ever PROPOSES
+    new_section_text; this is what actually places it, so a model that
+    ignores "only give me this one section" can't silently overwrite
+    unrelated content — the write is confined to exactly the slot `anchor`
+    identifies, regardless of what the model returned.
+
+    Raises ValueError if `anchor` isn't found in raw_text's CURRENT heading
+    scan — the caller must derive `anchor` from this same raw_text (e.g. via
+    the note's stored `toc`), so a miss means the guide changed underneath
+    the request.
+    """
+    headings = _scan_headings(raw_text)
+    match = next((h for h in headings if h["anchor"] == anchor), None)
+    if match is None:
+        raise ValueError(f"No section anchored at {anchor!r} in this guide's current raw_text.")
+
+    lines = raw_text.splitlines()
+    start = match["line"]
+    level = match["level"]
+    end = len(lines)
+    for h in headings:
+        if h["line"] > start and h["level"] <= level:
+            end = h["line"]
+            break
+
+    new_lines = lines[:start] + new_section_text.rstrip("\n").splitlines() + lines[end:]
+    return "\n".join(new_lines)
 
 
 def _isolated_config_dir() -> Path:
@@ -337,6 +388,129 @@ async def _invoke_claude(content: str, instruction: str) -> str:
     if not isinstance(result_text, str):
         raise ValueError(f"envelope missing string .result: {envelope!r}")
     return result_text
+
+
+# ---------------------------------------------------------------------------
+# Grimoire Phase 3: the research-scientist ask. `_invoke_claude_agentic`
+# grants READ-ONLY tools (Read/Grep/Glob/WebSearch/WebFetch) — NEVER Edit/
+# Write/Bash. Write-safety is structural: a guide is a note in the store, so
+# "edit" = update_note(raw_text=), applied by the backend after a human
+# reviews a diff — never by the model itself.
+#
+# Phase 0 finding (2026-07-04, live-tested against 6 real headless calls):
+# WebSearch/WebFetch genuinely work under an isolated CLAUDE_CONFIG_DIR, but
+# on a weakly-phrased prompt the model can silently SKIP calling the tool and
+# fabricate a plausible, confidently-cited answer instead — with NO error
+# signal anywhere (is_error=False, permission_denials=[], stop_reason=
+# end_turn). Worse: the final envelope's usage.server_tool_use.{web_search_
+# requests,web_fetch_requests} stays 0 even on a GENUINE successful tool
+# call (it meters the Anthropic-API-native server-side web tool, a
+# different, billing-only path — NOT Claude Code's own client-implemented
+# WebSearch/WebFetch tools used here). It is not a usable grounding signal.
+# The only reliable check is parsing the --output-format stream-json
+# transcript for actual tool_use blocks naming WebSearch/WebFetch — done
+# here, deterministically, never trusting the model's own claim of having
+# searched (the perception/validation-boundary discipline: an LLM's claim
+# of grounding is not itself trustworthy evidence of grounding).
+# ---------------------------------------------------------------------------
+
+_AGENTIC_MODEL = "claude-sonnet-5"
+_AGENTIC_ALLOWED_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch"
+_AGENTIC_DEFAULT_BUDGET_USD = float(os.environ.get("KHIMAIRA_NOTEBOOK_RESEARCH_BUDGET_USD", "1.5"))
+_WEB_TOOL_NAMES = frozenset({"WebSearch", "WebFetch"})
+
+# master's refinement (2026-07-04): an imperative-first instruction reliably
+# flipped a silent tool-skip into a real tool call in Phase 0 testing —
+# belt-and-suspenders alongside the transcript check below (suspenders).
+_GROUNDING_IMPERATIVE = (
+    "You MUST actually call your WebSearch/WebFetch/Read/Grep/Glob tools to "
+    "ground every factual claim — NEVER answer from memory alone, and NEVER "
+    "state a web- or code-attributed fact you have not just retrieved with "
+    "one of these tools in THIS turn."
+)
+
+
+async def _invoke_claude_agentic(
+    content: str,
+    instruction: str,
+    *,
+    repo_root: Path | None = None,
+    max_budget_usd: float = _AGENTIC_DEFAULT_BUDGET_USD,
+) -> dict[str, Any]:
+    """Headless, read-only-tool-enabled claude -p invocation. `content` goes
+    via stdin, `instruction` via --append-system-prompt (the same recipe as
+    _invoke_claude), plus --allowedTools/--add-dir/--max-budget-usd and
+    --output-format stream-json so the transcript can be inspected.
+
+    Returns {"result": <final text>, "web_grounded": bool, "total_cost_usd":
+    float | None}. Raises RuntimeError/ValueError on subprocess failure or a
+    missing final result — callers (research_answer/research_revise) own
+    retry policy, NOT this function (a single call runs ~$0.5-0.65 —
+    silently retrying here would double that on every failure).
+    """
+    instruction = _prepend_personal_context(instruction)
+    cfg_dir = _isolated_config_dir()
+    env = dict(os.environ)
+    env["CLAUDE_CONFIG_DIR"] = str(cfg_dir)
+
+    cmd = [
+        _resolve_claude_cmd(),
+        "-p",
+        "--append-system-prompt",
+        instruction,
+        "--allowedTools",
+        _AGENTIC_ALLOWED_TOOLS,
+        "--max-budget-usd",
+        str(max_budget_usd),
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--model",
+        _AGENTIC_MODEL,
+    ]
+    if repo_root is not None:
+        cmd.extend(["--add-dir", str(repo_root)])
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    stdout, stderr = await proc.communicate(content.encode("utf-8"))
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"claude -p (agentic) exited {proc.returncode}: {stderr.decode('utf-8', 'ignore')[:500]}"
+        )
+
+    web_grounded = False
+    final_result: str | None = None
+    total_cost_usd: float | None = None
+    for line in stdout.decode("utf-8", "ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        if event_type == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "tool_use" and block.get("name") in _WEB_TOOL_NAMES:
+                    web_grounded = True
+        elif event_type == "result":
+            final_result = event.get("result")
+            total_cost_usd = event.get("total_cost_usd")
+
+    if not isinstance(final_result, str):
+        raise ValueError("agentic claude -p produced no final result envelope")
+
+    return {"result": final_result, "web_grounded": web_grounded, "total_cost_usd": total_cost_usd}
 
 
 async def _run_once(
@@ -1022,3 +1196,214 @@ async def answer_question(
         "code_sources": code_sources,
         "code_unavailable": code_unavailable,
     }
+
+
+# ---------------------------------------------------------------------------
+# Grimoire Phase 3: the research-scientist toolbar. ANSWER (research_answer)
+# and REVISE (research_revise) share ONE schema and ONE grounded-invocation
+# helper — the only difference is the instruction (whole-answer vs a
+# proposed patch) and, for REVISE, the deterministic splice back into
+# raw_text. Neither path ever calls update_note/mark_organized/etc — REVISE
+# returns a PROPOSAL only; applying it is the existing PATCH /notes/{id}
+# (raw_text=), which already reschedules structuring and (via the Phase 2
+# organize-after-structuring hook) re-runs the organizer on apply — no new
+# plumbing needed for that.
+# ---------------------------------------------------------------------------
+
+
+class ResearchOutput(BaseModel):
+    answer: str
+    code_citations: list[str] = []
+    web_citations: list[str] = []
+    proposed_patch: str | None = None
+
+
+_RESEARCH_ANSWER_INSTRUCTION_TEMPLATE = (
+    _GROUNDING_IMPERATIVE + " "
+    "You are a research assistant helping ground a study guide's content "
+    "against the ACTUAL codebase (Read/Grep/Glob under {repo_root}) and the "
+    "live web (WebSearch/WebFetch). Answer the user's question using the "
+    "guide below as context — but verify anything checkable against real "
+    "code or the web rather than trusting the guide's prose at face value. "
+    "You are NOT proposing an edit to the guide — leave proposed_patch "
+    "null. Output ONLY a JSON object, no prose, no markdown fence, with "
+    'keys: answer (string), code_citations (array of "file:line" strings), '
+    "web_citations (array of URL strings), proposed_patch (null).\n\n"
+    "GUIDE:\n{guide}"
+)
+
+_RESEARCH_REVISE_INSTRUCTION_TEMPLATE = (
+    _GROUNDING_IMPERATIVE + " "
+    "You are proposing a revision to {scope} of a study guide, grounded in "
+    "the ACTUAL codebase (Read/Grep/Glob under {repo_root}) and the live "
+    "web (WebSearch/WebFetch) — verify anything checkable rather than "
+    "trusting the guide's existing prose. {scope_instruction} Output ONLY a "
+    "JSON object, no prose, no markdown fence, with keys: answer (a 1-3 "
+    "sentence description of what you changed and why), code_citations "
+    '(array of "file:line" strings), web_citations (array of URL strings), '
+    "proposed_patch (string — the full replacement text, markdown, no "
+    "surrounding commentary).\n\nGUIDE:\n{guide}"
+)
+
+_GROUNDING_RETRY_IMPERATIVE = (
+    "\n\nSTRICT: your previous attempt claimed web sources without actually "
+    "calling WebSearch/WebFetch. Call the tool for real this time, or drop "
+    "any web_citations you cannot back with an actual tool call."
+)
+
+
+async def _invoke_agentic_grounded(
+    content: str,
+    instruction: str,
+    *,
+    repo_root: Path | None,
+    max_budget_usd: float,
+) -> dict[str, Any]:
+    """Shared ANSWER/REVISE invocation against ResearchOutput. ONE retry
+    (stronger imperative) fires if the result claims web_citations but the
+    transcript shows no real WebSearch/WebFetch tool_use — master's
+    refinement (2026-07-04): this reliably flips a silent skip into a real
+    call in live testing, rather than surfacing unverified on the first trip.
+
+    Never raises — every failure mode (subprocess error, unparseable
+    response) returns a result dict with web_grounding_unverified=True and
+    an explanatory `answer`, so research_answer/research_revise don't need
+    their own try/except around this.
+    """
+
+    async def _attempt(extra: str = "") -> dict[str, Any] | None:
+        try:
+            invoked = await _invoke_claude_agentic(
+                content, instruction + extra, repo_root=repo_root, max_budget_usd=max_budget_usd
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            log.warning("notebook_pipeline: agentic invocation failed: %s", exc)
+            return None
+        try:
+            payload = json.loads(_strip_fence(invoked["result"]))
+            parsed = ResearchOutput.model_validate(payload).model_dump()
+        except (json.JSONDecodeError, ValidationError) as exc:
+            log.warning("notebook_pipeline: agentic response failed to parse: %s", exc)
+            return None
+        parsed["web_grounded"] = invoked["web_grounded"]
+        parsed["total_cost_usd"] = invoked["total_cost_usd"]
+        return parsed
+
+    result = await _attempt()
+    if result is None:
+        return {
+            "answer": "Research failed — the agentic call errored or returned an "
+            "unparseable response. Try again, or narrow the request.",
+            "code_citations": [],
+            "web_citations": [],
+            "proposed_patch": None,
+            "web_grounded": False,
+            "web_grounding_unverified": True,
+            "total_cost_usd": None,
+        }
+
+    suspect = bool(result.get("web_citations")) and not result["web_grounded"]
+    if suspect:
+        log.warning(
+            "notebook_pipeline: agentic response claimed web_citations with no "
+            "observed WebSearch/WebFetch tool_use — retrying with a stronger imperative"
+        )
+        retry = await _attempt(_GROUNDING_RETRY_IMPERATIVE)
+        if retry is not None:
+            result = retry
+            suspect = bool(result.get("web_citations")) and not result["web_grounded"]
+
+    result["web_grounding_unverified"] = suspect
+    return result
+
+
+async def research_answer(
+    note_id: str, question: str, *, max_budget_usd: float = _AGENTIC_DEFAULT_BUDGET_USD
+) -> dict[str, Any]:
+    """ANSWER path: research-grounds a question against note_id's guide +
+    the live codebase + the web, WITHOUT proposing any edit — read-only, no
+    update_note call anywhere in this path. Raises ValueError if note_id
+    doesn't exist (mirrors get_note)."""
+    record = notes.get_note(note_id)
+    repo = record.get("repo") or "khimaira"
+    repo_root = None if repo == notes.GENERAL_REPO else _repo_root(repo)
+    instruction = _RESEARCH_ANSWER_INSTRUCTION_TEMPLATE.format(
+        repo_root=repo_root or "(no codebase — general/cross-cutting note)",
+        guide=record.get("raw_text", ""),
+    )
+    return await _invoke_agentic_grounded(
+        question, instruction, repo_root=repo_root, max_budget_usd=max_budget_usd
+    )
+
+
+async def research_revise(
+    note_id: str,
+    directive: str,
+    *,
+    section_anchor: str | None = None,
+    max_budget_usd: float = _AGENTIC_DEFAULT_BUDGET_USD,
+) -> dict[str, Any]:
+    """REVISE path: proposes a patch to a guide, grounded against the
+    codebase + web — NEVER applies it. Returns a proposal only (including
+    `proposed_raw_text`, the FULL guide text with the patch already
+    deterministically spliced in — a ready-to-diff candidate); applying is
+    the existing PATCH /notes/{id} (raw_text=proposed_raw_text) after a
+    human reviews the diff and clicks Apply.
+
+    `section_anchor`, when given, scopes the patch to ONE section (matched
+    against the guide's CURRENT heading scan) — the model proposes only
+    that section's replacement text; `splice_section` confines the actual
+    write to that slot regardless of what the model returns, so a model
+    that ignores "just this section" can't silently rewrite the whole
+    guide. Omit `section_anchor` for a whole-guide revision.
+
+    Raises ValueError if note_id doesn't exist, or if section_anchor
+    doesn't match any heading in the guide's CURRENT raw_text (fails fast,
+    before spending an agentic call, on a stale anchor from a guide that
+    changed underneath the request).
+    """
+    record = notes.get_note(note_id)
+    raw_text = record.get("raw_text", "")
+    repo = record.get("repo") or "khimaira"
+    repo_root = None if repo == notes.GENERAL_REPO else _repo_root(repo)
+
+    if section_anchor is not None:
+        if not any(h["anchor"] == section_anchor for h in _scan_headings(raw_text)):
+            raise ValueError(
+                f"No section anchored at {section_anchor!r} in this guide's current raw_text."
+            )
+        scope = f"ONE section (anchored at {section_anchor!r})"
+        scope_instruction = (
+            "Revise ONLY that section — propose ONLY its replacement text, "
+            "starting with its own heading line, NOT the rest of the guide."
+        )
+    else:
+        scope = "the WHOLE guide"
+        scope_instruction = "Propose the full replacement guide text."
+
+    instruction = _RESEARCH_REVISE_INSTRUCTION_TEMPLATE.format(
+        scope=scope,
+        scope_instruction=scope_instruction,
+        repo_root=repo_root or "(no codebase — general/cross-cutting note)",
+        guide=raw_text,
+    )
+    result = await _invoke_agentic_grounded(
+        directive, instruction, repo_root=repo_root, max_budget_usd=max_budget_usd
+    )
+
+    proposed_raw_text = None
+    if result.get("proposed_patch"):
+        if section_anchor is not None:
+            try:
+                proposed_raw_text = splice_section(
+                    raw_text, section_anchor, result["proposed_patch"]
+                )
+            except ValueError as exc:
+                log.warning(
+                    "notebook_pipeline: research_revise(%s) splice failed: %s", note_id, exc
+                )
+        else:
+            proposed_raw_text = result["proposed_patch"]
+    result["proposed_raw_text"] = proposed_raw_text
+
+    return result
