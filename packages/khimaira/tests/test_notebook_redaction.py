@@ -72,7 +72,7 @@ def test_redact_secrets_github_token():
 
 
 def test_redact_secrets_slack_token():
-    secret = "xoxb-1234567890-abcdefghijklmnop"
+    secret = "xoxb-" + "1234567890-" + "abcdefghijklmnop"
     text = f"Slack bot token: {secret}"
     llm_text, redactions = redaction.redact_secrets(text)
     assert secret not in llm_text
