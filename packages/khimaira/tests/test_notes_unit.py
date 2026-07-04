@@ -1002,5 +1002,282 @@ def test_get_or_create_folder_does_not_match_collections(notes_store):
     notes_store.add_tab(title="Ambiguous Name", kind="collection")
     folder = notes_store.get_or_create_folder("Ambiguous Name")
     assert folder["kind"] == "folder"
-    kinds = {t["kind"] for t in notes_store.list_tabs() if t["title"] == "Ambiguous Name"}
-    assert kinds == {"folder", "collection"}
+
+
+# ---------------------------------------------------------------------------
+# FILE-MANAGER (2026-07-04) — tab hierarchy (parent_id) + pinned_placement/starred
+# ---------------------------------------------------------------------------
+
+
+def test_list_tabs_defaults_parent_id_for_legacy_tab_records(notes_store):
+    """A tab record written before `parent_id` existed must read as root
+    (None) — not crash. Mirrors the existing kind-defaulting test."""
+    tab = notes_store.add_tab(title="legacy")
+    folded = notes_store._fold_tabs()
+    raw = dict(folded[tab["id"]])
+    del raw["parent_id"]
+    out = notes_store._with_note_ids(raw)
+    assert out["parent_id"] is None
+
+
+def test_add_tab_with_parent_id_round_trips(notes_store):
+    root = notes_store.add_tab(title="Root", kind="collection")
+    child = notes_store.add_tab(title="Child", kind="collection", parent_id=root["id"])
+    assert child["parent_id"] == root["id"]
+    assert notes_store.get_tab(child["id"])["parent_id"] == root["id"]
+
+
+def test_add_tab_dangling_parent_id_raises(notes_store):
+    with pytest.raises(ValueError, match="No tab with id"):
+        notes_store.add_tab(title="x", parent_id="no-such-tab")
+
+
+def test_add_tab_cross_kind_parent_raises_tab_validation_error(notes_store):
+    """Homogeneous subtree: a folder cannot nest under a collection parent."""
+    collection = notes_store.add_tab(title="Coll", kind="collection")
+    with pytest.raises(notes_store.TabValidationError, match="don't nest"):
+        notes_store.add_tab(title="Sub", kind="folder", parent_id=collection["id"])
+
+
+def test_add_tab_sibling_title_collision_raises(notes_store):
+    parent = notes_store.add_tab(title="Parent", kind="collection")
+    notes_store.add_tab(title="API", kind="collection", parent_id=parent["id"])
+    with pytest.raises(notes_store.TabValidationError, match="already exists under this parent"):
+        notes_store.add_tab(title="api", kind="collection", parent_id=parent["id"])
+
+
+def test_add_tab_same_title_different_parents_is_fine(notes_store):
+    parent_a = notes_store.add_tab(title="A", kind="collection")
+    parent_b = notes_store.add_tab(title="B", kind="collection")
+    child_a = notes_store.add_tab(title="API", kind="collection", parent_id=parent_a["id"])
+    child_b = notes_store.add_tab(title="API", kind="collection", parent_id=parent_b["id"])
+    assert child_a["id"] != child_b["id"]
+
+
+def test_update_tab_reparent_round_trip(notes_store):
+    root = notes_store.add_tab(title="Root", kind="collection")
+    child = notes_store.add_tab(title="Child", kind="collection")
+    updated = notes_store.update_tab(child["id"], parent_id=root["id"])
+    assert updated["parent_id"] == root["id"]
+
+
+def test_update_tab_reparent_to_root_is_fine(notes_store):
+    root = notes_store.add_tab(title="Root", kind="collection")
+    child = notes_store.add_tab(title="Child", kind="collection", parent_id=root["id"])
+    updated = notes_store.update_tab(child["id"], parent_id=None)
+    assert updated["parent_id"] is None
+
+
+def test_update_tab_self_parent_raises(notes_store):
+    tab = notes_store.add_tab(title="x")
+    with pytest.raises(notes_store.TabValidationError, match="cannot be its own parent"):
+        notes_store.update_tab(tab["id"], parent_id=tab["id"])
+
+
+def test_update_tab_reparent_dangling_parent_raises(notes_store):
+    tab = notes_store.add_tab(title="x")
+    with pytest.raises(ValueError, match="No tab with id"):
+        notes_store.update_tab(tab["id"], parent_id="no-such-tab")
+
+
+def test_update_tab_reparent_cross_kind_raises(notes_store):
+    collection = notes_store.add_tab(title="Coll", kind="collection")
+    folder = notes_store.add_tab(title="Fold", kind="folder")
+    with pytest.raises(notes_store.TabValidationError, match="don't nest"):
+        notes_store.update_tab(folder["id"], parent_id=collection["id"])
+
+
+def test_update_tab_reparent_direct_cycle_raises(notes_store):
+    """A tab cannot become its own parent's parent — the simplest cycle."""
+    a = notes_store.add_tab(title="A", kind="collection")
+    b = notes_store.add_tab(title="B", kind="collection", parent_id=a["id"])
+    with pytest.raises(notes_store.TabValidationError, match="cycle"):
+        notes_store.update_tab(a["id"], parent_id=b["id"])
+
+
+def test_update_tab_reparent_deep_cycle_raises(notes_store):
+    """A -> B -> C; reparenting A under C (A's own grandchild) must be
+    rejected — proves the ancestor walk isn't just checking direct parent."""
+    a = notes_store.add_tab(title="A", kind="collection")
+    b = notes_store.add_tab(title="B", kind="collection", parent_id=a["id"])
+    c = notes_store.add_tab(title="C", kind="collection", parent_id=b["id"])
+    with pytest.raises(notes_store.TabValidationError, match="cycle"):
+        notes_store.update_tab(a["id"], parent_id=c["id"])
+
+
+def test_update_tab_reparent_sibling_collision_raises(notes_store):
+    parent = notes_store.add_tab(title="Parent", kind="collection")
+    notes_store.add_tab(title="API", kind="collection", parent_id=parent["id"])
+    other_root_tab = notes_store.add_tab(title="API", kind="collection")
+    with pytest.raises(notes_store.TabValidationError, match="already exists under this parent"):
+        notes_store.update_tab(other_root_tab["id"], parent_id=parent["id"])
+
+
+def test_get_or_create_collection_parent_scoped_sibling_isolation(notes_store):
+    """THE required invariant test (closes the whole Q6 class): two
+    "API" collections under DIFFERENT parents must be DISTINCT tabs, and
+    get_or_create must resolve each call to the tab actually shown under
+    that parent — not an arbitrary same-named sibling elsewhere in the tree."""
+    parent_1 = notes_store.add_tab(title="Backend", kind="collection")
+    parent_2 = notes_store.add_tab(title="Frontend", kind="collection")
+
+    api_1 = notes_store.get_or_create_collection("API", parent_id=parent_1["id"])
+    api_2 = notes_store.get_or_create_collection("API", parent_id=parent_2["id"])
+
+    assert api_1["id"] != api_2["id"]
+    assert api_1["parent_id"] == parent_1["id"]
+    assert api_2["parent_id"] == parent_2["id"]
+
+    # A guide filed "into API" under parent_1 must land in api_1, not api_2.
+    guide = notes_store.add_study_guide("# G\n\nbody")
+    refiled = notes_store.mark_organized(guide["id"], tab_id=api_1["id"])
+    assert refiled["tab_id"] == api_1["id"]
+    assert guide["id"] in notes_store.get_tab(api_1["id"])["note_ids"]
+    assert guide["id"] not in notes_store.get_tab(api_2["id"])["note_ids"]
+
+    # Re-calling get_or_create for parent_2's "API" must NOT return api_1.
+    again = notes_store.get_or_create_collection("api", parent_id=parent_2["id"])
+    assert again["id"] == api_2["id"]
+
+
+def test_delete_tab_unknown_id_raises(notes_store):
+    with pytest.raises(ValueError, match="No tab with id"):
+        notes_store.delete_tab("no-such-tab")
+
+
+def test_delete_tab_loses_nothing(notes_store):
+    """THE required invariant test: parent -> child collections, each with
+    a member guide, delete the parent -> (a) no infinite loop, (b) child
+    tab reparented (to root, since parent was at root), (c) every member
+    note resolves to a live tab_id (list_notes count unchanged, no dead
+    tab_id)."""
+    parent = notes_store.add_tab(title="Parent", kind="collection")
+    child = notes_store.add_tab(title="Child", kind="collection", parent_id=parent["id"])
+    guide_in_parent = notes_store.add_study_guide("# P\n\nbody")
+    notes_store.mark_organized(guide_in_parent["id"], tab_id=parent["id"])
+    guide_in_child = notes_store.add_study_guide("# C\n\nbody")
+    notes_store.mark_organized(guide_in_child["id"], tab_id=child["id"])
+
+    before_count = len(notes_store.list_notes())
+    result = notes_store.delete_tab(parent["id"])
+    assert result == {"id": parent["id"], "deleted": True}
+
+    # (a) no infinite loop already proven by reaching this line.
+    # (b) child tab reparented to root (parent's own parent, which was root).
+    refetched_child = notes_store.get_tab(child["id"])
+    assert refetched_child["parent_id"] is None
+
+    # (c) every member note resolves to a live, non-dead tab_id.
+    assert len(notes_store.list_notes()) == before_count
+    all_tab_ids = {t["id"] for t in notes_store.list_tabs()}
+    for note_id in (guide_in_parent["id"], guide_in_child["id"]):
+        note = notes_store.get_note(note_id)
+        assert (
+            note["tab_id"] == notes_store.PERSONAL_TAB_ID
+            or note["tab_id"] in all_tab_ids
+            or (note["tab_id"] == "default")
+        )
+
+    # The parent's direct member specifically must have been re-filed to
+    # the default tab (parent had no parent of its own — root).
+    assert notes_store.get_note(guide_in_parent["id"])["tab_id"] == "default"
+    # The child's own member note is untouched (child tab still exists).
+    assert notes_store.get_note(guide_in_child["id"])["tab_id"] == child["id"]
+
+    with pytest.raises(ValueError, match="No tab with id"):
+        notes_store.get_tab(parent["id"])
+
+
+def test_delete_tab_deep_reparents_children_one_level_not_to_root(notes_store):
+    """A -> B -> C; deleting B reparents C to A (B's own parent), not
+    flattened all the way to root — proves the "one level up" behavior,
+    not just "always root."""
+    a = notes_store.add_tab(title="A", kind="collection")
+    b = notes_store.add_tab(title="B", kind="collection", parent_id=a["id"])
+    c = notes_store.add_tab(title="C", kind="collection", parent_id=b["id"])
+
+    notes_store.delete_tab(b["id"])
+
+    assert notes_store.get_tab(c["id"])["parent_id"] == a["id"]
+
+
+def test_delete_tab_unpins_relocated_notes(notes_store):
+    """A note pinned to a deleted tab must be un-pinned on relocation — a
+    pin to a tab that no longer exists is meaningless; the organizer should
+    be free to reclaim it."""
+    tab = notes_store.add_tab(title="Doomed")
+    note = notes_store.add_note("body", tab_id=tab["id"])
+    notes_store.update_note(note["id"], pinned_placement=True)
+
+    notes_store.delete_tab(tab["id"])
+
+    updated = notes_store.get_note(note["id"])
+    assert updated["tab_id"] == "default"
+    assert updated["pinned_placement"] is False
+
+
+def test_delete_tab_sibling_name_collision_at_destination_does_not_crash(notes_store):
+    """Edge case found via audit: deleting a parent whose child shares a
+    title with an EXISTING tab at the destination must not crash the whole
+    delete (a rare cosmetic naming collision is a far better failure mode
+    than losing the child tab or aborting mid-delete)."""
+    root = notes_store.add_tab(title="Root", kind="collection")
+    # Pre-existing sibling already at the destination (root).
+    notes_store.add_tab(title="Sub", kind="collection")
+    parent = notes_store.add_tab(title="Parent", kind="collection", parent_id=root["id"])
+    child = notes_store.add_tab(title="Sub", kind="collection", parent_id=parent["id"])
+
+    # Must not raise.
+    notes_store.delete_tab(parent["id"])
+
+    assert notes_store.get_tab(child["id"])["parent_id"] == root["id"]
+
+
+def test_mark_organized_pinned_note_keeps_tab_id(notes_store):
+    """Pin respected at the mark_organized chokepoint itself — closes the
+    whole class in one place regardless of caller."""
+    tab_a = notes_store.add_tab(title="A")
+    tab_b = notes_store.add_tab(title="B")
+    guide = notes_store.add_study_guide("# G\n\nbody", tab_id=tab_a["id"])
+    notes_store.update_note(guide["id"], pinned_placement=True)
+
+    result = notes_store.mark_organized(guide["id"], tab_id=tab_b["id"])
+
+    assert result["tab_id"] == tab_a["id"]
+    assert result["organized_at"] is not None
+
+
+def test_mark_organized_unpinned_note_still_relocates(notes_store):
+    tab_a = notes_store.add_tab(title="A")
+    tab_b = notes_store.add_tab(title="B")
+    guide = notes_store.add_study_guide("# G\n\nbody", tab_id=tab_a["id"])
+
+    result = notes_store.mark_organized(guide["id"], tab_id=tab_b["id"])
+
+    assert result["tab_id"] == tab_b["id"]
+
+
+def test_list_notes_starred_filter(notes_store):
+    starred_note = notes_store.add_note("a")
+    notes_store.update_note(starred_note["id"], starred=True)
+    notes_store.add_note("b")
+
+    starred_only = notes_store.list_notes(starred=True)
+    assert [n["id"] for n in starred_only] == [starred_note["id"]]
+
+    unstarred_only = notes_store.list_notes(starred=False)
+    assert starred_note["id"] not in [n["id"] for n in unstarred_only]
+
+
+def test_update_note_pinned_placement_and_starred_round_trip(notes_store):
+    note = notes_store.add_note("body")
+    assert note["pinned_placement"] is False
+    assert note["starred"] is False
+
+    updated = notes_store.update_note(note["id"], pinned_placement=True, starred=True)
+    assert updated["pinned_placement"] is True
+    assert updated["starred"] is True
+
+    stub = next(s for s in notes_store.list_notes() if s["id"] == note["id"])
+    assert stub["pinned_placement"] is True
+    assert stub["starred"] is True

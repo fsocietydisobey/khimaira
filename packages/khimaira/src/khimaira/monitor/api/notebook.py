@@ -3,7 +3,8 @@
 Endpoints:
   POST   /notes                 — create a draft note (or, kind="study_guide", a
                                    grimoire guide); kicks off the structuring pipeline
-  GET    /notes?tab_id=&repo=&kind= — list notes, optionally filtered by tab/repo/kind
+  GET    /notes?tab_id=&repo=&kind=&priority=&starred= — list notes, optionally
+                                   filtered by tab/repo/kind/priority/starred
   POST   /notes/import          — grimoire Phase 1c: bulk-import study guides from a
                                    directory (dry_run=True by default — manifest only)
   GET    /notes/search?q=       — Phase 2b: semantic search over embedded notes
@@ -17,7 +18,9 @@ Endpoints:
                                    {job_id} — poll GET /notes/research/{job_id}
                                    (kind:"notebook_chat"). NOT true multi-turn.
   GET    /notes/{id}            — one note
-  PATCH  /notes/{id}            — edit title/tab/raw_text/status/links/repo/pipeline-patch
+  PATCH  /notes/{id}            — edit title/tab/raw_text/status/links/repo/pipeline-patch/
+                                   pinned_placement/starred (FILE-MANAGER, 2026-07-04); a
+                                   "move" = tab_id + pinned_placement=true together
   DELETE /notes/{id}            — delete a note
   POST   /notes/{id}/promote    — curated promotion (training.promoted=True)
   POST   /notes/{id}/resolution — v2: attach a resolution (roster-loop write-back);
@@ -41,9 +44,13 @@ Endpoints:
   POST   /notes/{id}/chat/compact — summarize older chat turns into one message,
                                    keeping the tail verbatim (cost control — every
                                    turn passes the full history into the agentic call)
-  GET    /tabs                  — list tabs (note_ids derived from live notes)
-  POST   /tabs                  — create a tab
-  PATCH  /tabs/{id}             — rename a tab
+  GET    /tabs                  — list tabs (note_ids derived from live notes; FLAT —
+                                   client builds the tree from parent_id)
+  POST   /tabs                  — create a tab (kind/parent_id — FILE-MANAGER, 2026-07-04)
+  PATCH  /tabs/{id}             — rename/re-kind/reparent a tab (parent_id — cycle,
+                                   cross-kind-nesting, sibling-name checks enforced)
+  DELETE /tabs/{id}             — delete a tab; reparents child tabs + re-files direct
+                                   member notes so nothing becomes tree-unreachable
 
 `trigger_pipeline` schedules the Phase 1c headless `claude -p` transform as
 a background task — POST /notes returns immediately with a draft note; the
@@ -113,6 +120,8 @@ class UpdateNoteReq(BaseModel):
     pipeline: dict | None = None
     sensitive: bool | None = None
     priority: str | None = None
+    pinned_placement: bool | None = None
+    starred: bool | None = None
 
 
 class AddResolutionReq(BaseModel):
@@ -155,10 +164,14 @@ class NotebookChatReq(BaseModel):
 
 class CreateTabReq(BaseModel):
     title: str = ""
+    kind: str = ""
+    parent_id: str | None = None
 
 
 class UpdateTabReq(BaseModel):
     title: str | None = None
+    kind: str | None = None
+    parent_id: str | None = None
 
 
 def trigger_pipeline(note_id: str) -> None:
@@ -224,6 +237,7 @@ def build_router():
         repo: str | None = None,
         kind: str | None = None,
         priority: str | None = None,
+        starred: bool | None = None,
         sort: str | None = None,
     ) -> dict:
         """`repo`, when given, scopes to that repo plus the "General" bucket
@@ -232,11 +246,15 @@ def build_router():
         returns both — the existing UI filters personal/guide notes out
         client-side rather than relying on server-side exclusion).
 
-        `priority`, when given, scopes to one priority value. `sort`
-        (`"priority"` or `"-priority"`) orders the result by urgent > high >
-        normal > low (or the reverse) — a presentation concern, so it's
-        applied here rather than inside notes.list_notes."""
-        result = notes.list_notes(tab_id=tab_id, repo=repo, kind=kind, priority=priority)
+        `priority`, when given, scopes to one priority value. `starred`
+        (FILE-MANAGER, 2026-07-04), when given, scopes to that starred
+        state — the Starred rail. `sort` (`"priority"` or `"-priority"`)
+        orders the result by urgent > high > normal > low (or the
+        reverse) — a presentation concern, so it's applied here rather
+        than inside notes.list_notes."""
+        result = notes.list_notes(
+            tab_id=tab_id, repo=repo, kind=kind, priority=priority, starred=starred
+        )
         if sort in ("priority", "-priority"):
             result = sorted(
                 result,
@@ -476,13 +494,39 @@ def build_router():
 
     @router.post("/tabs")
     async def create_tab(req: CreateTabReq) -> dict:
-        return notes.add_tab(title=req.title)
+        """FILE-MANAGER (2026-07-04): `kind` + `parent_id` accepted for
+        human-authored nested collections/folders. Raises 422 for a
+        structural validation failure (cross-kind nesting, sibling-name
+        collision — notes.TabValidationError), 404 for a dangling
+        parent_id (plain ValueError, mirrors get_tab)."""
+        try:
+            return notes.add_tab(title=req.title, kind=req.kind, parent_id=req.parent_id)
+        except notes.TabValidationError as e:
+            raise fastapi.HTTPException(422, str(e)) from e
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
 
     @router.patch("/tabs/{tab_id}")
     async def update_tab(tab_id: str, req: UpdateTabReq) -> dict:
+        """FILE-MANAGER (2026-07-04): `parent_id` reparents — enforces
+        no-cycle/homogeneous-kind/sibling-uniqueness (422,
+        notes.TabValidationError) and parent-exists (404, plain
+        ValueError, mirrors get_tab)."""
         fields = req.model_dump(exclude_unset=True)
         try:
             return notes.update_tab(tab_id, **fields)
+        except notes.TabValidationError as e:
+            raise fastapi.HTTPException(422, str(e)) from e
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+
+    @router.delete("/tabs/{tab_id}")
+    async def delete_tab_route(tab_id: str) -> dict:
+        """FILE-MANAGER (2026-07-04): re-files child tabs (to this tab's own
+        parent) AND direct member notes (to this tab's parent, or the
+        default tab at root) — "never lose a guide." See notes.delete_tab."""
+        try:
+            return notes.delete_tab(tab_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 

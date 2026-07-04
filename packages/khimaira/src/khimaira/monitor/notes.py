@@ -34,7 +34,18 @@ log = get_logger("monitor.notes")
 
 _VALID_STATUSES = frozenset({"draft", "processed", "promoted", "failed"})
 _NOTE_MUTABLE_FIELDS = frozenset(
-    {"title", "tab_id", "raw_text", "status", "links", "repo", "sensitive", "priority"}
+    {
+        "title",
+        "tab_id",
+        "raw_text",
+        "status",
+        "links",
+        "repo",
+        "sensitive",
+        "priority",
+        "pinned_placement",
+        "starred",
+    }
 )
 _DEFAULT_TAB_ID = "default"
 _DEFAULT_REPO = "khimaira"
@@ -73,6 +84,15 @@ _DEFAULT_KIND = "note"
 # in the Library view. A collection IS a tab — no separate store.
 _VALID_TAB_KINDS = frozenset({"folder", "collection"})
 _DEFAULT_TAB_KIND = "folder"
+
+
+class TabValidationError(ValueError):
+    """FILE-MANAGER (2026-07-04): a tab create/reparent request that's
+    structurally invalid (cycle, cross-kind nesting, sibling-name collision)
+    — distinct from a plain ValueError (unknown tab_id / dangling parent_id,
+    still raised by get_tab as-is) so API routes can map it to 422 (bad
+    input) instead of 404 (not found). Subclasses ValueError so any existing
+    generic `except ValueError` catch still works unchanged."""
 
 
 # Sensitive / credential-safe notes (2026-07-04): a place to paste content
@@ -222,6 +242,8 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "priority": record.get("priority", _DEFAULT_PRIORITY),
         "lifecycle": derive_lifecycle(record),
         "deleted": deleted,
+        "pinned_placement": record.get("pinned_placement", False),
+        "starred": record.get("starred", False),
     }
 
 
@@ -328,6 +350,8 @@ def add_note(
         "llm_text": llm_text,
         "redactions": redactions,
         "priority": _DEFAULT_PRIORITY,
+        "pinned_placement": False,
+        "starred": False,
     }
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
@@ -404,6 +428,8 @@ def add_study_guide(
         "llm_text": llm_text,
         "redactions": redactions,
         "priority": _DEFAULT_PRIORITY,
+        "pinned_placement": False,
+        "starred": False,
     }
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
@@ -440,6 +466,7 @@ def list_notes(
     repo: str | None = None,
     kind: str | None = None,
     priority: str | None = None,
+    starred: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Newest-created first. Sorted by created_at (not updated_at) so a
     revalidate/heal pass — which only bumps updated_at — doesn't reshuffle
@@ -457,7 +484,12 @@ def list_notes(
     than hidden by default here.
 
     `priority`, when given, scopes to that priority ("low"|"normal"|"high"|
-    "urgent"). `priority=None` returns all priorities."""
+    "urgent"). `priority=None` returns all priorities.
+
+    `starred`, when given, scopes to that starred state (FILE-MANAGER,
+    2026-07-04 — the Starred rail). Filters on the folded index STUB, not a
+    fresh get_note() per note — see _index_stub, which projects `starred`
+    for exactly this reason."""
     stubs = list(_fold_index().values())
     if tab_id is not None:
         stubs = [s for s in stubs if s["tab_id"] == tab_id]
@@ -467,6 +499,8 @@ def list_notes(
         stubs = [s for s in stubs if s.get("kind", _DEFAULT_KIND) == kind]
     if priority is not None:
         stubs = [s for s in stubs if s.get("priority", _DEFAULT_PRIORITY) == priority]
+    if starred is not None:
+        stubs = [s for s in stubs if s.get("starred", False) == starred]
     stubs.sort(key=lambda s: s["created_at"], reverse=True)
     return stubs
 
@@ -583,11 +617,28 @@ def mark_organized(note_id: str, tab_id: str | None = None) -> dict[str, Any]:
     """Stamp organized_at (the organizer just placed/checked this note) and
     optionally re-file it (set tab_id) in one write. The Phase 1 hook is
     notebook_organizer.assign_deterministic (called right after import/
-    creation); the batched LLM organize_library() pass (later phase) also
-    lands here."""
+    creation); the batched LLM organize_library() pass also lands here;
+    notebook_import.py's own inline re-file does too.
+
+    Pinned notes (2026-07-04, FILE-MANAGER): a note with
+    `pinned_placement=True` NEVER has its tab_id changed here, regardless of
+    caller. This is the single chokepoint every automated organize path
+    (assign_deterministic, organize_library, notebook_import's re-file)
+    already funnels through, so guarding HERE closes the whole "auto-
+    organizer overrides a manual pin" class in one place instead of
+    requiring every current AND future caller to remember its own check —
+    same shape as llm_view() closing the sensitive-notes egress class.
+    organized_at is still stamped either way (the item WAS considered/
+    checked, it just kept its user-chosen placement).
+
+    This does NOT apply to a structural re-file where the note's OWN tab was
+    deleted (delete_tab) — that path writes tab_id directly via update_note,
+    not through here, since a pinned note whose home vanished must still be
+    relocated (a dead tab_id is a genuine data-integrity break, not an
+    organizer opinion the pin should override)."""
     record = get_note(note_id)
     now = _now_iso()
-    if tab_id is not None:
+    if tab_id is not None and not record.get("pinned_placement"):
         record["tab_id"] = tab_id
     record["organized_at"] = now
     record["updated_at"] = now
@@ -788,19 +839,83 @@ def backfill_drop_spurious_heals_all() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def add_tab(title: str = "", *, kind: str = "") -> dict[str, Any]:
+def _assert_sibling_unique(
+    title: str, kind: str, parent_id: str | None, *, exclude_tab_id: str | None = None
+) -> None:
+    """FILE-MANAGER (2026-07-04): `(kind, parent_id, title_norm)` must be
+    unique among live tabs — the invariant that replaces the old GLOBAL
+    title-uniqueness assumption once tabs nest (two "API" collections under
+    DIFFERENT parents are fine; two under the SAME parent are not — the
+    latter is what silently let the organizer misfile before nesting
+    existed to make the ambiguity possible)."""
+    title_norm = title.strip().lower()
+    for tab in list_tabs():
+        if tab["id"] == exclude_tab_id:
+            continue
+        if (
+            tab.get("kind") == kind
+            and tab.get("parent_id") == parent_id
+            and tab["title"].strip().lower() == title_norm
+        ):
+            raise TabValidationError(
+                f"A {kind} tab titled {title!r} already exists under this parent "
+                "— sibling titles must be unique."
+            )
+
+
+def _tab_ancestor_ids(tab_id: str, tabs_by_id: dict[str, dict[str, Any]]) -> list[str]:
+    """Ancestor tab_ids from immediate parent up to root, in order. Defends
+    against a corrupt/cyclic parent chain already on disk (pre-invariant
+    data) by capping at len(tabs_by_id) hops rather than looping forever —
+    this walk itself must never be the infinite loop the cycle check exists
+    to prevent elsewhere."""
+    ancestors: list[str] = []
+    seen: set[str] = set()
+    current = tabs_by_id.get(tab_id)
+    hops = 0
+    while current is not None and current.get("parent_id") is not None and hops <= len(tabs_by_id):
+        pid = current["parent_id"]
+        if pid in seen:
+            break
+        seen.add(pid)
+        ancestors.append(pid)
+        current = tabs_by_id.get(pid)
+        hops += 1
+    return ancestors
+
+
+def add_tab(title: str = "", *, kind: str = "", parent_id: str | None = None) -> dict[str, Any]:
     """`kind`: "folder" (default, regular note groups) or "collection"
     (study-guide groups, shown in the Library view) — so the two don't
-    intermix in the filter bar."""
+    intermix in the filter bar.
+
+    `parent_id` (FILE-MANAGER, 2026-07-04): nests this tab under an
+    existing tab (adjacency list — None means root level). Enforces, at
+    creation time same as reparent: the parent must exist (reuses get_tab's
+    own ValueError), `parent.kind == kind` (homogeneous subtree — folders
+    and collections never nest into each other), and sibling-uniqueness
+    among `(kind, parent_id, title_norm)`.
+    """
     _ensure_dirs()
     if kind and kind not in _VALID_TAB_KINDS:
         raise ValueError(f"Invalid tab kind {kind!r}; must be one of {sorted(_VALID_TAB_KINDS)}.")
+    kind = kind or _DEFAULT_TAB_KIND
+    if parent_id is not None:
+        parent = get_tab(parent_id)  # raises plain ValueError if missing
+        if parent.get("kind") != kind:
+            raise TabValidationError(
+                f"Cannot create a {kind!r} tab under a {parent.get('kind')!r} parent "
+                "(folders and collections don't nest into each other)."
+            )
+    title = title or f"Tab {_new_id()[:6]}"
+    _assert_sibling_unique(title, kind, parent_id)
     tab_id = _new_id()
     now = _now_iso()
     record = {
         "id": tab_id,
-        "title": title or f"Tab {tab_id[:6]}",
-        "kind": kind or _DEFAULT_TAB_KIND,
+        "title": title,
+        "kind": kind,
+        "parent_id": parent_id,
         "created_at": now,
         "updated_at": now,
         "deleted": False,
@@ -818,23 +933,120 @@ def get_tab(tab_id: str) -> dict[str, Any]:
 
 
 def update_tab(tab_id: str, **fields: Any) -> dict[str, Any]:
+    """Edit title/kind/parent_id. Reparenting (`parent_id` in fields)
+    enforces ALL FOUR tab invariants (FILE-MANAGER, 2026-07-04):
+
+    1. No cycle — a tab is never its own ancestor (else infinite-loop /
+       stack-overflow DoS on every tree-build / breadcrumb / descendant
+       walk). Walks ancestors of the proposed parent; rejects if `tab_id`
+       appears.
+    2. Homogeneous subtree — `parent.kind == (new) kind`.
+    3. Sibling-unique — `(kind, parent_id, title_norm)` among live tabs.
+    4. Parent exists — a dangling `parent_id` is rejected (reuses get_tab's
+       own ValueError).
+
+    Raises TabValidationError (a ValueError subclass) for 1-3; a plain
+    ValueError for an unknown tab_id/parent_id (mirrors get_tab)."""
     _ensure_dirs()
     existing = get_tab(tab_id)
     existing.pop("note_ids", None)
-    unknown = set(fields) - {"title", "kind"}
+    unknown = set(fields) - {"title", "kind", "parent_id"}
     if unknown:
         raise ValueError(
-            f"Unknown tab field(s): {sorted(unknown)}. Mutable fields: ['title', 'kind']."
+            f"Unknown tab field(s): {sorted(unknown)}. "
+            "Mutable fields: ['title', 'kind', 'parent_id']."
         )
     if "kind" in fields and fields["kind"] not in _VALID_TAB_KINDS:
         raise ValueError(
             f"Invalid tab kind {fields['kind']!r}; must be one of {sorted(_VALID_TAB_KINDS)}."
         )
+
+    new_kind = fields.get("kind", existing["kind"])
+    new_parent_id = fields["parent_id"] if "parent_id" in fields else existing.get("parent_id")
+    new_title = fields.get("title", existing["title"])
+
+    if "parent_id" in fields and new_parent_id is not None:
+        if new_parent_id == tab_id:
+            raise TabValidationError(f"Tab {tab_id!r} cannot be its own parent.")
+        tabs_by_id = {t["id"]: t for t in list_tabs()}
+        parent = tabs_by_id.get(new_parent_id)
+        if parent is None:
+            raise ValueError(
+                f"No tab with id={new_parent_id!r}. Use list_tabs() to see available tabs."
+            )
+        if parent["kind"] != new_kind:
+            raise TabValidationError(
+                f"Cannot reparent a {new_kind!r} tab under a {parent['kind']!r} tab "
+                "(folders and collections don't nest into each other)."
+            )
+        if tab_id in _tab_ancestor_ids(new_parent_id, tabs_by_id):
+            raise TabValidationError(
+                f"Reparenting {tab_id!r} under {new_parent_id!r} would create a cycle "
+                "(the proposed parent is a descendant of this tab)."
+            )
+
+    if {"title", "parent_id", "kind"} & set(fields):
+        _assert_sibling_unique(new_title, new_kind, new_parent_id, exclude_tab_id=tab_id)
+
     existing.update(fields)
     existing["updated_at"] = _now_iso()
     existing["deleted"] = False
     _append_jsonl(_tabs_path(), existing)
     return _with_note_ids(existing)
+
+
+def delete_tab(tab_id: str) -> dict[str, Any]:
+    """Delete a tab (FILE-MANAGER, 2026-07-04 — greenfield, no prior
+    implementation). "Never lose a guide" requires re-filing TWO things,
+    not just one — the easy thing a naive implementation omits is the
+    second:
+
+    1. Child tabs → reparent to the deleted tab's OWN parent (one level up
+       — not always root, so deleting a tab deep in a tree collapses one
+       level, not the whole subtree). Bypasses update_tab's own
+       cycle/kind/uniqueness validation via a direct write: cycle is
+       structurally impossible here (the new parent is this tab's own
+       parent, which cannot be a descendant of any of this tab's children
+       without an already-corrupt tree) and kind homogeneity is preserved
+       automatically (a child's kind already equals this tab's kind, which
+       already equals the grandparent's kind, transitively). A sibling-name
+       COLLISION at the destination is possible (rare) and is deliberately
+       NOT blocked here — a cosmetic, later-fixable naming clash is a far
+       better failure mode than aborting a delete partway through or losing
+       a child tab's contents outright.
+    2. Direct member NOTES → re-file to the deleted tab's parent (or
+       _DEFAULT_TAB_ID if the deleted tab was itself at root) — THIS is the
+       actual "never lose a guide" enforcement. Reparenting child tabs
+       alone leaves member notes carrying a now-dead tab_id: not deleted
+       from disk, but tree-unreachable (invisible in every tab-scoped
+       list/breadcrumb). Also un-pins the note (a pin to a tab that no
+       longer exists doesn't mean anything — the organizer is free to
+       reclaim it on the next sweep; the user can always re-pin).
+
+    Raises ValueError if tab_id doesn't exist (mirrors get_tab)."""
+    existing = get_tab(tab_id)
+    fallback_parent_id = existing.get("parent_id")  # None -> root
+    fallback_note_tab_id = fallback_parent_id or _DEFAULT_TAB_ID
+
+    for child in list_tabs():
+        if child.get("parent_id") == tab_id:
+            child["parent_id"] = fallback_parent_id
+            child["updated_at"] = _now_iso()
+            child["deleted"] = False
+            _append_jsonl(_tabs_path(), child)
+
+    for note_stub in list_notes(tab_id=tab_id):
+        update_note(note_stub["id"], tab_id=fallback_note_tab_id, pinned_placement=False)
+
+    now = _now_iso()
+    existing.pop("note_ids", None)
+    existing["deleted"] = True
+    existing["updated_at"] = now
+    _append_jsonl(_tabs_path(), existing)
+    log.info(
+        "notes: deleted tab %s (children+notes reparented to %s)", tab_id, fallback_note_tab_id
+    )
+    return {"id": tab_id, "deleted": True}
 
 
 def list_tabs() -> list[dict[str, Any]]:
@@ -846,33 +1058,50 @@ def list_tabs() -> list[dict[str, Any]]:
 def _with_note_ids(tab_record: dict[str, Any]) -> dict[str, Any]:
     out = dict(tab_record)
     out.setdefault("kind", _DEFAULT_TAB_KIND)
+    out.setdefault("parent_id", None)  # pre-FILE-MANAGER tabs read as root
     out["note_ids"] = [n["id"] for n in list_notes(tab_id=tab_record["id"])]
     return out
 
 
-def _get_or_create_tab_by_kind(title: str, kind: str) -> dict[str, Any]:
-    """Find an existing tab of the given `kind` matching `title`
-    (case-insensitive), or create one. The deterministic-first primitive
-    shared by notebook_import.py and notebook_organizer.py — both need "does
-    a tab named X already exist" before deciding to create a new one vs
-    re-file into an existing one, and must agree on the same lookup or
-    they'd create near-duplicate tabs differing only in casing."""
+def _get_or_create_tab_by_kind(
+    title: str, kind: str, parent_id: str | None = None
+) -> dict[str, Any]:
+    """Find an existing tab of the given `kind` + `parent_id` matching
+    `title` (case-insensitive), or create one. The deterministic-first
+    primitive shared by notebook_import.py and notebook_organizer.py — both
+    need "does a tab named X already exist AT THIS LOCATION" before
+    deciding to create a new one vs re-file into an existing one.
+
+    Parent-scoped (FILE-MANAGER, 2026-07-04): matching on `(kind, parent_id,
+    title_norm)`, NOT title alone — title-alone matching returns an
+    arbitrary same-named sibling once titles are non-unique across a
+    nested tree, silently cross-filing guides on every organize sweep. v1
+    callers (notebook_organizer) always pass `parent_id=None` — the
+    organizer auto-files into ROOT-level collections/folders only; a
+    human-authored nested "API" collection is deliberately invisible to
+    the organizer's auto-create until a tree-aware v2 pass (documented safe
+    limitation, not a silent misfile)."""
     title_norm = title.strip().lower()
     for tab in list_tabs():
-        if tab.get("kind") == kind and tab["title"].strip().lower() == title_norm:
+        if (
+            tab.get("kind") == kind
+            and tab.get("parent_id") == parent_id
+            and tab["title"].strip().lower() == title_norm
+        ):
             return tab
-    return add_tab(title=title, kind=kind)
+    return add_tab(title=title, kind=kind, parent_id=parent_id)
 
 
-def get_or_create_collection(title: str) -> dict[str, Any]:
+def get_or_create_collection(title: str, parent_id: str | None = None) -> dict[str, Any]:
     """Get-or-create a `kind="collection"` tab — study guides' organize
-    destination."""
-    return _get_or_create_tab_by_kind(title, "collection")
+    destination. `parent_id=None` (root) is what the organizer always
+    passes — nesting is human-authored, see _get_or_create_tab_by_kind."""
+    return _get_or_create_tab_by_kind(title, "collection", parent_id)
 
 
-def get_or_create_folder(title: str) -> dict[str, Any]:
+def get_or_create_folder(title: str, parent_id: str | None = None) -> dict[str, Any]:
     """Get-or-create a `kind="folder"` tab — regular notes' organize
     destination (the sibling to get_or_create_collection, added when the
     organizer was extended to notes — kept in its own namespace so notes
     and guides never intermix in the tab filter bar)."""
-    return _get_or_create_tab_by_kind(title, "folder")
+    return _get_or_create_tab_by_kind(title, "folder", parent_id)

@@ -351,6 +351,103 @@ def test_patch_tab_unknown_id_returns_404(notebook_client):
     assert r.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# FILE-MANAGER (2026-07-04) — tab hierarchy (parent_id) + note pinned_placement/starred
+# ---------------------------------------------------------------------------
+
+
+def test_create_tab_with_kind_and_parent_id(notebook_client):
+    root = notebook_client.post("/api/tabs", json={"title": "Root", "kind": "collection"}).json()
+    child = notebook_client.post(
+        "/api/tabs", json={"title": "Child", "kind": "collection", "parent_id": root["id"]}
+    )
+    assert child.status_code == 200
+    assert child.json()["parent_id"] == root["id"]
+
+
+def test_create_tab_dangling_parent_returns_404(notebook_client):
+    r = notebook_client.post("/api/tabs", json={"title": "x", "parent_id": "no-such-tab"})
+    assert r.status_code == 404
+
+
+def test_create_tab_cross_kind_parent_returns_422(notebook_client):
+    collection = notebook_client.post("/api/tabs", json={"title": "C", "kind": "collection"}).json()
+    r = notebook_client.post(
+        "/api/tabs", json={"title": "F", "kind": "folder", "parent_id": collection["id"]}
+    )
+    assert r.status_code == 422
+
+
+def test_create_tab_sibling_collision_returns_422(notebook_client):
+    parent = notebook_client.post("/api/tabs", json={"title": "P", "kind": "collection"}).json()
+    notebook_client.post(
+        "/api/tabs", json={"title": "API", "kind": "collection", "parent_id": parent["id"]}
+    )
+    r = notebook_client.post(
+        "/api/tabs", json={"title": "api", "kind": "collection", "parent_id": parent["id"]}
+    )
+    assert r.status_code == 422
+
+
+def test_patch_tab_reparent(notebook_client):
+    root = notebook_client.post("/api/tabs", json={"title": "Root", "kind": "collection"}).json()
+    child = notebook_client.post("/api/tabs", json={"title": "Child", "kind": "collection"}).json()
+    r = notebook_client.patch(f"/api/tabs/{child['id']}", json={"parent_id": root["id"]})
+    assert r.status_code == 200
+    assert r.json()["parent_id"] == root["id"]
+
+
+def test_patch_tab_reparent_cycle_returns_422(notebook_client):
+    a = notebook_client.post("/api/tabs", json={"title": "A", "kind": "collection"}).json()
+    b = notebook_client.post(
+        "/api/tabs", json={"title": "B", "kind": "collection", "parent_id": a["id"]}
+    ).json()
+    r = notebook_client.patch(f"/api/tabs/{a['id']}", json={"parent_id": b["id"]})
+    assert r.status_code == 422
+
+
+def test_delete_tab_route_happy_path(notebook_client):
+    parent = notebook_client.post("/api/tabs", json={"title": "Parent"}).json()
+    note = notebook_client.post("/api/notes", json={"raw_text": "a", "tab_id": parent["id"]}).json()
+
+    r = notebook_client.delete(f"/api/tabs/{parent['id']}")
+    assert r.status_code == 200
+    assert r.json() == {"id": parent["id"], "deleted": True}
+
+    # The note must resolve to a live tab_id (re-filed to "default", parent had no parent).
+    refetched = notebook_client.get(f"/api/notes/{note['id']}").json()
+    assert refetched["tab_id"] == "default"
+
+    r = notebook_client.get("/api/tabs")
+    assert parent["id"] not in [t["id"] for t in r.json()["tabs"]]
+
+
+def test_delete_tab_route_unknown_id_returns_404(notebook_client):
+    r = notebook_client.delete("/api/tabs/no-such-tab")
+    assert r.status_code == 404
+
+
+def test_patch_note_pinned_placement_and_starred(notebook_client):
+    note = notebook_client.post("/api/notes", json={"raw_text": "a"}).json()
+    r = notebook_client.patch(
+        f"/api/notes/{note['id']}", json={"pinned_placement": True, "starred": True}
+    )
+    assert r.status_code == 200
+    assert r.json()["pinned_placement"] is True
+    assert r.json()["starred"] is True
+
+
+def test_list_notes_starred_filter_route(notebook_client):
+    starred = notebook_client.post("/api/notes", json={"raw_text": "a"}).json()
+    notebook_client.patch(f"/api/notes/{starred['id']}", json={"starred": True})
+    notebook_client.post("/api/notes", json={"raw_text": "b"})
+
+    r = notebook_client.get("/api/notes", params={"starred": "true"})
+    assert r.status_code == 200
+    ids = [n["id"] for n in r.json()["notes"]]
+    assert ids == [starred["id"]]
+
+
 def test_list_tabs_empty_store(notebook_client):
     r = notebook_client.get("/api/tabs")
     assert r.status_code == 200

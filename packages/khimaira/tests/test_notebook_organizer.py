@@ -344,6 +344,63 @@ async def test_organize_library_never_touches_priority(organizer_llm, notes_stor
     assert notes_store.get_note(note["id"])["priority"] == "urgent"
 
 
+async def test_organize_library_excludes_pinned_notes_from_prompt_and_reporting(
+    organizer_llm, notes_store, monkeypatch
+):
+    """FILE-MANAGER (2026-07-04): a pinned note is excluded from
+    organize_library's own prompt/considered-count entirely — not just
+    prevented from actually moving."""
+    organizer, pipeline_mod = organizer_llm
+    pinned = _note_with_summary(notes_store, "Pinned Note", "About widgets.")
+    notes_store.update_note(pinned["id"], pinned_placement=True)
+    unpinned = _note_with_summary(notes_store, "Unpinned Note", "About gadgets.")
+
+    captured_ids = []
+
+    async def fake_transform_note(content, *, instruction, schema):
+        captured_ids.append("Pinned Note" in content or pinned["id"] in content)
+        return {"placements": [{"note_id": unpinned["id"], "collection": "Gadgets"}]}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert result["considered"] == 1  # only the unpinned note
+    assert pinned["id"] not in result["reassigned"]
+
+
+async def test_pin_survives_organize_sweep_and_reimport(organizer_llm, notes_store, monkeypatch):
+    """THE required invariant test (closes Q4's side path): pin a guide,
+    run organize_library() -> tab_id unchanged, THEN fire
+    assign_deterministic (the re-import-equivalent path) -> tab_id STILL
+    unchanged. The second half is what a naive impl (guard organize_library
+    only, forget assign_deterministic/import) fails."""
+    organizer, pipeline_mod = organizer_llm
+    home_tab = notes_store.add_tab(title="Home", kind="collection")
+    guide = _guide_with_abstract(
+        notes_store, "Pinned Guide", "About widgets.", tab_id=home_tab["id"]
+    )
+    notes_store.update_note(guide["id"], pinned_placement=True)
+
+    # Sweep: organize_library must not move it, even if the LLM proposes a
+    # different collection.
+    async def fake_transform_note(content, *, instruction, schema):
+        return {"placements": [{"note_id": guide["id"], "collection": "Elsewhere"}]}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    await organizer.organize_library()
+    assert notes_store.get_note(guide["id"])["tab_id"] == home_tab["id"]
+
+    # Re-import-equivalent: assign_deterministic on the SAME (existing,
+    # pinned) note_id, deriving a DIFFERENT collection from a path — must
+    # also refuse to move it (the side path master's review specifically
+    # flagged: mark_organized's own pin guard, not organize_library's filter,
+    # is what closes this).
+    other_root = Path("/shared-docs")
+    other_path = other_root / "somewhere-else" / "guide.md"
+    organizer.assign_deterministic(guide["id"], other_path, other_root)
+    assert notes_store.get_note(guide["id"])["tab_id"] == home_tab["id"]
+
+
 async def test_organize_library_note_blurb_uses_summary_not_abstract(
     organizer_llm, notes_store, monkeypatch
 ):

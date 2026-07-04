@@ -171,6 +171,14 @@ async def organize_library(note_ids: list[str] | None = None) -> dict[str, Any]:
     judge content from otherwise); this also excludes personal-tab notes,
     which are never structured at all (see api/notebook.py's create_note).
 
+    FILE-MANAGER (2026-07-04): also excludes `pinned_placement=True` notes —
+    a manual move is a durable override the organizer must never churn.
+    This keeps a pinned item out of the LLM prompt (cost) and out of
+    `reassigned`/considered reporting entirely; `notes.mark_organized`
+    ALSO refuses a tab_id change for a pinned note as a structural
+    backstop (covers assign_deterministic and notebook_import's own
+    re-file, which don't go through this filter at all).
+
     Re-files (mark_organized with a new tab_id) only when the LLM's chosen
     location differs from the item's current one; otherwise just stamps
     organized_at (checked, still correctly placed). Unknown/hallucinated
@@ -186,7 +194,11 @@ async def organize_library(note_ids: list[str] | None = None) -> dict[str, Any]:
     from khimaira.monitor import notebook_pipeline
 
     all_notes = notes.list_notes()
-    organizable = [n for n in all_notes if n.get("pipeline") and _organizable_kind(n)]
+    organizable = [
+        n
+        for n in all_notes
+        if n.get("pipeline") and _organizable_kind(n) and not n.get("pinned_placement")
+    ]
     targets = [n for n in organizable if note_ids is None or n["id"] in note_ids]
     if not targets:
         return {"considered": 0, "reassigned": [], "new_collections": []}

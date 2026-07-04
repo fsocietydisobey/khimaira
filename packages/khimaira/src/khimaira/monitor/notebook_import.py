@@ -156,6 +156,12 @@ def import_dir(root: str | Path, *, repo: str = "", dry_run: bool = True) -> dic
                 repo=repo or notes.GENERAL_REPO,
                 source_path=source_path,
             )
+            # FILE-MANAGER (2026-07-04): only ever fires on a BRAND-NEW note
+            # (find_by_source_path already skipped an existing match above),
+            # so there's no pinned note to override here — but mark_organized
+            # itself refuses a tab_id change for any pinned note regardless,
+            # closing this as one of the "three call sites" the pin invariant
+            # must hold across (see mark_organized's own docstring).
             record = notes.mark_organized(record["id"], tab_id=tab["id"])
             notebook_pipeline.schedule_pipeline(record["id"])
             imported.append(record["id"])
