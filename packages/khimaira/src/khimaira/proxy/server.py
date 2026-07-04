@@ -109,9 +109,25 @@ _backup_tok_cache: dict[str, object] = {"token": None, "mtime": 0.0}
 _failover_events: int = 0  # observability
 
 
+_BACKUP_TOKEN_EXPIRY_SKEW_S = 60.0  # treat as expired this long before the real expiresAt
+
+
 def _backup_bearer() -> str | None:
     """Backup account OAuth access token, cached by file mtime. None if
-    unavailable → failover silently no-ops (primary behaviour unchanged)."""
+    unavailable OR expired → failover silently no-ops (primary behaviour
+    unchanged) instead of handing upstream a dead bearer.
+
+    2026-07-04 root cause: the backup account is dormant between failovers,
+    so Claude Code never auto-refreshes its accessToken the way it does for
+    an actively-used account — it silently rots past `expiresAt` with nothing
+    noticing. This function used to return that stale token unconditionally
+    (and `backup_token_present` only checked "file exists", not "token
+    valid"), so a failover would authenticate with a dead bearer and the
+    whole roster would see "unauthenticated account" instead of a clean
+    failover. Refreshing the token itself (one-shot or on a timer) is a
+    separate, deliberately manual step (`bin/failover refresh`) — this
+    function's job is just to never LIE about the token being usable.
+    """
     try:
         st = os.stat(_BACKUP_CREDS_PATH)
         if (
@@ -119,9 +135,15 @@ def _backup_bearer() -> str | None:
             or st.st_mtime != _backup_tok_cache["mtime"]
         ):
             with open(_BACKUP_CREDS_PATH) as f:
-                tok = json.load(f).get("claudeAiOauth", {}).get("accessToken")
-            _backup_tok_cache["token"] = tok
+                oauth = json.load(f).get("claudeAiOauth", {})
+            _backup_tok_cache["token"] = oauth.get("accessToken")
+            _backup_tok_cache["expires_at_ms"] = oauth.get("expiresAt")
             _backup_tok_cache["mtime"] = st.st_mtime
+        expires_at_ms = _backup_tok_cache.get("expires_at_ms")
+        if isinstance(expires_at_ms, (int, float)):
+            now_ms = time.time() * 1000
+            if now_ms >= expires_at_ms - _BACKUP_TOKEN_EXPIRY_SKEW_S * 1000:
+                return None  # expired (or near-expiry) — treat as absent, don't hand out a dead bearer
         return _backup_tok_cache["token"]  # type: ignore[return-value]
     except Exception:
         return None

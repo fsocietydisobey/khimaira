@@ -790,3 +790,62 @@ def test_on_backup_already_detects_backup_headers():
     with patch.object(srv, "_backup_bearer", lambda: "BK"):
         assert srv._on_backup_already({"authorization": "Bearer BK"}) is True
         assert srv._on_backup_already({"authorization": "Bearer PRIMARY"}) is False
+
+
+def _write_backup_creds(path, access_token, expires_at_ms):
+    path.write_text(json.dumps({"claudeAiOauth": {"accessToken": access_token, "expiresAt": expires_at_ms}}))
+
+
+class TestBackupBearerExpiry:
+    """2026-07-04 bug: the backup account is dormant between failovers, so its
+    accessToken silently rots past expiresAt with nothing refreshing it —
+    _backup_bearer used to hand that dead token out unconditionally (and
+    backup_token_present only checked "file exists"), so a failover would
+    authenticate with a dead bearer instead of cleanly no-oping. These test
+    the real function against a real (temp) credentials file, not a mock —
+    the mtime-keyed cache and expiresAt math are the actual bug surface."""
+
+    def _reset_cache(self, srv):
+        srv._backup_tok_cache["token"] = None
+        srv._backup_tok_cache["mtime"] = 0.0
+        srv._backup_tok_cache.pop("expires_at_ms", None)
+
+    def test_fresh_token_returned(self, tmp_path):
+        import khimaira.proxy.server as srv
+
+        creds = tmp_path / "creds.json"
+        _write_backup_creds(creds, "FRESH_TOKEN", (time.time() + 3600) * 1000)
+        self._reset_cache(srv)
+        with patch.object(srv, "_BACKUP_CREDS_PATH", str(creds)):
+            assert srv._backup_bearer() == "FRESH_TOKEN"
+
+    def test_expired_token_treated_as_absent(self, tmp_path):
+        import khimaira.proxy.server as srv
+
+        creds = tmp_path / "creds.json"
+        _write_backup_creds(creds, "DEAD_TOKEN", (time.time() - 3600) * 1000)  # 1h expired
+        self._reset_cache(srv)
+        with patch.object(srv, "_BACKUP_CREDS_PATH", str(creds)):
+            assert srv._backup_bearer() is None
+
+    def test_near_expiry_within_skew_treated_as_absent(self, tmp_path):
+        import khimaira.proxy.server as srv
+
+        creds = tmp_path / "creds.json"
+        # 10s from now, well inside the skew window — must not be handed out.
+        _write_backup_creds(creds, "ALMOST_DEAD_TOKEN", (time.time() + 10) * 1000)
+        self._reset_cache(srv)
+        with patch.object(srv, "_BACKUP_CREDS_PATH", str(creds)):
+            assert srv._backup_bearer() is None
+
+    def test_missing_expires_at_falls_back_to_present(self, tmp_path):
+        """A credentials shape with no expiresAt field at all (shouldn't happen
+        in practice, but don't newly break on it) still returns the token —
+        only a REAL expiresAt in the past disables it."""
+        import khimaira.proxy.server as srv
+
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"claudeAiOauth": {"accessToken": "TOK"}}))
+        self._reset_cache(srv)
+        with patch.object(srv, "_BACKUP_CREDS_PATH", str(creds)):
+            assert srv._backup_bearer() == "TOK"
