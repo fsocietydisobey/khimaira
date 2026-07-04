@@ -152,6 +152,11 @@ def build_router():
         # touch the structured content, so they skip reprocessing. Personal-tab
         # notes are read raw (no pipeline, no embed), mirroring create_note.
         if "raw_text" in fields and record["tab_id"] != notes.PERSONAL_TAB_ID:
+            # Flip to draft so the UI shows a "reprocessing" state while the
+            # (async) pipeline runs — set_pipeline flips it back to processed +
+            # stamps structured_at on completion. The old tabs stay visible
+            # meanwhile (pipeline isn't cleared), just badged as reprocessing.
+            record = notes.update_note(record["id"], status="draft")
             trigger_pipeline(record["id"])
             notebook_retrieval.schedule_upsert(record)
         return record

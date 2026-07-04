@@ -141,6 +141,7 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "repo": record.get("repo", _DEFAULT_REPO),
         "last_validated_at": record.get("last_validated_at"),
         "validated_git_sha": record.get("validated_git_sha"),
+        "structured_at": record.get("structured_at"),
         "history_count": len(record.get("history") or []),
         "resolution": record.get("resolution", ""),
         "resolved_by": record.get("resolved_by", ""),
@@ -209,6 +210,10 @@ def add_note(raw_text: str, tab_id: str = "", title: str = "", repo: str = "") -
         "history": [],
         "last_validated_at": None,
         "validated_git_sha": None,
+        # When the structuring pipeline last (re)generated the tabs — distinct
+        # from updated_at (which bumps on any edit, incl. resolution/title). None
+        # until the first transform completes (set in set_pipeline).
+        "structured_at": None,
         "resolution": "",
         "resolved_by": "",
         "resolved_at": None,
@@ -292,7 +297,11 @@ def set_pipeline(
     if title:
         record["title"] = title
     record["status"] = "processed"
-    record["updated_at"] = _now_iso()
+    now = _now_iso()
+    record["updated_at"] = now
+    # Stamp when the tabs were (re)generated — the reader shows "structured
+    # <time>" from this, and a fresh reprocess visibly bumps it.
+    record["structured_at"] = now
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
     return record
@@ -408,9 +417,9 @@ _SUBSTANCE_FIELDS = ("summary", "technical", "plain", "tags", "entities")
 
 
 def _same_substance_different_organized_md(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    return all(a.get(k) == b.get(k) for k in _SUBSTANCE_FIELDS) and a.get(
+    return all(a.get(k) == b.get(k) for k in _SUBSTANCE_FIELDS) and a.get("organized_md") != b.get(
         "organized_md"
-    ) != b.get("organized_md")
+    )
 
 
 def backfill_drop_spurious_heals(note_id: str) -> dict[str, Any]:

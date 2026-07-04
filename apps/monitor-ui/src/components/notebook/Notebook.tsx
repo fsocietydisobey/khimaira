@@ -1427,7 +1427,10 @@ function NoteStructuredReader({
   repoOptions: string[];
   onChangeRepo: (noteId: string, repo: string) => void;
 }) {
-  const { data: notesData } = useListNotesQuery();
+  // Poll so a reprocess (agent-triggered or a raw_text edit) surfaces live —
+  // the note flips to a "reprocessing" badge, then back to processed with a
+  // freshly-bumped "structured" time — without a manual refresh.
+  const { data: notesData } = useListNotesQuery(undefined, { pollingInterval: 3000 });
   const note = notesData?.notes.find((n) => n.id === noteId);
 
   if (!note) {
@@ -1438,6 +1441,9 @@ function NoteStructuredReader({
     );
   }
 
+  // A note that already has tabs but is back in "draft" is being reprocessed
+  // (raw_text changed) — the old tabs stay visible, badged as reprocessing.
+  const reprocessing = note.status === "draft" && !!note.pipeline;
   const badge = STATUS_BADGE[note.status];
   const validationLabel = note.last_validated_at
     ? note.history_count > 0
@@ -1463,11 +1469,25 @@ function NoteStructuredReader({
           >
             {validationLabel}
           </p>
+          {note.structured_at ? (
+            <p className="mt-0.5 text-[10px] text-muted-foreground/70">
+              structured {relativeTime(note.structured_at)}
+            </p>
+          ) : null}
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
-          <Badge variant={badge.variant} className="text-[10px]">
-            {badge.label}
-          </Badge>
+          {reprocessing ? (
+            <Badge
+              variant="outline"
+              className="animate-pulse border-amber-500/40 text-[10px] text-amber-400"
+            >
+              ⟳ reprocessing…
+            </Badge>
+          ) : (
+            <Badge variant={badge.variant} className="text-[10px]">
+              {badge.label}
+            </Badge>
+          )}
           {note.resolution ? (
             <Badge
               variant="outline"

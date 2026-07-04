@@ -165,6 +165,41 @@ def test_patch_raw_text_on_personal_note_does_not_reprocess(notebook_client, mon
     assert calls == []
 
 
+def test_patch_raw_text_flips_status_to_draft_for_reprocessing(notebook_client):
+    """A raw_text edit flips the note back to 'draft' — the UI's reprocessing
+    signal — while the async pipeline re-runs (set_pipeline flips it back)."""
+    created = notebook_client.post("/api/notes", json={"raw_text": "original"}).json()
+    notebook_client.patch(f"/api/notes/{created['id']}", json={"status": "processed"})
+    r = notebook_client.patch(f"/api/notes/{created['id']}", json={"raw_text": "edited"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "draft"
+
+
+def test_set_pipeline_stamps_structured_at(isolated_state):
+    """structured_at is None until the pipeline completes, then stamped — the
+    reader's 'structured <time>' signal, distinct from updated_at."""
+    import importlib
+
+    from khimaira.monitor import notes as notes_mod
+
+    importlib.reload(notes_mod)
+    note = notes_mod.add_note("hi")
+    assert note["structured_at"] is None
+    updated = notes_mod.set_pipeline(
+        note["id"],
+        {
+            "summary": "s",
+            "technical": "t",
+            "plain": "p",
+            "organized_md": "m",
+            "tags": [],
+            "entities": [],
+        },
+    )
+    assert updated["structured_at"] is not None
+    assert updated["status"] == "processed"
+
+
 def test_delete_note_happy_path(notebook_client):
     created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
     r = notebook_client.delete(f"/api/notes/{created['id']}")

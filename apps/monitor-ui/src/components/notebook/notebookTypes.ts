@@ -44,6 +44,10 @@ export interface Note {
   last_validated_at: string | null;
   /** Git SHA the note was last checked against; null if never revalidated. */
   validated_git_sha: string | null;
+  /** When the structuring pipeline last (re)generated the tabs — distinct from
+   *  updated_at (which bumps on any edit). null until first structured. A
+   *  raw_text edit re-runs the pipeline and bumps this. */
+  structured_at: string | null;
   /** Count of prior pipeline versions superseded by a heal (list view carries
    *  only the count — full version bodies are on the note's `history` array,
    *  fetched via GET /notes/{id} if ever needed). */
