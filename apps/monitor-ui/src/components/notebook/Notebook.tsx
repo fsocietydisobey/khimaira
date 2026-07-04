@@ -20,7 +20,7 @@
  * for nav consistency with the other observability views.
  */
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import {
   BookMarked,
@@ -1488,11 +1488,26 @@ function NoteStructuredReader({
   repoOptions: string[];
   onChangeRepo: (noteId: string, repo: string) => void;
 }) {
-  // Poll so a reprocess (agent-triggered or a raw_text edit) surfaces live —
-  // the note flips to a "reprocessing" badge, then back to processed with a
-  // freshly-bumped "structured" time — without a manual refresh.
-  const { data: notesData } = useListNotesQuery(undefined, { pollingInterval: 3000 });
+  // Poll ONLY while a reprocess is actually in flight (raw_text edit →
+  // "reprocessing" badge → settles back to processed) — that's the entire
+  // reason this poll exists, so a settled note (or a study guide, which
+  // never reprocesses) shouldn't pay for it. Unconditional 3s polling here
+  // was a regression: every tick re-rendered MarkdownView, remounting
+  // MermaidBlock and re-running mermaid.render — visible diagram flicker
+  // on every note/guide, worst on guides since they never stop "polling
+  // for nothing" (Joseph report, 2026-07-04).
+  const [pollWhileReprocessing, setPollWhileReprocessing] = useState(false);
+  const { data: notesData } = useListNotesQuery(undefined, {
+    pollingInterval: pollWhileReprocessing ? 3000 : 0,
+  });
   const note = notesData?.notes.find((n) => n.id === noteId);
+  // A note that already has tabs but is back in "draft" is being reprocessed
+  // (raw_text changed) — the old tabs stay visible, badged as reprocessing.
+  const reprocessing = !!note && note.status === "draft" && !!note.pipeline;
+
+  useEffect(() => {
+    setPollWhileReprocessing(reprocessing);
+  }, [reprocessing]);
 
   if (!note) {
     return (
@@ -1501,10 +1516,6 @@ function NoteStructuredReader({
       </div>
     );
   }
-
-  // A note that already has tabs but is back in "draft" is being reprocessed
-  // (raw_text changed) — the old tabs stay visible, badged as reprocessing.
-  const reprocessing = note.status === "draft" && !!note.pipeline;
   const badge = STATUS_BADGE[note.status];
   // This reader only ever shows notes (study guides live in the Library and
   // are excluded from the list this component's caller reads from) — narrow
