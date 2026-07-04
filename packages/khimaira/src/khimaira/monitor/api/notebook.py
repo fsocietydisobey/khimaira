@@ -1,8 +1,11 @@
 """`/api/notes`, `/api/tabs` — AI-notebook backend (Phase 1a-2c).
 
 Endpoints:
-  POST   /notes                 — create a draft note; kicks off the (stub) pipeline
-  GET    /notes?tab_id=         — list notes, optionally filtered by tab
+  POST   /notes                 — create a draft note (or, kind="study_guide", a
+                                   grimoire guide); kicks off the structuring pipeline
+  GET    /notes?tab_id=&repo=&kind= — list notes, optionally filtered by tab/repo/kind
+  POST   /notes/import          — grimoire Phase 1c: bulk-import study guides from a
+                                   directory (dry_run=True by default — manifest only)
   GET    /notes/search?q=       — Phase 2b: semantic search over embedded notes
   POST   /notes/ask             — Phase 2c capstone: ask -> retrieve -> heal -> answer
   GET    /notes/{id}            — one note
@@ -32,7 +35,13 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from khimaira.monitor import notebook_pipeline, notebook_retrieval, notebook_training, notes
+from khimaira.monitor import (
+    notebook_import,
+    notebook_pipeline,
+    notebook_retrieval,
+    notebook_training,
+    notes,
+)
 
 from .._optional import require
 
@@ -42,6 +51,14 @@ class CreateNoteReq(BaseModel):
     tab_id: str = ""
     title: str = ""
     repo: str = ""
+    kind: str = "note"
+    source_path: str | None = None
+
+
+class ImportGuidesReq(BaseModel):
+    root: str
+    repo: str = ""
+    dry_run: bool = True
 
 
 class UpdateNoteReq(BaseModel):
@@ -85,6 +102,22 @@ def build_router():
 
     @router.post("/notes")
     async def create_note(req: CreateNoteReq) -> dict:
+        if req.kind == "study_guide":
+            # Grimoire: study guides are housed + rendered, never
+            # re-expressed — structuring only ever generates
+            # abstract/tags/entities (schedule_pipeline's kind branch picks
+            # trigger_study_guide_pipeline), raw_text is never touched.
+            record = notes.add_study_guide(
+                req.raw_text,
+                tab_id=req.tab_id,
+                title=req.title,
+                repo=req.repo,
+                source_path=req.source_path,
+            )
+            trigger_pipeline(record["id"])
+            notebook_retrieval.schedule_upsert(record)
+            return record
+
         record = notes.add_note(req.raw_text, tab_id=req.tab_id, title=req.title, repo=req.repo)
         if record["tab_id"] == notes.PERSONAL_TAB_ID:
             # Personal/Behavior folder notes are read as raw_text directly
@@ -98,10 +131,25 @@ def build_router():
         return record
 
     @router.get("/notes")
-    async def list_notes_endpoint(tab_id: str | None = None, repo: str | None = None) -> dict:
+    async def list_notes_endpoint(
+        tab_id: str | None = None, repo: str | None = None, kind: str | None = None
+    ) -> dict:
         """`repo`, when given, scopes to that repo plus the "General" bucket
-        (repo=None returns every project's notes — the "All projects" view)."""
-        return {"notes": notes.list_notes(tab_id=tab_id, repo=repo)}
+        (repo=None returns every project's notes — the "All projects" view).
+        `kind`, when given, scopes to "note" or "study_guide" (kind=None
+        returns both — the existing UI filters personal/guide notes out
+        client-side rather than relying on server-side exclusion)."""
+        return {"notes": notes.list_notes(tab_id=tab_id, repo=repo, kind=kind)}
+
+    @router.post("/notes/import")
+    async def import_guides(req: ImportGuidesReq) -> dict:
+        """Grimoire Phase 1c: bulk-import study guides from a flat directory.
+
+        `dry_run` (default True) produces a manifest ONLY — writes nothing.
+        Review the manifest before ever calling with dry_run=False; a real
+        import creates a note per file (idempotent via source_path — safe
+        to re-run) and schedules each one's structuring pipeline async."""
+        return notebook_import.import_dir(req.root, repo=req.repo, dry_run=req.dry_run)
 
     @router.get("/notes/search")
     async def search_notes(
@@ -133,7 +181,7 @@ def build_router():
         try:
             return notes.get_note(note_id)
         except ValueError as e:
-            raise fastapi.HTTPException(404, str(e))
+            raise fastapi.HTTPException(404, str(e)) from e
 
     @router.patch("/notes/{note_id}")
     async def update_note(note_id: str, req: UpdateNoteReq) -> dict:
@@ -143,7 +191,7 @@ def build_router():
         except ValueError as e:
             msg = str(e)
             status = 404 if "No note with id" in msg else 422
-            raise fastapi.HTTPException(status, msg)
+            raise fastapi.HTTPException(status, msg) from e
         # A raw_text edit invalidates the DERIVED artifacts — the structuring
         # pipeline (summary/technical/plain tabs) and the search embedding are
         # both computed from raw_text, so an edit that doesn't reprocess leaves
@@ -166,7 +214,7 @@ def build_router():
         try:
             result = notes.delete_note(note_id)
         except ValueError as e:
-            raise fastapi.HTTPException(404, str(e))
+            raise fastapi.HTTPException(404, str(e)) from e
         notebook_retrieval.schedule_delete(note_id)
         return result
 
@@ -175,7 +223,7 @@ def build_router():
         try:
             return notes.promote_note(note_id)
         except ValueError as e:
-            raise fastapi.HTTPException(404, str(e))
+            raise fastapi.HTTPException(404, str(e)) from e
 
     @router.post("/notes/{note_id}/resolution")
     async def add_resolution(note_id: str, req: AddResolutionReq) -> dict:
@@ -189,7 +237,7 @@ def build_router():
         try:
             updated = notes.add_resolution(note_id, req.resolution, resolved_by=req.resolved_by)
         except ValueError as e:
-            raise fastapi.HTTPException(404, str(e))
+            raise fastapi.HTTPException(404, str(e)) from e
         if updated.get("resolution"):
             notebook_training.schedule_promote(updated)
         return updated
@@ -199,7 +247,7 @@ def build_router():
         try:
             return await notebook_pipeline.revalidate_note(note_id)
         except ValueError as e:
-            raise fastapi.HTTPException(404, str(e))
+            raise fastapi.HTTPException(404, str(e)) from e
 
     @router.get("/tabs")
     async def list_tabs() -> dict:
@@ -215,6 +263,6 @@ def build_router():
         try:
             return notes.update_tab(tab_id, **fields)
         except ValueError as e:
-            raise fastapi.HTTPException(404, str(e))
+            raise fastapi.HTTPException(404, str(e)) from e
 
     return router

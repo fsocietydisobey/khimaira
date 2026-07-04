@@ -64,10 +64,12 @@ export function ProjectNavTabs({
       title: "Knowledge graph — interactive node-edge view of the jeevy KG for a deliverable",
     },
     {
+      // Route/path stays "notebook" (internal namespace) — only the
+      // user-visible label is "Grimoire" (Joseph's product name, 2026-07-04).
       to: `/${projectName}/notebook`,
-      label: "notebook",
+      label: "grimoire",
       icon: NotebookText,
-      title: "AI-notebook — paste + auto-structure notes, curate into the mnemosyne knowledge loop",
+      title: "Grimoire — paste + auto-structure notes, house study guides, curate into the mnemosyne knowledge loop",
     },
   ];
 

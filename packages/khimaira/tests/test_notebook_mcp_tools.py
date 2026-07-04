@@ -59,6 +59,34 @@ def test_notebook_list_tab_filter_passed_as_query_param():
     assert mock_get.call_args[0][0] == "/api/notes?tab_id=t1"
 
 
+def test_notebook_list_kind_filter_passed_as_query_param():
+    with patch.object(nt, "_get", return_value={"notes": []}) as mock_get:
+        _run(nt.notebook_list(kind="study_guide"))
+    assert mock_get.call_args[0][0] == "/api/notes?kind=study_guide"
+
+
+def test_notebook_list_tab_and_kind_filters_combine():
+    with patch.object(nt, "_get", return_value={"notes": []}) as mock_get:
+        _run(nt.notebook_list(tab="t1", kind="study_guide"))
+    assert mock_get.call_args[0][0] == "/api/notes?tab_id=t1&kind=study_guide"
+
+
+def test_notebook_list_marks_study_guides():
+    payload = {
+        "notes": [
+            _note(id="a", kind="note"),
+            _note(id="b", kind="study_guide", lifecycle="housed"),
+        ]
+    }
+    with patch.object(nt, "_get", return_value=payload):
+        out = _run(nt.notebook_list())
+    lines = out.splitlines()
+    guide_line = next(line for line in lines if "`b`" in line)
+    note_line = next(line for line in lines if "`a`" in line)
+    assert "📖" in guide_line
+    assert "📖" not in note_line
+
+
 def test_notebook_list_project_filter_applied_client_side():
     payload = {"notes": [_note(id="a", repo="khimaira"), _note(id="b", repo="jeevy_portal")]}
     with patch.object(nt, "_get", return_value=payload):
@@ -161,6 +189,47 @@ def test_notebook_get_error_passthrough():
     with patch.object(nt, "_get", return_value="khimaira-monitor → HTTP 404: No note with id"):
         out = _run(nt.notebook_get("no-such-note"))
     assert "HTTP 404" in out
+
+
+def test_notebook_get_study_guide_renders_abstract_and_toc_not_resolution():
+    payload = _note(
+        id="guide-1",
+        title="Onboarding Guide",
+        kind="study_guide",
+        lifecycle="organized",
+        raw_text="# Onboarding\n\n## Setup\n\nDo this first.",
+        pipeline={
+            "abstract": "How to get a new engineer productive on day one.",
+            "toc": [
+                {"title": "Onboarding", "anchor": "onboarding", "level": 1},
+                {"title": "Setup", "anchor": "setup", "level": 2},
+            ],
+            "tags": ["onboarding"],
+            "entities": [],
+        },
+    )
+    with patch.object(nt, "_get", return_value=payload):
+        out = _run(nt.notebook_get("guide-1"))
+    assert "How to get a new engineer productive on day one." in out
+    assert "Onboarding" in out
+    assert "Setup" in out
+    # Guide rendering must never prompt for a resolution — that's a note concept.
+    assert "No resolution yet" not in out
+    assert "notebook_add_resolution" not in out
+    # Summary/organized_md are the NOTE pipeline shape — must not leak in for a guide.
+    assert "Summary:" not in out
+    assert "Organized:" not in out
+
+
+def test_notebook_get_study_guide_with_no_pipeline_yet():
+    """A freshly-created guide (still drafting) must not crash on a missing
+    pipeline — same as a regular note's draft state."""
+    payload = _note(id="guide-2", kind="study_guide", lifecycle="housed", pipeline=None)
+    with patch.object(nt, "_get", return_value=payload):
+        out = _run(nt.notebook_get("guide-2"))
+    assert "guide-2" in out
+    assert "Abstract:" not in out
+    assert "No resolution yet" not in out
 
 
 # ---------------------------------------------------------------------------

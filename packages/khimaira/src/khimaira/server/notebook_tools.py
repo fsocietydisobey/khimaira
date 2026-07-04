@@ -32,6 +32,10 @@ _LIFECYCLE_BADGE = {
     "captured": "📝",
     "reviewed": "👀",
     "resolved": "✅",
+    # Grimoire study-guide lifecycle — distinct from the note captured/
+    # reviewed/resolved chain (guides don't have a resolution concept).
+    "housed": "📚",
+    "organized": "🗂️",
 }
 
 
@@ -39,18 +43,25 @@ def _badge(lifecycle: str) -> str:
     return _LIFECYCLE_BADGE.get(lifecycle, "❓")
 
 
-def _notes_qs(tab: str = "") -> str:
-    return f"?tab_id={urllib.parse.quote(tab)}" if tab else ""
+def _notes_qs(tab: str = "", kind: str = "") -> str:
+    params = []
+    if tab:
+        params.append(f"tab_id={urllib.parse.quote(tab)}")
+    if kind:
+        params.append(f"kind={urllib.parse.quote(kind)}")
+    return f"?{'&'.join(params)}" if params else ""
 
 
-async def notebook_list(project: str = "", tab: str = "") -> str:
+async def notebook_list(project: str = "", tab: str = "", kind: str = "") -> str:
     """List notes — read for context before working a problem.
 
     `project` scopes to one repo's notes client-side (GET /api/notes has no
     server-side repo filter; every stub already carries `repo`, so filtering
     here costs nothing extra). `tab` scopes server-side via `tab_id`.
+    `kind="study_guide"` lists grimoire study guides instead of regular
+    notes; omit (or "") to see both.
     """
-    data = _get(f"/api/notes{_notes_qs(tab)}")
+    data = _get(f"/api/notes{_notes_qs(tab, kind)}")
     if isinstance(data, str):
         return data
 
@@ -64,8 +75,9 @@ async def notebook_list(project: str = "", tab: str = "") -> str:
     lines = [f"📓 **{len(notes)} note(s)**{f' — project={project!r}' if project else ''}:\n"]
     for n in notes:
         lifecycle = n.get("lifecycle", "captured")
+        guide_marker = " 📖" if n.get("kind") == "study_guide" else ""
         lines.append(
-            f"{_badge(lifecycle)} `{n['id']}` **{n.get('title', '?')}** "
+            f"{_badge(lifecycle)} `{n['id']}` **{n.get('title', '?')}**{guide_marker} "
             f"[{lifecycle}]  repo={n.get('repo', '?')} tab={n.get('tab_id', '?')}"
         )
     lines.append(
@@ -106,7 +118,12 @@ async def notebook_search(query: str, project: str = "", top_k: int = 5) -> str:
 
 async def notebook_get(note_id: str) -> str:
     """Read one note in full — title, raw paste, structured pipeline output
-    (if processed), and any existing resolution."""
+    (if processed), and any existing resolution.
+
+    Study guides (kind="study_guide") render differently: abstract + table
+    of contents instead of summary/organized_md, and no resolution prompt —
+    guides are finished deliverables to house, not problems to resolve.
+    """
     if not note_id:
         return "❌ notebook_get requires a note_id — get one from notebook_list/notebook_search."
     data = _get(f"/api/notes/{urllib.parse.quote(note_id, safe='')}")
@@ -121,6 +138,22 @@ async def notebook_get(note_id: str) -> str:
         f"**Raw paste:**\n{data.get('raw_text', '')}\n",
     ]
     pipeline = data.get("pipeline")
+
+    if data.get("kind") == "study_guide":
+        if pipeline:
+            lines.append(f"**Abstract:** {pipeline.get('abstract', '')}")
+            toc = pipeline.get("toc") or []
+            if toc:
+                toc_lines = "\n".join(
+                    f"{'  ' * max(h.get('level', 1) - 1, 0)}- {h.get('title', '?')}" for h in toc
+                )
+                lines.append(f"\n**Table of contents:**\n{toc_lines}")
+        lines.append(
+            "\n_This is a study guide — raw_text above is its authoritative body, "
+            "never rewritten by the notebook pipeline._"
+        )
+        return "\n".join(lines)
+
     if pipeline:
         lines.append(f"**Summary:** {pipeline.get('summary', '')}")
         lines.append(f"\n**Organized:**\n{pipeline.get('organized_md', '')}\n")

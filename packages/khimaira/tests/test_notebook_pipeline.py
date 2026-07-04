@@ -45,7 +45,9 @@ def pipeline(notes_store, monkeypatch):
     # _code_grounding_for_repo itself) keeps that function's own real logic
     # exercised by every test, and lets the tests that exercise it directly
     # override these two per-test as needed.
-    monkeypatch.setattr(pipeline_mod, "_seance_code_search", lambda repo, question: ([], False, False))
+    monkeypatch.setattr(
+        pipeline_mod, "_seance_code_search", lambda repo, question: ([], False, False)
+    )
     monkeypatch.setattr(pipeline_mod, "_repo_root", lambda repo: None)
     yield pipeline_mod
 
@@ -388,7 +390,9 @@ async def test_revalidate_note_backfills_title_even_when_unchanged(
         [
             _FakeProc(
                 _envelope(
-                    json.dumps({**_ANCHORED_PAYLOAD, "title": "Fresh backfilled title", "unchanged": True})
+                    json.dumps(
+                        {**_ANCHORED_PAYLOAD, "title": "Fresh backfilled title", "unchanged": True}
+                    )
                 )
             )
         ],
@@ -1079,3 +1083,144 @@ def test_seed_personal_context_skipped_when_notes_already_present(pipeline, note
     notes_store.add_note("Existing rule.", tab_id=notes_store.PERSONAL_TAB_ID)
     assert pipeline.seed_personal_context_if_empty() is False
     assert len(notes_store.list_notes(tab_id=notes_store.PERSONAL_TAB_ID)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Grimoire (2026-07-04): study guides — deterministic TOC parsing +
+# trigger_study_guide_pipeline + schedule_pipeline's kind branch.
+# ---------------------------------------------------------------------------
+
+_GUIDE_PAYLOAD = {
+    "abstract": "a guide about widgets",
+    "tags": ["widgets"],
+    "entities": ["widget.py"],
+}
+
+
+def test_parse_toc_basic_headings(pipeline):
+    text = "# Title\n\nintro\n\n## Section One\n\ntext\n\n### Sub\n\nmore\n\n## Section Two\n"
+    toc = pipeline._parse_toc(text)
+    assert toc == [
+        {"title": "Title", "anchor": "title", "level": 1},
+        {"title": "Section One", "anchor": "section-one", "level": 2},
+        {"title": "Sub", "anchor": "sub", "level": 3},
+        {"title": "Section Two", "anchor": "section-two", "level": 2},
+    ]
+
+
+def test_parse_toc_empty_when_no_headings(pipeline):
+    assert pipeline._parse_toc("just some\nplain paragraphs\nno headings at all") == []
+
+
+def test_parse_toc_skips_fenced_code_blocks(pipeline):
+    text = (
+        "# Real Heading\n\n"
+        "```python\n"
+        "# this is a comment, not a heading\n"
+        "def foo(): pass\n"
+        "```\n\n"
+        "## Another Real Heading\n"
+    )
+    toc = pipeline._parse_toc(text)
+    assert [h["title"] for h in toc] == ["Real Heading", "Another Real Heading"]
+
+
+def test_parse_toc_disambiguates_duplicate_titles(pipeline):
+    text = "# Doc\n\n## Example\n\nfoo\n\n## Example\n\nbar\n"
+    toc = pipeline._parse_toc(text)
+    anchors = [h["anchor"] for h in toc]
+    assert anchors == ["doc", "example", "example-1"]
+
+
+def test_parse_toc_ignores_trailing_closing_hashes(pipeline):
+    """ATX-style closing hashes (`## Title ##`) must not leak into the
+    parsed title or the slug."""
+    toc = pipeline._parse_toc("## My Heading ##\n")
+    assert toc == [{"title": "My Heading", "anchor": "my-heading", "level": 2}]
+
+
+async def test_trigger_study_guide_pipeline_success_never_touches_raw_text(
+    pipeline, notes_store, monkeypatch
+):
+    guide = notes_store.add_study_guide("# Widgets\n\n## Overview\n\nAll about widgets.")
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_GUIDE_PAYLOAD)))])
+
+    await pipeline.trigger_study_guide_pipeline(guide["id"])
+
+    updated = notes_store.get_note(guide["id"])
+    assert updated["status"] == "processed"
+    assert updated["raw_text"] == "# Widgets\n\n## Overview\n\nAll about widgets."  # untouched
+    assert updated["pipeline"]["abstract"] == "a guide about widgets"
+    assert updated["pipeline"]["tags"] == ["widgets"]
+    assert updated["pipeline"]["entities"] == ["widget.py"]
+    assert updated["pipeline"]["toc"] == [
+        {"title": "Widgets", "anchor": "widgets", "level": 1},
+        {"title": "Overview", "anchor": "overview", "level": 2},
+    ]
+    # Guide title is never LLM-touched — stays whatever add_study_guide
+    # derived from raw_text (here, the literal first line).
+    assert updated["title"] == "# Widgets"
+
+
+async def test_trigger_study_guide_pipeline_failure_marks_failed(
+    pipeline, notes_store, monkeypatch
+):
+    guide = notes_store.add_study_guide("# Widgets\n\nbody")
+    _queue_responses(
+        pipeline,
+        monkeypatch,
+        [
+            _FakeProc(_envelope("garbage")),
+            _FakeProc(_envelope("still garbage")),
+            _FakeProc(_envelope("still garbage too")),
+        ],
+    )
+
+    await pipeline.trigger_study_guide_pipeline(guide["id"])
+
+    updated = notes_store.get_note(guide["id"])
+    assert updated["status"] == "failed"
+    assert updated["raw_text"] == "# Widgets\n\nbody"
+    assert updated["pipeline"] is None
+
+
+async def test_schedule_pipeline_dispatches_study_guide_to_the_guide_pipeline(
+    pipeline, notes_store, monkeypatch
+):
+    guide = notes_store.add_study_guide("# G\n\nbody")
+    called = {"guide": False, "note": False}
+
+    async def fake_guide_pipeline(note_id):
+        called["guide"] = True
+
+    async def fake_note_pipeline(note_id):
+        called["note"] = True
+
+    monkeypatch.setattr(pipeline, "trigger_study_guide_pipeline", fake_guide_pipeline)
+    monkeypatch.setattr(pipeline, "trigger_pipeline", fake_note_pipeline)
+
+    pipeline.schedule_pipeline(guide["id"])
+    await asyncio.sleep(0.05)  # let the fire-and-forget task run
+
+    assert called == {"guide": True, "note": False}
+
+
+async def test_schedule_pipeline_dispatches_regular_note_to_the_note_pipeline(
+    pipeline, notes_store, monkeypatch
+):
+    note = notes_store.add_note("raw")
+    called = {"guide": False, "note": False}
+
+    async def fake_guide_pipeline(note_id):
+        called["guide"] = True
+
+    async def fake_note_pipeline(note_id):
+        called["note"] = True
+
+    monkeypatch.setattr(pipeline, "trigger_study_guide_pipeline", fake_guide_pipeline)
+    monkeypatch.setattr(pipeline, "trigger_pipeline", fake_note_pipeline)
+
+    pipeline.schedule_pipeline(note["id"])
+    await asyncio.sleep(0.05)
+
+    assert called == {"guide": False, "note": True}

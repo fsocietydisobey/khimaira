@@ -1,6 +1,12 @@
 import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
 
-import type { AskAnswer, Note, NotebookTab, NoteStatus } from "@/components/notebook/notebookTypes";
+import type {
+  AskAnswer,
+  Note,
+  NotebookTab,
+  NoteKind,
+  NoteStatus,
+} from "@/components/notebook/notebookTypes";
 
 export interface Connection {
   var: string;
@@ -274,11 +280,15 @@ export const monitorApi = createApi({
     // api/notebook.py). Global daemon state — not scoped by project, despite
     // the per-project route the frontend mounts it under.
     // -----------------------------------------------------------------------
-    listNotes: build.query<{ notes: Note[] }, { tabId?: string; repo?: string } | void>({
+    listNotes: build.query<
+      { notes: Note[] },
+      { tabId?: string; repo?: string; kind?: NoteKind } | void
+    >({
       query: (arg) => {
         const params = new URLSearchParams();
         if (arg?.tabId) params.set("tab_id", arg.tabId);
         if (arg?.repo) params.set("repo", arg.repo);
+        if (arg?.kind) params.set("kind", arg.kind);
         const qs = params.toString();
         return qs ? `/notes?${qs}` : "/notes";
       },

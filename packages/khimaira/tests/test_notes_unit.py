@@ -525,3 +525,170 @@ def test_get_tab_unknown_id_raises(notes_store):
 def test_update_tab_unknown_id_raises(notes_store):
     with pytest.raises(ValueError, match="No tab with id"):
         notes_store.update_tab("no-such-tab", title="x")
+
+
+# ---------------------------------------------------------------------------
+# Grimoire (2026-07-04): study guides — a distinct KIND of note, housed +
+# rendered rather than re-expressed. LOAD-BEARING INVARIANT tested
+# throughout: raw_text is never touched by anything in this module.
+# ---------------------------------------------------------------------------
+
+
+def test_add_study_guide_sets_kind_and_defaults(notes_store):
+    guide = notes_store.add_study_guide("# Guide\n\nBody text.")
+    assert guide["kind"] == "study_guide"
+    assert guide["source_path"] is None
+    assert guide["organized_at"] is None
+    assert guide["pipeline"] is None
+    assert guide["status"] == "draft"
+    assert guide["raw_text"] == "# Guide\n\nBody text."
+
+
+def test_add_study_guide_records_source_path(notes_store):
+    guide = notes_store.add_study_guide("body", source_path="/tmp/foo.md")
+    assert guide["source_path"] == "/tmp/foo.md"
+
+
+def test_add_note_defaults_kind_to_note(notes_store):
+    note = notes_store.add_note("raw")
+    assert note["kind"] == "note"
+    assert note["source_path"] is None
+    assert note["organized_at"] is None
+
+
+def test_index_stub_defaults_kind_for_legacy_records(notes_store):
+    """A note record written before `kind` existed (no key in the JSON at
+    all) must default to "note" when read through the index projection —
+    not crash, not silently become a "study_guide"."""
+    note = notes_store.add_note("raw")
+    legacy_record = notes_store.get_note(note["id"])
+    del legacy_record["kind"]
+    stub = notes_store._index_stub(legacy_record)
+    assert stub["kind"] == "note"
+
+
+def test_set_study_guide_pipeline_never_touches_title(notes_store):
+    guide = notes_store.add_study_guide("body", title="Original Title")
+    pipeline = {"abstract": "a", "toc": [], "tags": [], "entities": []}
+    updated = notes_store.set_study_guide_pipeline(guide["id"], pipeline)
+    assert updated["title"] == "Original Title"
+    assert updated["pipeline"] == pipeline
+    assert updated["status"] == "processed"
+    assert updated["structured_at"] is not None
+
+
+def test_derive_lifecycle_study_guide_housed_then_organized(notes_store):
+    guide = notes_store.add_study_guide("body")
+    assert notes_store.derive_lifecycle(guide) == "housed"
+
+    organized = notes_store.mark_organized(guide["id"])
+    assert notes_store.derive_lifecycle(organized) == "organized"
+
+
+def test_derive_lifecycle_study_guide_ignores_resolution_fields(notes_store):
+    """A guide's lifecycle must never fall through to the note
+    captured/reviewed/resolved chain, even if resolution fields somehow
+    got set on it."""
+    guide = notes_store.add_study_guide("body")
+    guide["resolution"] = "should not matter"
+    assert notes_store.derive_lifecycle(guide) == "housed"
+
+
+def test_mark_organized_stamps_without_refiling_when_tab_id_omitted(notes_store):
+    guide = notes_store.add_study_guide("body", tab_id="original-tab")
+    updated = notes_store.mark_organized(guide["id"])
+    assert updated["tab_id"] == "original-tab"
+    assert updated["organized_at"] is not None
+
+
+def test_mark_organized_refiles_when_tab_id_given(notes_store):
+    guide = notes_store.add_study_guide("body", tab_id="original-tab")
+    updated = notes_store.mark_organized(guide["id"], tab_id="new-tab")
+    assert updated["tab_id"] == "new-tab"
+
+
+def test_find_by_source_path_finds_existing(notes_store):
+    guide = notes_store.add_study_guide("body", source_path="/tmp/x.md")
+    found = notes_store.find_by_source_path("/tmp/x.md")
+    assert found is not None
+    assert found["id"] == guide["id"]
+
+
+def test_find_by_source_path_returns_none_when_missing(notes_store):
+    assert notes_store.find_by_source_path("/tmp/does-not-exist.md") is None
+
+
+def test_list_notes_kind_filter(notes_store):
+    note = notes_store.add_note("raw")
+    guide = notes_store.add_study_guide("body")
+
+    notes_only = notes_store.list_notes(kind="note")
+    assert [n["id"] for n in notes_only] == [note["id"]]
+
+    guides_only = notes_store.list_notes(kind="study_guide")
+    assert [n["id"] for n in guides_only] == [guide["id"]]
+
+    both = notes_store.list_notes()
+    assert {n["id"] for n in both} == {note["id"], guide["id"]}
+
+
+def test_add_tab_defaults_kind_folder(notes_store):
+    tab = notes_store.add_tab(title="My Tab")
+    assert tab["kind"] == "folder"
+
+
+def test_add_tab_kind_collection(notes_store):
+    tab = notes_store.add_tab(title="My Collection", kind="collection")
+    assert tab["kind"] == "collection"
+
+
+def test_add_tab_invalid_kind_raises(notes_store):
+    with pytest.raises(ValueError, match="Invalid tab kind"):
+        notes_store.add_tab(title="x", kind="not-a-real-kind")
+
+
+def test_update_tab_kind_is_mutable(notes_store):
+    tab = notes_store.add_tab(title="x")
+    updated = notes_store.update_tab(tab["id"], kind="collection")
+    assert updated["kind"] == "collection"
+
+
+def test_update_tab_invalid_kind_raises(notes_store):
+    tab = notes_store.add_tab(title="x")
+    with pytest.raises(ValueError, match="Invalid tab kind"):
+        notes_store.update_tab(tab["id"], kind="bogus")
+
+
+def test_list_tabs_defaults_kind_for_legacy_tab_records(notes_store):
+    """A tab record written before `kind` existed must default to "folder"
+    when read — not crash."""
+    tab = notes_store.add_tab(title="legacy")
+    # Simulate a pre-migration tab record with no "kind" key at all.
+    folded = notes_store._fold_tabs()
+    raw = dict(folded[tab["id"]])
+    del raw["kind"]
+    out = notes_store._with_note_ids(raw)
+    assert out["kind"] == "folder"
+
+
+def test_get_or_create_collection_creates_when_absent(notes_store):
+    tab = notes_store.get_or_create_collection("New Collection")
+    assert tab["kind"] == "collection"
+    assert tab["title"] == "New Collection"
+
+
+def test_get_or_create_collection_reuses_existing_case_insensitive(notes_store):
+    first = notes_store.get_or_create_collection("My Collection")
+    second = notes_store.get_or_create_collection("my collection")
+    assert first["id"] == second["id"]
+    assert len([t for t in notes_store.list_tabs() if t["kind"] == "collection"]) == 1
+
+
+def test_get_or_create_collection_does_not_match_folders(notes_store):
+    """A "folder"-kind tab with the same title must NOT be mistaken for a
+    matching collection — kind is part of the lookup key."""
+    notes_store.add_tab(title="Ambiguous Name", kind="folder")
+    collection = notes_store.get_or_create_collection("Ambiguous Name")
+    assert collection["kind"] == "collection"
+    kinds = {t["kind"] for t in notes_store.list_tabs() if t["title"] == "Ambiguous Name"}
+    assert kinds == {"folder", "collection"}

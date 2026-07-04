@@ -58,8 +58,16 @@ def _note(
     pipeline: dict | None = None,
     repo: str = "khimaira",
     tab_id: str = "default",
+    kind: str = "note",
 ) -> dict:
-    return {"id": note_id, "raw_text": raw_text, "pipeline": pipeline, "repo": repo, "tab_id": tab_id}
+    return {
+        "id": note_id,
+        "raw_text": raw_text,
+        "pipeline": pipeline,
+        "repo": repo,
+        "tab_id": tab_id,
+        "kind": kind,
+    }
 
 
 def test_upsert_and_search_finds_note(retrieval):
@@ -177,10 +185,62 @@ def test_upsert_note_never_embeds_personal_folder_notes(retrieval):
     never be embedded, or "write in this voice" would show up as a
     retrieved "relevant note" and pollute real answers."""
     shared_text = "unique gronk widget frobnicator content"
-    retrieval.upsert_note(
-        _note("note-personal", raw_text=shared_text, tab_id="personal")
-    )
+    retrieval.upsert_note(_note("note-personal", raw_text=shared_text, tab_id="personal"))
     retrieval.upsert_note(_note("note-regular", raw_text=shared_text, tab_id="default"))
 
     hits = retrieval.search_notes(shared_text, threshold=0.3)
     assert {h["note_id"] for h in hits} == {"note-regular"}
+
+
+def test_passage_text_study_guide_uses_abstract_and_raw_text():
+    from khimaira.monitor import notebook_retrieval as r
+
+    record = {
+        "kind": "study_guide",
+        "raw_text": "the full guide body",
+        "pipeline": {"abstract": "a short blurb", "toc": [], "tags": [], "entities": []},
+    }
+    text = r._passage_text(record)
+    assert "a short blurb" in text
+    assert "the full guide body" in text
+
+
+def test_passage_text_study_guide_no_pipeline_yet_falls_back_to_raw_text_only():
+    from khimaira.monitor import notebook_retrieval as r
+
+    record = {"kind": "study_guide", "raw_text": "draft guide body", "pipeline": None}
+    text = r._passage_text(record)
+    assert "draft guide body" in text
+
+
+def test_passage_text_study_guide_bounds_raw_text_length():
+    from khimaira.monitor import notebook_retrieval as r
+
+    record = {
+        "kind": "study_guide",
+        "raw_text": "x" * 10_000,
+        "pipeline": {"abstract": "short", "toc": [], "tags": [], "entities": []},
+    }
+    text = r._passage_text(record)
+    # abstract + separator + bounded raw_text — well under the full 10k.
+    assert len(text) < 4100
+
+
+def test_upsert_note_embeds_study_guides_unlike_personal_notes(retrieval):
+    """The opposite guard-rail from personal notes: guides ARE embedded and
+    retrievable — they're answerable content, just a different kind."""
+    retrieval.upsert_note(
+        _note(
+            "guide-1",
+            kind="study_guide",
+            raw_text="a unique zorbex frobnicator study guide body",
+            pipeline={
+                "abstract": "about zorbex frobnicators",
+                "toc": [],
+                "tags": [],
+                "entities": [],
+            },
+        )
+    )
+    hits = retrieval.search_notes("zorbex frobnicator guide", threshold=0.3)
+    assert {h["note_id"] for h in hits} == {"guide-1"}

@@ -1,0 +1,168 @@
+"""Tests for khimaira.monitor.notebook_import (Grimoire Phase 1c).
+
+Uses a disposable tmp_path directory tree standing in for
+~/work/jeevy_portal/shared-docs — NEVER the real directory. Dry-run is the
+default and is tested as the primary path; real import is tested against
+the synthetic fixture only, never scheduling a real structuring pipeline
+(schedule_pipeline is monkeypatched to a no-op — this module's own
+responsibility ends at creating + filing the note; the pipeline is a
+separate, already-tested concern).
+"""
+
+from __future__ import annotations
+
+import importlib
+
+import pytest
+
+
+@pytest.fixture
+def notes_store(isolated_state, monkeypatch):
+    from khimaira.monitor import notes as notes_mod
+
+    importlib.reload(notes_mod)
+    yield notes_mod
+    importlib.reload(notes_mod)
+
+
+@pytest.fixture
+def importer(notes_store, monkeypatch):
+    from khimaira.monitor import notebook_import as imp
+    from khimaira.monitor import notebook_organizer as org
+    from khimaira.monitor import notebook_pipeline as pipeline_mod
+
+    importlib.reload(org)
+    importlib.reload(imp)
+    # Never actually schedule a claude -p structuring call from these tests
+    # — notebook_pipeline's own scheduling/dispatch is covered in
+    # test_notebook_pipeline.py; this module's job ends at create + file.
+    monkeypatch.setattr(pipeline_mod, "schedule_pipeline", lambda note_id: None)
+    yield imp
+
+
+def _make_guide_tree(tmp_path):
+    """onboarding/getting-started.md, onboarding/faq.md, architecture/kg.md,
+    top-level.md (uncategorized), and a non-markdown file that must be
+    skipped."""
+    (tmp_path / "onboarding").mkdir()
+    (tmp_path / "architecture").mkdir()
+    (tmp_path / "onboarding" / "getting-started.md").write_text("# Getting Started\n\nWelcome.\n")
+    (tmp_path / "onboarding" / "faq.md").write_text("# FAQ\n\nQuestions.\n")
+    (tmp_path / "architecture" / "kg.md").write_text("# KG Overview\n\nHow it works.\n")
+    (tmp_path / "top-level.md").write_text("# Top Level\n\nRoot doc.\n")
+    (tmp_path / "notes.txt").write_text("not a guide")
+    return tmp_path
+
+
+def test_qualify_only_matches_markdown_files(importer, tmp_path):
+    md = tmp_path / "a.md"
+    md.write_text("x")
+    txt = tmp_path / "b.txt"
+    txt.write_text("x")
+    directory = tmp_path / "subdir"
+    directory.mkdir()
+    assert importer.qualify(md) is True
+    assert importer.qualify(txt) is False
+    assert importer.qualify(directory) is False
+
+
+def test_derive_title_prefers_first_heading(importer, tmp_path):
+    path = tmp_path / "x.md"
+    assert importer._derive_title(path, "# Real Title\n\nbody") == "Real Title"
+
+
+def test_derive_title_falls_back_to_filename_when_no_heading(importer, tmp_path):
+    path = tmp_path / "my-cool-doc.md"
+    assert importer._derive_title(path, "just a paragraph, no heading") == "My Cool Doc"
+
+
+def test_import_dir_dry_run_writes_nothing(importer, notes_store, tmp_path):
+    _make_guide_tree(tmp_path)
+    result = importer.import_dir(tmp_path, dry_run=True)
+
+    assert result["imported"] == []
+    assert notes_store.list_notes(kind="study_guide") == []
+    # 4 markdown files qualify; notes.txt is skipped entirely (not even manifested).
+    assert len(result["manifest"]) == 4
+    assert all(m["status"] == "would_import" for m in result["manifest"])
+
+
+def test_import_dir_dry_run_manifest_shape(importer, notes_store, tmp_path):
+    _make_guide_tree(tmp_path)
+    result = importer.import_dir(tmp_path, dry_run=True)
+
+    by_title = {m["title"]: m for m in result["manifest"]}
+    assert by_title["Getting Started"]["collection"] == "Onboarding"
+    assert by_title["FAQ"]["collection"] == "Onboarding"
+    assert by_title["KG Overview"]["collection"] == "Architecture"
+    assert by_title["Top Level"]["collection"] == "Uncategorized"
+    for m in result["manifest"]:
+        assert m["source_path"] == m["path"]
+
+
+def test_import_dir_real_import_creates_notes(importer, notes_store, tmp_path):
+    _make_guide_tree(tmp_path)
+    result = importer.import_dir(tmp_path, repo="jeevy_portal", dry_run=False)
+
+    assert len(result["imported"]) == 4
+    guides = notes_store.list_notes(kind="study_guide")
+    assert len(guides) == 4
+    assert all(g["repo"] == "jeevy_portal" for g in guides)
+    assert all(g["organized_at"] is not None for g in guides)
+    assert all(g["source_path"] for g in guides)
+
+    onboarding_guides = [
+        g for g in guides if notes_store.get_tab(g["tab_id"])["title"] == "Onboarding"
+    ]
+    assert len(onboarding_guides) == 2
+
+
+def test_import_dir_is_idempotent_on_rerun(importer, notes_store, tmp_path):
+    _make_guide_tree(tmp_path)
+    first = importer.import_dir(tmp_path, dry_run=False)
+    assert len(first["imported"]) == 4
+
+    second = importer.import_dir(tmp_path, dry_run=False)
+    assert second["imported"] == []
+    assert all(m["status"] == "skipped_existing" for m in second["manifest"])
+    assert len(notes_store.list_notes(kind="study_guide")) == 4  # no duplicates
+
+
+def test_import_dir_dry_run_reports_existing_as_skipped(importer, notes_store, tmp_path):
+    """Even a dry-run manifest must reflect what a real import would do —
+    files already imported show as skipped_existing, not would_import."""
+    _make_guide_tree(tmp_path)
+    importer.import_dir(tmp_path, dry_run=False)
+
+    result = importer.import_dir(tmp_path, dry_run=True)
+    assert result["imported"] == []
+    assert all(m["status"] == "skipped_existing" for m in result["manifest"])
+
+
+def test_import_dir_reports_unreadable_file(importer, notes_store, tmp_path, monkeypatch):
+    """A file that fails to read (permissions, encoding, I/O error) must be
+    reported in the manifest as "unreadable", not silently dropped or
+    crash the whole scan."""
+    from pathlib import Path
+
+    (tmp_path / "bad.md").write_text("would be fine if it were readable")
+    (tmp_path / "good.md").write_text("# Good\n\nfine")
+    real_read_text = Path.read_text
+
+    def flaky_read_text(self, *args, **kwargs):
+        if self.name == "bad.md":
+            raise OSError("simulated read failure")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    result = importer.import_dir(tmp_path, dry_run=True)
+
+    bad_entry = next(m for m in result["manifest"] if m["path"].endswith("bad.md"))
+    good_entry = next(m for m in result["manifest"] if m["path"].endswith("good.md"))
+    assert bad_entry["status"] == "unreadable"
+    assert good_entry["status"] == "would_import"
+
+
+def test_import_dir_empty_directory_returns_empty_manifest(importer, notes_store, tmp_path):
+    result = importer.import_dir(tmp_path, dry_run=True)
+    assert result == {"manifest": [], "imported": []}

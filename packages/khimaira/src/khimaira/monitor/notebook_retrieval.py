@@ -91,9 +91,22 @@ def _point_id(note_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, note_id))
 
 
+_MAX_GUIDE_EMBED_CHARS = 4000
+
+
 def _passage_text(record: dict[str, Any]) -> str:
     """What we embed: summary + organized_md once processed (best retrieval
-    signal); raw_text for a draft that hasn't been structured yet."""
+    signal); raw_text for a draft that hasn't been structured yet.
+
+    Study guides (kind="study_guide") embed abstract + raw_text[:N] instead
+    — a guide's pipeline has no summary/organized_md (it has abstract/toc),
+    and unlike a regular note's unstructured paste, a guide's raw_text IS
+    the finished, retrievable content itself."""
+    if record.get("kind") == "study_guide":
+        pipeline = record.get("pipeline") or {}
+        abstract = pipeline.get("abstract", "")
+        body = (record.get("raw_text") or "")[:_MAX_GUIDE_EMBED_CHARS]
+        return f"{abstract}\n\n{body}".strip()
     pipeline = record.get("pipeline")
     if pipeline:
         return f"{pipeline.get('summary', '')}\n\n{pipeline.get('organized_md', '')}".strip()

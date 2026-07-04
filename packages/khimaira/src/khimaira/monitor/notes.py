@@ -48,6 +48,22 @@ GENERAL_REPO = "general"
 # and api/notebook.py's create_note.
 PERSONAL_TAB_ID = "personal"
 
+# Grimoire (2026-07-04): a study guide is a distinct KIND of note — a
+# finished, human-authored deliverable to be HOUSED + RENDERED, not
+# re-expressed into the note pipeline's summary/technical/plain triple.
+# LOAD-BEARING INVARIANT: raw_text (the guide body) is the human deliverable
+# and is NEVER LLM-rewritten (except an explicit, human-approved research
+# REVISE — a later phase). Every derived artifact (pipeline={abstract, toc,
+# tags, entities}, collection, currency drift) sits alongside raw_text,
+# never in place of it. See add_study_guide / set_study_guide_pipeline.
+_VALID_KINDS = frozenset({"note", "study_guide"})
+_DEFAULT_KIND = "note"
+
+# Tab kind: "folder" groups regular notes; "collection" groups study guides
+# in the Library view. A collection IS a tab — no separate store.
+_VALID_TAB_KINDS = frozenset({"folder", "collection"})
+_DEFAULT_TAB_KIND = "folder"
+
 
 def _base_dir() -> Path:
     xdg = Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")))
@@ -88,7 +104,15 @@ def derive_lifecycle(record: dict[str, Any]) -> str:
     that's the training-quality gate: a problem earns training status by
     being worked to completion, not by being merely structured. "reviewed"
     means the structuring pipeline ran (status processed/promoted) but no
-    resolution has landed yet; anything else (draft/failed) is "captured"."""
+    resolution has landed yet; anything else (draft/failed) is "captured".
+
+    Study guides (kind="study_guide") get a DIFFERENT lifecycle — they're
+    finished deliverables to house, not problems to resolve, so
+    "resolution" doesn't apply: "housed" (imported/created, not yet
+    organized) -> "organized" (`organized_at` is set, i.e. the organizer
+    has placed/checked it in a real collection)."""
+    if record.get("kind") == "study_guide":
+        return "organized" if record.get("organized_at") else "housed"
     if record.get("resolution"):
         return "resolved"
     if record.get("status") in ("processed", "promoted"):
@@ -146,6 +170,9 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "resolution": record.get("resolution", ""),
         "resolved_by": record.get("resolved_by", ""),
         "resolved_at": record.get("resolved_at"),
+        "kind": record.get("kind", _DEFAULT_KIND),
+        "source_path": record.get("source_path"),
+        "organized_at": record.get("organized_at"),
         "lifecycle": derive_lifecycle(record),
         "deleted": deleted,
     }
@@ -217,10 +244,80 @@ def add_note(raw_text: str, tab_id: str = "", title: str = "", repo: str = "") -
         "resolution": "",
         "resolved_by": "",
         "resolved_at": None,
+        "kind": _DEFAULT_KIND,
+        "source_path": None,
+        "organized_at": None,
     }
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
     log.info("notes: added %s in tab=%s repo=%s", note_id, record["tab_id"], record["repo"])
+    return record
+
+
+def add_study_guide(
+    raw_text: str,
+    *,
+    tab_id: str = "",
+    title: str = "",
+    repo: str = "",
+    source_path: str | None = None,
+) -> dict[str, Any]:
+    """Create a study guide — a distinct KIND of note: a finished,
+    human-authored deliverable to be HOUSED + RENDERED, not re-expressed
+    into the note pipeline's summary/technical/plain triple.
+
+    LOAD-BEARING INVARIANT: raw_text (the guide body) is the human
+    deliverable and is NEVER LLM-rewritten (except an explicit,
+    human-approved research REVISE — a later phase). `pipeline` is null
+    until trigger_study_guide_pipeline runs, same as a regular note's
+    draft state, but the eventual shape is discriminated:
+    {abstract, toc, tags, entities} — see set_study_guide_pipeline.
+
+    `source_path`: import provenance + dedup key (notebook_import.py keys
+    on this via find_by_source_path to avoid re-importing the same file) +
+    the eventual export round-trip target. None for guides authored
+    directly (not imported from a file).
+    """
+    note_id = _new_id()
+    now = _now_iso()
+    record: dict[str, Any] = {
+        "id": note_id,
+        "created_at": now,
+        "updated_at": now,
+        "title": title or _derive_title(raw_text),
+        "tab_id": tab_id or _DEFAULT_TAB_ID,
+        "raw_text": raw_text,
+        "status": "draft",
+        "pipeline": None,
+        "embedding_id": None,
+        "training": {
+            "promoted": False,
+            "promoted_at": None,
+            "domain": "khimaira:notes",
+            "distilled_pairs": 0,
+        },
+        "links": [],
+        "repo": repo or _DEFAULT_REPO,
+        "history": [],
+        "last_validated_at": None,
+        "validated_git_sha": None,
+        "structured_at": None,
+        "resolution": "",
+        "resolved_by": "",
+        "resolved_at": None,
+        "kind": "study_guide",
+        "source_path": source_path,
+        "organized_at": None,
+    }
+    _write_note_atomic(note_id, record)
+    _append_jsonl(_index_path(), _index_stub(record))
+    log.info(
+        "notes: added study guide %s in tab=%s repo=%s source_path=%s",
+        note_id,
+        record["tab_id"],
+        record["repo"],
+        source_path,
+    )
     return record
 
 
@@ -231,7 +328,20 @@ def get_note(note_id: str) -> dict[str, Any]:
     return record
 
 
-def list_notes(tab_id: str | None = None, repo: str | None = None) -> list[dict[str, Any]]:
+def find_by_source_path(source_path: str) -> dict[str, Any] | None:
+    """Find an existing note by its import source_path — the dedup key
+    notebook_import.py uses to avoid re-importing the same file on a
+    repeat run. Full-scan (mirrors list_notes' own filtering approach);
+    fine at the ~130-guide scale this exists for."""
+    for stub in list_notes():
+        if stub.get("source_path") == source_path:
+            return get_note(stub["id"])
+    return None
+
+
+def list_notes(
+    tab_id: str | None = None, repo: str | None = None, kind: str | None = None
+) -> list[dict[str, Any]]:
     """Newest-created first. Sorted by created_at (not updated_at) so a
     revalidate/heal pass — which only bumps updated_at — doesn't reshuffle
     the list out from under someone reading it.
@@ -239,12 +349,20 @@ def list_notes(tab_id: str | None = None, repo: str | None = None) -> list[dict[
     `repo`, when given, scopes to that repo PLUS GENERAL_REPO (the "no
     codebase" bucket for cross-cutting notes always stays visible alongside
     whichever project is in view). `repo=None` returns everything — the
-    "All projects" view."""
+    "All projects" view.
+
+    `kind`, when given, scopes to that kind ("note" | "study_guide").
+    `kind=None` returns both — callers that want notes-only (the existing
+    UI) or guides-only (the grimoire Library view) filter explicitly,
+    mirroring how personal-tab notes are excluded client-side today rather
+    than hidden by default here."""
     stubs = list(_fold_index().values())
     if tab_id is not None:
         stubs = [s for s in stubs if s["tab_id"] == tab_id]
     if repo is not None:
         stubs = [s for s in stubs if s.get("repo") in (repo, GENERAL_REPO)]
+    if kind is not None:
+        stubs = [s for s in stubs if s.get("kind", _DEFAULT_KIND) == kind]
     stubs.sort(key=lambda s: s["created_at"], reverse=True)
     return stubs
 
@@ -302,6 +420,38 @@ def set_pipeline(
     # Stamp when the tabs were (re)generated — the reader shows "structured
     # <time>" from this, and a fresh reprocess visibly bumps it.
     record["structured_at"] = now
+    _write_note_atomic(note_id, record)
+    _append_jsonl(_index_path(), _index_stub(record))
+    return record
+
+
+def set_study_guide_pipeline(note_id: str, pipeline: dict[str, Any]) -> dict[str, Any]:
+    """Full replace of a study guide's pipeline dict (called by
+    notebook_pipeline.trigger_study_guide_pipeline on completion) — marks
+    it processed. `pipeline` is the discriminated guide shape:
+    {abstract, toc, tags, entities}.
+
+    Unlike set_pipeline, NEVER touches `title` — a study guide's title is
+    human-authored or import-derived (from its filename/first heading),
+    never LLM-regenerated. Guides are finished deliverables, and title is
+    part of that deliverable, not a note-pipeline artifact to improve.
+    Delegates to set_pipeline (identical write, just never passes a title)
+    rather than duplicating the atomic-write logic."""
+    return set_pipeline(note_id, pipeline)
+
+
+def mark_organized(note_id: str, tab_id: str | None = None) -> dict[str, Any]:
+    """Stamp organized_at (the organizer just placed/checked this note) and
+    optionally re-file it (set tab_id) in one write. The Phase 1 hook is
+    notebook_organizer.assign_deterministic (called right after import/
+    creation); the batched LLM organize_library() pass (later phase) also
+    lands here."""
+    record = get_note(note_id)
+    now = _now_iso()
+    if tab_id is not None:
+        record["tab_id"] = tab_id
+    record["organized_at"] = now
+    record["updated_at"] = now
     _write_note_atomic(note_id, record)
     _append_jsonl(_index_path(), _index_stub(record))
     return record
@@ -476,13 +626,19 @@ def backfill_drop_spurious_heals_all() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def add_tab(title: str = "") -> dict[str, Any]:
+def add_tab(title: str = "", *, kind: str = "") -> dict[str, Any]:
+    """`kind`: "folder" (default, regular note groups) or "collection"
+    (study-guide groups, shown in the Library view) — so the two don't
+    intermix in the filter bar."""
     _ensure_dirs()
+    if kind and kind not in _VALID_TAB_KINDS:
+        raise ValueError(f"Invalid tab kind {kind!r}; must be one of {sorted(_VALID_TAB_KINDS)}.")
     tab_id = _new_id()
     now = _now_iso()
     record = {
         "id": tab_id,
         "title": title or f"Tab {tab_id[:6]}",
+        "kind": kind or _DEFAULT_TAB_KIND,
         "created_at": now,
         "updated_at": now,
         "deleted": False,
@@ -503,9 +659,15 @@ def update_tab(tab_id: str, **fields: Any) -> dict[str, Any]:
     _ensure_dirs()
     existing = get_tab(tab_id)
     existing.pop("note_ids", None)
-    unknown = set(fields) - {"title"}
+    unknown = set(fields) - {"title", "kind"}
     if unknown:
-        raise ValueError(f"Unknown tab field(s): {sorted(unknown)}. Mutable fields: ['title'].")
+        raise ValueError(
+            f"Unknown tab field(s): {sorted(unknown)}. Mutable fields: ['title', 'kind']."
+        )
+    if "kind" in fields and fields["kind"] not in _VALID_TAB_KINDS:
+        raise ValueError(
+            f"Invalid tab kind {fields['kind']!r}; must be one of {sorted(_VALID_TAB_KINDS)}."
+        )
     existing.update(fields)
     existing["updated_at"] = _now_iso()
     existing["deleted"] = False
@@ -521,5 +683,20 @@ def list_tabs() -> list[dict[str, Any]]:
 
 def _with_note_ids(tab_record: dict[str, Any]) -> dict[str, Any]:
     out = dict(tab_record)
+    out.setdefault("kind", _DEFAULT_TAB_KIND)
     out["note_ids"] = [n["id"] for n in list_notes(tab_id=tab_record["id"])]
     return out
+
+
+def get_or_create_collection(title: str) -> dict[str, Any]:
+    """Find an existing tab with kind="collection" matching `title`
+    (case-insensitive), or create one. The deterministic-first primitive
+    shared by notebook_import.py and notebook_organizer.py — both need "does
+    a collection named X already exist" before deciding to create a new one
+    vs re-file into an existing one, and must agree on the same lookup or
+    they'd create near-duplicate collections differing only in casing."""
+    title_norm = title.strip().lower()
+    for tab in list_tabs():
+        if tab.get("kind") == "collection" and tab["title"].strip().lower() == title_norm:
+            return tab
+    return add_tab(title=title, kind="collection")

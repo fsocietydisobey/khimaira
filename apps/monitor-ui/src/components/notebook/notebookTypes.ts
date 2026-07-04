@@ -9,11 +9,34 @@
 
 export type NoteStatus = "draft" | "processed" | "promoted" | "failed";
 
+/** Grimoire (Phase 1f): a note is either a regular structured note, or a
+ *  study guide — a finished deliverable to be housed + rendered, never
+ *  re-expressed into the summary/technical/plain triple. Discriminated by
+ *  `Note.kind`; narrow on that field before reading `pipeline`. */
+export type NoteKind = "note" | "study_guide";
+
 export interface NotePipeline {
   summary: string;
   technical: string;
   plain: string;
   organized_md: string;
+  tags: string[];
+  entities: string[];
+}
+
+/** One heading in a study guide's table of contents — a deterministic parse
+ *  of `raw_text`'s markdown headings, not LLM-derived. `anchor` must match
+ *  the `id` the guide reader assigns to the corresponding rendered heading. */
+export interface StudyGuideTocEntry {
+  title: string;
+  anchor: string;
+  level: number;
+}
+
+export interface StudyGuidePipeline {
+  /** LLM-derived library-card blurb — the only LLM-derived field on a guide. */
+  abstract: string;
+  toc: StudyGuideTocEntry[];
   tags: string[];
   entities: string[];
 }
@@ -33,8 +56,14 @@ export interface Note {
   tab_id: string;
   raw_text: string;
   status: NoteStatus;
-  /** Null until the Phase 1c transform completes. */
-  pipeline: NotePipeline | null;
+  /** Default "note" for every pre-grimoire record. Narrow on this before
+   *  reading `pipeline` — it discriminates NotePipeline vs StudyGuidePipeline. */
+  kind: NoteKind;
+  /** Null until the Phase 1c transform (note) or study-guide pipeline completes. */
+  pipeline: NotePipeline | StudyGuidePipeline | null;
+  /** Import provenance for a study guide (dedup key + export round-trip target).
+   *  Null for notes and for guides authored directly (not imported). */
+  source_path: string | null;
   embedding_id: string | null;
   training: NoteTraining;
   links: string[];
@@ -60,15 +89,32 @@ export interface Note {
   resolved_by: string;
   /** When the resolution was attached; null until resolved. */
   resolved_at: string | null;
+  /** When the organizer last placed/checked this note's tab_id. Null if the
+   *  organizer has never touched it (e.g. every pre-grimoire note). */
+  organized_at: string | null;
 }
+
+/** Discriminates a plain note-folder from a study-guide collection so the
+ *  two don't intermix in the tab filter bar. Absent/undefined on pre-grimoire
+ *  tab records — treat as "folder". */
+export type NotebookTabKind = "folder" | "collection";
 
 export interface NotebookTab {
   id: string;
   title: string;
   created_at: string;
   updated_at: string;
+  kind?: NotebookTabKind;
   /** Note ids grouped by tab_id — derived at read time, not stored redundantly. */
   note_ids: string[];
+}
+
+/** True when `note.kind === "study_guide"` — narrows `note.pipeline` to
+ *  `StudyGuidePipeline` for callers that already branched on `Note.kind`. */
+export function isStudyGuidePipeline(
+  pipeline: NotePipeline | StudyGuidePipeline | null,
+): pipeline is StudyGuidePipeline {
+  return pipeline !== null && "toc" in pipeline;
 }
 
 /** A code chunk (Séance semantic search, or a grep fallback) cited in an ask answer. */

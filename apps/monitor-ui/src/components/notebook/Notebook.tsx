@@ -49,8 +49,9 @@ import {
   useRevalidateNoteMutation,
   useUpdateNoteMutation,
 } from "@/api";
+import { Library } from "@/components/notebook/LibraryView";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
-import type { AskAnswer, Note } from "@/components/notebook/notebookTypes";
+import { isStudyGuidePipeline, type AskAnswer, type Note } from "@/components/notebook/notebookTypes";
 import { ProjectNavTabs } from "@/components/project/ProjectNavTabs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -77,6 +78,11 @@ const SUGGESTED_QUESTIONS = [
 
 type ViewMode = "grid" | "reader";
 
+/** Grimoire (Phase 1f): top-level note⇄guide switch, independent of ViewMode
+ *  (which only applies within "notes"). "library" mounts <Library /> in place
+ *  of the whole notes grid/reader area. */
+type NotebookSection = "notes" | "library";
+
 type CenterView =
   | { kind: "note"; noteId: string }
   | { kind: "answer"; data: AskAnswer; question: string }
@@ -87,7 +93,7 @@ type CenterView =
 // unavailability (private browsing), mirroring KgMapper's palette/glow prefs.
 // ---------------------------------------------------------------------------
 
-function usePersistedBoolean(key: string, defaultValue: boolean) {
+export function usePersistedBoolean(key: string, defaultValue: boolean) {
   const [value, setValue] = useState<boolean>(() => {
     if (typeof localStorage === "undefined") return defaultValue;
     const saved = localStorage.getItem(key);
@@ -169,7 +175,7 @@ function ResizeHandle({ onResize }: { onResize: (deltaPx: number) => void }) {
  * Collapsed state renders a thin rail with a re-expand affordance, like
  * NotebookLM's Sources/Studio panels.
  */
-function SidePanelShell({
+export function SidePanelShell({
   side,
   label,
   width,
@@ -285,6 +291,7 @@ export function Notebook() {
   const { name } = useParams<{ name: string }>();
   const projectName = name ?? "";
 
+  const [section, setSection] = useState<NotebookSection>("notes");
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
   const [selectedTab, setSelectedTab] = useState<string>(ALL_TABS);
   const [showAddNote, setShowAddNote] = useState(false);
@@ -334,8 +341,16 @@ export function Notebook() {
   const tabs = tabsData?.tabs ?? [];
   // Personal/Behavior notes are a distinct section (below) — never mixed
   // into the regular list/grid/reader/@-mention flow, matching the backend
-  // excluding them from embedding + ask retrieval.
-  const notes = (notesData?.notes ?? []).filter((n) => n.tab_id !== PERSONAL_TAB_ID);
+  // excluding them from embedding + ask retrieval. Study guides are a
+  // distinct KIND (grimoire) — housed in the Library, kind-filtered out here
+  // the same way personal notes are.
+  const notesExcludingPersonal = (notesData?.notes ?? []).filter(
+    (n) => n.tab_id !== PERSONAL_TAB_ID,
+  );
+  const notes = notesExcludingPersonal.filter((n) => n.kind !== "study_guide");
+  // Guides ARE askable/@-mentionable (unlike personal notes) — only excluded
+  // from the browsing grid/list above, per void-null's settled contract.
+  const mentionableNotes = notesExcludingPersonal;
   const personalNotes = personalNotesData?.notes ?? [];
   const repoOptions = [...(projectsData ?? []).map((p) => p.name), GENERAL_REPO];
   const selectedNote =
@@ -451,21 +466,28 @@ export function Notebook() {
       <header className="shrink-0 border-b border-border bg-card/40 px-4 py-3">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <h2 className="text-sm font-semibold">notebook — {projectName}</h2>
+            <h2 className="text-sm font-semibold">Grimoire — {projectName}</h2>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
               paste → auto-structure → ask → self-heal against the live code
             </p>
           </div>
           <div className="flex items-center gap-3">
-            <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+            <NotebookSectionToggle section={section} onChange={setSection} />
+            {section === "notes" ? (
+              <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+            ) : null}
             <ProjectNavTabs projectName={projectName} />
           </div>
         </div>
       </header>
 
-      <AskBar onAsk={handleAsk} asking={asking} notes={notes} />
+      {section === "library" ? (
+        <Library />
+      ) : (
+        <>
+          <AskBar onAsk={handleAsk} asking={asking} notes={mentionableNotes} />
 
-      {viewMode === "grid" ? (
+          {viewMode === "grid" ? (
         <div className="flex flex-1 overflow-hidden">
           <SidePanelShell
             side="left"
@@ -546,6 +568,41 @@ export function Notebook() {
           </SidePanelShell>
         </div>
       )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function NotebookSectionToggle({
+  section,
+  onChange,
+}: {
+  section: NotebookSection;
+  onChange: (s: NotebookSection) => void;
+}) {
+  const options: { key: NotebookSection; label: string; Icon: typeof BookOpen }[] = [
+    { key: "notes", label: "notes", Icon: LayoutGrid },
+    { key: "library", label: "library", Icon: BookMarked },
+  ];
+  return (
+    <div className="flex items-center gap-0.5 rounded-md border border-border bg-card/40 p-0.5">
+      {options.map(({ key, label, Icon }) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => onChange(key)}
+          className={cn(
+            "flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors",
+            section === key
+              ? "bg-accent text-accent-foreground"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          <Icon className="h-3.5 w-3.5" />
+          {label}
+        </button>
+      ))}
     </div>
   );
 }
@@ -1157,7 +1214,11 @@ function NoteCard({
   const [section, setSection] = useState<"summary" | "technical" | "plain">("summary");
   const [revalidateNote, { isLoading: revalidating }] = useRevalidateNoteMutation();
   const badge = STATUS_BADGE[note.status];
-  const pipeline = note.pipeline;
+  // GridView only ever renders notes (study guides are excluded upstream and
+  // live in the Library), so pipeline here is always NotePipeline — narrow
+  // explicitly since Note.pipeline's static type is the discriminated union.
+  const pipeline =
+    note.pipeline && !isStudyGuidePipeline(note.pipeline) ? note.pipeline : null;
 
   const validationLabel = note.last_validated_at
     ? note.history_count > 0
@@ -1445,6 +1506,11 @@ function NoteStructuredReader({
   // (raw_text changed) — the old tabs stay visible, badged as reprocessing.
   const reprocessing = note.status === "draft" && !!note.pipeline;
   const badge = STATUS_BADGE[note.status];
+  // This reader only ever shows notes (study guides live in the Library and
+  // are excluded from the list this component's caller reads from) — narrow
+  // explicitly since Note.pipeline's static type is the discriminated union.
+  const pipeline =
+    note.pipeline && !isStudyGuidePipeline(note.pipeline) ? note.pipeline : null;
   const validationLabel = note.last_validated_at
     ? note.history_count > 0
       ? `healed ×${note.history_count} · checked ${relativeTime(note.last_validated_at)}`
@@ -1505,7 +1571,7 @@ function NoteStructuredReader({
       </div>
 
       <div className="min-w-0 flex-1 overflow-y-auto p-4">
-        {note.pipeline ? (
+        {pipeline ? (
           <>
             <div className="mb-3 flex gap-1">
               {(["summary", "technical", "plain"] as const).map((s) => (
@@ -1524,10 +1590,10 @@ function NoteStructuredReader({
                 </button>
               ))}
             </div>
-            <MarkdownView content={note.pipeline[section]} />
-            {note.pipeline.tags.length > 0 ? (
+            <MarkdownView content={pipeline[section]} />
+            {pipeline.tags.length > 0 ? (
               <div className="mt-3 flex flex-wrap gap-1">
-                {note.pipeline.tags.map((tag) => (
+                {pipeline.tags.map((tag) => (
                   <Badge key={tag} variant="outline" className="text-[9px]">
                     {tag}
                   </Badge>

@@ -54,6 +54,44 @@ def test_create_note_in_personal_folder_skips_structuring(notebook_client):
     assert body["pipeline"] is None
 
 
+def test_create_note_defaults_kind_to_note(notebook_client):
+    r = notebook_client.post("/api/notes", json={"raw_text": "hello"})
+    assert r.json()["kind"] == "note"
+
+
+def test_create_note_study_guide_kind(notebook_client):
+    r = notebook_client.post(
+        "/api/notes",
+        json={
+            "raw_text": "# Guide\n\nBody.",
+            "kind": "study_guide",
+            "source_path": "/tmp/guide.md",
+            "repo": "jeevy_portal",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["kind"] == "study_guide"
+    assert body["source_path"] == "/tmp/guide.md"
+    assert body["status"] == "draft"
+    assert body["pipeline"] is None
+    assert body["repo"] == "jeevy_portal"
+
+
+def test_list_notes_kind_filter_route(notebook_client):
+    notebook_client.post("/api/notes", json={"raw_text": "a note"})
+    notebook_client.post(
+        "/api/notes", json={"raw_text": "# A Guide\n\nbody", "kind": "study_guide"}
+    )
+
+    guides = notebook_client.get("/api/notes", params={"kind": "study_guide"}).json()["notes"]
+    assert len(guides) == 1
+    assert guides[0]["kind"] == "study_guide"
+
+    both = notebook_client.get("/api/notes").json()["notes"]
+    assert len(both) == 2
+
+
 def test_list_notes_empty_store(notebook_client):
     r = notebook_client.get("/api/notes")
     assert r.status_code == 200
@@ -389,3 +427,40 @@ def test_add_resolution_empty_string_does_not_schedule_training_promote(
     r = notebook_client.post(f"/api/notes/{created['id']}/resolution", json={"resolution": ""})
     assert r.status_code == 200
     assert scheduled == []
+
+
+def test_import_guides_route_dry_run_default_writes_nothing(notebook_client, tmp_path):
+    (tmp_path / "onboarding").mkdir()
+    (tmp_path / "onboarding" / "start.md").write_text("# Start\n\nwelcome")
+
+    r = notebook_client.post("/api/notes/import", json={"root": str(tmp_path)})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["imported"] == []
+    assert len(body["manifest"]) == 1
+    assert body["manifest"][0]["status"] == "would_import"
+    assert body["manifest"][0]["collection"] == "Onboarding"
+
+    listed = notebook_client.get("/api/notes", params={"kind": "study_guide"}).json()["notes"]
+    assert listed == []
+
+
+def test_import_guides_route_real_import(notebook_client, tmp_path, monkeypatch):
+    from khimaira.monitor import notebook_pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod, "schedule_pipeline", lambda note_id: None)
+
+    (tmp_path / "onboarding").mkdir()
+    (tmp_path / "onboarding" / "start.md").write_text("# Start\n\nwelcome")
+
+    r = notebook_client.post(
+        "/api/notes/import", json={"root": str(tmp_path), "repo": "jeevy_portal", "dry_run": False}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["imported"]) == 1
+
+    listed = notebook_client.get("/api/notes", params={"kind": "study_guide"}).json()["notes"]
+    assert len(listed) == 1
+    assert listed[0]["repo"] == "jeevy_portal"
+    assert listed[0]["organized_at"] is not None

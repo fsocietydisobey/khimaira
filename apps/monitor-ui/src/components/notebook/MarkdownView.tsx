@@ -14,7 +14,8 @@
  * wide descendant force the container wider in the first place.
  */
 
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useRef } from "react";
+import type { ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -24,23 +25,87 @@ const MermaidBlock = lazy(() =>
   import("@/components/notebook/MermaidBlock").then((m) => ({ default: m.MermaidBlock })),
 );
 
-export function MarkdownView({ content }: { content: string }) {
+/** Flatten a heading's children into plain text, for slug generation. Headings
+ *  can contain inline code/emphasis, so this isn't just `props.children`. */
+function headingText(node: ReactNode): string {
+  if (typeof node === "string") return node;
+  if (typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(headingText).join("");
+  if (node && typeof node === "object" && "props" in node) {
+    return headingText((node as { props: { children?: ReactNode } }).props.children);
+  }
+  return "";
+}
+
+/** GitHub-style heading slug (lowercase, strip punctuation, spaces→hyphens,
+ *  de-dupe with a -N suffix) — the common convention for a "deterministic
+ *  heading parse". Grimoire (Phase 1f): must match whatever anchor scheme
+ *  `notebook_pipeline._parse_toc` (backend) produces for a guide's TOC —
+ *  if the backend's contract differs, this is the one place to adjust. */
+function slugifyHeading(text: string, seen: Map<string, number>): string {
+  const base =
+    text
+      .toLowerCase()
+      .trim()
+      .replace(/[^\w\- ]+/g, "")
+      .replace(/\s+/g, "-") || "section";
+  const count = seen.get(base) ?? 0;
+  seen.set(base, count + 1);
+  return count === 0 ? base : `${base}-${count}`;
+}
+
+export function MarkdownView({
+  content,
+  slugHeadings = false,
+}: {
+  content: string;
+  /** Grimoire (Phase 1f): assign each heading a stable `id` (GitHub-slug of
+   *  its text) so a guide's TOC can scroll-to-anchor. Off by default — every
+   *  other MarkdownView surface (summary/technical/plain/answers) doesn't
+   *  need heading ids and shouldn't pay the slug bookkeeping. */
+  slugHeadings?: boolean;
+}) {
+  // Reset once per render — headings are recomputed fresh every render (cheap
+  // relative to markdown parsing itself), so dedup counts never leak stale
+  // state across a content change.
+  const seenSlugs = useRef<Map<string, number>>(new Map());
+  seenSlugs.current = new Map();
+
+  const headingId = (children: ReactNode): string | undefined =>
+    slugHeadings ? slugifyHeading(headingText(children), seenSlugs.current) : undefined;
+
   return (
     <div className="min-w-0 max-w-full overflow-x-hidden text-xs">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
           h1: (props) => (
-            <h1 className="mb-1.5 mt-3 text-sm font-semibold text-foreground first:mt-0" {...props} />
+            <h1
+              id={headingId(props.children)}
+              className="mb-1.5 mt-3 text-sm font-semibold text-foreground first:mt-0"
+              {...props}
+            />
           ),
           h2: (props) => (
             <h2
+              id={headingId(props.children)}
               className="mb-1.5 mt-3 text-[13px] font-semibold text-foreground first:mt-0"
               {...props}
             />
           ),
           h3: (props) => (
-            <h3 className="mb-1 mt-2 text-xs font-semibold text-foreground first:mt-0" {...props} />
+            <h3
+              id={headingId(props.children)}
+              className="mb-1 mt-2 text-xs font-semibold text-foreground first:mt-0"
+              {...props}
+            />
+          ),
+          h4: (props) => (
+            <h4
+              id={headingId(props.children)}
+              className="mb-1 mt-2 text-xs font-semibold text-foreground first:mt-0"
+              {...props}
+            />
           ),
           p: (props) => (
             <p

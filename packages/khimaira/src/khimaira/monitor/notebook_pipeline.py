@@ -113,6 +113,88 @@ class RevalidationOutput(PipelineOutput):
     unchanged: bool
 
 
+# ---------------------------------------------------------------------------
+# Grimoire (2026-07-04): study guides — a distinct KIND of note, housed +
+# rendered rather than re-expressed. LOAD-BEARING INVARIANT: raw_text (the
+# guide body) is NEVER LLM-rewritten by this pipeline — only `abstract` is
+# LLM-generated; `toc` is a deterministic heading parse; `title` is never
+# touched here at all (human/import-derived, see notes.add_study_guide).
+# ---------------------------------------------------------------------------
+
+_STUDY_GUIDE_INSTRUCTION = (
+    "You are cataloging a study guide (a finished, long-form markdown "
+    "deliverable) for a library card — NOT restructuring or rewriting it. "
+    "Output ONLY a JSON object, no prose, no markdown fence, with keys: "
+    "abstract (a 2-4 sentence library-card blurb describing what this "
+    "guide covers and who would want it, written for someone scanning a "
+    "library — not a summary for the guide's own reader), tags (array of "
+    "strings), entities (array of strings — code symbols/files/concepts "
+    "the guide references). Do NOT rewrite, restructure, or summarize the "
+    "guide section-by-section — you are only producing metadata ABOUT it. "
+    "The entire user message is the guide's raw markdown."
+)
+
+
+class StudyGuideOutput(BaseModel):
+    abstract: str
+    tags: list[str]
+    entities: list[str]
+
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
+
+
+def _slugify_heading(text: str) -> str:
+    """GitHub-flavored-markdown-style heading slug: lowercase, strip
+    non-alphanumeric (keep spaces/hyphens), spaces to hyphens, collapse
+    repeats. Matches the anchor convention most markdown renderers (and
+    the eventual guide-reader UI) use, so toc[].anchor is usable as a
+    `#anchor` link without the frontend needing its own slugify pass."""
+    slug = text.strip().lower()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[\s_]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug
+
+
+def _parse_toc(raw_text: str) -> list[dict[str, Any]]:
+    """Deterministic heading parse — NOT an LLM call. Extracts every
+    markdown ATX heading (# through ######) in document order as
+    {title, anchor, level}.
+
+    Skips headings inside fenced code blocks (```/~~~) — these are
+    code-grounded guides, so a naive regex would false-positive on a
+    commented-out '# heading' inside a code sample. Disambiguates
+    duplicate heading titles (common in docs — multiple "## Example"
+    sections) with a GFM-style `-1`/`-2` suffix, matching how GitHub
+    itself resolves duplicate anchors."""
+    toc: list[dict[str, Any]] = []
+    seen_slugs: dict[str, int] = {}
+    in_fence = False
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _HEADING_RE.match(stripped)
+        if not m:
+            continue
+        title = m.group(2).strip()
+        if not title:
+            continue
+        level = len(m.group(1))
+        slug = _slugify_heading(title)
+        if slug in seen_slugs:
+            seen_slugs[slug] += 1
+            slug = f"{slug}-{seen_slugs[slug]}"
+        else:
+            seen_slugs[slug] = 0
+        toc.append({"title": title, "anchor": slug, "level": level})
+    return toc
+
+
 def _isolated_config_dir() -> Path:
     """Dedicated CLAUDE_CONFIG_DIR: credentials only, empty settings (no
     hooks), no CLAUDE.md. This is what keeps each transform cheap (kills the
@@ -325,10 +407,64 @@ async def trigger_pipeline(note_id: str) -> None:
     await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
 
 
+async def trigger_study_guide_pipeline(note_id: str) -> None:
+    """Transform note_id's raw_text into a study-guide pipeline and write it
+    back. Same shape as trigger_pipeline, but NEVER touches raw_text — the
+    load-bearing invariant — and produces the discriminated pipeline shape
+    {abstract, toc, tags, entities} instead of the note pipeline's
+    summary/technical/plain/organized_md.
+
+    `abstract`/`tags`/`entities` come from the LLM (StudyGuideOutput);
+    `toc` is a deterministic heading parse (_parse_toc) — never touches the
+    LLM, so a guide's navigation structure can't drift from its actual
+    headings."""
+    try:
+        record = notes.get_note(note_id)
+    except ValueError:
+        log.warning("notebook_pipeline: study guide %s vanished before transform", note_id)
+        return
+
+    result = await transform_note(
+        record["raw_text"], instruction=_STUDY_GUIDE_INSTRUCTION, schema=StudyGuideOutput
+    )
+    if result is None:
+        with contextlib.suppress(ValueError):
+            notes.update_note(note_id, status="failed")
+        log.warning("notebook_pipeline: study guide %s failed to structure after retry", note_id)
+        return
+
+    pipeline = {
+        "abstract": result["abstract"],
+        "toc": _parse_toc(record["raw_text"]),
+        "tags": result["tags"],
+        "entities": result["entities"],
+    }
+    try:
+        updated = notes.set_study_guide_pipeline(note_id, pipeline)
+    except ValueError:
+        log.warning("notebook_pipeline: study guide %s deleted before pipeline completed", note_id)
+        return
+
+    await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
+
+
 def schedule_pipeline(note_id: str) -> None:
-    """Sync entry point for the POST /notes route — fires trigger_pipeline
-    as a background task without blocking the response."""
-    task = asyncio.create_task(trigger_pipeline(note_id))
+    """Sync entry point for the POST /notes route — fires the right
+    structuring pipeline (kind-branched: study guide vs regular note) as a
+    background task without blocking the response. The branch lives here,
+    not at each call site, so callers (api/notebook.py, notebook_import.py)
+    never need their own kind check to know which pipeline to trigger."""
+    try:
+        record = notes.get_note(note_id)
+    except ValueError:
+        log.warning("notebook_pipeline: note %s vanished before scheduling", note_id)
+        return
+    coro = (
+        trigger_study_guide_pipeline(note_id)
+        if record.get("kind") == "study_guide"
+        else trigger_pipeline(note_id)
+    )
+    task = asyncio.create_task(coro)
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
 
