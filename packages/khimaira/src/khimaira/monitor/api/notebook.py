@@ -53,6 +53,7 @@ class CreateNoteReq(BaseModel):
     repo: str = ""
     kind: str = "note"
     source_path: str | None = None
+    collection: str = ""
 
 
 class ImportGuidesReq(BaseModel):
@@ -107,9 +108,20 @@ def build_router():
             # re-expressed — structuring only ever generates
             # abstract/tags/entities (schedule_pipeline's kind branch picks
             # trigger_study_guide_pipeline), raw_text is never touched.
+            #
+            # `collection`, when given, is a friendly collection NAME
+            # (get-or-create semantics) — the caller (e.g. the
+            # notebook_create_study_guide MCP tool, a thin HTTP client) has
+            # no in-process access to notes.get_or_create_collection, so the
+            # daemon resolves it here rather than requiring callers to know
+            # a tab_id up front. Takes precedence over a raw tab_id if both
+            # are somehow given.
+            tab_id = req.tab_id
+            if req.collection:
+                tab_id = notes.get_or_create_collection(req.collection)["id"]
             record = notes.add_study_guide(
                 req.raw_text,
-                tab_id=req.tab_id,
+                tab_id=tab_id,
                 title=req.title,
                 repo=req.repo,
                 source_path=req.source_path,

@@ -91,3 +91,204 @@ def test_assign_deterministic_reuses_existing_collection(organizer, notes_store)
     assert updated_a["tab_id"] == updated_b["tab_id"]
     collections = [t for t in notes_store.list_tabs() if t["kind"] == "collection"]
     assert len(collections) == 1
+
+
+# ---------------------------------------------------------------------------
+# Grimoire Phase 2 — the LLM organize pass. `_invoke_claude`'s subprocess
+# layer is mocked out (via notebook_pipeline.transform_note) — these tests
+# exercise organize_library's own placement/filtering/scoping logic, not the
+# real CLI (same convention as test_notebook_pipeline.py).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def organizer_llm(organizer, monkeypatch):
+    from khimaira.monitor import notebook_pipeline as pipeline_mod
+
+    yield organizer, pipeline_mod
+
+
+def _guide_with_abstract(notes_store, title, abstract, tags=None, tab_id=""):
+    guide = notes_store.add_study_guide(f"# {title}\n\nbody", title=title, tab_id=tab_id)
+    notes_store.set_study_guide_pipeline(
+        guide["id"], {"abstract": abstract, "toc": [], "tags": tags or [], "entities": []}
+    )
+    return notes_store.get_note(guide["id"])
+
+
+async def test_organize_library_empty_when_no_guides(organizer_llm):
+    organizer, _pipeline_mod = organizer_llm
+    result = await organizer.organize_library()
+    assert result == {"considered": 0, "reassigned": [], "new_collections": []}
+
+
+async def test_organize_library_places_guide_into_matching_existing_collection(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+    existing = notes_store.add_tab(title="Architecture", kind="collection")
+    guide = _guide_with_abstract(notes_store, "KG Overview", "Explains the knowledge graph.")
+
+    async def fake_transform_note(content, *, instruction, schema):
+        return {"placements": [{"note_id": guide["id"], "collection": "Architecture"}]}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert result["considered"] == 1
+    assert result["reassigned"] == [guide["id"]]
+    assert result["new_collections"] == []
+    updated = notes_store.get_note(guide["id"])
+    assert updated["tab_id"] == existing["id"]
+    assert updated["organized_at"] is not None
+
+
+async def test_organize_library_creates_new_collection_when_llm_proposes_one(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+    guide = _guide_with_abstract(notes_store, "Vector DB Internals", "How embeddings are stored.")
+
+    async def fake_transform_note(content, *, instruction, schema):
+        return {"placements": [{"note_id": guide["id"], "collection": "Retrieval"}]}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert result["reassigned"] == [guide["id"]]
+    assert result["new_collections"] == ["Retrieval"]
+    tabs = [t for t in notes_store.list_tabs() if t["kind"] == "collection"]
+    assert any(t["title"] == "Retrieval" for t in tabs)
+
+
+async def test_organize_library_no_op_stamps_organized_at_without_reassigning(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+    tab = notes_store.add_tab(title="Onboarding", kind="collection")
+    guide = _guide_with_abstract(notes_store, "Getting Started", "Intro guide.", tab_id=tab["id"])
+    assert guide["organized_at"] is None
+
+    async def fake_transform_note(content, *, instruction, schema):
+        return {"placements": [{"note_id": guide["id"], "collection": "Onboarding"}]}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert result["reassigned"] == []
+    updated = notes_store.get_note(guide["id"])
+    assert updated["tab_id"] == tab["id"]
+    assert updated["organized_at"] is not None
+
+
+async def test_organize_library_discards_placements_for_unknown_note_ids(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+    guide = _guide_with_abstract(notes_store, "Real Guide", "abstract")
+
+    async def fake_transform_note(content, *, instruction, schema):
+        return {
+            "placements": [
+                {"note_id": "nonexistent00", "collection": "Ghost"},
+                {"note_id": guide["id"], "collection": "Somewhere"},
+            ]
+        }
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert result["reassigned"] == [guide["id"]]
+    tabs = [t for t in notes_store.list_tabs() if t["kind"] == "collection"]
+    assert not any(t["title"] == "Ghost" for t in tabs)
+
+
+async def test_organize_library_scoped_to_note_ids_excludes_others(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+    guide_a = _guide_with_abstract(notes_store, "Guide A", "abstract a")
+    guide_b = _guide_with_abstract(notes_store, "Guide B", "abstract b")
+    seen_content: list[str] = []
+
+    async def fake_transform_note(content, *, instruction, schema):
+        seen_content.append(content)
+        return {"placements": [{"note_id": guide_a["id"], "collection": "Somewhere"}]}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library(note_ids=[guide_a["id"]])
+
+    assert result["considered"] == 1
+    assert guide_a["id"] in seen_content[0]
+    assert guide_b["id"] not in seen_content[0]
+
+
+async def test_organize_library_returns_gracefully_when_llm_fails(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+    guide = _guide_with_abstract(notes_store, "Guide", "abstract")
+
+    async def fake_transform_note(content, *, instruction, schema):
+        return None
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert result == {"considered": 1, "reassigned": [], "new_collections": []}
+    updated = notes_store.get_note(guide["id"])
+    assert updated["organized_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# organize_after_structuring — the post-structuring hook + its re-entrancy
+# guard (defense-in-depth against the reaper-cascade bug class; see the
+# function's docstring for the audit that the current write path is safe).
+# ---------------------------------------------------------------------------
+
+
+async def test_organize_after_structuring_calls_organize_library_scoped_to_note(
+    organizer, monkeypatch
+):
+    calls: list[list[str] | None] = []
+
+    async def fake_organize_library(note_ids=None):
+        calls.append(note_ids)
+        return {"considered": 1, "reassigned": [], "new_collections": []}
+
+    monkeypatch.setattr(organizer, "organize_library", fake_organize_library)
+    await organizer.organize_after_structuring("note123")
+
+    assert calls == [["note123"]]
+
+
+async def test_organize_after_structuring_swallows_errors(organizer, monkeypatch):
+    async def failing_organize_library(note_ids=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(organizer, "organize_library", failing_organize_library)
+    await organizer.organize_after_structuring("note123")  # must not raise
+
+
+async def test_organize_after_structuring_reentrancy_guard_skips_when_already_organizing(
+    organizer, monkeypatch
+):
+    calls: list[list[str] | None] = []
+
+    async def fake_organize_library(note_ids=None):
+        calls.append(note_ids)
+        return {"considered": 0, "reassigned": [], "new_collections": []}
+
+    monkeypatch.setattr(organizer, "organize_library", fake_organize_library)
+    organizer._ORGANIZING_NOTE_IDS.add("note123")
+    try:
+        await organizer.organize_after_structuring("note123")
+    finally:
+        organizer._ORGANIZING_NOTE_IDS.discard("note123")
+
+    assert calls == []
+
+
+async def test_organize_sweep_loop_returns_immediately_when_disabled(organizer, monkeypatch):
+    monkeypatch.setattr(organizer, "_SWEEP_ENABLED", False)
+    await organizer.organize_sweep_loop()  # must return, not hang

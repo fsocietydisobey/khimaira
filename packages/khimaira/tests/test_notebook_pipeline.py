@@ -538,6 +538,124 @@ async def test_revalidate_note_unknown_id_raises(pipeline):
 
 
 # ---------------------------------------------------------------------------
+# Grimoire Phase 2: guide currency = a DRIFT REPORT, not a full pipeline
+# regeneration — only `abstract` is ever regenerated; `toc`/`tags`/`entities`
+# and `title`/`raw_text` are never touched. A separate concern from
+# notebook_organizer's collection placement.
+# ---------------------------------------------------------------------------
+
+_GUIDE_ANCHORED_PIPELINE = {
+    "abstract": "original abstract",
+    "toc": [{"title": "Widgets", "anchor": "widgets", "level": 1}],
+    "tags": ["widgets"],
+    "entities": ["sessions.py"],
+}
+
+
+async def test_revalidate_note_study_guide_staleness_gate_skips_when_unchanged(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    guide = notes_store.add_study_guide("# Widgets\n\nbody", repo="testrepo")
+    notes_store.set_study_guide_pipeline(guide["id"], _GUIDE_ANCHORED_PIPELINE)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(guide["id"], git_sha=initial_sha, new_pipeline=None)
+
+    _queue_responses(pipeline, monkeypatch, [])  # no LLM call expected
+
+    result = await pipeline.revalidate_note(guide["id"])
+    assert result["validated_git_sha"] == initial_sha
+    assert result["history"] == []
+    assert result["pipeline"] == _GUIDE_ANCHORED_PIPELINE
+
+
+async def test_revalidate_note_study_guide_drift_regenerates_abstract_only(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    guide = notes_store.add_study_guide("# Widgets\n\nbody", repo="testrepo")
+    notes_store.set_study_guide_pipeline(guide["id"], _GUIDE_ANCHORED_PIPELINE)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(guide["id"], git_sha=initial_sha, new_pipeline=None)
+
+    (git_repo / "sessions.py").write_text("def foo():\n    return 42\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "change")
+    new_sha = _git_head(git_repo)
+
+    drift_response = {"abstract": "corrected abstract", "unchanged": False}
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(drift_response)))])
+
+    result = await pipeline.revalidate_note(guide["id"])
+
+    assert result["pipeline"]["abstract"] == "corrected abstract"
+    assert result["pipeline"]["toc"] == _GUIDE_ANCHORED_PIPELINE["toc"]  # untouched
+    assert result["pipeline"]["tags"] == _GUIDE_ANCHORED_PIPELINE["tags"]  # untouched
+    assert result["pipeline"]["entities"] == _GUIDE_ANCHORED_PIPELINE["entities"]  # untouched
+    assert result["validated_git_sha"] == new_sha
+    assert result["title"] == guide["title"]  # never LLM-touched
+    assert result["raw_text"] == "# Widgets\n\nbody"  # never touched
+    assert len(result["history"]) == 1
+    assert result["history"][0]["pipeline"] == _GUIDE_ANCHORED_PIPELINE
+
+
+async def test_revalidate_note_study_guide_unchanged_stamps_without_history_churn(
+    notes_store, pipeline, monkeypatch, git_repo
+):
+    _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
+    guide = notes_store.add_study_guide("# Widgets\n\nbody", repo="testrepo")
+    notes_store.set_study_guide_pipeline(guide["id"], _GUIDE_ANCHORED_PIPELINE)
+    initial_sha = _git_head(git_repo)
+    notes_store.apply_validation(guide["id"], git_sha=initial_sha, new_pipeline=None)
+
+    (git_repo / "sessions.py").write_text("def foo():\n    pass  # cosmetic\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "cosmetic")
+    new_sha = _git_head(git_repo)
+
+    _queue_responses(
+        pipeline,
+        monkeypatch,
+        [_FakeProc(_envelope(json.dumps({"abstract": "corrected abstract", "unchanged": True})))],
+    )
+
+    result = await pipeline.revalidate_note(guide["id"])
+    assert result["pipeline"] == _GUIDE_ANCHORED_PIPELINE  # unchanged -> discarded
+    assert result["validated_git_sha"] == new_sha
+    assert result["history"] == []
+
+
+async def test_revalidate_note_study_guide_uses_higher_anchor_cap(
+    notes_store, pipeline, monkeypatch
+):
+    """Guides get _MAX_ANCHOR_FILES_GUIDE (15), not the note cap (5)."""
+    guide = notes_store.add_study_guide("# Widgets\n\nbody", repo="testrepo")
+    notes_store.set_study_guide_pipeline(guide["id"], _GUIDE_ANCHORED_PIPELINE)
+
+    seen_caps: list[int] = []
+
+    def fake_resolve_anchor_files(repo_root, entities, cap):
+        seen_caps.append(cap)
+        return []
+
+    async def fake_current_git_sha(repo_root):
+        return "deadbeef"
+
+    monkeypatch.setattr(pipeline, "_repo_root", lambda repo: "/fake/repo")
+    monkeypatch.setattr(pipeline, "_current_git_sha", fake_current_git_sha)
+    monkeypatch.setattr(pipeline, "_resolve_anchor_files", fake_resolve_anchor_files)
+    _queue_responses(
+        pipeline,
+        monkeypatch,
+        [_FakeProc(_envelope(json.dumps({"abstract": "x", "unchanged": True})))],
+    )
+
+    await pipeline.revalidate_note(guide["id"])
+
+    assert seen_caps == [pipeline._MAX_ANCHOR_FILES_GUIDE]
+
+
+# ---------------------------------------------------------------------------
 # answer_question (Phase 2c — the ask-layer capstone)
 #
 # search_notes_async + revalidate_note are mocked directly here — the real
@@ -1139,9 +1257,25 @@ def test_parse_toc_ignores_trailing_closing_hashes(pipeline):
     assert toc == [{"title": "My Heading", "anchor": "my-heading", "level": 2}]
 
 
+def _stub_organize_after_structuring(monkeypatch):
+    """Grimoire Phase 2's post-structuring organize hook is a SEPARATE
+    concern (tested in its own right in test_notebook_organizer.py) — stub
+    it to a no-op here so tests of the structuring pipeline itself don't
+    also need to queue/mock an organize-pass LLM call."""
+    from khimaira.monitor import notebook_organizer
+
+    async def fake_organize_after_structuring(note_id):
+        return None
+
+    monkeypatch.setattr(
+        notebook_organizer, "organize_after_structuring", fake_organize_after_structuring
+    )
+
+
 async def test_trigger_study_guide_pipeline_success_never_touches_raw_text(
     pipeline, notes_store, monkeypatch
 ):
+    _stub_organize_after_structuring(monkeypatch)
     guide = notes_store.add_study_guide("# Widgets\n\n## Overview\n\nAll about widgets.")
     _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_GUIDE_PAYLOAD)))])
 
@@ -1182,6 +1316,59 @@ async def test_trigger_study_guide_pipeline_failure_marks_failed(
     assert updated["status"] == "failed"
     assert updated["raw_text"] == "# Widgets\n\nbody"
     assert updated["pipeline"] is None
+
+
+async def test_trigger_study_guide_pipeline_calls_organize_after_structuring(
+    pipeline, notes_store, monkeypatch
+):
+    """Grimoire Phase 2: a successful structuring pass fires the organizer's
+    post-structuring hook (notebook_organizer.organize_after_structuring),
+    scoped to exactly the guide that just finished — the placement logic
+    itself is exercised in test_notebook_organizer.py, not here."""
+    from khimaira.monitor import notebook_organizer
+
+    guide = notes_store.add_study_guide("# Widgets\n\nbody")
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_GUIDE_PAYLOAD)))])
+    calls: list[str] = []
+
+    async def fake_organize_after_structuring(note_id):
+        calls.append(note_id)
+
+    monkeypatch.setattr(
+        notebook_organizer, "organize_after_structuring", fake_organize_after_structuring
+    )
+
+    await pipeline.trigger_study_guide_pipeline(guide["id"])
+
+    assert calls == [guide["id"]]
+
+
+async def test_trigger_study_guide_pipeline_organize_failure_does_not_break_structuring(
+    pipeline, notes_store, monkeypatch
+):
+    """organize_after_structuring already fails open internally (see its own
+    docstring/tests) — this confirms trigger_study_guide_pipeline doesn't
+    ALSO need its own guard: even if the hook somehow raised, the guide's
+    structuring result (already written before the hook runs) must stand."""
+    from khimaira.monitor import notebook_organizer
+
+    guide = notes_store.add_study_guide("# Widgets\n\nbody")
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(_GUIDE_PAYLOAD)))])
+
+    async def raising_organize_after_structuring(note_id):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        notebook_organizer, "organize_after_structuring", raising_organize_after_structuring
+    )
+
+    with pytest.raises(RuntimeError):
+        await pipeline.trigger_study_guide_pipeline(guide["id"])
+
+    # The structuring write already landed before the hook ran.
+    updated = notes_store.get_note(guide["id"])
+    assert updated["status"] == "processed"
+    assert updated["pipeline"]["abstract"] == "a guide about widgets"
 
 
 async def test_schedule_pipeline_dispatches_study_guide_to_the_guide_pipeline(

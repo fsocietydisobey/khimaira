@@ -66,6 +66,34 @@ def test_qualify_only_matches_markdown_files(importer, tmp_path):
     assert importer.qualify(directory) is False
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "CHANGELOG.md",
+        "changelog.md",
+        "README.md",
+        "readme.markdown",
+        "STANDUP_NOTES.md",
+        "standup-notes.md",
+        "TODO.md",
+        "todo.md",
+    ],
+)
+def test_qualify_excludes_known_housekeeping_filenames(importer, tmp_path, filename):
+    path = tmp_path / filename
+    path.write_text("not a guide")
+    assert importer.qualify(path) is False
+
+
+def test_qualify_still_matches_a_real_guide_named_similarly(importer, tmp_path):
+    """A guide whose title happens to contain one of the excluded words
+    (but isn't a bare housekeeping filename) must still qualify — the
+    exclusion is a STEM match, not a substring match."""
+    path = tmp_path / "readme-driven-development.md"
+    path.write_text("# Readme-Driven Development\n\nA real guide.\n")
+    assert importer.qualify(path) is True
+
+
 def test_derive_title_prefers_first_heading(importer, tmp_path):
     path = tmp_path / "x.md"
     assert importer._derive_title(path, "# Real Title\n\nbody") == "Real Title"

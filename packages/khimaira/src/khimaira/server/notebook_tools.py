@@ -349,6 +349,50 @@ async def notebook_create(
     )
 
 
+async def notebook_create_study_guide(
+    project: str = "",
+    raw_text: str = "",
+    title: str = "",
+    collection: str = "",
+) -> str:
+    """Author a NEW study guide directly into the grimoire — the roster's
+    write-IN path for a finished, long-form deliverable (as opposed to
+    `notebook_create`, which captures an unstructured working note).
+
+    Unlike a regular note, a study guide's raw_text is NEVER LLM-rewritten —
+    only a library-card abstract/TOC/tags are derived from it. Reach for this
+    once you've finished a topic explainer or an IMPLEMENTATION.md-shaped
+    deliverable and want it housed, searchable, and organized alongside the
+    rest of the grimoire.
+
+    `project` is the repo the guide is validated against ("khimaira",
+    "jeevy_portal", ...) — pass it EXPLICITLY. `collection` names the
+    collection (folder) to file it under — an existing name reuses that
+    collection, a new one creates it; omit it to let the organizer place the
+    guide automatically once it's cataloged (a few seconds later, not
+    instant — pass `collection` when you already know where it belongs).
+    """
+    if not raw_text.strip():
+        return "❌ notebook_create_study_guide requires non-empty raw_text — the guide's body."
+    body: dict[str, Any] = {"raw_text": raw_text, "kind": "study_guide"}
+    if title:
+        body["title"] = title
+    if project:
+        body["repo"] = project
+    if collection:
+        body["collection"] = collection
+    data = _post("/api/notes", body)
+    if isinstance(data, str):
+        return data
+    return (
+        f"📚 authored `{data['id']}` — **{data.get('title', '?')}** "
+        f"[{data.get('status', 'draft')}]  repo={data.get('repo', '?')}"
+        + (f"  collection={collection!r}" if collection else "  (auto-organizing)")
+        + ". Cataloging (abstract/TOC/tags) running async — "
+        "read it back with `notebook_get(note_id)` shortly."
+    )
+
+
 async def notebook_delete(note_id: str) -> str:
     """Delete a note permanently. DESTRUCTIVE — the note file is removed (a
     deleted-tombstone remains in the index, but the content is gone; the

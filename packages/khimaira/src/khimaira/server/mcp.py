@@ -2965,6 +2965,36 @@ async def notebook_create(
 
 
 @mcp.tool()
+@logged_tool("notebook_create_study_guide")
+async def notebook_create_study_guide(
+    project: str = "",
+    raw_text: str = "",
+    title: str = "",
+    collection: str = "",
+) -> str:
+    """Author a NEW study guide directly into the grimoire — the roster's
+    write-IN path for a finished, long-form deliverable (as opposed to
+    `notebook_create`, which captures an unstructured working note).
+
+    Unlike a regular note, a study guide's raw_text is NEVER LLM-rewritten —
+    only a library-card abstract/TOC/tags are derived from it. Reach for this
+    once you've finished a topic explainer or an IMPLEMENTATION.md-shaped
+    deliverable and want it housed, searchable, and organized alongside the
+    rest of the grimoire.
+
+    Args:
+        project: repo the guide is validated against ("khimaira",
+            "jeevy_portal", ...). Pass it EXPLICITLY.
+        raw_text: the guide's full markdown body (required).
+        title: optional title; falls back to the guide's first heading.
+        collection: optional collection (folder) name — an existing name
+            reuses that collection, a new one creates it; omit it to let
+            the organizer place the guide automatically a few seconds later.
+    """
+    return await _notebook_tools.notebook_create_study_guide(project, raw_text, title, collection)
+
+
+@mcp.tool()
 @logged_tool("notebook_revalidate")
 async def notebook_revalidate(note_id: str) -> str:
     """Re-ground a note against the current code and re-run its structuring

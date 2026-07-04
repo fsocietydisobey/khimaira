@@ -27,12 +27,36 @@ log = get_logger("monitor.notebook_import")
 _GUIDE_EXTENSIONS = (".md", ".markdown")
 _MAX_TITLE_SCAN_LINES = 20
 
+# Grimoire Phase 2, master's spec: tighten qualify() so the real import is
+# guides-only (~130-150 files), not every markdown file the Phase 1 naive
+# sweep picked up (251). Known non-guide housekeeping filenames — stem match,
+# case-insensitive, hyphen/space/underscore normalized.
+_EXCLUDED_STEMS = frozenset({"changelog", "readme", "standup_notes", "todo"})
+
+
+def _normalized_stem(path: Path) -> str:
+    return path.stem.strip().lower().replace("-", "_").replace(" ", "_")
+
 
 def qualify(path: Path) -> bool:
     """Does this file look like an importable study guide? Markdown files
-    only. Directory-vs-file filtering (skip dotfiles/hidden dirs) is the
-    caller's glob's job, not this predicate's."""
-    return path.is_file() and path.suffix.lower() in _GUIDE_EXTENSIONS
+    only, excluding known non-guide housekeeping filenames (CHANGELOG/
+    README/STANDUP_NOTES/TODO). Directory-vs-file filtering (skip dotfiles/
+    hidden dirs) is the caller's glob's job, not this predicate's.
+
+    Deliberately does NOT try to detect "per-person single-file dirs" (the
+    other noise category master flagged, e.g. a lone person-scratch file
+    sitting alone in its own directory) — guessing at that shape blind,
+    without having seen the real ~/work/jeevy_portal/shared-docs corpus,
+    risks silently EXCLUDING a real guide from the dry-run manifest, which
+    nobody would notice (over-inclusion is the recoverable direction — a
+    human catches it reviewing the manifest before approving the real
+    import). Flagged back to master rather than guessed at; needs the actual
+    dry-run output reviewed to build a correct rule.
+    """
+    if not path.is_file() or path.suffix.lower() not in _GUIDE_EXTENSIONS:
+        return False
+    return _normalized_stem(path) not in _EXCLUDED_STEMS
 
 
 def derive_collection(path: Path, root: Path) -> str:

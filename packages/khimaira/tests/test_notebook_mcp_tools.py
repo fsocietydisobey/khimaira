@@ -402,6 +402,59 @@ def test_notebook_create_error_passthrough():
 
 
 # ---------------------------------------------------------------------------
+# notebook_create_study_guide (Grimoire Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def test_notebook_create_study_guide_happy_path_returns_id():
+    payload = _note(id="guide-1", title="Widgets", status="draft", kind="study_guide")
+    with patch.object(nt, "_post", return_value=payload) as mock_post:
+        out = _run(
+            nt.notebook_create_study_guide(project="jeevy_portal", raw_text="# Widgets\n\nbody")
+        )
+    assert "authored" in out.lower()
+    assert "guide-1" in out
+    assert mock_post.call_args[0][0] == "/api/notes"
+    assert mock_post.call_args[0][1] == {
+        "raw_text": "# Widgets\n\nbody",
+        "kind": "study_guide",
+        "repo": "jeevy_portal",
+    }
+
+
+def test_notebook_create_study_guide_all_fields_reach_body():
+    with patch.object(nt, "_post", return_value=_note(id="g", kind="study_guide")) as mock_post:
+        _run(
+            nt.notebook_create_study_guide(
+                project="khimaira",
+                raw_text="# T\n\nbody",
+                title="T",
+                collection="Onboarding",
+            )
+        )
+    assert mock_post.call_args[0][1] == {
+        "raw_text": "# T\n\nbody",
+        "kind": "study_guide",
+        "title": "T",
+        "repo": "khimaira",
+        "collection": "Onboarding",
+    }
+
+
+def test_notebook_create_study_guide_rejects_empty_raw_text():
+    with patch.object(nt, "_post") as mock_post:
+        out = _run(nt.notebook_create_study_guide(project="khimaira", raw_text="   "))
+    assert "❌" in out
+    mock_post.assert_not_called()
+
+
+def test_notebook_create_study_guide_error_passthrough():
+    with patch.object(nt, "_post", return_value="khimaira-monitor → HTTP 500: boom"):
+        out = _run(nt.notebook_create_study_guide(project="khimaira", raw_text="# T\n\nbody"))
+    assert "HTTP 500" in out
+
+
+# ---------------------------------------------------------------------------
 # notebook_delete
 # ---------------------------------------------------------------------------
 

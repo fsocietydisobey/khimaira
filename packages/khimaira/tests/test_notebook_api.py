@@ -78,6 +78,48 @@ def test_create_note_study_guide_kind(notebook_client):
     assert body["repo"] == "jeevy_portal"
 
 
+def test_create_note_study_guide_collection_resolves_to_tab(notebook_client):
+    """Grimoire Phase 2: `collection` is a friendly get-or-create name (the
+    MCP client has no in-process access to notes.get_or_create_collection),
+    resolved to a tab_id server-side."""
+    r = notebook_client.post(
+        "/api/notes",
+        json={"raw_text": "# Guide\n\nBody.", "kind": "study_guide", "collection": "Onboarding"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+
+    tabs = notebook_client.get("/api/tabs").json()["tabs"]
+    onboarding = next(t for t in tabs if t["title"] == "Onboarding")
+    assert onboarding["kind"] == "collection"
+    assert body["tab_id"] == onboarding["id"]
+
+
+def test_create_note_study_guide_collection_reuses_existing(notebook_client):
+    first = notebook_client.post(
+        "/api/notes",
+        json={
+            "raw_text": "# Guide One\n\nBody.",
+            "kind": "study_guide",
+            "collection": "Onboarding",
+        },
+    ).json()
+    second = notebook_client.post(
+        "/api/notes",
+        json={
+            "raw_text": "# Guide Two\n\nBody.",
+            "kind": "study_guide",
+            "collection": "onboarding",
+        },
+    ).json()
+
+    assert first["tab_id"] == second["tab_id"]
+    collections = [
+        t for t in notebook_client.get("/api/tabs").json()["tabs"] if t["kind"] == "collection"
+    ]
+    assert len(collections) == 1
+
+
 def test_list_notes_kind_filter_route(notebook_client):
     notebook_client.post("/api/notes", json={"raw_text": "a note"})
     notebook_client.post(

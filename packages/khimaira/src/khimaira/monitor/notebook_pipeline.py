@@ -447,6 +447,16 @@ async def trigger_study_guide_pipeline(note_id: str) -> None:
 
     await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
 
+    # Grimoire Phase 2: give the guide an LLM-judged collection placement
+    # right after abstract/tags land (deterministic-only Phase 1 assign has
+    # nothing to work with for a guide authored directly, with no source
+    # path). Local import — notebook_organizer imports this module at
+    # function scope too (organize_library needs transform_note), so a
+    # module-level import here would be circular.
+    from khimaira.monitor import notebook_organizer
+
+    await notebook_organizer.organize_after_structuring(note_id)
+
 
 def schedule_pipeline(note_id: str) -> None:
     """Sync entry point for the POST /notes route — fires the right
@@ -491,6 +501,11 @@ _ANCHOR_EXTENSIONS = (
     ".toml",
 )
 _MAX_ANCHOR_FILES = 5
+# Study guides are longer, more code-grounded deliverables than a pasted
+# note — they typically reference more distinct files, so a guide's
+# currency check gets a higher anchor cap than a regular note's (Grimoire
+# Phase 2, master's spec: "raise anchor caps for guides").
+_MAX_ANCHOR_FILES_GUIDE = 15
 _MAX_ANCHOR_FILE_CHARS = 20_000  # per-file cap fed into the revalidation prompt
 
 _REVALIDATE_INSTRUCTION_TEMPLATE = (
@@ -597,6 +612,60 @@ async def _anchor_files_changed(repo_root: Path, since_sha: str, anchor_files: l
     return bool(changed & anchor_rel)
 
 
+_GUIDE_DRIFT_INSTRUCTION_TEMPLATE = (
+    "You are checking whether a study guide's library-card ABSTRACT is still "
+    "accurate given the CURRENT source code below. The user message contains "
+    "the guide's EXISTING ABSTRACT as plain text. Output a JSON object with "
+    "keys `abstract` (string) and `unchanged` (boolean). Set unchanged=true "
+    "if the existing abstract is still accurate (echo it back in `abstract` "
+    "— it will be discarded either way when unchanged). Set unchanged=false "
+    "and provide a CORRECTED abstract if the guide's described content has "
+    "drifted from what the current code actually does. You are NOT "
+    "rewriting the guide itself, and you are NOT checking its table of "
+    "contents or tags — only its library-card abstract. Output ONLY the "
+    "JSON object, no prose, no markdown fence.\n\nCURRENT CODE:\n{code}"
+)
+
+
+class GuideDriftOutput(BaseModel):
+    abstract: str
+    unchanged: bool
+
+
+async def _revalidate_guide_drift(
+    note_id: str, pipeline: dict[str, Any] | None, code_blob: str, current_sha: str
+) -> dict[str, Any]:
+    """Guide currency = a DRIFT REPORT, not a heal-and-overwrite (Grimoire
+    Phase 2, the load-bearing invariant carried into revalidation): only
+    `abstract` is ever regenerated. `toc` is a deterministic heading parse
+    that doesn't need re-derivation (raw_text never changes here), and
+    `title` is never LLM-touched for guides (see add_study_guide) — so
+    neither is passed to apply_validation. This is a SEPARATE concern from
+    notebook_organizer's collection placement.
+    """
+    instruction = _GUIDE_DRIFT_INSTRUCTION_TEMPLATE.format(code=code_blob)
+    content = (pipeline or {}).get("abstract", "")
+    result = await transform_note(content, instruction=instruction, schema=GuideDriftOutput)
+
+    if result is None:
+        log.warning(
+            "notebook_pipeline: guide drift-check for %s failed to parse after retry; "
+            "leaving record unchanged",
+            note_id,
+        )
+        return notes.get_note(note_id)
+
+    unchanged = result["unchanged"]
+    new_pipeline = None
+    if not unchanged:
+        new_pipeline = dict(pipeline or {})
+        new_pipeline["abstract"] = result["abstract"]
+    updated = notes.apply_validation(note_id, git_sha=current_sha, new_pipeline=new_pipeline)
+    if new_pipeline is not None:
+        await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
+    return updated
+
+
 async def revalidate_note(note_id: str) -> dict[str, Any]:
     """Re-ground a note against its repo's current code (the north-star core).
 
@@ -607,6 +676,11 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
     accurate vs current code?" If the model's answer differs from the
     existing pipeline, that's a HEAL: the old pipeline is pushed to history
     before the new one lands.
+
+    Study guides (kind="study_guide") branch to `_revalidate_guide_drift`
+    after the shared staleness gate + anchor-file resolution — a guide's
+    currency check is a DRIFT REPORT on its abstract only, never a full
+    pipeline regeneration (see that function's docstring).
 
     Fails open on anything that isn't the note itself: unresolvable repo, not
     a git checkout, or an LLM parse failure all leave the record untouched
@@ -641,9 +715,11 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
         )
         return record
 
+    is_guide = record.get("kind") == "study_guide"
     pipeline = record.get("pipeline")
     entities = (pipeline or {}).get("entities", [])
-    anchor_files = _resolve_anchor_files(repo_root, entities)
+    anchor_cap = _MAX_ANCHOR_FILES_GUIDE if is_guide else _MAX_ANCHOR_FILES
+    anchor_files = _resolve_anchor_files(repo_root, entities, cap=anchor_cap)
 
     prior_sha = record.get("validated_git_sha")
     if prior_sha and record.get("last_validated_at"):
@@ -659,6 +735,9 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
         except OSError:
             continue
     code_blob = "\n\n---\n\n".join(code_sections) if code_sections else "(no anchor files resolved)"
+
+    if is_guide:
+        return await _revalidate_guide_drift(note_id, pipeline, code_blob, current_sha)
 
     instruction = _REVALIDATE_INSTRUCTION_TEMPLATE.format(code=code_blob)
     result = await transform_note(

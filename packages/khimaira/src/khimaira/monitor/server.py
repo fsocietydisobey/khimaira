@@ -188,6 +188,15 @@ def build_app():
                 "notebook: seeded the Personal/Behavior folder with default voice/structure rules"
             )
 
+    # Grimoire Phase 2: periodic LLM organize sweep — self-corrects study
+    # guide collection placement drift across the whole library. Disable via
+    # KHIMAIRA_NOTEBOOK_ORGANIZE_SWEEP=0.
+    @app.on_event("startup")
+    async def _start_notebook_organize_sweep() -> None:
+        from . import notebook_organizer
+
+        _spawn(notebook_organizer.organize_sweep_loop())
+
     # SSE delivery cursor persistence — load cursors from disk at startup
     # so reconnecting subscribers resume from their last yielded position.
     @app.on_event("startup")
