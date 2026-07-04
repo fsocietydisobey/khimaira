@@ -116,6 +116,13 @@ export interface Note {
   /** What was masked in the redacted twin — null for non-sensitive notes.
    *  NEVER contains the actual secret value. */
   redactions: NoteRedaction[] | null;
+  /** File-manager (2026-07-04): a manual drag-move sets `tab_id` AND this
+   *  together — `organize_library` skips pinned notes, so a manual placement
+   *  survives every future auto-organize sweep (and re-import). Default
+   *  false. */
+  pinned_placement: boolean;
+  /** File-manager: the Starred rail. Default false. */
+  starred: boolean;
 }
 
 /** Discriminates a plain note-folder from a study-guide collection so the
@@ -129,6 +136,9 @@ export interface NotebookTab {
   created_at: string;
   updated_at: string;
   kind?: NotebookTabKind;
+  /** File-manager (2026-07-04): adjacency-list nesting — null is root level.
+   *  Pre-migration tabs read as null via the backend's setdefault. */
+  parent_id: string | null;
   /** Note ids grouped by tab_id — derived at read time, not stored redundantly. */
   note_ids: string[];
 }

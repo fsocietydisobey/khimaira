@@ -5,6 +5,7 @@ import type {
   CodeSource,
   Note,
   NotebookTab,
+  NotebookTabKind,
   NoteKind,
   NotePriority,
   NoteStatus,
@@ -290,6 +291,8 @@ export const monitorApi = createApi({
           kind?: NoteKind;
           priority?: NotePriority;
           sort?: string;
+          /** File-manager Starred rail. */
+          starred?: boolean;
         }
       | void
     >({
@@ -300,6 +303,7 @@ export const monitorApi = createApi({
         if (arg?.kind) params.set("kind", arg.kind);
         if (arg?.priority) params.set("priority", arg.priority);
         if (arg?.sort) params.set("sort", arg.sort);
+        if (arg?.starred) params.set("starred", "true");
         const qs = params.toString();
         return qs ? `/notes?${qs}` : "/notes";
       },
@@ -335,6 +339,11 @@ export const monitorApi = createApi({
          *  `llm_text` twin at write time; every LLM egress path routes
          *  through it, `raw_text` stays the real, human-readable text. */
         sensitive?: boolean;
+        /** Default "note" server-side — pass "study_guide" for a manually-
+         *  authored guide (FILE-MANAGER "+ New guide"); the backend routes
+         *  to the guide pipeline (abstract/tags/entities only, raw_text
+         *  never re-expressed) instead of the note structuring pipeline. */
+        kind?: NoteKind;
       }
     >({
       query: (body) => ({ url: "/notes", method: "POST", body }),
@@ -353,6 +362,10 @@ export const monitorApi = createApi({
         raw_text?: string;
         /** Grimoire — user-set importance, independent of `status`. */
         priority?: NotePriority;
+        /** File-manager — a manual drag-move sends `tab_id` + this together. */
+        pinned_placement?: boolean;
+        /** File-manager — the Starred rail toggle. */
+        starred?: boolean;
       }
     >({
       query: ({ id, ...body }) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "PATCH", body }),
@@ -448,13 +461,35 @@ export const monitorApi = createApi({
             ]
           : [{ type: "Tabs" as const, id: "LIST" }],
     }),
-    createTab: build.mutation<NotebookTab, { title?: string }>({
+    createTab: build.mutation<
+      NotebookTab,
+      { title?: string; kind?: NotebookTabKind; parent_id?: string | null }
+    >({
       query: (body) => ({ url: "/tabs", method: "POST", body }),
       invalidatesTags: [{ type: "Tabs", id: "LIST" }],
     }),
-    updateTab: build.mutation<NotebookTab, { id: string; title: string }>({
+    // File-manager (2026-07-04): `parent_id` reparents (undefined = don't
+    // touch, null = move to root — the backend distinguishes via
+    // exclude_unset, so never send `parent_id: undefined` as a literal key).
+    // 422 (cycle / cross-kind-nesting / sibling-name collision) surfaces as
+    // `err.data.detail` on the rejected `.unwrap()` promise — callers must
+    // catch and show it, RTK Query won't do that for you.
+    updateTab: build.mutation<
+      NotebookTab,
+      { id: string; title?: string; kind?: NotebookTabKind; parent_id?: string | null }
+    >({
       query: ({ id, ...body }) => ({ url: `/tabs/${encodeURIComponent(id)}`, method: "PATCH", body }),
-      invalidatesTags: (_r, _e, { id }) => [{ type: "Tabs", id }, { type: "Tabs", id: "LIST" }],
+      invalidatesTags: (_r, _e, { id }) => [
+        { type: "Tabs", id },
+        { type: "Tabs", id: "LIST" },
+        { type: "Notes", id: "LIST" },
+      ],
+    }),
+    // Re-files child tabs + direct member notes server-side (never loses a
+    // guide) — invalidate both Tabs and Notes lists, not just Tabs.
+    deleteTab: build.mutation<{ id: string; deleted: boolean }, string>({
+      query: (id) => ({ url: `/tabs/${encodeURIComponent(id)}`, method: "DELETE" }),
+      invalidatesTags: [{ type: "Tabs", id: "LIST" }, { type: "Notes", id: "LIST" }],
     }),
   }),
 });
@@ -484,4 +519,5 @@ export const {
   useListTabsQuery,
   useCreateTabMutation,
   useUpdateTabMutation,
+  useDeleteTabMutation,
 } = monitorApi;

@@ -21,7 +21,7 @@
  */
 
 import { skipToken } from "@reduxjs/toolkit/query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import {
   BookMarked,
@@ -29,9 +29,14 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  Folder,
+  Grid3x3,
   LayoutGrid,
+  List,
   Plus,
   RefreshCw,
+  Search,
+  Star,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -49,12 +54,21 @@ import {
   useUpdateNoteMutation,
 } from "@/api";
 import { ChatBody, ChatHeaderControls, useNotebookChat, useRecordChat } from "@/components/notebook/ChatPanel";
+import {
+  DRAG_MIME,
+  FileManagerSidebar,
+  filterRecordsByRail,
+  filterRecordsByTags,
+  type Rail,
+  TagFilterInput,
+} from "@/components/notebook/FileManagerSidebar";
 import { IdChip } from "@/components/notebook/IdChip";
 import { Library } from "@/components/notebook/LibraryView";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
 import {
   isStudyGuidePipeline,
   type Note,
+  type NotebookTab,
   type NotePriority,
 } from "@/components/notebook/notebookTypes";
 import { PrioritySelector } from "@/components/notebook/PrioritySelector";
@@ -66,7 +80,6 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
 const ALL_TABS = "__all__";
-const GRID_LEFT_WIDTH = 240;
 const CHAT_WIDTH = 380;
 /** Mirrors notes.GENERAL_REPO — a repo value meaning "no codebase", for
  *  cross-cutting notes. Always in scope alongside whichever project the
@@ -78,7 +91,10 @@ const GENERAL_REPO = "general";
  *  call (structuring, revalidation, ask-synthesis). */
 const PERSONAL_TAB_ID = "personal";
 
-type ViewMode = "grid" | "reader";
+// Grid (Joseph, 2026-07-04): folded into Files' "all folders" default —
+// the full-corpus card triage view IS Files' landing state now, not a
+// separate mode. Two modes only: Files (browse) + Reader (focus).
+type ViewMode = "files" | "reader";
 
 /** Grimoire (Phase 1f): top-level note⇄guide switch, independent of ViewMode
  *  (which only applies within "notes"). "library" mounts <Library /> in place
@@ -264,7 +280,7 @@ export function SidePanelShell({
 
 function ViewModeToggle({ mode, onChange }: { mode: ViewMode; onChange: (m: ViewMode) => void }) {
   const options: { key: ViewMode; label: string; Icon: typeof LayoutGrid }[] = [
-    { key: "grid", label: "grid", Icon: LayoutGrid },
+    { key: "files", label: "files", Icon: Folder },
     { key: "reader", label: "reader", Icon: BookOpen },
   ];
   return (
@@ -294,16 +310,18 @@ export function Notebook() {
   const projectName = name ?? "";
 
   const [section, setSection] = useState<NotebookSection>("notes");
-  const [viewMode, setViewMode] = useState<ViewMode>("grid");
+  const [viewMode, setViewMode] = useState<ViewMode>("files");
   const [selectedTab, setSelectedTab] = useState<string>(ALL_TABS);
-  const [priorityFilter, setPriorityFilter] = useState<NotePriority | "">("");
-  const [showAddNote, setShowAddNote] = useState(false);
-  const [draft, setDraft] = useState("");
-  const [draftSensitive, setDraftSensitive] = useState(false);
-  const [showAddPersonalNote, setShowAddPersonalNote] = useState(false);
-  const [personalDraft, setPersonalDraft] = useState("");
+  // Files mode (2026-07-04 FM) is a THIRD, independent lens — its own
+  // folder-drill-down state, never scoping Grid's "everything" default
+  // (Joseph: Grid is the triage/scan-all view, Files is organize-by-folder).
+  const [rail, setRail] = useState<Rail>({ kind: "tab", tabId: null });
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [creatingTab, setCreatingTab] = useState(false);
   const [newTabTitle, setNewTabTitle] = useState("");
+  const [priorityFilter, setPriorityFilter] = useState<NotePriority | "">("");
+  const [showAddPersonalNote, setShowAddPersonalNote] = useState(false);
+  const [personalDraft, setPersonalDraft] = useState("");
   const [centerView, setCenterView] = useState<CenterView>(null);
   const [originalRawMode, setOriginalRawMode] = useState(false);
 
@@ -330,6 +348,14 @@ export function Notebook() {
     },
     { pollingInterval: 3000 },
   );
+  // Files mode (2026-07-04 FM) — a genuinely separate query: it does its own
+  // folder drill-down + rail filtering over the FULL repo-scoped set, so it
+  // must NOT be narrowed by Grid/Reader's selectedTab or priorityFilter.
+  // skipToken when Files isn't the active mode — no wasted fetch.
+  const { data: filesNotesData, isLoading: filesNotesLoading } = useListNotesQuery(
+    viewMode === "files" ? { repo: repoScope } : skipToken,
+    { pollingInterval: 5000 },
+  );
   // Personal/Behavior folder — independent of the tab filter / repo scope
   // above; always the same notes regardless of what the regular list is
   // scoped to.
@@ -346,6 +372,9 @@ export function Notebook() {
   const [revalidateNote, { isLoading: revalidating }] = useRevalidateNoteMutation();
 
   const tabs = tabsData?.tabs ?? [];
+  // Folders are notes' tab namespace (guide collections live in the
+  // Library) — kind-scoped so the two never intermix in the FM tree.
+  const folders = tabs.filter((t) => t.kind !== "collection");
   // Personal/Behavior notes are a distinct section (below) — never mixed
   // into the regular list/grid/reader/@-mention flow, matching the backend
   // excluding them from embedding + ask retrieval. Study guides are a
@@ -355,6 +384,11 @@ export function Notebook() {
     (n) => n.tab_id !== PERSONAL_TAB_ID,
   );
   const notes = notesExcludingPersonal.filter((n) => n.kind !== "study_guide");
+  // Files-mode's own record set — same personal/guide exclusions, sourced
+  // from the unscoped query above.
+  const filesNotes = (filesNotesData?.notes ?? []).filter(
+    (n) => n.tab_id !== PERSONAL_TAB_ID && n.kind !== "study_guide",
+  );
   // Guides ARE askable/@-mentionable (unlike personal notes) — only excluded
   // from the browsing grid/list above, per void-null's settled contract.
   const mentionableNotes = notesExcludingPersonal;
@@ -386,22 +420,22 @@ export function Notebook() {
   const handleChangeRepo = (noteId: string, repo: string) => updateNote({ id: noteId, repo });
   const handleChangePriority = (noteId: string, priority: NotePriority) =>
     updateNote({ id: noteId, priority });
+  const handleToggleStarred = (noteId: string, starred: boolean) => updateNote({ id: noteId, starred });
 
-  const handleAddNote = async () => {
-    const text = draft.trim();
-    if (!text) return;
+  // Shared by the Reader-mode capture box (defaults to the flat selectedTab
+  // filter) AND Files mode (defaults to whatever folder the rail is
+  // currently scoped to) — see NoteCaptureBox below. `tabId` undefined =
+  // no folder (root/uncategorized).
+  const handleAddNote = async (rawText: string, sensitive: boolean, tabId?: string) => {
     await createNote({
-      raw_text: text,
-      tab_id: selectedTab === ALL_TABS ? undefined : selectedTab,
+      raw_text: rawText,
+      tab_id: tabId,
       // Quick-win default (Joseph, 2026-07-03): scope new notes to the
       // project they were pasted under, instead of the backend's hardcoded
       // "khimaira" fallback — a full repo-set/change UI is a separate spec.
       repo: projectName || undefined,
-      sensitive: draftSensitive,
+      sensitive,
     }).unwrap();
-    setDraft("");
-    setDraftSensitive(false);
-    setShowAddNote(false);
   };
 
   const handleAddPersonalNote = async () => {
@@ -424,6 +458,22 @@ export function Notebook() {
     setSelectedTab(created.id);
   };
 
+  // Files mode only — multi-select + drag-move-pin over the unscoped
+  // filesNotes set (Grid/Reader's selectedTab-scoped notes never touch this).
+  const clearNoteSelection = () => setSelected(new Set());
+  const moveNotesToTab = async (noteIds: string[], targetTabId: string) => {
+    await Promise.all(
+      noteIds.map((id) =>
+        updateNote({ id, tab_id: targetTabId, pinned_placement: true })
+          .unwrap()
+          .catch(() => {
+            /* one note failing to move shouldn't block the others */
+          }),
+      ),
+    );
+    clearNoteSelection();
+  };
+
   const notesListPanel = (
     <NotesListPanel
       tabs={tabs}
@@ -435,14 +485,10 @@ export function Notebook() {
       onPriorityFilterChange={setPriorityFilter}
       selectedNoteId={viewMode === "reader" && centerView?.kind === "note" ? centerView.noteId : null}
       onSelectNote={handleSelectNote}
-      showAddNote={showAddNote}
-      onToggleAddNote={() => setShowAddNote((v) => !v)}
-      draft={draft}
-      onDraftChange={setDraft}
-      draftSensitive={draftSensitive}
-      onDraftSensitiveChange={setDraftSensitive}
       creatingNote={creatingNote}
-      onAddNote={handleAddNote}
+      onAddNote={(text, sensitive) =>
+        handleAddNote(text, sensitive, selectedTab === ALL_TABS ? undefined : selectedTab)
+      }
       creatingTab={creatingTab}
       onStartCreateTab={() => setCreatingTab(true)}
       newTabTitle={newTabTitle}
@@ -496,41 +542,33 @@ export function Notebook() {
 
       {section === "library" ? (
         <Library />
-      ) : viewMode === "grid" ? (
-        <div className="flex flex-1 overflow-hidden">
-          <SidePanelShell
-            side="left"
-            label="notes"
-            width={GRID_LEFT_WIDTH}
-            collapsed={leftCollapsed}
-            onToggleCollapsed={() => setLeftCollapsed(!leftCollapsed)}
-            resizable={false}
-          >
-            {notesListWithPersonal}
-          </SidePanelShell>
-          <GridView
-            notes={notes}
-            notesLoading={notesLoading}
-            selectedTab={selectedTab}
-            onOpenNote={handleSelectNote}
-            onPromote={(id) => promoteNote(id)}
-            onDelete={(id) => deleteNote(id)}
-            repoOptions={repoOptions}
-            onChangeRepo={handleChangeRepo}
-            onChangePriority={handleChangePriority}
-          />
-          <SidePanelShell
-            side="right"
-            label="chat"
-            width={CHAT_WIDTH}
-            collapsed={chatCollapsed}
-            onToggleCollapsed={() => setChatCollapsed(!chatCollapsed)}
-            resizable={false}
-            extraHeader={<ChatHeaderControls state={activeChat} />}
-          >
-            <ChatBody state={activeChat} mode={chatMode} notes={mentionableNotes} />
-          </SidePanelShell>
-        </div>
+      ) : viewMode === "files" ? (
+        <NotesFileManager
+          folders={folders}
+          notes={filesNotes}
+          isLoading={filesNotesLoading}
+          rail={rail}
+          onRailChange={setRail}
+          selected={selected}
+          onToggleSelect={(id) =>
+            setSelected((prev) => {
+              const next = new Set(prev);
+              if (next.has(id)) next.delete(id);
+              else next.add(id);
+              return next;
+            })
+          }
+          onClearSelect={clearNoteSelection}
+          onMoveToTab={(ids, tabId) => void moveNotesToTab(ids, tabId)}
+          onOpenNote={handleSelectNote}
+          onPromote={(id) => promoteNote(id)}
+          onDelete={(id) => deleteNote(id)}
+          repoOptions={repoOptions}
+          onChangeRepo={handleChangeRepo}
+          onChangePriority={handleChangePriority}
+          creatingNote={creatingNote}
+          onAddNote={handleAddNote}
+        />
       ) : (
         <div className="flex flex-1 overflow-hidden">
           <SidePanelShell
@@ -560,6 +598,7 @@ export function Notebook() {
             repoOptions={repoOptions}
             onChangeRepo={handleChangeRepo}
             onChangePriority={handleChangePriority}
+            onToggleStarred={handleToggleStarred}
           />
           <SidePanelShell
             side="right"
@@ -778,6 +817,403 @@ function PersonalFolderSection({
   );
 }
 
+/** Files mode (2026-07-04 FM, revised same day) — notes' unified browse
+ *  view: rails (Recent/Starred/Vault/Tags) + a folder tree in the sidebar
+ *  for organizing, and a main pane that's ALWAYS a flat card grid/list (no
+ *  breadcrumb drill-down, no folder-rows) — "all folders" (the default
+ *  landing) shows the FULL corpus as cards, exactly what the old standalone
+ *  Grid mode did (Joseph folded Grid into Files: the default must show
+ *  cards immediately, not a tree to expand one-by-one). Selecting a
+ *  specific folder in the sidebar narrows the same card grid to its direct
+ *  members; Recent/Starred/Vault/a tag narrow it their own way. Reuses the
+ *  real `NoteCard` (summary/technical/plain tabs + re-check/promote/delete)
+ *  for the rich view and a compact `NoteFMListRow` for the dense one. */
+function NotesFileManager({
+  folders,
+  notes,
+  isLoading,
+  rail,
+  onRailChange,
+  selected,
+  onToggleSelect,
+  onClearSelect,
+  onMoveToTab,
+  onOpenNote,
+  onPromote,
+  onDelete,
+  repoOptions,
+  onChangeRepo,
+  onChangePriority,
+  creatingNote,
+  onAddNote,
+}: {
+  folders: NotebookTab[];
+  notes: Note[];
+  isLoading: boolean;
+  rail: Rail;
+  onRailChange: (r: Rail) => void;
+  selected: Set<string>;
+  onToggleSelect: (id: string) => void;
+  onClearSelect: () => void;
+  onMoveToTab: (ids: string[], tabId: string) => void;
+  onOpenNote: (id: string) => void;
+  onPromote: (id: string) => void;
+  onDelete: (id: string) => void;
+  repoOptions: string[];
+  onChangeRepo: (noteId: string, repo: string) => void;
+  onChangePriority: (noteId: string, priority: NotePriority) => void;
+  creatingNote: boolean;
+  onAddNote: (rawText: string, sensitive: boolean, tabId?: string) => Promise<void>;
+}) {
+  const [grid, setGrid] = usePersistedBoolean("notebook-fm-grid", true);
+  const [search, setSearch] = useState("");
+  const [priorityFilter, setPriorityFilter] = useState<NotePriority | "">("");
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+
+  const noteTags = useMemo(() => {
+    const tags = new Set<string>();
+    for (const n of notes) n.pipeline?.tags.forEach((t) => tags.add(t));
+    return Array.from(tags).sort();
+  }, [notes]);
+
+  const items = useMemo(() => {
+    let filtered = filterRecordsByRail(notes, rail);
+    filtered = filterRecordsByTags(filtered, selectedTags);
+
+    const query = search.trim().toLowerCase();
+    if (query) {
+      filtered = filtered.filter(
+        (n) =>
+          n.title.toLowerCase().includes(query) ||
+          (n.pipeline?.tags.some((t) => t.toLowerCase().includes(query)) ?? false),
+      );
+    }
+    if (priorityFilter) filtered = filtered.filter((n) => n.priority === priorityFilter);
+
+    return filtered;
+  }, [rail, notes, selectedTags, search, priorityFilter]);
+
+  const railLabel =
+    rail.kind === "tab"
+      ? rail.tabId === null
+        ? "all folders"
+        : (folders.find((f) => f.id === rail.tabId)?.title ?? "all folders")
+      : rail.kind;
+
+  const handleDragStartNote = (e: React.DragEvent, noteId: string) => {
+    const ids = selected.has(noteId) && selected.size > 0 ? Array.from(selected) : [noteId];
+    e.dataTransfer.setData(DRAG_MIME, JSON.stringify(ids));
+    e.dataTransfer.effectAllowed = "move";
+  };
+
+  return (
+    <div className="flex flex-1 overflow-hidden">
+      <div className="flex w-52 shrink-0 flex-col overflow-hidden border-r border-border bg-card/10">
+        <FileManagerSidebar
+          tabKind="folder"
+          tabs={folders}
+          rail={rail}
+          onRailChange={onRailChange}
+          onDropRecords={onMoveToTab}
+        />
+      </div>
+
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex shrink-0 flex-col gap-2 border-b border-border/70 px-4 py-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="truncate text-sm font-medium capitalize">{railLabel}</h3>
+            <div className="flex items-center gap-2">
+              <TagFilterInput allTags={noteTags} selected={selectedTags} onChange={setSelectedTags} />
+              <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5">
+                <button
+                  type="button"
+                  title="List view"
+                  onClick={() => setGrid(false)}
+                  className={cn(
+                    "rounded p-1",
+                    !grid ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <List className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  title="Grid view"
+                  onClick={() => setGrid(true)}
+                  className={cn(
+                    "rounded p-1",
+                    grid ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Grid3x3 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+          <NoteCaptureBox
+            creating={creatingNote}
+            defaultSensitive={rail.kind === "vault"}
+            triggerLabel="new note"
+            onSubmit={(text, sensitive) =>
+              onAddNote(text, sensitive, rail.kind === "tab" ? (rail.tabId ?? undefined) : undefined)
+            }
+          />
+          <div className="flex items-center gap-2">
+            <div className="relative max-w-sm flex-1">
+              <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="search notes…"
+                className="w-full rounded-md border border-border bg-card/40 py-1.5 pl-7 pr-2 text-xs outline-none focus:border-ring"
+              />
+            </div>
+            <select
+              value={priorityFilter}
+              onChange={(e) => setPriorityFilter(e.target.value as NotePriority | "")}
+              title="Filter by priority"
+              className="h-8 shrink-0 rounded-md border border-input bg-background px-1.5 text-[11px] text-muted-foreground hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            >
+              <option value="">any priority</option>
+              <option value="urgent">🔴 urgent</option>
+              <option value="high">🟠 high</option>
+              <option value="normal">⚪ normal</option>
+              <option value="low">⚫ low</option>
+            </select>
+          </div>
+          {selected.size > 0 ? (
+            <div className="flex items-center gap-2 rounded-md border border-border bg-accent/30 px-2 py-1.5 text-[10px]">
+              <span className="font-medium text-foreground">{selected.size} selected</span>
+              <select
+                value=""
+                onChange={(e) => {
+                  if (e.target.value) onMoveToTab(Array.from(selected), e.target.value);
+                }}
+                className="h-6 rounded border border-input bg-background px-1 text-[10px] text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+              >
+                <option value="">move to…</option>
+                {folders.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.title}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={onClearSelect}
+                className="ml-auto text-muted-foreground hover:text-foreground"
+              >
+                clear
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          {isLoading ? (
+            <p className="text-xs text-muted-foreground">loading…</p>
+          ) : items.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              {search ? `no notes match "${search}".` : "nothing here yet."}
+            </p>
+          ) : grid ? (
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {items.map((n) => (
+                <NoteCard
+                  key={n.id}
+                  note={n}
+                  onOpen={() => onOpenNote(n.id)}
+                  onPromote={() => onPromote(n.id)}
+                  onDelete={() => onDelete(n.id)}
+                  repoOptions={repoOptions}
+                  onChangeRepo={(repo) => onChangeRepo(n.id, repo)}
+                  onChangePriority={(p) => onChangePriority(n.id, p)}
+                  selected={selected.has(n.id)}
+                  onToggleSelect={() => onToggleSelect(n.id)}
+                  onDragStart={(e) => handleDragStartNote(e, n.id)}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="divide-y divide-border/50 rounded-md border border-border/50">
+              {items.map((n) => (
+                <NoteFMListRow
+                  key={n.id}
+                  note={n}
+                  selected={selected.has(n.id)}
+                  onOpen={() => onOpenNote(n.id)}
+                  onToggleSelect={() => onToggleSelect(n.id)}
+                  onDragStart={(e) => handleDragStartNote(e, n.id)}
+                  onChangePriority={(p) => onChangePriority(n.id, p)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NoteFMListRow({
+  note,
+  selected,
+  onOpen,
+  onToggleSelect,
+  onDragStart,
+  onChangePriority,
+}: {
+  note: Note;
+  selected: boolean;
+  onOpen: () => void;
+  onToggleSelect: () => void;
+  onDragStart: (e: React.DragEvent) => void;
+  onChangePriority: (p: NotePriority) => void;
+}) {
+  const badge = STATUS_BADGE[note.status];
+  return (
+    <div
+      draggable
+      onDragStart={onDragStart}
+      onClick={onOpen}
+      className={cn(
+        "flex w-full min-w-0 cursor-pointer items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-accent/40",
+        selected && "bg-accent/50",
+      )}
+    >
+      <input
+        type="checkbox"
+        checked={selected}
+        onClick={(e) => e.stopPropagation()}
+        onChange={onToggleSelect}
+        className="shrink-0"
+      />
+      <span className="min-w-0 flex-1 truncate font-medium" title={note.title}>
+        {note.title}
+      </span>
+      <span className="hidden shrink-0 text-[10px] text-muted-foreground md:inline">
+        {relativeTime(note.updated_at)}
+      </span>
+      <div onClick={(e) => e.stopPropagation()} className="shrink-0">
+        <PrioritySelector priority={note.priority} onChange={onChangePriority} />
+      </div>
+      <Badge variant={badge.variant} className="shrink-0 text-[9px]">
+        {badge.label}
+      </Badge>
+      <div className="flex shrink-0 items-center gap-1">
+        {note.starred ? <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400" /> : null}
+        {note.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
+        <IdChip id={note.id} />
+      </div>
+    </div>
+  );
+}
+
+/** Shared create affordance for notes AND guides (FILE-MANAGER regression
+ *  fix, 2026-07-04 — Files mode dropped the only create button when it
+ *  replaced the flat notes sidebar; this is now mounted in BOTH Reader
+ *  mode's left panel and Files mode's header so the create path is never
+ *  lost again). Collapsed = a single trigger button; expanded = raw_text
+ *  textarea + 🔒 sensitive toggle (the vault-add path — Files mode pre-
+ *  toggles this on when the Vault rail is active). Owns its own draft/
+ *  sensitive/expanded state; the caller only supplies where the note lands
+ *  (`onSubmit`'s job) and what to call it. */
+export function NoteCaptureBox({
+  creating,
+  onSubmit,
+  defaultSensitive = false,
+  triggerLabel = "paste note",
+  triggerClassName,
+  placeholder = "Paste a note…",
+}: {
+  creating: boolean;
+  onSubmit: (rawText: string, sensitive: boolean) => Promise<void>;
+  defaultSensitive?: boolean;
+  triggerLabel?: string;
+  triggerClassName?: string;
+  placeholder?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [sensitive, setSensitive] = useState(defaultSensitive);
+
+  // Re-sync to the caller's default (e.g. Vault rail → pre-toggle on) while
+  // collapsed — once the user opens the box and touches the checkbox
+  // themselves, their choice shouldn't get silently overwritten by a rail
+  // change happening behind it.
+  useEffect(() => {
+    if (!expanded) setSensitive(defaultSensitive);
+  }, [defaultSensitive, expanded]);
+
+  const handleSubmit = async () => {
+    const text = draft.trim();
+    if (!text || creating) return;
+    await onSubmit(text, sensitive);
+    setDraft("");
+    setExpanded(false);
+  };
+
+  if (!expanded) {
+    return (
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        className={cn("h-7 text-[11px]", triggerClassName)}
+        onClick={() => setExpanded(true)}
+      >
+        <Plus className="mr-1.5 h-3.5 w-3.5" />
+        {triggerLabel}
+      </Button>
+    );
+  }
+
+  return (
+    <div>
+      <textarea
+        autoFocus
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        placeholder={placeholder}
+        rows={4}
+        className="w-full resize-y rounded-md border border-input bg-background px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-ring"
+      />
+      <div className="mt-1.5 flex items-center justify-between gap-1">
+        <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={sensitive}
+            onChange={(e) => setSensitive(e.target.checked)}
+            className="h-3 w-3"
+          />
+          🔒 sensitive
+        </label>
+        <div className="flex items-center gap-1">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-[10px]"
+            onClick={() => setExpanded(false)}
+          >
+            cancel
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            className="h-6 px-2 text-[10px]"
+            disabled={!draft.trim() || creating}
+            onClick={() => void handleSubmit()}
+          >
+            <Upload className="mr-1 h-3 w-3" />
+            {creating ? "adding…" : "add"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** The notes library: tab filter, collapsible add-note, click-to-load list. */
 function NotesListPanel({
   tabs,
@@ -789,12 +1225,6 @@ function NotesListPanel({
   onPriorityFilterChange,
   selectedNoteId,
   onSelectNote,
-  showAddNote,
-  onToggleAddNote,
-  draft,
-  onDraftChange,
-  draftSensitive,
-  onDraftSensitiveChange,
   creatingNote,
   onAddNote,
   creatingTab,
@@ -815,14 +1245,8 @@ function NotesListPanel({
   onPriorityFilterChange: (p: NotePriority | "") => void;
   selectedNoteId: string | null;
   onSelectNote: (id: string) => void;
-  showAddNote: boolean;
-  onToggleAddNote: () => void;
-  draft: string;
-  onDraftChange: (v: string) => void;
-  draftSensitive: boolean;
-  onDraftSensitiveChange: (v: boolean) => void;
   creatingNote: boolean;
-  onAddNote: () => void;
+  onAddNote: (rawText: string, sensitive: boolean) => Promise<void>;
   creatingTab: boolean;
   onStartCreateTab: () => void;
   newTabTitle: string;
@@ -880,7 +1304,7 @@ function NotesListPanel({
           <button
             type="button"
             onClick={onStartCreateTab}
-            title="New tab"
+            title="New top-level folder"
             className="rounded-md p-1 text-muted-foreground hover:bg-accent/50"
           >
             <Plus className="h-3 w-3" />
@@ -907,61 +1331,7 @@ function NotesListPanel({
       </div>
 
       <div className="shrink-0 border-b border-border/70 p-2">
-        {showAddNote ? (
-          <div>
-            <textarea
-              autoFocus
-              value={draft}
-              onChange={(e) => onDraftChange(e.target.value)}
-              placeholder="Paste a note…"
-              rows={4}
-              className="w-full resize-y rounded-md border border-input bg-background px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-ring"
-            />
-            <div className="mt-1.5 flex items-center justify-between gap-1">
-              <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
-                <input
-                  type="checkbox"
-                  checked={draftSensitive}
-                  onChange={(e) => onDraftSensitiveChange(e.target.checked)}
-                  className="h-3 w-3"
-                />
-                🔒 sensitive
-              </label>
-              <div className="flex items-center gap-1">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 px-2 text-[10px]"
-                  onClick={onToggleAddNote}
-                >
-                  cancel
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  className="h-6 px-2 text-[10px]"
-                  disabled={!draft.trim() || creatingNote}
-                  onClick={onAddNote}
-                >
-                  <Upload className="mr-1 h-3 w-3" />
-                  {creatingNote ? "adding…" : "add"}
-                </Button>
-              </div>
-            </div>
-          </div>
-        ) : (
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="h-7 w-full text-[11px]"
-            onClick={onToggleAddNote}
-          >
-            <Plus className="mr-1.5 h-3.5 w-3.5" />
-            paste note
-          </Button>
-        )}
+        <NoteCaptureBox creating={creatingNote} onSubmit={onAddNote} triggerClassName="w-full" />
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -1001,7 +1371,7 @@ function NotesListPanel({
   );
 }
 
-function relativeTime(iso: string): string {
+export function relativeTime(iso: string): string {
   const diffMin = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
   if (diffMin < 1) return "just now";
   if (diffMin < 60) return `${diffMin}m ago`;
@@ -1020,56 +1390,10 @@ const STATUS_BADGE: Record<
   failed: { label: "structuring failed", variant: "destructive" },
 };
 
-/** GRID — full-width multi-card overview, for scanning/comparing many notes. */
-function GridView({
-  notes,
-  notesLoading,
-  selectedTab,
-  onOpenNote,
-  onPromote,
-  onDelete,
-  repoOptions,
-  onChangeRepo,
-  onChangePriority,
-}: {
-  notes: Note[];
-  notesLoading: boolean;
-  selectedTab: string;
-  onOpenNote: (id: string) => void;
-  onPromote: (id: string) => void;
-  onDelete: (id: string) => void;
-  repoOptions: string[];
-  onChangeRepo: (noteId: string, repo: string) => void;
-  onChangePriority: (noteId: string, priority: NotePriority) => void;
-}) {
-  return (
-    <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
-      {notesLoading ? (
-        <p className="text-xs text-muted-foreground">loading notes…</p>
-      ) : notes.length === 0 ? (
-        <p className="text-xs text-muted-foreground">
-          no notes {selectedTab === ALL_TABS ? "yet" : "in this tab"}. Paste one from the left panel.
-        </p>
-      ) : (
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {notes.map((n) => (
-            <NoteCard
-              key={n.id}
-              note={n}
-              onOpen={() => onOpenNote(n.id)}
-              onPromote={() => onPromote(n.id)}
-              onDelete={() => onDelete(n.id)}
-              repoOptions={repoOptions}
-              onChangeRepo={(repo) => onChangeRepo(n.id, repo)}
-              onChangePriority={(priority) => onChangePriority(n.id, priority)}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
+/** Files' rich card (Grid mode's original render, reused verbatim there
+ *  after Grid folded into Files 2026-07-04) — `selected`/`onToggleSelect`/
+ *  `onDragStart` are optional so Files mode can layer multi-select +
+ *  drag-to-move on top without a second card type. */
 function NoteCard({
   note,
   onOpen,
@@ -1078,6 +1402,9 @@ function NoteCard({
   repoOptions,
   onChangeRepo,
   onChangePriority,
+  selected,
+  onToggleSelect,
+  onDragStart,
 }: {
   note: Note;
   onOpen: () => void;
@@ -1086,13 +1413,17 @@ function NoteCard({
   repoOptions: string[];
   onChangeRepo: (repo: string) => void;
   onChangePriority: (priority: NotePriority) => void;
+  selected?: boolean;
+  onToggleSelect?: () => void;
+  onDragStart?: (e: React.DragEvent) => void;
 }) {
   const [section, setSection] = useState<"summary" | "technical" | "plain">("summary");
   const [revalidateNote, { isLoading: revalidating }] = useRevalidateNoteMutation();
   const badge = STATUS_BADGE[note.status];
-  // GridView only ever renders notes (study guides are excluded upstream and
-  // live in the Library), so pipeline here is always NotePipeline — narrow
-  // explicitly since Note.pipeline's static type is the discriminated union.
+  // Files/Grid only ever render notes (study guides are excluded upstream
+  // and live in the Library), so pipeline here is always NotePipeline —
+  // narrow explicitly since Note.pipeline's static type is the
+  // discriminated union.
   const pipeline =
     note.pipeline && !isStudyGuidePipeline(note.pipeline) ? note.pipeline : null;
 
@@ -1103,9 +1434,25 @@ function NoteCard({
     : "never validated vs code";
 
   return (
-    <Card className="flex min-w-0 flex-col overflow-hidden">
+    <Card
+      draggable={!!onDragStart}
+      onDragStart={onDragStart}
+      className={cn("relative flex min-w-0 flex-col overflow-hidden", selected && "border-ring")}
+    >
+      {onToggleSelect ? (
+        <input
+          type="checkbox"
+          checked={!!selected}
+          onClick={(e) => e.stopPropagation()}
+          onChange={onToggleSelect}
+          className="absolute left-2 top-2 z-10"
+        />
+      ) : null}
       <CardHeader
-        className="flex-row cursor-pointer items-start justify-between gap-2 pb-2 transition-colors hover:bg-accent/30"
+        className={cn(
+          "flex-row cursor-pointer items-start justify-between gap-2 pb-2 transition-colors hover:bg-accent/30",
+          onToggleSelect && "pl-7",
+        )}
         onClick={onOpen}
         title="Open in reader"
       >
@@ -1127,6 +1474,7 @@ function NoteCard({
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
           <div className="flex items-center gap-1">
+            {note.starred ? <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400" /> : null}
             {note.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
             <IdChip id={note.id} />
           </div>
@@ -1234,6 +1582,7 @@ function CenterReaderPanel({
   repoOptions,
   onChangeRepo,
   onChangePriority,
+  onToggleStarred,
 }: {
   view: CenterView;
   onPromote?: () => void;
@@ -1243,6 +1592,7 @@ function CenterReaderPanel({
   repoOptions: string[];
   onChangeRepo: (noteId: string, repo: string) => void;
   onChangePriority: (noteId: string, priority: NotePriority) => void;
+  onToggleStarred: (noteId: string, starred: boolean) => void;
 }) {
   const [section, setSection] = useState<"summary" | "technical" | "plain">("summary");
 
@@ -1266,6 +1616,7 @@ function CenterReaderPanel({
       repoOptions={repoOptions}
       onChangeRepo={onChangeRepo}
       onChangePriority={onChangePriority}
+      onToggleStarred={onToggleStarred}
     />
   );
 }
@@ -1286,6 +1637,7 @@ function NoteStructuredReader({
   repoOptions,
   onChangeRepo,
   onChangePriority,
+  onToggleStarred,
 }: {
   noteId: string;
   section: "summary" | "technical" | "plain";
@@ -1297,6 +1649,7 @@ function NoteStructuredReader({
   repoOptions: string[];
   onChangeRepo: (noteId: string, repo: string) => void;
   onChangePriority: (noteId: string, priority: NotePriority) => void;
+  onToggleStarred: (noteId: string, starred: boolean) => void;
 }) {
   // Poll ONLY while a reprocess is actually in flight (raw_text edit →
   // "reprocessing" badge → settles back to processed) — that's the entire
@@ -1372,6 +1725,18 @@ function NoteStructuredReader({
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
           <div className="flex items-center gap-1">
+            <button
+              type="button"
+              title={note.starred ? "Unstar" : "Star"}
+              onClick={() => onToggleStarred(note.id, !note.starred)}
+            >
+              <Star
+                className={cn(
+                  "h-3.5 w-3.5",
+                  note.starred ? "fill-amber-400 text-amber-400" : "text-muted-foreground",
+                )}
+              />
+            </button>
             {note.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
             <IdChip id={note.id} />
           </div>

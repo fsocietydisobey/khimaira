@@ -1,31 +1,39 @@
 /**
- * Library — the grimoire's browsing + reading surface for study guides
- * (Phase 1f). A study guide is a distinct note KIND (`kind: "study_guide"`):
- * a finished deliverable to be housed + rendered, never re-expressed into
- * the note model's summary/technical/plain triple. Guides are grouped by
- * COLLECTION (a tab with `kind: "collection"`; `tab_id` on the guide IS its
- * collection) rather than the note model's flat tab filter.
+ * Library — file-manager presentation over the auto-organized guide store
+ * (Grimoire FILE-MANAGER, tasks/grimoire/FILE-MANAGER.md). Collections are a
+ * TREE now (`NotebookTab.parent_id`), not a flat list — hierarchy is a
+ * PRESENTATION layer over the existing content-based self-organization, not
+ * a manual filesystem: a drag-move sets `tab_id` AND `pinned_placement=true`
+ * (the organizer skips pinned notes and keeps auto-filing everything else).
  *
- * Two states, like Notebook's own grid/reader split: browse (card grid per
- * collection, searchable) and read (clickable TOC + the full guide via the
- * shared MarkdownView). Reuses Notebook's SidePanelShell/usePersistedBoolean
- * for layout consistency instead of re-inventing collapsible panels here.
+ * Two states, like Notebook's own grid/reader split: browse (this file's
+ * FileManager — sidebar rails + tree + list/grid main pane) and read
+ * (clickable TOC + the full guide via the shared MarkdownView). Reuses
+ * Notebook's SidePanelShell/usePersistedBoolean/relativeTime for layout
+ * consistency instead of re-inventing collapsible panels or time formatting
+ * here.
  */
 
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import { Grid3x3, List, Star } from "lucide-react";
 import { ChevronLeft, Search } from "lucide-react";
 
-import { useListNotesQuery, useListTabsQuery, useUpdateNoteMutation } from "@/api";
+import { useCreateNoteMutation, useListNotesQuery, useListTabsQuery, useUpdateNoteMutation } from "@/api";
 import { IdChip } from "@/components/notebook/IdChip";
 import { ChatBody, ChatHeaderControls, useRecordChat } from "@/components/notebook/ChatPanel";
-import { MarkdownView } from "@/components/notebook/MarkdownView";
-import { SidePanelShell, usePersistedBoolean } from "@/components/notebook/Notebook";
 import {
-  isStudyGuidePipeline,
-  type Note,
-  type NotebookTab,
-  type NotePriority,
-} from "@/components/notebook/notebookTypes";
+  ancestorChain,
+  DRAG_MIME,
+  filterRecordsByRail,
+  filterRecordsByTags,
+  FileManagerSidebar,
+  type Rail,
+  TagFilterInput,
+  useTabTree,
+} from "@/components/notebook/FileManagerSidebar";
+import { MarkdownView } from "@/components/notebook/MarkdownView";
+import { NoteCaptureBox, relativeTime, SidePanelShell, usePersistedBoolean } from "@/components/notebook/Notebook";
+import { isStudyGuidePipeline, type Note, type NotebookTab, type NotePriority } from "@/components/notebook/notebookTypes";
 import { PrioritySelector } from "@/components/notebook/PrioritySelector";
 import { SensitiveBanner } from "@/components/notebook/SensitiveBadge";
 import { Badge } from "@/components/ui/badge";
@@ -54,14 +62,14 @@ export function Library() {
 
   if (selectedGuideId && !selectedGuide && !isLoading) {
     // Guide vanished from underneath us (deleted elsewhere) — fall back to
-    // the grid rather than showing a dead reader.
+    // the file manager rather than showing a dead reader.
     setSelectedGuideId(null);
   }
 
   return selectedGuide ? (
     <GuideReader guide={selectedGuide} onBack={() => setSelectedGuideId(null)} />
   ) : (
-    <LibraryGrid
+    <FileManager
       guides={guides}
       collections={collections}
       isLoading={isLoading}
@@ -89,7 +97,12 @@ function GuideStatusBadge({ guide }: { guide: Note }) {
   );
 }
 
-function LibraryGrid({
+// ---------------------------------------------------------------------------
+// File manager — sidebar rails + tree, breadcrumb main pane, list/grid,
+// multi-select, drag-to-move.
+// ---------------------------------------------------------------------------
+
+function FileManager({
   guides,
   collections,
   isLoading,
@@ -100,135 +113,414 @@ function LibraryGrid({
   isLoading: boolean;
   onOpenGuide: (id: string) => void;
 }) {
+  const [rail, setRail] = useState<Rail>({ kind: "tab", tabId: null });
+  const [grid, setGrid] = usePersistedBoolean("library-fm-grid", false);
   const [search, setSearch] = useState("");
   const [priorityFilter, setPriorityFilter] = useState<NotePriority | "">("");
-  const query = search.trim().toLowerCase();
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
 
-  const searched = query
-    ? guides.filter((g) => {
+  const [updateNote] = useUpdateNoteMutation();
+  const [createNote, { isLoading: creatingGuide }] = useCreateNoteMutation();
+
+  const { tabsById } = useTabTree(collections);
+
+  const allTags = useMemo(() => {
+    const tags = new Set<string>();
+    for (const g of guides) {
+      const pipeline = isStudyGuidePipeline(g.pipeline) ? g.pipeline : null;
+      pipeline?.tags.forEach((t) => tags.add(t));
+    }
+    return Array.from(tags).sort();
+  }, [guides]);
+
+  const breadcrumbs = rail.kind === "tab" ? ancestorChain(rail.tabId, tabsById) : [];
+
+  const items = useMemo(() => {
+    let filtered = filterRecordsByRail(guides, rail);
+    filtered = filterRecordsByTags(filtered, selectedTags);
+
+    const query = search.trim().toLowerCase();
+    if (query) {
+      filtered = filtered.filter((g) => {
         const pipeline = isStudyGuidePipeline(g.pipeline) ? g.pipeline : null;
         return (
           g.title.toLowerCase().includes(query) ||
           (pipeline?.abstract.toLowerCase().includes(query) ?? false) ||
           (pipeline?.tags.some((t) => t.toLowerCase().includes(query)) ?? false)
         );
-      })
-    : guides;
-  const filtered = priorityFilter
-    ? searched.filter((g) => g.priority === priorityFilter)
-    : searched;
-
-  const byCollection = new Map<string, Note[]>();
-  const uncollected: Note[] = [];
-  for (const g of filtered) {
-    const inCollection = collections.some((c) => c.id === g.tab_id);
-    if (inCollection) {
-      const list = byCollection.get(g.tab_id) ?? [];
-      list.push(g);
-      byCollection.set(g.tab_id, list);
-    } else {
-      uncollected.push(g);
+      });
     }
-  }
+    if (priorityFilter) filtered = filtered.filter((g) => g.priority === priorityFilter);
 
-  const hasAnyGuides = guides.length > 0;
+    return filtered;
+  }, [rail, guides, selectedTags, search, priorityFilter]);
+
+  const toggleSelect = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const clearSelection = () => setSelected(new Set());
+
+  const moveGuidesToTab = async (guideIds: string[], targetTabId: string) => {
+    await Promise.all(
+      guideIds.map((id) =>
+        updateNote({ id, tab_id: targetTabId, pinned_placement: true })
+          .unwrap()
+          .catch(() => {
+            /* one guide failing to move shouldn't block the others */
+          }),
+      ),
+    );
+    clearSelection();
+  };
+
+  const handleDragStartGuide = (e: React.DragEvent, guideId: string) => {
+    const ids = selected.has(guideId) && selected.size > 0 ? Array.from(selected) : [guideId];
+    e.dataTransfer.setData(DRAG_MIME, JSON.stringify(ids));
+    e.dataTransfer.effectAllowed = "move";
+  };
+
+  // Manual guide authoring (FILE-MANAGER, 2026-07-04) — guides are normally
+  // roster-authored (notebook_create_study_guide), but Joseph needs a
+  // by-hand path too. Same create endpoint as notes, kind:"study_guide"
+  // routes the backend to the guide pipeline (abstract/tags only, raw_text
+  // never re-expressed) instead of note structuring.
+  const handleAddGuide = async (rawText: string, sensitive: boolean) => {
+    await createNote({
+      raw_text: rawText,
+      tab_id: rail.kind === "tab" ? (rail.tabId ?? undefined) : undefined,
+      sensitive,
+      kind: "study_guide",
+    }).unwrap();
+  };
+
+  const railLabel = rail.kind === "tab" ? (breadcrumbs.at(-1)?.title ?? "all collections") : rail.kind;
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden">
-      <div className="flex shrink-0 items-center gap-2 border-b border-border/70 px-4 py-2.5">
-        <div className="relative max-w-sm flex-1">
-          <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="search guides…"
-            className="w-full rounded-md border border-border bg-card/40 py-1.5 pl-7 pr-2 text-xs outline-none focus:border-ring"
-          />
-        </div>
-        <select
-          value={priorityFilter}
-          onChange={(e) => setPriorityFilter(e.target.value as NotePriority | "")}
-          title="Filter by priority"
-          className="h-8 shrink-0 rounded-md border border-input bg-background px-1.5 text-[11px] text-muted-foreground hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-        >
-          <option value="">any priority</option>
-          <option value="urgent">🔴 urgent</option>
-          <option value="high">🟠 high</option>
-          <option value="normal">⚪ normal</option>
-          <option value="low">⚫ low</option>
-        </select>
+    <div className="flex flex-1 overflow-hidden">
+      <div className="flex w-52 shrink-0 flex-col overflow-hidden border-r border-border bg-card/10">
+        <FileManagerSidebar
+          tabKind="collection"
+          tabs={collections}
+          rail={rail}
+          onRailChange={setRail}
+          onDropRecords={(ids, tabId) => void moveGuidesToTab(ids, tabId)}
+        />
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto p-4">
-        {isLoading ? (
-          <p className="text-xs text-muted-foreground">loading…</p>
-        ) : !hasAnyGuides ? (
-          <p className="text-xs text-muted-foreground">
-            no study guides yet — the jeevy roster authors them in, or import existing files.
-          </p>
-        ) : filtered.length === 0 ? (
-          <p className="text-xs text-muted-foreground">no guides match "{search}".</p>
-        ) : (
-          <div className="space-y-6">
-            {collections.map((c) => {
-              const list = byCollection.get(c.id) ?? [];
-              if (list.length === 0) return null;
-              return (
-                <CollectionSection key={c.id} title={c.title} guides={list} onOpenGuide={onOpenGuide} />
-              );
-            })}
-            {uncollected.length > 0 ? (
-              <CollectionSection title="uncollected" guides={uncollected} onOpenGuide={onOpenGuide} />
-            ) : null}
+
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex shrink-0 flex-col gap-2 border-b border-border/70 px-4 py-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <Breadcrumbs
+              rail={rail}
+              breadcrumbs={breadcrumbs}
+              railLabel={railLabel}
+              onSelect={(tabId) => setRail({ kind: "tab", tabId })}
+            />
+            <div className="flex shrink-0 items-center gap-2">
+              <TagFilterInput allTags={allTags} selected={selectedTags} onChange={setSelectedTags} />
+              <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5">
+                <button
+                  type="button"
+                  title="List view"
+                  onClick={() => setGrid(false)}
+                  className={cn(
+                    "rounded p-1",
+                    !grid ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <List className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  title="Grid view"
+                  onClick={() => setGrid(true)}
+                  className={cn(
+                    "rounded p-1",
+                    grid ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Grid3x3 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
           </div>
-        )}
+          <NoteCaptureBox
+            creating={creatingGuide}
+            defaultSensitive={rail.kind === "vault"}
+            triggerLabel="new guide"
+            placeholder="Paste the guide's content…"
+            onSubmit={handleAddGuide}
+          />
+          <div className="flex items-center gap-2">
+            <div className="relative max-w-sm flex-1">
+              <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="search guides…"
+                className="w-full rounded-md border border-border bg-card/40 py-1.5 pl-7 pr-2 text-xs outline-none focus:border-ring"
+              />
+            </div>
+            <select
+              value={priorityFilter}
+              onChange={(e) => setPriorityFilter(e.target.value as NotePriority | "")}
+              title="Filter by priority"
+              className="h-8 shrink-0 rounded-md border border-input bg-background px-1.5 text-[11px] text-muted-foreground hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            >
+              <option value="">any priority</option>
+              <option value="urgent">🔴 urgent</option>
+              <option value="high">🟠 high</option>
+              <option value="normal">⚪ normal</option>
+              <option value="low">⚫ low</option>
+            </select>
+          </div>
+          {selected.size > 0 ? (
+            <BulkActionBar
+              count={selected.size}
+              collections={collections}
+              onMove={(tabId) => void moveGuidesToTab(Array.from(selected), tabId)}
+              onClear={clearSelection}
+            />
+          ) : null}
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          {isLoading ? (
+            <p className="text-xs text-muted-foreground">loading…</p>
+          ) : items.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              {search
+                ? `no guides match "${search}".`
+                : "nothing here — the jeevy roster authors guides in, or import existing files."}
+            </p>
+          ) : grid ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              {items.map((g) => (
+                <GuideCard
+                  key={g.id}
+                  guide={g}
+                  selected={selected.has(g.id)}
+                  onOpen={() => onOpenGuide(g.id)}
+                  onToggleSelect={() => toggleSelect(g.id)}
+                  onDragStart={(e) => handleDragStartGuide(e, g.id)}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="divide-y divide-border/50 rounded-md border border-border/50">
+              {items.map((g) => (
+                <GuideListRow
+                  key={g.id}
+                  guide={g}
+                  selected={selected.has(g.id)}
+                  onOpen={() => onOpenGuide(g.id)}
+                  onToggleSelect={() => toggleSelect(g.id)}
+                  onDragStart={(e) => handleDragStartGuide(e, g.id)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-function CollectionSection({
-  title,
-  guides,
-  onOpenGuide,
+function Breadcrumbs({
+  rail,
+  breadcrumbs,
+  railLabel,
+  onSelect,
 }: {
-  title: string;
-  guides: Note[];
-  onOpenGuide: (id: string) => void;
+  rail: Rail;
+  breadcrumbs: NotebookTab[];
+  railLabel: string;
+  onSelect: (tabId: string | null) => void;
 }) {
+  if (rail.kind !== "tab") {
+    return <h3 className="truncate text-sm font-medium capitalize">{railLabel}</h3>;
+  }
   return (
-    <section>
-      <h3 className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        {title}
-        <span className="text-[10px] font-normal normal-case text-muted-foreground/60">
-          ({guides.length})
+    <div className="flex min-w-0 items-center gap-1 text-sm">
+      <button
+        type="button"
+        onClick={() => onSelect(null)}
+        className={cn(
+          "shrink-0 font-medium",
+          rail.tabId === null ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+        )}
+      >
+        all collections
+      </button>
+      {breadcrumbs.map((tab) => (
+        <span key={tab.id} className="flex min-w-0 items-center gap-1">
+          <span className="text-muted-foreground/50">/</span>
+          <button
+            type="button"
+            onClick={() => onSelect(tab.id)}
+            className={cn(
+              "min-w-0 truncate font-medium",
+              rail.tabId === tab.id ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+            )}
+            title={tab.title}
+          >
+            {tab.title}
+          </button>
         </span>
-      </h3>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {guides.map((g) => (
-          <GuideCard key={g.id} guide={g} onOpen={() => onOpenGuide(g.id)} />
-        ))}
-      </div>
-    </section>
+      ))}
+    </div>
   );
 }
 
-function GuideCard({ guide, onOpen }: { guide: Note; onOpen: () => void }) {
+function BulkActionBar({
+  count,
+  collections,
+  onMove,
+  onClear,
+}: {
+  count: number;
+  collections: NotebookTab[];
+  onMove: (tabId: string) => void;
+  onClear: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-2 rounded-md border border-border bg-accent/30 px-2 py-1.5 text-[10px]">
+      <span className="font-medium text-foreground">{count} selected</span>
+      <select
+        value=""
+        onChange={(e) => {
+          if (e.target.value) onMove(e.target.value);
+        }}
+        className="h-6 rounded border border-input bg-background px-1 text-[10px] text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+      >
+        <option value="">move to…</option>
+        {collections.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.title}
+          </option>
+        ))}
+      </select>
+      <button type="button" onClick={onClear} className="ml-auto text-muted-foreground hover:text-foreground">
+        clear
+      </button>
+    </div>
+  );
+}
+
+function GuideMetaRow({ guide }: { guide: Note }) {
+  return (
+    <div className="flex shrink-0 items-center gap-1">
+      {guide.starred ? <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400" /> : null}
+      {guide.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
+      <IdChip id={guide.id} />
+    </div>
+  );
+}
+
+function GuideListRow({
+  guide,
+  selected,
+  onOpen,
+  onToggleSelect,
+  onDragStart,
+}: {
+  guide: Note;
+  selected: boolean;
+  onOpen: () => void;
+  onToggleSelect: () => void;
+  onDragStart: (e: React.DragEvent) => void;
+}) {
+  const pipeline = isStudyGuidePipeline(guide.pipeline) ? guide.pipeline : null;
+  const [updateNote] = useUpdateNoteMutation();
+  return (
+    <div
+      draggable
+      onDragStart={onDragStart}
+      onClick={onOpen}
+      className={cn(
+        "flex w-full min-w-0 cursor-pointer items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-accent/40",
+        selected && "bg-accent/50",
+      )}
+    >
+      <input
+        type="checkbox"
+        checked={selected}
+        onClick={(e) => e.stopPropagation()}
+        onChange={onToggleSelect}
+        className="shrink-0"
+      />
+      <span className="min-w-0 flex-1 truncate font-medium" title={guide.title}>
+        {guide.title}
+      </span>
+      {pipeline && pipeline.tags.length > 0 ? (
+        <div className="hidden shrink-0 items-center gap-1 sm:flex">
+          {pipeline.tags.slice(0, 2).map((tag) => (
+            <Badge key={tag} variant="outline" className="text-[9px]">
+              {tag}
+            </Badge>
+          ))}
+        </div>
+      ) : null}
+      <span className="hidden shrink-0 text-[10px] text-muted-foreground md:inline">
+        {relativeTime(guide.updated_at)}
+      </span>
+      <div onClick={(e) => e.stopPropagation()} className="shrink-0">
+        <PrioritySelector
+          priority={guide.priority}
+          onChange={(priority) => updateNote({ id: guide.id, priority })}
+        />
+      </div>
+      <GuideStatusBadge guide={guide} />
+      <GuideMetaRow guide={guide} />
+    </div>
+  );
+}
+
+function GuideCard({
+  guide,
+  selected,
+  onOpen,
+  onToggleSelect,
+  onDragStart,
+}: {
+  guide: Note;
+  selected: boolean;
+  onOpen: () => void;
+  onToggleSelect: () => void;
+  onDragStart: (e: React.DragEvent) => void;
+}) {
   const pipeline = isStudyGuidePipeline(guide.pipeline) ? guide.pipeline : null;
   const [updateNote] = useUpdateNoteMutation();
   return (
     <Card
-      className="min-w-0 cursor-pointer transition-colors hover:border-ring/60"
+      draggable
+      onDragStart={onDragStart}
+      className={cn(
+        "relative min-w-0 cursor-pointer transition-colors hover:border-ring/60",
+        selected && "border-ring",
+      )}
       onClick={onOpen}
     >
-      <CardHeader className="flex-row items-start justify-between gap-2 space-y-0 p-3 pb-1.5">
+      <input
+        type="checkbox"
+        checked={selected}
+        onClick={(e) => e.stopPropagation()}
+        onChange={onToggleSelect}
+        className="absolute left-2 top-2 z-10"
+      />
+      <CardHeader className="flex-row items-start justify-between gap-2 space-y-0 p-3 pb-1.5 pl-7">
         <h4 className="min-w-0 truncate text-xs font-medium" title={guide.title}>
           {guide.title}
         </h4>
         <div className="flex shrink-0 flex-col items-end gap-1">
-          <div className="flex items-center gap-1">
-            {guide.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
-            <IdChip id={guide.id} />
-          </div>
+          <GuideMetaRow guide={guide} />
           <PrioritySelector
             priority={guide.priority}
             onChange={(priority) => updateNote({ id: guide.id, priority })}
@@ -340,6 +632,18 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
           </div>
           <div className="flex shrink-0 flex-col items-end gap-1">
             <div className="flex items-center gap-1">
+              <button
+                type="button"
+                title={guide.starred ? "Unstar" : "Star"}
+                onClick={() => updateNote({ id: guide.id, starred: !guide.starred })}
+              >
+                <Star
+                  className={cn(
+                    "h-3.5 w-3.5",
+                    guide.starred ? "fill-amber-400 text-amber-400" : "text-muted-foreground",
+                  )}
+                />
+              </button>
               {guide.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
               <IdChip id={guide.id} />
             </div>
