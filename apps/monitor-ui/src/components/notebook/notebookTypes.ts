@@ -9,6 +9,18 @@
 
 export type NoteStatus = "draft" | "processed" | "promoted" | "failed";
 
+/** User-set importance, independent of `NoteStatus` (lifecycle). Mirrors the
+ *  backend's `_VALID_PRIORITIES`; default "normal". */
+export type NotePriority = "low" | "normal" | "high" | "urgent";
+
+/** What got masked in a sensitive note's `llm_text` twin — never the secret
+ *  value itself, only its placeholder + kind (for the reader's "what's
+ *  hidden" panel). */
+export interface NoteRedaction {
+  placeholder: string;
+  kind: string;
+}
+
 /** Grimoire (Phase 1f): a note is either a regular structured note, or a
  *  study guide — a finished deliverable to be housed + rendered, never
  *  re-expressed into the summary/technical/plain triple. Discriminated by
@@ -92,6 +104,18 @@ export interface Note {
   /** When the organizer last placed/checked this note's tab_id. Null if the
    *  organizer has never touched it (e.g. every pre-grimoire note). */
   organized_at: string | null;
+  /** User-set importance; independent of `status`. Default "normal". */
+  priority: NotePriority;
+  /** True if this note contains credentials — its LLM egress (structuring,
+   *  embedding, chat, training export) is redacted; `raw_text` (this field)
+   *  stays the real, human-readable text. Default false on new records —
+   *  but pre-grimoire records were never backfilled, so this is live-
+   *  verified `null` on those (not `false`); always check truthiness,
+   *  never `=== false`. */
+  sensitive: boolean | null;
+  /** What was masked in the redacted twin — null for non-sensitive notes.
+   *  NEVER contains the actual secret value. */
+  redactions: NoteRedaction[] | null;
 }
 
 /** Discriminates a plain note-folder from a study-guide collection so the

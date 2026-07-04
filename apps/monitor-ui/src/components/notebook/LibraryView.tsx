@@ -15,7 +15,7 @@
 import { useRef, useState } from "react";
 import { ChevronLeft, Search } from "lucide-react";
 
-import { useListNotesQuery, useListTabsQuery } from "@/api";
+import { useListNotesQuery, useListTabsQuery, useUpdateNoteMutation } from "@/api";
 import { IdChip } from "@/components/notebook/IdChip";
 import {
   GuideChatBody,
@@ -24,7 +24,14 @@ import {
 } from "@/components/notebook/GuideChatPanel";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
 import { SidePanelShell, usePersistedBoolean } from "@/components/notebook/Notebook";
-import { isStudyGuidePipeline, type Note, type NotebookTab } from "@/components/notebook/notebookTypes";
+import {
+  isStudyGuidePipeline,
+  type Note,
+  type NotebookTab,
+  type NotePriority,
+} from "@/components/notebook/notebookTypes";
+import { PrioritySelector } from "@/components/notebook/PrioritySelector";
+import { SensitiveBanner } from "@/components/notebook/SensitiveBadge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -98,9 +105,10 @@ function LibraryGrid({
   onOpenGuide: (id: string) => void;
 }) {
   const [search, setSearch] = useState("");
+  const [priorityFilter, setPriorityFilter] = useState<NotePriority | "">("");
   const query = search.trim().toLowerCase();
 
-  const filtered = query
+  const searched = query
     ? guides.filter((g) => {
         const pipeline = isStudyGuidePipeline(g.pipeline) ? g.pipeline : null;
         return (
@@ -110,6 +118,9 @@ function LibraryGrid({
         );
       })
     : guides;
+  const filtered = priorityFilter
+    ? searched.filter((g) => g.priority === priorityFilter)
+    : searched;
 
   const byCollection = new Map<string, Note[]>();
   const uncollected: Note[] = [];
@@ -128,8 +139,8 @@ function LibraryGrid({
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
-      <div className="shrink-0 border-b border-border/70 px-4 py-2.5">
-        <div className="relative max-w-sm">
+      <div className="flex shrink-0 items-center gap-2 border-b border-border/70 px-4 py-2.5">
+        <div className="relative max-w-sm flex-1">
           <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
             value={search}
@@ -138,6 +149,18 @@ function LibraryGrid({
             className="w-full rounded-md border border-border bg-card/40 py-1.5 pl-7 pr-2 text-xs outline-none focus:border-ring"
           />
         </div>
+        <select
+          value={priorityFilter}
+          onChange={(e) => setPriorityFilter(e.target.value as NotePriority | "")}
+          title="Filter by priority"
+          className="h-8 shrink-0 rounded-md border border-input bg-background px-1.5 text-[11px] text-muted-foreground hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        >
+          <option value="">any priority</option>
+          <option value="urgent">🔴 urgent</option>
+          <option value="high">🟠 high</option>
+          <option value="normal">⚪ normal</option>
+          <option value="low">⚫ low</option>
+        </select>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
         {isLoading ? (
@@ -195,6 +218,7 @@ function CollectionSection({
 
 function GuideCard({ guide, onOpen }: { guide: Note; onOpen: () => void }) {
   const pipeline = isStudyGuidePipeline(guide.pipeline) ? guide.pipeline : null;
+  const [updateNote] = useUpdateNoteMutation();
   return (
     <Card
       className="min-w-0 cursor-pointer transition-colors hover:border-ring/60"
@@ -205,7 +229,14 @@ function GuideCard({ guide, onOpen }: { guide: Note; onOpen: () => void }) {
           {guide.title}
         </h4>
         <div className="flex shrink-0 flex-col items-end gap-1">
-          <IdChip id={guide.id} />
+          <div className="flex items-center gap-1">
+            {guide.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
+            <IdChip id={guide.id} />
+          </div>
+          <PrioritySelector
+            priority={guide.priority}
+            onChange={(priority) => updateNote({ id: guide.id, priority })}
+          />
           <GuideStatusBadge guide={guide} />
         </div>
       </CardHeader>
@@ -243,6 +274,7 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
   const pipeline = isStudyGuidePipeline(guide.pipeline) ? guide.pipeline : null;
   const contentRef = useRef<HTMLDivElement>(null);
   const chat = useGuideChat(guide.id);
+  const [updateNote] = useUpdateNoteMutation();
 
   const handleTocClick = (anchor: string) => {
     const el = contentRef.current?.querySelector(`#${CSS.escape(anchor)}`);
@@ -311,13 +343,23 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
             ) : null}
           </div>
           <div className="flex shrink-0 flex-col items-end gap-1">
-            <IdChip id={guide.id} />
+            <div className="flex items-center gap-1">
+              {guide.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
+              <IdChip id={guide.id} />
+            </div>
+            <PrioritySelector
+              priority={guide.priority}
+              onChange={(priority: NotePriority) => updateNote({ id: guide.id, priority })}
+            />
             <GuideStatusBadge guide={guide} />
           </div>
         </div>
         <div ref={contentRef} className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
           {pipeline ? (
-            <MarkdownView content={guide.raw_text} slugHeadings />
+            <>
+              {guide.sensitive ? <SensitiveBanner redactions={guide.redactions} /> : null}
+              <MarkdownView content={guide.raw_text} slugHeadings />
+            </>
           ) : (
             <p className="text-xs italic text-muted-foreground/60">not yet structured…</p>
           )}
@@ -333,7 +375,7 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
         resizable={false}
         extraHeader={<GuideChatHeaderControls state={chat} />}
       >
-        <GuideChatBody state={chat} />
+        <GuideChatBody state={chat} sensitive={!!guide.sensitive} />
       </SidePanelShell>
     </div>
   );

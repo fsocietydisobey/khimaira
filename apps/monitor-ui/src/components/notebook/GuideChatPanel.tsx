@@ -222,8 +222,16 @@ function ChatBubble({ message }: { message: ChatMessage }) {
 
 /** Message list + input — the SidePanelShell wrapping this owns the "chat"
  *  header bar (label + collapse chevron + GuideChatHeaderControls); this
- *  component renders none of that itself (Bug 2 fix). */
-export function GuideChatBody({ state }: { state: GuideChatState }) {
+ *  component renders none of that itself (Bug 2 fix). `sensitive` only
+ *  changes the input's placeholder/hint — the backend already refuses to
+ *  auto-apply an edit on a sensitive guide; this is purely informational. */
+export function GuideChatBody({
+  state,
+  sensitive = false,
+}: {
+  state: GuideChatState;
+  sensitive?: boolean;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -232,6 +240,11 @@ export function GuideChatBody({ state }: { state: GuideChatState }) {
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      {sensitive ? (
+        <p className="shrink-0 border-b border-amber-500/30 bg-amber-500/5 px-2 py-1 text-[9px] text-amber-400">
+          🔒 sensitive guide — answer-only, edits are disabled
+        </p>
+      ) : null}
       <div ref={scrollRef} className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto p-2">
         {state.history.length === 0 && !state.pendingUserMessage ? (
           <div className="flex h-full flex-col items-center justify-center gap-1.5 p-4 text-center">
@@ -275,7 +288,7 @@ export function GuideChatBody({ state }: { state: GuideChatState }) {
                 state.handleSend();
               }
             }}
-            placeholder="ask, or instruct — e.g. 'add a benchmark'"
+            placeholder={sensitive ? "ask a question — edits are off for sensitive guides" : "ask, or instruct — e.g. 'add a benchmark'"}
             disabled={state.busy}
             className="min-w-0 flex-1 rounded border border-border bg-background/60 px-2 py-1.5 text-xs outline-none focus:border-ring disabled:opacity-50"
           />

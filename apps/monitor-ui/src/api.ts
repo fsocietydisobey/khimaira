@@ -6,6 +6,7 @@ import type {
   Note,
   NotebookTab,
   NoteKind,
+  NotePriority,
   NoteStatus,
 } from "@/components/notebook/notebookTypes";
 
@@ -283,13 +284,22 @@ export const monitorApi = createApi({
     // -----------------------------------------------------------------------
     listNotes: build.query<
       { notes: Note[] },
-      { tabId?: string; repo?: string; kind?: NoteKind } | void
+      | {
+          tabId?: string;
+          repo?: string;
+          kind?: NoteKind;
+          priority?: NotePriority;
+          sort?: string;
+        }
+      | void
     >({
       query: (arg) => {
         const params = new URLSearchParams();
         if (arg?.tabId) params.set("tab_id", arg.tabId);
         if (arg?.repo) params.set("repo", arg.repo);
         if (arg?.kind) params.set("kind", arg.kind);
+        if (arg?.priority) params.set("priority", arg.priority);
+        if (arg?.sort) params.set("sort", arg.sort);
         const qs = params.toString();
         return qs ? `/notes?${qs}` : "/notes";
       },
@@ -303,11 +313,29 @@ export const monitorApi = createApi({
     }),
     getNote: build.query<Note, string>({
       query: (id) => `/notes/${encodeURIComponent(id)}`,
+      // The single-note fetch returns `history` (full version bodies), not
+      // the list endpoint's pre-computed `history_count` — normalize here so
+      // every consumer sees the same `Note` shape regardless of which
+      // endpoint it came from (caught via live verification: this is the
+      // single-note endpoint's real payload, not a guess).
+      transformResponse: (raw: Note & { history?: unknown[] }): Note => ({
+        ...raw,
+        history_count: raw.history?.length ?? raw.history_count ?? 0,
+      }),
       providesTags: (_r, _e, id) => [{ type: "Notes", id }],
     }),
     createNote: build.mutation<
       Note,
-      { raw_text: string; tab_id?: string; title?: string; repo?: string }
+      {
+        raw_text: string;
+        tab_id?: string;
+        title?: string;
+        repo?: string;
+        /** Grimoire — marks the note credential-safe: the backend redacts a
+         *  `llm_text` twin at write time; every LLM egress path routes
+         *  through it, `raw_text` stays the real, human-readable text. */
+        sensitive?: boolean;
+      }
     >({
       query: (body) => ({ url: "/notes", method: "POST", body }),
       invalidatesTags: [{ type: "Notes", id: "LIST" }, { type: "Tabs", id: "LIST" }],
@@ -323,6 +351,8 @@ export const monitorApi = createApi({
         /** Grimoire (Phase 3): applying a REVISE proposal is a plain raw_text
          *  PATCH — never auto-applied, always the result of an explicit Accept. */
         raw_text?: string;
+        /** Grimoire — user-set importance, independent of `status`. */
+        priority?: NotePriority;
       }
     >({
       query: ({ id, ...body }) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "PATCH", body }),

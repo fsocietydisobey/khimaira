@@ -20,6 +20,7 @@
  * for nav consistency with the other observability views.
  */
 
+import { skipToken } from "@reduxjs/toolkit/query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import {
@@ -42,6 +43,7 @@ import {
   useCreateNoteMutation,
   useCreateTabMutation,
   useDeleteNoteMutation,
+  useGetNoteQuery,
   useListNotesQuery,
   useListProjectsQuery,
   useListTabsQuery,
@@ -52,7 +54,14 @@ import {
 import { IdChip } from "@/components/notebook/IdChip";
 import { Library } from "@/components/notebook/LibraryView";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
-import { isStudyGuidePipeline, type AskAnswer, type Note } from "@/components/notebook/notebookTypes";
+import {
+  isStudyGuidePipeline,
+  type AskAnswer,
+  type Note,
+  type NotePriority,
+} from "@/components/notebook/notebookTypes";
+import { PrioritySelector } from "@/components/notebook/PrioritySelector";
+import { SensitiveBanner } from "@/components/notebook/SensitiveBadge";
 import { ProjectNavTabs } from "@/components/project/ProjectNavTabs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -295,8 +304,10 @@ export function Notebook() {
   const [section, setSection] = useState<NotebookSection>("notes");
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
   const [selectedTab, setSelectedTab] = useState<string>(ALL_TABS);
+  const [priorityFilter, setPriorityFilter] = useState<NotePriority | "">("");
   const [showAddNote, setShowAddNote] = useState(false);
   const [draft, setDraft] = useState("");
+  const [draftSensitive, setDraftSensitive] = useState(false);
   const [showAddPersonalNote, setShowAddPersonalNote] = useState(false);
   const [personalDraft, setPersonalDraft] = useState("");
   const [creatingTab, setCreatingTab] = useState(false);
@@ -319,7 +330,12 @@ export function Notebook() {
 
   const { data: tabsData } = useListTabsQuery();
   const { data: notesData, isLoading: notesLoading } = useListNotesQuery(
-    { tabId: selectedTab === ALL_TABS ? undefined : selectedTab, repo: repoScope },
+    {
+      tabId: selectedTab === ALL_TABS ? undefined : selectedTab,
+      repo: repoScope,
+      priority: priorityFilter || undefined,
+      sort: "-priority",
+    },
     { pollingInterval: 3000 },
   );
   // Personal/Behavior folder — independent of the tab filter / repo scope
@@ -373,6 +389,8 @@ export function Notebook() {
   };
 
   const handleChangeRepo = (noteId: string, repo: string) => updateNote({ id: noteId, repo });
+  const handleChangePriority = (noteId: string, priority: NotePriority) =>
+    updateNote({ id: noteId, priority });
 
   const handleSaveAnswer = async () => {
     if (centerView?.kind !== "answer") return;
@@ -391,8 +409,10 @@ export function Notebook() {
       // project they were pasted under, instead of the backend's hardcoded
       // "khimaira" fallback — a full repo-set/change UI is a separate spec.
       repo: projectName || undefined,
+      sensitive: draftSensitive,
     }).unwrap();
     setDraft("");
+    setDraftSensitive(false);
     setShowAddNote(false);
   };
 
@@ -423,12 +443,16 @@ export function Notebook() {
       notesLoading={notesLoading}
       selectedTab={selectedTab}
       onSelectTab={setSelectedTab}
+      priorityFilter={priorityFilter}
+      onPriorityFilterChange={setPriorityFilter}
       selectedNoteId={viewMode === "reader" && centerView?.kind === "note" ? centerView.noteId : null}
       onSelectNote={handleSelectNote}
       showAddNote={showAddNote}
       onToggleAddNote={() => setShowAddNote((v) => !v)}
       draft={draft}
       onDraftChange={setDraft}
+      draftSensitive={draftSensitive}
+      onDraftSensitiveChange={setDraftSensitive}
       creatingNote={creatingNote}
       onAddNote={handleAddNote}
       creatingTab={creatingTab}
@@ -509,6 +533,7 @@ export function Notebook() {
             onDelete={(id) => deleteNote(id)}
             repoOptions={repoOptions}
             onChangeRepo={handleChangeRepo}
+            onChangePriority={handleChangePriority}
           />
         </div>
       ) : (
@@ -543,6 +568,7 @@ export function Notebook() {
             answerSaved={centerView?.kind === "answer" && savedAnswerRef === centerView.data}
             repoOptions={repoOptions}
             onChangeRepo={handleChangeRepo}
+            onChangePriority={handleChangePriority}
           />
           <SidePanelShell
             side="right"
@@ -565,7 +591,7 @@ export function Notebook() {
               ) : null
             }
           >
-            <OriginalPanel note={selectedNote} rawMode={originalRawMode} />
+            <OriginalPanel noteId={selectedNote?.id ?? null} rawMode={originalRawMode} />
           </SidePanelShell>
         </div>
       )}
@@ -930,12 +956,16 @@ function NotesListPanel({
   notesLoading,
   selectedTab,
   onSelectTab,
+  priorityFilter,
+  onPriorityFilterChange,
   selectedNoteId,
   onSelectNote,
   showAddNote,
   onToggleAddNote,
   draft,
   onDraftChange,
+  draftSensitive,
+  onDraftSensitiveChange,
   creatingNote,
   onAddNote,
   creatingTab,
@@ -952,12 +982,16 @@ function NotesListPanel({
   notesLoading: boolean;
   selectedTab: string;
   onSelectTab: (id: string) => void;
+  priorityFilter: NotePriority | "";
+  onPriorityFilterChange: (p: NotePriority | "") => void;
   selectedNoteId: string | null;
   onSelectNote: (id: string) => void;
   showAddNote: boolean;
   onToggleAddNote: () => void;
   draft: string;
   onDraftChange: (v: string) => void;
+  draftSensitive: boolean;
+  onDraftSensitiveChange: (v: boolean) => void;
   creatingNote: boolean;
   onAddNote: () => void;
   creatingTab: boolean;
@@ -984,6 +1018,18 @@ function NotesListPanel({
               {t.title} ({t.note_ids.length})
             </option>
           ))}
+        </select>
+        <select
+          value={priorityFilter}
+          onChange={(e) => onPriorityFilterChange(e.target.value as NotePriority | "")}
+          title="Filter by priority"
+          className="h-7 shrink-0 rounded-md border border-input bg-background px-1.5 text-[11px] text-muted-foreground hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        >
+          <option value="">any priority</option>
+          <option value="urgent">🔴 urgent</option>
+          <option value="high">🟠 high</option>
+          <option value="normal">⚪ normal</option>
+          <option value="low">⚫ low</option>
         </select>
         {creatingTab ? (
           <input
@@ -1042,26 +1088,37 @@ function NotesListPanel({
               rows={4}
               className="w-full resize-y rounded-md border border-input bg-background px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-ring"
             />
-            <div className="mt-1.5 flex items-center justify-end gap-1">
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                className="h-6 px-2 text-[10px]"
-                onClick={onToggleAddNote}
-              >
-                cancel
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                className="h-6 px-2 text-[10px]"
-                disabled={!draft.trim() || creatingNote}
-                onClick={onAddNote}
-              >
-                <Upload className="mr-1 h-3 w-3" />
-                {creatingNote ? "adding…" : "add"}
-              </Button>
+            <div className="mt-1.5 flex items-center justify-between gap-1">
+              <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={draftSensitive}
+                  onChange={(e) => onDraftSensitiveChange(e.target.checked)}
+                  className="h-3 w-3"
+                />
+                🔒 sensitive
+              </label>
+              <div className="flex items-center gap-1">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={onToggleAddNote}
+                >
+                  cancel
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  disabled={!draft.trim() || creatingNote}
+                  onClick={onAddNote}
+                >
+                  <Upload className="mr-1 h-3 w-3" />
+                  {creatingNote ? "adding…" : "add"}
+                </Button>
+              </div>
             </div>
           </div>
         ) : (
@@ -1144,6 +1201,7 @@ function GridView({
   onDelete,
   repoOptions,
   onChangeRepo,
+  onChangePriority,
 }: {
   notes: Note[];
   notesLoading: boolean;
@@ -1153,6 +1211,7 @@ function GridView({
   onDelete: (id: string) => void;
   repoOptions: string[];
   onChangeRepo: (noteId: string, repo: string) => void;
+  onChangePriority: (noteId: string, priority: NotePriority) => void;
 }) {
   return (
     <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
@@ -1173,6 +1232,7 @@ function GridView({
               onDelete={() => onDelete(n.id)}
               repoOptions={repoOptions}
               onChangeRepo={(repo) => onChangeRepo(n.id, repo)}
+              onChangePriority={(priority) => onChangePriority(n.id, priority)}
             />
           ))}
         </div>
@@ -1188,6 +1248,7 @@ function NoteCard({
   onDelete,
   repoOptions,
   onChangeRepo,
+  onChangePriority,
 }: {
   note: Note;
   onOpen: () => void;
@@ -1195,6 +1256,7 @@ function NoteCard({
   onDelete: () => void;
   repoOptions: string[];
   onChangeRepo: (repo: string) => void;
+  onChangePriority: (priority: NotePriority) => void;
 }) {
   const [section, setSection] = useState<"summary" | "technical" | "plain">("summary");
   const [revalidateNote, { isLoading: revalidating }] = useRevalidateNoteMutation();
@@ -1235,7 +1297,11 @@ function NoteCard({
           </p>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
-          <IdChip id={note.id} />
+          <div className="flex items-center gap-1">
+            {note.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
+            <IdChip id={note.id} />
+          </div>
+          <PrioritySelector priority={note.priority} onChange={onChangePriority} />
           <Badge variant={badge.variant} className="text-[10px]">
             {badge.label}
           </Badge>
@@ -1342,6 +1408,7 @@ function CenterReaderPanel({
   answerSaved,
   repoOptions,
   onChangeRepo,
+  onChangePriority,
 }: {
   view: CenterView;
   onSelectSource: (id: string) => void;
@@ -1354,6 +1421,7 @@ function CenterReaderPanel({
   answerSaved: boolean;
   repoOptions: string[];
   onChangeRepo: (noteId: string, repo: string) => void;
+  onChangePriority: (noteId: string, priority: NotePriority) => void;
 }) {
   const [section, setSection] = useState<"summary" | "technical" | "plain">("summary");
 
@@ -1444,6 +1512,7 @@ function CenterReaderPanel({
       revalidating={revalidating}
       repoOptions={repoOptions}
       onChangeRepo={onChangeRepo}
+      onChangePriority={onChangePriority}
     />
   );
 }
@@ -1463,6 +1532,7 @@ function NoteStructuredReader({
   revalidating,
   repoOptions,
   onChangeRepo,
+  onChangePriority,
 }: {
   noteId: string;
   section: "summary" | "technical" | "plain";
@@ -1473,6 +1543,7 @@ function NoteStructuredReader({
   revalidating: boolean;
   repoOptions: string[];
   onChangeRepo: (noteId: string, repo: string) => void;
+  onChangePriority: (noteId: string, priority: NotePriority) => void;
 }) {
   // Poll ONLY while a reprocess is actually in flight (raw_text edit →
   // "reprocessing" badge → settles back to processed) — that's the entire
@@ -1482,11 +1553,19 @@ function NoteStructuredReader({
   // MermaidBlock and re-running mermaid.render — visible diagram flicker
   // on every note/guide, worst on guides since they never stop "polling
   // for nothing" (Joseph report, 2026-07-04).
+  //
+  // Single-note fetch (`getNote`), NOT the bulk `listNotes` — live-verified
+  // (2026-07-04) the list endpoint MASKS raw_text to a placeholder for
+  // sensitive notes ("[sensitive note — open it to view the real content]"),
+  // per the sensitive-notes spec's own "list never returns raw_text of a
+  // sensitive note in bulk" rule. The reader must show the REAL text, so it
+  // can't source from the list — using the single-note endpoint (which
+  // returns the real raw_text) is what the security boundary requires, not
+  // a stylistic choice.
   const [pollWhileReprocessing, setPollWhileReprocessing] = useState(false);
-  const { data: notesData } = useListNotesQuery(undefined, {
+  const { data: note } = useGetNoteQuery(noteId, {
     pollingInterval: pollWhileReprocessing ? 3000 : 0,
   });
-  const note = notesData?.notes.find((n) => n.id === noteId);
   // A note that already has tabs but is back in "draft" is being reprocessed
   // (raw_text changed) — the old tabs stay visible, badged as reprocessing.
   const reprocessing = !!note && note.status === "draft" && !!note.pipeline;
@@ -1539,7 +1618,14 @@ function NoteStructuredReader({
           ) : null}
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
-          <IdChip id={note.id} />
+          <div className="flex items-center gap-1">
+            {note.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
+            <IdChip id={note.id} />
+          </div>
+          <PrioritySelector
+            priority={note.priority}
+            onChange={(priority) => onChangePriority(note.id, priority)}
+          />
           {reprocessing ? (
             <Badge
               variant="outline"
@@ -1569,6 +1655,7 @@ function NoteStructuredReader({
       </div>
 
       <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
+        {note.sensitive ? <SensitiveBanner redactions={note.redactions} /> : null}
         {pipeline ? (
           <>
             <div className="mb-3 flex gap-1">
@@ -1665,7 +1752,12 @@ function NoteStructuredReader({
 }
 
 /** RIGHT (Reader mode) — the note's immutable original (raw_text). */
-function OriginalPanel({ note, rawMode }: { note: Note | null; rawMode: boolean }) {
+/** Fetches the single note directly (`getNote`), NOT the masked bulk list —
+ *  same live-verified reason as `NoteStructuredReader`: the list endpoint
+ *  replaces a sensitive note's raw_text with a placeholder, and this panel's
+ *  whole job is showing the real, immutable original. */
+function OriginalPanel({ noteId, rawMode }: { noteId: string | null; rawMode: boolean }) {
+  const { data: note } = useGetNoteQuery(noteId ?? skipToken);
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
