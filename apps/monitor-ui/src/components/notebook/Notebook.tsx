@@ -971,36 +971,20 @@ function NotesListPanel({
 }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border/70 px-2 py-1.5">
-        <button
-          type="button"
-          onClick={() => onSelectTab(ALL_TABS)}
-          className={cn(
-            "rounded-md px-2 py-1 text-[10px] font-medium whitespace-nowrap transition-colors",
-            selectedTab === ALL_TABS
-              ? "bg-accent text-accent-foreground"
-              : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-          )}
+      <div className="flex shrink-0 items-center gap-1.5 border-b border-border/70 px-2 py-1.5">
+        <select
+          value={selectedTab}
+          onChange={(e) => onSelectTab(e.target.value)}
+          title="Filter by collection"
+          className="h-7 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-[11px] text-muted-foreground hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
         >
-          all
-        </button>
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            type="button"
-            onClick={() => onSelectTab(t.id)}
-            title={`${t.note_ids.length} note${t.note_ids.length === 1 ? "" : "s"}`}
-            className={cn(
-              "rounded-md px-2 py-1 text-[10px] font-medium whitespace-nowrap transition-colors",
-              selectedTab === t.id
-                ? "bg-accent text-accent-foreground"
-                : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-            )}
-          >
-            {t.title}
-            <span className="ml-1 text-muted-foreground/60">{t.note_ids.length}</span>
-          </button>
-        ))}
+          <option value={ALL_TABS}>all</option>
+          {tabs.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.title} ({t.note_ids.length})
+            </option>
+          ))}
+        </select>
         {creatingTab ? (
           <input
             autoFocus
