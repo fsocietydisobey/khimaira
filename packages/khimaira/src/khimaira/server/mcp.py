@@ -2965,6 +2965,24 @@ async def notebook_create(
 
 
 @mcp.tool()
+@logged_tool("notebook_revalidate")
+async def notebook_revalidate(note_id: str) -> str:
+    """Re-ground a note against the current code and re-run its structuring
+    pipeline — the manual reprocess/resync fallback.
+
+    Normally unnecessary: notebook mutations auto-resync at the daemon
+    (notebook_create + raw_text edits re-run the pipeline; delete/resolution
+    handle their own resyncs). Use this only when you OBSERVE a stale note —
+    its tabs don't match its source, or the code it validates against moved on.
+    Slower than other notebook_* tools (spawns a headless claude -p re-check).
+
+    Args:
+        note_id: the note id to reprocess (from notebook_list/notebook_search).
+    """
+    return await _notebook_tools.notebook_revalidate(note_id)
+
+
+@mcp.tool()
 @logged_tool("notebook_delete")
 async def notebook_delete(note_id: str) -> str:
     """Delete a note permanently. DESTRUCTIVE — the note content is removed

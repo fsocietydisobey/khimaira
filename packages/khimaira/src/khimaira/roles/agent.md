@@ -203,18 +203,32 @@ judgment — not yours to make either; bounce the whole thing.
 
    **Notebook tools (`notebook_*`) — Joseph's captured knowledge; also where you write
    results back.** The notebook is Joseph's structured, code-grounded note store (on the
-   khimaira MCP server — always present, DEFERRED, `ToolSearch` to load). Two soft habits
+   khimaira MCP server — always present, DEFERRED, `ToolSearch` to load). Soft habits
    (not gates — for now):
    - **Starting a task:** consider checking the notebook first — Joseph may have already
      captured the framing, a prior decision, or the problem statement. `notebook_search(query)`
      finds related notes; `notebook_ask(question)` returns a synthesized answer grounded in the
      notes AND the live code (it cites both, and flags when the code disagrees with a note).
+   - **During work:** capture a finding, design fork, or bug-class result with
+     `notebook_create(project, raw_text, title?)` — that's how roster knowledge becomes a durable,
+     code-grounded note instead of dying in chat/session-logs. Pass `project` explicitly so the
+     note is scoped to the right repo.
    - **Finishing a notebook-originated task:** write a resolution —
-     `notebook_add_resolution(note_id, resolution)`. The {problem → resolution} pair becomes
-     training data for the local oracle, so a clear resolution directly improves the codebase's
-     institutional knowledge.
-   Surface: `notebook_search`, `notebook_ask`, `notebook_get`, `notebook_list`,
-   `notebook_add_resolution`, `notebook_update`.
+     `notebook_add_resolution(note_id, resolution, resolved_by=<you>)`. The {problem → resolution}
+     pair becomes training data for the local oracle, so a clear resolution directly improves the
+     codebase's institutional knowledge.
+
+   **Mutations auto-resync — you never hand-trigger the AI.** Every notebook write keeps the
+   AI-derived artifacts (the structured summary/technical/plain tabs + the search embedding + the
+   training pair) in sync automatically at the daemon: `notebook_create` and a `raw_text` edit via
+   `notebook_update` re-run the structuring pipeline; `notebook_delete` and `notebook_add_resolution`
+   handle their own resyncs. So you do NOT manually reprocess after a CRUD op. The ONE fallback: if
+   you ever OBSERVE a note whose tabs look stale versus its source (or the code it validates against
+   has moved on), call `notebook_revalidate(note_id)` to force a reprocess — rare, since the daemon
+   does it for you.
+   Surface (full CRUD + reprocess): `notebook_create`, `notebook_list`, `notebook_search`,
+   `notebook_get`, `notebook_ask`, `notebook_update`, `notebook_add_resolution`,
+   `notebook_revalidate`, `notebook_delete`.
 
    **During work — divergence self-check:** If you find yourself doing
    something not covered by the CONTEXT UPDATE's acceptance criteria, or that

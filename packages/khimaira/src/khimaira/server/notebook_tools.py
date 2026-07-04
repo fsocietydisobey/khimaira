@@ -235,6 +235,38 @@ async def notebook_update(
     return f"✅ `{data['id']}` updated — **{data.get('title', '?')}**."
 
 
+async def notebook_revalidate(note_id: str) -> str:
+    """Re-ground a note against the CURRENT code and re-run its structuring
+    pipeline — the manual reprocess/resync fallback.
+
+    Normally you never need this: notebook mutations auto-resync at the daemon
+    (`notebook_create` and `raw_text` edits via `notebook_update` re-run the
+    structuring pipeline; `notebook_delete` / `notebook_add_resolution` handle
+    their own resyncs). Reach for this only when you OBSERVE a note whose
+    structured tabs look stale versus its source, or the code it's validated
+    against has moved on — it re-derives summary/technical/plain and heals the
+    note if the code drifted. Slower than the other notebook_* tools (spawns a
+    headless `claude -p` re-check), so it's awaited with a longer timeout.
+    """
+    if not note_id:
+        return "❌ notebook_revalidate requires a note_id — get one from notebook_list/notebook_search."
+    data = _post(
+        f"/api/notes/{urllib.parse.quote(note_id, safe='')}/revalidate",
+        {},
+        timeout=180.0,
+    )
+    if isinstance(data, str):
+        return data
+    heals = len(data.get("history") or [])
+    return (
+        f"🔄 revalidated `{data.get('id', note_id)}` — **{data.get('title', '?')}** "
+        f"[{data.get('status', '?')}], re-checked vs code at "
+        f"{data.get('last_validated_at', '?')}"
+        + (f" · {heals} heal(s) in history" if heals else "")
+        + "."
+    )
+
+
 async def notebook_create(
     project: str = "",
     raw_text: str = "",

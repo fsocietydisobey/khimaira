@@ -391,6 +391,40 @@ def test_notebook_delete_error_passthrough_on_delete_call():
 
 
 # ---------------------------------------------------------------------------
+# notebook_revalidate
+# ---------------------------------------------------------------------------
+
+
+def test_notebook_revalidate_happy_path():
+    payload = _note(id="r-1", status="processed", last_validated_at="2026-07-04T01:00:00+00:00")
+    with patch.object(nt, "_post", return_value=payload) as mock_post:
+        out = _run(nt.notebook_revalidate("r-1"))
+    assert "revalidated" in out.lower()
+    assert "r-1" in out
+    assert mock_post.call_args[0][0] == "/api/notes/r-1/revalidate"
+
+
+def test_notebook_revalidate_reports_heals():
+    payload = _note(id="r-1", history=[{"v": 1}, {"v": 2}])
+    with patch.object(nt, "_post", return_value=payload):
+        out = _run(nt.notebook_revalidate("r-1"))
+    assert "2 heal" in out
+
+
+def test_notebook_revalidate_rejects_empty_note_id():
+    with patch.object(nt, "_post") as mock_post:
+        out = _run(nt.notebook_revalidate(""))
+    assert "❌" in out
+    mock_post.assert_not_called()
+
+
+def test_notebook_revalidate_error_passthrough():
+    with patch.object(nt, "_post", return_value="khimaira-monitor → HTTP 404: No note with id"):
+        out = _run(nt.notebook_revalidate("no-such-note"))
+    assert "HTTP 404" in out
+
+
+# ---------------------------------------------------------------------------
 # personal-tab constant stays in sync with the daemon-side notes module
 # ---------------------------------------------------------------------------
 
