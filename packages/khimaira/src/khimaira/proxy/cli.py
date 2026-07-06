@@ -61,9 +61,15 @@ def _load_env() -> None:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
+    # _load_env() MUST run before `.server` is imported — server.py reads its
+    # config (KHIMAIRA_PROXY_*, backup-creds path, failover flags) into
+    # module-level constants at import time, so loading .env afterward would
+    # silently freeze those at their no-.env defaults. This is the exact
+    # command `khimaira proxy serve` (and its systemd unit) invokes, so this
+    # was a live bug, not just a theoretical one.
+    _load_env()
     from .server import serve
 
-    _load_env()
     serve(port=_port())
     return 0
 

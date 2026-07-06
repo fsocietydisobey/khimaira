@@ -34,6 +34,7 @@ from . import (
     mcp_serve,
     models as models_cmd,
     monitor,
+    notebook_readonly as notebook_readonly_cmd,
     observer,
     proxy as proxy_cmd,
     route,
@@ -63,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     doctor.add_subparser(subparsers)
     monitor.add_subparser(subparsers)
     proxy_cmd.add_subparser(subparsers)
+    notebook_readonly_cmd.add_subparser(subparsers)
     mcp_serve.add_subparser(subparsers)
     install_hooks.add_subparser(subparsers)
     attach_cmd.add_subparser(subparsers)
