@@ -29,6 +29,16 @@ def chat(notes_store, monkeypatch):
 
     importlib.reload(pipeline_mod)
     importlib.reload(chat_mod)
+    # Default the related-notes retrieval (2026-07-06) to "no hits" — most
+    # tests in this file aren't exercising that feature, and without this
+    # every run_chat_turn call would hit a real embeddings/Qdrant backend
+    # (same leaf-defaulting rationale as test_notebook_pipeline.py's
+    # `pipeline` fixture patching _seance_code_search). Tests that DO
+    # exercise related-notes injection override this per-test.
+    async def _fake_search_notes_async(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(chat_mod.notebook_retrieval, "search_notes_async", _fake_search_notes_async)
     yield chat_mod
 
 
@@ -433,6 +443,134 @@ async def test_run_chat_turn_returns_grounding_shape(chat, notes_store, monkeypa
     assert result["grounding"]["code_citations"] == ["a.py:1"]
     assert result["grounding"]["web_citations"] == ["http://x"]
     assert result["total_cost_usd"] == 0.3
+
+
+# ---------------------------------------------------------------------------
+# Related-notes retrieval-injection (2026-07-06, Joseph bug report): the
+# per-record chat subprocess has no live tool to browse other notes
+# (deliberately MCP-free) — without this, it's architecturally blind to
+# everything but the one document it's scoped to. Fix reuses the SAME
+# semantic search answer_question already runs and injects the top matches
+# as prompt context, reporting which notes were included via `sources`
+# (same field/shape answer_question already returns).
+# ---------------------------------------------------------------------------
+
+
+async def test_run_chat_turn_injects_related_notes_into_instruction(chat, notes_store, monkeypatch):
+    other = notes_store.add_note("the OTHER note's own body text", repo="khimaira")
+    primary = notes_store.add_note("the primary note being chatted about", repo="khimaira")
+    captured = {}
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": other["id"], "score": 0.9}]
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
+        captured["instruction"] = instruction
+        return _grounded(answer="ok")
+
+    monkeypatch.setattr(chat.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+
+    result = await chat.run_chat_turn(primary["id"], "what does the other note say?")
+
+    assert "the OTHER note's own body text" in captured["instruction"]
+    assert result["sources"] == [other["id"]]
+    # Persisted history must carry sources too — the frontend refetches
+    # history rather than trusting the job's transient result, so this is
+    # what actually renders in the UI.
+    history = chat.get_chat_history(primary["id"])
+    assert history[1]["sources"] == [other["id"]]
+
+
+async def test_run_chat_turn_excludes_self_from_related_notes(chat, notes_store, monkeypatch):
+    """Semantic search can legitimately return the primary note itself as a
+    top hit — it must never show up in its own 'other notes' section."""
+    primary = notes_store.add_note("primary note body", repo="khimaira")
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": primary["id"], "score": 0.99}]
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
+        return _grounded(answer="ok")
+
+    monkeypatch.setattr(chat.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+
+    result = await chat.run_chat_turn(primary["id"], "q")
+    assert result["sources"] == []
+
+
+async def test_run_chat_turn_related_notes_respects_limit(chat, notes_store, monkeypatch):
+    primary = notes_store.add_note("primary", repo="khimaira")
+    others = [notes_store.add_note(f"other note body {i}", repo="khimaira") for i in range(5)]
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": o["id"], "score": 0.5} for o in others]
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
+        return _grounded(answer="ok")
+
+    monkeypatch.setattr(chat.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+
+    result = await chat.run_chat_turn(primary["id"], "q")
+    assert len(result["sources"]) == chat._CHAT_RELATED_NOTES_LIMIT
+
+
+async def test_run_chat_turn_skips_related_note_deleted_since_indexing(
+    chat, notes_store, monkeypatch
+):
+    primary = notes_store.add_note("primary", repo="khimaira")
+
+    async def fake_search(query, **kwargs):
+        return [{"note_id": "deleted-ghost-id", "score": 0.9}]
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
+        return _grounded(answer="ok")
+
+    monkeypatch.setattr(chat.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+
+    result = await chat.run_chat_turn(primary["id"], "q")
+    assert result["sources"] == []
+
+
+async def test_run_chat_turn_related_notes_search_failure_degrades_gracefully(
+    chat, notes_store, monkeypatch
+):
+    """A search-backend error (e.g. Qdrant unreachable) must not crash the
+    whole chat turn — related-notes injection degrades to 'none found'."""
+    primary = notes_store.add_note("primary", repo="khimaira")
+
+    async def fake_search(query, **kwargs):
+        raise RuntimeError("qdrant unreachable")
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
+        return _grounded(answer="ok")
+
+    monkeypatch.setattr(chat.notebook_retrieval, "search_notes_async", fake_search)
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+
+    result = await chat.run_chat_turn(primary["id"], "q")
+    assert result["sources"] == []
+
+
+async def test_run_chat_turn_no_hits_shows_none_found_in_instruction(chat, notes_store, monkeypatch):
+    """Default fixture behavior (no hits at all) — instruction must say so
+    explicitly rather than leaving a blank/malformed section, so the model
+    doesn't hallucinate related notes that were never actually retrieved."""
+    primary = notes_store.add_note("primary", repo="khimaira")
+    captured = {}
+
+    async def fake_grounded(content, instruction, *, repo_root, max_budget_usd, schema, **kwargs):
+        captured["instruction"] = instruction
+        return _grounded(answer="ok")
+
+    monkeypatch.setattr(chat.notebook_pipeline, "_invoke_agentic_grounded", fake_grounded)
+    result = await chat.run_chat_turn(primary["id"], "q")
+
+    assert chat._NO_RELATED_NOTES in captured["instruction"]
+    assert result["sources"] == []
 
 
 # ---------------------------------------------------------------------------

@@ -39,7 +39,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from khimaira.log import get_logger
-from khimaira.monitor import notebook_pipeline, notes
+from khimaira.monitor import notebook_pipeline, notebook_retrieval, notes
 
 log = get_logger("monitor.notebook_chat")
 
@@ -149,7 +149,11 @@ _CHAT_INSTRUCTION_TEMPLATE = (
     "a single file. Research the ACTUAL codebase (Read/Grep/Glob under "
     "{repo_root}) and the live web (WebSearch/WebFetch) to ground your "
     "answers; verify anything checkable rather than trusting the "
-    "document's existing prose.\n\n"
+    "document's existing prose. You do NOT have a tool to browse or fetch "
+    "arbitrary other notes — OTHER NOTES below is everything from the rest "
+    "of the notebook you'll get for this turn (auto-retrieved by semantic "
+    "match against the user's message); if it's not there, say so rather "
+    "than guessing at a note's contents.\n\n"
     "By default, just ANSWER the user's message — leave edit null. ONLY "
     "when the user explicitly asks you to change, fix, update, add to, or "
     "rewrite the document (or a specific section of it), populate edit with "
@@ -166,8 +170,69 @@ _CHAT_INSTRUCTION_TEMPLATE = (
     'of "file:line" strings), web_citations (array of URL strings), edit '
     "(null, or an object with section_anchor and new_text).\n\n"
     "DOCUMENT:\n{guide}\n\n"
+    "OTHER NOTES (semantically related to the user's latest message — may "
+    "or may not be relevant; use if helpful, ignore if not):\n{related_notes}\n\n"
     "CONVERSATION SO FAR:\n{history}"
 )
+
+# Cost control: this retrieval + injection runs on EVERY chat turn (unlike
+# answer_question's one-shot ask), and each related note's body can be a
+# full organized_md — capped well below notebook_retrieval's own top_k=5
+# default so a chatty back-and-forth doesn't compound the per-turn prompt
+# size on top of the primary document + growing conversation history.
+_CHAT_RELATED_NOTES_LIMIT = 3
+
+_NO_RELATED_NOTES = "(none found)"
+
+
+async def _related_notes_for_chat(
+    note_id: str, message: str, repo: str
+) -> tuple[str, list[str]]:
+    """Deterministic retrieval-injection (2026-07-06, Joseph report): the
+    per-record chat runs in a subprocess locked to zero MCP servers and
+    only `--add-dir`s the CODE repo, never the notebook's own storage — so
+    without this, the chat is architecturally blind to every note but the
+    one it's scoped to (confirmed live: asked about a different note by id,
+    the model correctly said it had no way to fetch it). Rather than open a
+    live notebook-lookup tool to the subprocess (more flexible but pierces
+    the deliberate MCP-free sandboxing chosen for cost/determinism), this
+    reuses the SAME semantic search `answer_question` already runs for the
+    notebook-wide ask and injects the top matches as prompt context — the
+    model never decides what to fetch, matching this codebase's
+    deterministic-first grounding pattern (see ai-engineering.md).
+
+    Returns (formatted section text, note_ids actually included) so the
+    caller can surface those ids as `sources` alongside the model's own
+    code/web citations — same shape as answer_question's `sources` field.
+    """
+    try:
+        hits = await notebook_retrieval.search_notes_async(message, repo=repo)
+    except Exception:
+        log.warning("notebook_chat: related-notes search failed for %s", note_id, exc_info=True)
+        return _NO_RELATED_NOTES, []
+
+    sections: list[str] = []
+    included_ids: list[str] = []
+    for hit in hits:
+        other_id = hit["note_id"]
+        if other_id == note_id:
+            continue  # the primary document is already under DOCUMENT above
+        try:
+            other = notes.get_note(other_id)
+        except ValueError:
+            continue  # indexed but deleted since — skip, don't fail the turn
+        pipeline = other.get("pipeline") or {}
+        body = pipeline.get("organized_md") or pipeline.get("summary") or notes.llm_view(other)
+        if not body:
+            continue
+        sections.append(f"### {other.get('title', other_id)} (id: {other_id})\n\n{body}")
+        included_ids.append(other_id)
+        if len(included_ids) >= _CHAT_RELATED_NOTES_LIMIT:
+            break
+
+    if not sections:
+        return _NO_RELATED_NOTES, []
+    return "\n\n---\n\n".join(sections), included_ids
 
 # Sensitive notes (2026-07-04): appended to the instruction ONLY for a
 # sensitive note's chat turn. Belt (tell the model not to bother proposing
@@ -261,10 +326,12 @@ async def run_chat_turn(
     repo = record.get("repo") or "khimaira"
     repo_root = None if repo == notes.GENERAL_REPO else notebook_pipeline._repo_root(repo)
     history = get_chat_history(note_id)
+    related_notes_section, related_note_ids = await _related_notes_for_chat(note_id, message, repo)
 
     instruction = _CHAT_INSTRUCTION_TEMPLATE.format(
         repo_root=repo_root or "(no codebase — general/cross-cutting note)",
         guide=notes.llm_view(record),
+        related_notes=related_notes_section,
         history=_format_chat_history_for_prompt(history),
     )
     if record.get("sensitive"):
@@ -309,6 +376,10 @@ async def run_chat_turn(
         "edit": applied_edit,
         "cost": result.get("total_cost_usd"),
         "grounding": grounding,
+        # Other notes retrieval-injected into this turn's prompt (2026-07-06)
+        # — same field name/shape as answer_question's `sources`, so the
+        # existing frontend citation rendering picks it up with no changes.
+        "sources": related_note_ids,
     }
     append_chat_messages(note_id, user_msg, assistant_msg)
 
@@ -316,6 +387,7 @@ async def run_chat_turn(
         "message": {"content": assistant_msg["content"], "edit": applied_edit},
         "grounding": grounding,
         "total_cost_usd": result.get("total_cost_usd"),
+        "sources": related_note_ids,
     }
 
 

@@ -188,7 +188,14 @@ export interface ChatEdit {
  *  UNIFY.md) — renders TWO distinct backend shapes through one type:
  *
  *  - **Per-record** (guide or note, `POST/GET /notes/{id}/chat`, persistent):
- *    `edit`/`cost`/`grounding` — agentic, may auto-apply an edit.
+ *    `edit`/`cost`/`grounding` — agentic, may auto-apply an edit. `sources`
+ *    (2026-07-06) is now ALSO populated here — the per-record chat's
+ *    subprocess has no live tool to browse other notes (deliberately
+ *    MCP-free), so `notebook_chat.run_chat_turn` retrieval-injects the
+ *    top semantically-related OTHER notes into the prompt and reports
+ *    which ones via this same field, matching answer_question's shape so
+ *    `ChatBubble` doesn't need a mode check to render either kind's
+ *    citations.
  *  - **Notebook-wide** (`POST /notes/chat`, one-shot, client-accumulated
  *    only — no server history): `sources`/`healed`/`codeSources`/
  *    `codeUnavailable` — `answer_question`'s retrieval shape, converted at
@@ -208,10 +215,13 @@ export interface ChatMessage {
   cost?: number | null;
   /** Per-record only. */
   grounding?: ChatGrounding;
-  /** Notebook-wide only — note ids the answer drew on. */
+  /** Note ids consulted for this turn — populated by BOTH per-record chat
+   *  (related-notes retrieval-injection) and notebook-wide ask. */
   sources?: string[];
   /** Notebook-wide only — subset of `sources` that were healed (revalidated
-   *  and found stale) during this ask. */
+   *  and found stale) during this ask. Per-record chat does NOT revalidate
+   *  its injected related notes (cost — chat turns are far more frequent
+   *  than a one-off ask), so this stays empty/absent there. */
   healed?: string[];
   /** Notebook-wide only — code chunks, pre-formatted as "file_path:start-end"
    *  (converted from `CodeSource[]` at the integration boundary, same
