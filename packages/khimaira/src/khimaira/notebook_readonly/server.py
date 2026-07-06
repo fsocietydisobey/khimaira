@@ -9,11 +9,16 @@ SECURITY MODEL — two layers, both required:
 
   1. The real daemon (`khimaira.monitor.server`) asserts loopback-only
      binding as its ENTIRE auth layer (`_assert_loopback` — no bearer, no
-     API key, nothing else). This proxy is what makes the notebook
-     reachable off-box AT ALL, so it cannot inherit that same "loopback is
-     enough" assumption — it terminates on a real interface (Tailscale, or
-     whatever `--host` is passed), so it enforces its OWN auth: a bearer
-     token, required at startup (refuses to boot without one, same
+     API key, nothing else). THIS proxy also binds loopback-only by
+     default now (`serve(host="127.0.0.1", ...)`) — it is NOT the thing
+     terminating on the tailnet anymore. That role moved to the co-located
+     `khimaira.notebook_readonly.mcp_client` FastMCP HTTP server, which is
+     the only process that talks to this proxy (over 127.0.0.1) and the
+     only one bearing a token meant to cross the tailnet
+     (`KHIMAIRA_NOTEBOOK_MCP_TOKEN`, deliberately distinct from this
+     proxy's own `KHIMAIRA_NOTEBOOK_RO_TOKEN`). This proxy still enforces
+     its own bearer auth regardless — defense in depth, not "loopback is
+     enough" — required at startup (refuses to boot without one, same
      fail-loud posture as `_assert_loopback`).
 
   2. Notebook records are NOT public even to an authenticated caller —
@@ -210,7 +215,7 @@ async def ask(req: AskReq) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def serve(*, host: str = "0.0.0.0", port: int = 8742) -> None:
+def serve(*, host: str = "127.0.0.1", port: int = 8742) -> None:
     """Start the read-only notebook proxy in the foreground (blocks until shutdown)."""
     import uvicorn
 

@@ -26,6 +26,11 @@ dependencies = [
     "anthropic>=0.40",
     "httpx>=0.27",
     "mcp[cli]>=1.0",
+    # StaticTokenVerifier + HTTP-transport serving for the notebook-readonly
+    # MCP client (khimaira.notebook_readonly.mcp_client) — was already present
+    # transitively via khimaira-transport; declaring it directly since that
+    # module imports `fastmcp` itself now, not just `mcp.server.fastmcp`.
+    "fastmcp>=2.6",
     "tree-sitter>=0.21",
     "tree-sitter-python>=0.21",
     # psycopg is needed to read Postgres-backed LangGraph checkpointers
