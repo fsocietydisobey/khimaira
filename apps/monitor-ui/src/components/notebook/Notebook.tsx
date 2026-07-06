@@ -1651,14 +1651,26 @@ function NoteStructuredReader({
   onChangePriority: (noteId: string, priority: NotePriority) => void;
   onToggleStarred: (noteId: string, starred: boolean) => void;
 }) {
-  // Poll ONLY while a reprocess is actually in flight (raw_text edit →
-  // "reprocessing" badge → settles back to processed) — that's the entire
-  // reason this poll exists, so a settled note (or a study guide, which
+  // Poll ONLY while structuring is actually in flight — status stays "draft"
+  // for the ENTIRE structuring pass, whether this is a note's first-ever
+  // pipeline run (fresh note: draft + pipeline=null) or a reprocess of an
+  // already-structured note (raw_text edit: draft + pipeline still holds
+  // the stale prior version) — so a settled note (or a study guide, which
   // never reprocesses) shouldn't pay for it. Unconditional 3s polling here
   // was a regression: every tick re-rendered MarkdownView, remounting
   // MermaidBlock and re-running mermaid.render — visible diagram flicker
   // on every note/guide, worst on guides since they never stop "polling
   // for nothing" (Joseph report, 2026-07-04).
+  //
+  // BUG (2026-07-06, Joseph report): a prior version of this gate required
+  // `!!note.pipeline` in addition to status==="draft", to distinguish
+  // "reprocessing" from "first-time processing" for the badge label below.
+  // That accidentally made polling ITSELF conditional on already having a
+  // pipeline — so opening a brand-new note (pipeline still null) before its
+  // first structuring pass finished never polled at all, and the reader got
+  // stuck on "still processing" forever (only a full app reload re-fetched
+  // it). Polling must key on status alone; `hadPriorPipeline` below is
+  // display-only (which badge label to show), never a polling gate.
   //
   // Single-note fetch (`getNote`), NOT the bulk `listNotes` — live-verified
   // (2026-07-04) the list endpoint MASKS raw_text to a placeholder for
@@ -1668,17 +1680,19 @@ function NoteStructuredReader({
   // can't source from the list — using the single-note endpoint (which
   // returns the real raw_text) is what the security boundary requires, not
   // a stylistic choice.
-  const [pollWhileReprocessing, setPollWhileReprocessing] = useState(false);
+  const [pollWhileProcessing, setPollWhileProcessing] = useState(false);
   const { data: note } = useGetNoteQuery(noteId, {
-    pollingInterval: pollWhileReprocessing ? 3000 : 0,
+    pollingInterval: pollWhileProcessing ? 3000 : 0,
   });
+  const stillProcessing = !!note && note.status === "draft";
   // A note that already has tabs but is back in "draft" is being reprocessed
-  // (raw_text changed) — the old tabs stay visible, badged as reprocessing.
-  const reprocessing = !!note && note.status === "draft" && !!note.pipeline;
+  // (raw_text changed) — the old tabs stay visible, badged as reprocessing
+  // rather than the plain "processing…" a first-time structuring pass gets.
+  const reprocessing = stillProcessing && !!note.pipeline;
 
   useEffect(() => {
-    setPollWhileReprocessing(reprocessing);
-  }, [reprocessing]);
+    setPollWhileProcessing(stillProcessing);
+  }, [stillProcessing]);
 
   if (!note) {
     return (
