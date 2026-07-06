@@ -10,11 +10,19 @@ integration's surface exactly as small as the proxy it talks to, with
 nothing to install.
 
 Talks to `khimaira.notebook_readonly.server`'s real wire format
-(`GET /notes/search`, `GET /notes/{note_id}`, `POST /notes/ask`, bearer
-auth) — NOT to `khimaira.server.notebook_tools`'s `/api/notes/...` daemon
-routes, which that proxy doesn't expose at all (see the wire-compat
-verdict posted in chat-102d8b5fd82f: path prefix AND missing auth header
-were both real breaks).
+(`GET /notes/search`, `GET /notes/{note_id}`, `POST /notes/ask`,
+`POST /notes/ask-joseph`, bearer auth) — NOT to
+`khimaira.server.notebook_tools`'s `/api/notes/...` daemon routes, which
+that proxy doesn't expose at all (see the wire-compat verdict posted in
+chat-102d8b5fd82f: path prefix AND missing auth header were both real
+breaks).
+
+Four tools: `notebook_search`/`notebook_get`/`notebook_ask` (read-only),
+plus `notebook_ask_joseph` — the "notify + pull-to-check" async-question
+flow (Joseph's pick over full bidirectional real-time chat): posts to one
+fixed, pre-created note (id from `KHIMAIRA_ENGINEER_QUESTIONS_NOTE_ID` on
+the REST-proxy side, not this process), fires a desktop notification, and
+the engineer checks back later with `notebook_get` on the returned id.
 
 TWO independent trust boundaries, two independent tokens — deliberately
 not shared, so a leak of one doesn't compromise the other:
@@ -196,6 +204,24 @@ async def _notebook_ask_impl(question: str) -> str:
     return "\n".join(lines)
 
 
+async def _notebook_ask_joseph_impl(question: str, asker: str) -> str:
+    if not question.strip():
+        return "❌ notebook_ask_joseph needs a non-empty question."
+    if not asker.strip():
+        return "❌ notebook_ask_joseph needs a non-empty asker (your name)."
+    data = await _request("POST", "/notes/ask-joseph", json={"asker": asker, "question": question})
+    if isinstance(data, str):
+        return data
+
+    note_id = data.get("note_id", "?")
+    return (
+        f"✅ Posted your question to Joseph (note `{note_id}`) — he's been notified.\n\n"
+        f"Check back later by calling `notebook_get(\"{note_id}\")`: scan the note for "
+        f"your name/question — the entry's `STATUS:` line flips from `pending` to "
+        f"`answered` (with the answer appended) once Joseph replies."
+    )
+
+
 @mcp.tool()
 async def notebook_search(query: str, top_k: int = 10) -> str:
     """Semantic search over Joseph's read-only notebook (jeevy_portal scope).
@@ -234,6 +260,27 @@ async def notebook_ask(question: str) -> str:
         question: the question to ask.
     """
     return await _notebook_ask_impl(question)
+
+
+@mcp.tool()
+async def notebook_ask_joseph(question: str, asker: str) -> str:
+    """Post a question to Joseph — the async "notify + check back later" flow.
+
+    This does NOT get you an immediate answer. It appends your question to
+    a shared, fixed note, fires a desktop notification to Joseph, and
+    returns that note's id. Joseph answers later via his own notebook chat
+    (whenever he sees the notification / gets to it).
+
+    Check back by calling `notebook_get(note_id)` on the id this tool
+    returns — scan for your own name/question; its `STATUS:` line flips
+    from `pending` to `answered` once Joseph replies.
+
+    Args:
+        question: what you want to ask Joseph.
+        asker: your name — so Joseph knows who's asking and you can find
+            your own entry when you check back.
+    """
+    return await _notebook_ask_joseph_impl(question, asker)
 
 
 def serve(*, host: str = "0.0.0.0", port: int = 8743) -> None:

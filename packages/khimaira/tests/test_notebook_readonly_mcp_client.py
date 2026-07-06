@@ -146,9 +146,9 @@ class TestWireFormat:
         assert seen["path"] == "/notes/ask"
         assert seen["auth"] == "Bearer test-token"
         assert seen["body"] == {"question": "how does X work"}
-        # No write routes exist on the proxy — this client must never even
-        # attempt create/update/delete. Confirmed by absence: no such
-        # tools are defined on `mcp_client.mcp` at all (see TestNoWriteTools).
+        # No general write routes (create/update/delete of arbitrary notes)
+        # exist on the proxy or this client — the only write capability is
+        # the narrow, fixed-note `ask-joseph` append (see TestSurfaceArea).
 
 
 # ---------------------------------------------------------------------------
@@ -273,14 +273,73 @@ class TestNotebookAsk:
 
 
 # ---------------------------------------------------------------------------
-# Surface area — no write tools, read-only by construction
+# Surface area — exactly 4 tools, no general write tools (create/update/
+# delete of arbitrary notes), only the narrow ask-joseph append
 # ---------------------------------------------------------------------------
 
 
-class TestNoWriteTools:
-    def test_only_three_tools_registered(self):
+class TestSurfaceArea:
+    def test_only_four_tools_registered(self):
         names = {t.name for t in _run(mcp_client.mcp.list_tools())}
-        assert names == {"notebook_search", "notebook_get", "notebook_ask"}
+        assert names == {"notebook_search", "notebook_get", "notebook_ask", "notebook_ask_joseph"}
+
+
+# ---------------------------------------------------------------------------
+# notebook_ask_joseph
+# ---------------------------------------------------------------------------
+
+
+class TestNotebookAskJoseph:
+    def test_happy_path_posts_and_renders_note_id(self):
+        _wire(_json_handler(200, {"posted": True, "note_id": "fed9d370fb94"}))
+        out = _run(mcp_client.notebook_ask_joseph("how do I run the migration?", "priya"))
+        assert "fed9d370fb94" in out
+        assert "notebook_get" in out
+
+    def test_attaches_bearer_header_and_correct_path_and_body(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["auth"] = request.headers.get("authorization")
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"posted": True, "note_id": "fed9d370fb94"})
+
+        _wire(handler)
+        _run(mcp_client.notebook_ask_joseph("how do I run the migration?", "priya"))
+        assert seen["path"] == "/notes/ask-joseph"
+        assert seen["auth"] == "Bearer test-token"
+        assert seen["body"] == {"asker": "priya", "question": "how do I run the migration?"}
+
+    def test_empty_question_rejected_before_call(self):
+        called = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            called.append(request)
+            return httpx.Response(200, json={"posted": True, "note_id": "x"})
+
+        _wire(handler)
+        out = _run(mcp_client.notebook_ask_joseph("   ", "priya"))
+        assert "non-empty question" in out
+        assert not called
+
+    def test_empty_asker_rejected_before_call(self):
+        called = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            called.append(request)
+            return httpx.Response(200, json={"posted": True, "note_id": "x"})
+
+        _wire(handler)
+        out = _run(mcp_client.notebook_ask_joseph("a real question", "   "))
+        assert "non-empty asker" in out
+        assert not called
+
+    def test_daemon_error_passes_through_verbatim(self):
+        _wire(_json_handler(500, {"detail": "KHIMAIRA_ENGINEER_QUESTIONS_NOTE_ID is unset on the server."}))
+        out = _run(mcp_client.notebook_ask_joseph("q", "priya"))
+        assert "HTTP 500" in out
+        assert "KHIMAIRA_ENGINEER_QUESTIONS_NOTE_ID" in out
 
 
 # ---------------------------------------------------------------------------

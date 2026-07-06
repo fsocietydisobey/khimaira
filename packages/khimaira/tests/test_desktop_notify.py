@@ -119,6 +119,30 @@ def test_post_handoff_fires_notification(isolated_state, tmp_path, monkeypatch):
     assert args[1] == str(project)
 
 
+def test_notify_engineer_question_bypasses_master_switch_when_off(linux_platform, monkeypatch):
+    """The whole point of this wrapper: it must still fire even when the
+    master KHIMAIRA_DESKTOP_NOTIFY switch is off (Joseph runs with it off
+    to silence routine roster noise — a real external human asking a
+    question is a different category and shouldn't be silenced by that)."""
+    monkeypatch.setenv("KHIMAIRA_DESKTOP_NOTIFY", "0")
+    monkeypatch.delenv("KHIMAIRA_DESKTOP_NOTIFY_ENGINEER_QUESTIONS", raising=False)
+    with patch.object(desktop_notify.subprocess, "Popen") as mock_popen:
+        desktop_notify.notify_engineer_question("priya", "how do I run the migration?")
+    mock_popen.assert_called_once()
+    cmd = mock_popen.call_args[0][0]
+    assert cmd[0] == "notify-send"
+    assert "priya" in cmd[3]
+    assert "how do I run the migration?" in cmd[3]
+
+
+def test_notify_engineer_question_has_its_own_opt_out(linux_platform, monkeypatch):
+    monkeypatch.delenv("KHIMAIRA_DESKTOP_NOTIFY", raising=False)
+    monkeypatch.setenv("KHIMAIRA_DESKTOP_NOTIFY_ENGINEER_QUESTIONS", "0")
+    with patch.object(desktop_notify.subprocess, "Popen") as mock_popen:
+        desktop_notify.notify_engineer_question("priya", "q")
+    mock_popen.assert_not_called()
+
+
 def test_notify_invite_includes_owner_and_invitee(linux_platform, enabled):
     with patch.object(desktop_notify.subprocess, "Popen") as mock_popen:
         desktop_notify.notify_invite(

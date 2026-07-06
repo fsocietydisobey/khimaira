@@ -124,3 +124,50 @@ def notify_broadcast(
         f"📡 {owner_session_id[:8]} → {subscriber_session_id[:12]} ({kind})",
         text[:160],
     )
+
+
+def _engineer_questions_enabled() -> bool:
+    """Independent of the master KHIMAIRA_DESKTOP_NOTIFY switch — that switch
+    exists to silence session-to-session roster noise (handoffs, invites,
+    decision fan-out), not "an external human is waiting on you." Default ON
+    even when the master switch is off; set
+    KHIMAIRA_DESKTOP_NOTIFY_ENGINEER_QUESTIONS=0 to silence this one too."""
+    return os.environ.get("KHIMAIRA_DESKTOP_NOTIFY_ENGINEER_QUESTIONS", "1") not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def notify_engineer_question(asker: str, question: str) -> None:
+    """A remote engineer posted a question via notebook_ask_joseph.
+
+    Bypasses the master KHIMAIRA_DESKTOP_NOTIFY=0 switch deliberately — see
+    `_engineer_questions_enabled`'s docstring.
+    """
+    if not _engineer_questions_enabled():
+        return
+
+    system = platform.system()
+    title = "❓ Engineer question"
+    message = f"{asker}: {question[:200]}"
+    try:
+        if system == "Linux":
+            subprocess.Popen(
+                ["notify-send", f"--app-name={_APP_NAME}", title, message],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif system == "Darwin":
+            script = (
+                f"display notification {shlex.quote(message)} "
+                f"with title {shlex.quote(_APP_NAME)} "
+                f"subtitle {shlex.quote(title)}"
+            )
+            subprocess.Popen(
+                ["osascript", "-e", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except (FileNotFoundError, OSError):
+        pass

@@ -5,6 +5,14 @@ reachable over the Tailscale tailnet, so teammates who don't run the full
 khimaira daemon locally (e.g. remote engineers) can query Joseph's
 accumulated notebook context from their own Claude Code sessions.
 
+PLUS one narrow write path — `POST /notes/ask-joseph` — the "notify +
+pull-to-check" async-question flow: an engineer's question gets appended
+to one fixed, pre-created note (id from `KHIMAIRA_ENGINEER_QUESTIONS_NOTE_ID`,
+never a caller-supplied note_id — this route can't touch any other note),
+Joseph gets a desktop notification, and he answers later via the existing
+per-record grimoire chat (which auto-applies the edit). Not a general
+write surface: still read-only for every OTHER note.
+
 SECURITY MODEL — two layers, both required:
 
   1. The real daemon (`khimaira.monitor.server`) asserts loopback-only
@@ -45,6 +53,7 @@ import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any, AsyncIterator
 
 import httpx
@@ -63,6 +72,7 @@ logger = logging.getLogger(__name__)
 _DAEMON_BASE = os.environ.get("KHIMAIRA_MONITOR_URL", "http://127.0.0.1:8740").rstrip("/")
 _AUTH_TOKEN = os.environ.get("KHIMAIRA_NOTEBOOK_RO_TOKEN", "").strip()
 _REPO_SCOPE = os.environ.get("KHIMAIRA_NOTEBOOK_RO_REPO", "").strip() or None
+_ASK_JOSEPH_NOTE_ID = os.environ.get("KHIMAIRA_ENGINEER_QUESTIONS_NOTE_ID", "").strip()
 
 _DEFAULT_TOP_K = 10
 _ASK_TIMEOUT_S = 180.0
@@ -165,6 +175,11 @@ class AskReq(BaseModel):
     repo: str | None = None
 
 
+class AskJosephReq(BaseModel):
+    asker: str
+    question: str
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -208,6 +223,54 @@ async def ask(req: AskReq) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+@app.post("/notes/ask-joseph", dependencies=[Depends(_check_auth)])
+async def ask_joseph(req: AskJosephReq) -> dict:
+    """The "notify + pull-to-check" async-question flow (Joseph's pick over
+    full bidirectional real-time chat): append a structured question block
+    to one FIXED, pre-created note, fire a desktop notification, return the
+    note_id so the caller knows where to check back. Never touches any
+    other note — `note_id` is never caller-supplied.
+
+    Race note: this is read-then-write (GET the note, append, PATCH the
+    whole raw_text back) with no optimistic-concurrency guard — the
+    daemon's PATCH /api/notes/{id} takes no `expected_updated_at` or
+    similar field. At this note's actual traffic (2 engineers, occasional
+    questions) a lost-update race is unlikely and low-cost if it happens
+    (a re-asked question); not worth solving until traffic changes.
+
+    Timestamp is date+HH:MM UTC, not full microsecond-precision ISO —
+    this heading becomes a `section_anchor` slug for the grimoire chat's
+    auto-apply-edit (see `notebook_pipeline._slugify_heading`, which strips
+    all punctuation), and an LLM scoping an edit to "the pending question
+    from X" has to reproduce that slug byte-exact. A 20-digit microsecond
+    timestamp is effectively unreproducible; date+HH:MM is short enough an
+    LLM can realistically get it right, and still unique enough to
+    disambiguate same-day questions in practice.
+    """
+    if not _ASK_JOSEPH_NOTE_ID:
+        raise HTTPException(500, "KHIMAIRA_ENGINEER_QUESTIONS_NOTE_ID is unset on the server.")
+    assert _client is not None
+
+    resp = await _client.get(f"/api/notes/{_ASK_JOSEPH_NOTE_ID}")
+    if resp.status_code == 404:
+        raise HTTPException(404, f"KHIMAIRA_ENGINEER_QUESTIONS_NOTE_ID={_ASK_JOSEPH_NOTE_ID!r} not found.")
+    resp.raise_for_status()
+    note = resp.json()
+
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    block = f"\n\n## Question from {req.asker} — {timestamp} — STATUS: pending\n{req.question}\n"
+    new_raw_text = note.get("raw_text", "") + block
+
+    patch_resp = await _client.patch(f"/api/notes/{_ASK_JOSEPH_NOTE_ID}", json={"raw_text": new_raw_text})
+    patch_resp.raise_for_status()
+
+    from khimaira.monitor.desktop_notify import notify_engineer_question
+
+    notify_engineer_question(req.asker, req.question)
+
+    return {"posted": True, "note_id": _ASK_JOSEPH_NOTE_ID}
 
 
 # ---------------------------------------------------------------------------

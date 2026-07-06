@@ -18,16 +18,19 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         "notebook-readonly",
         help="Run the read-only notebook proxy + its MCP server (Tailscale-reachable, ports 8742/8743).",
         description=(
-            "khimaira-notebook-readonly — bearer-token-authenticated, read-only "
-            "surface onto the notebook (search/get/ask only) for teammates who "
-            "don't run khimaira at all. Two co-located processes: `serve` (the "
-            "REST proxy, loopback-only) and `mcp` (the FastMCP HTTP server, "
+            "khimaira-notebook-readonly — bearer-token-authenticated, mostly-"
+            "read-only surface onto the notebook (search/get/ask, plus one "
+            "narrow ask-joseph write path) for teammates who don't run "
+            "khimaira at all. Two co-located processes: `serve` (the REST "
+            "proxy, loopback-only) and `mcp` (the FastMCP HTTP server, "
             "Tailscale-reachable — this is what remote engineers' .mcp.json "
             "points at). Reads KHIMAIRA_NOTEBOOK_RO_TOKEN (required, REST proxy "
             "auth), KHIMAIRA_NOTEBOOK_MCP_TOKEN (required, MCP server auth — "
             "deliberately a DIFFERENT secret), KHIMAIRA_NOTEBOOK_RO_REPO "
-            "(optional repo allowlist), KHIMAIRA_MONITOR_URL (daemon the REST "
-            "proxy relays to, default http://127.0.0.1:8740)."
+            "(optional repo allowlist), KHIMAIRA_ENGINEER_QUESTIONS_NOTE_ID "
+            "(required for notebook_ask_joseph — the fixed note id questions "
+            "get appended to), KHIMAIRA_MONITOR_URL (daemon the REST proxy "
+            "relays to, default http://127.0.0.1:8740)."
         ),
     )
     sub = nb.add_subparsers(dest="notebook_readonly_cmd", required=True)
@@ -43,8 +46,9 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Run the read-only notebook MCP server over HTTP (Tailscale-reachable, for remote engineers).",
         description=(
             "Launches a standalone FastMCP HTTP server exposing exactly "
-            "notebook_search/notebook_get/notebook_ask, wired to the co-located "
-            "REST proxy (KHIMAIRA_NOTEBOOK_RO_URL, typically http://127.0.0.1:8742) "
+            "notebook_search/notebook_get/notebook_ask/notebook_ask_joseph, "
+            "wired to the co-located REST proxy "
+            "(KHIMAIRA_NOTEBOOK_RO_URL, typically http://127.0.0.1:8742) "
             "with bearer auth (KHIMAIRA_NOTEBOOK_RO_TOKEN), and itself gated by a "
             "SEPARATE bearer token (KHIMAIRA_NOTEBOOK_MCP_TOKEN) via FastMCP's "
             "StaticTokenVerifier. Remote engineers register this as a pure-URL "

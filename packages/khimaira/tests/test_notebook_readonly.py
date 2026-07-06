@@ -15,10 +15,11 @@ get_note for any note outside scope.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-
 from khimaira.notebook_readonly import server
 
 AUTH = {"Authorization": "Bearer test-token"}
@@ -208,3 +209,98 @@ class TestRepoScope:
         client = _client_for(handler)
         client.get("/notes/search", params={"q": "x", "repo": "whatever_repo"}, headers=AUTH)
         assert seen["repo"] == "whatever_repo"
+
+
+# ---------------------------------------------------------------------------
+# ask-joseph — the "notify + pull-to-check" async-question write path
+# ---------------------------------------------------------------------------
+
+
+class TestAskJoseph:
+    def test_missing_note_id_env_returns_500_no_call(self, monkeypatch):
+        monkeypatch.setattr(server, "_ASK_JOSEPH_NOTE_ID", "")
+        called = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            called.append(request)
+            return httpx.Response(200, json={})
+
+        client = _client_for(handler)
+        resp = client.post(
+            "/notes/ask-joseph", json={"asker": "priya", "question": "how do I run the migration?"}, headers=AUTH
+        )
+        assert resp.status_code == 500
+        assert "KHIMAIRA_ENGINEER_QUESTIONS_NOTE_ID" in resp.json()["detail"]
+        assert not called
+
+    def test_configured_note_not_found_404(self, monkeypatch):
+        monkeypatch.setattr(server, "_ASK_JOSEPH_NOTE_ID", "fed9d370fb94")
+        client = _client_for(_json_handler(404, {"detail": "not found"}))
+        resp = client.post(
+            "/notes/ask-joseph", json={"asker": "priya", "question": "q"}, headers=AUTH
+        )
+        assert resp.status_code == 404
+        assert "fed9d370fb94" in resp.json()["detail"]
+
+    def test_happy_path_appends_block_notifies_and_returns_note_id(self, monkeypatch):
+        monkeypatch.setattr(server, "_ASK_JOSEPH_NOTE_ID", "fed9d370fb94")
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={"id": "fed9d370fb94", "raw_text": "# Engineer Questions\n\nexisting content", "repo": "jeevy_portal"},
+                )
+            if request.method == "PATCH":
+                import json as _json
+
+                seen["patch_body"] = _json.loads(request.content)
+                return httpx.Response(200, json={"id": "fed9d370fb94", "title": "Engineer Questions (India team)"})
+            raise AssertionError(f"unexpected method {request.method}")
+
+        client = _client_for(handler)
+        with patch("khimaira.monitor.desktop_notify.notify_engineer_question") as mock_notify:
+            resp = client.post(
+                "/notes/ask-joseph",
+                json={"asker": "priya", "question": "how do I run the migration?"},
+                headers=AUTH,
+            )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"posted": True, "note_id": "fed9d370fb94"}
+
+        new_raw_text = seen["patch_body"]["raw_text"]
+        assert "existing content" in new_raw_text  # original preserved
+        assert "## Question from priya" in new_raw_text
+        assert "STATUS: pending" in new_raw_text
+        assert "how do I run the migration?" in new_raw_text
+
+        mock_notify.assert_called_once_with("priya", "how do I run the migration?")
+
+    def test_works_regardless_of_repo_scope(self, monkeypatch):
+        """ask-joseph is not a read against arbitrary notes — it always
+        targets the one fixed, pre-created note — so KHIMAIRA_NOTEBOOK_RO_REPO
+        scoping (which gates get_note/search/ask) must NOT apply here."""
+        monkeypatch.setattr(server, "_ASK_JOSEPH_NOTE_ID", "fed9d370fb94")
+        monkeypatch.setattr(server, "_REPO_SCOPE", "some_other_repo")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(
+                    200, json={"id": "fed9d370fb94", "raw_text": "x", "repo": "jeevy_portal"}
+                )
+            return httpx.Response(200, json={"id": "fed9d370fb94"})
+
+        client = _client_for(handler)
+        with patch("khimaira.monitor.desktop_notify.notify_engineer_question"):
+            resp = client.post(
+                "/notes/ask-joseph", json={"asker": "priya", "question": "q"}, headers=AUTH
+            )
+        assert resp.status_code == 200
+
+    def test_auth_required(self, monkeypatch):
+        monkeypatch.setattr(server, "_ASK_JOSEPH_NOTE_ID", "fed9d370fb94")
+        client = _client_for(_json_handler(200, {"raw_text": "x"}))
+        resp = client.post("/notes/ask-joseph", json={"asker": "priya", "question": "q"})
+        assert resp.status_code == 401
