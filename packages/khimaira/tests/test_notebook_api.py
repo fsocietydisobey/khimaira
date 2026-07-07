@@ -1113,9 +1113,164 @@ def test_list_notes_sort_by_priority_descending(notebook_client):
     assert [n["priority"] for n in ascending] == ["low", "normal", "urgent"]
 
 
+# ---------------------------------------------------------------------------
+# Testing-workflow status (2026-07-07)
+# ---------------------------------------------------------------------------
+
+
+def test_patch_note_test_status_round_trips(notebook_client):
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+    assert created["test_status"] == "untested"
+
+    r = notebook_client.patch(f"/api/notes/{created['id']}", json={"test_status": "tested"})
+    assert r.status_code == 200
+    assert r.json()["test_status"] == "tested"
+
+
+def test_patch_note_invalid_test_status_returns_422(notebook_client):
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+    r = notebook_client.patch(f"/api/notes/{created['id']}", json={"test_status": "done"})
+    assert r.status_code == 422
+
+
+def test_list_notes_test_status_filter_route(notebook_client):
+    notebook_client.post("/api/notes", json={"raw_text": "a"})
+    tested = notebook_client.post("/api/notes", json={"raw_text": "b"}).json()
+    notebook_client.patch(f"/api/notes/{tested['id']}", json={"test_status": "tested"})
+
+    filtered = notebook_client.get("/api/notes", params={"test_status": "tested"}).json()["notes"]
+    assert len(filtered) == 1
+    assert filtered[0]["id"] == tested["id"]
+
+
 def test_promote_note_route_refuses_sensitive_notes(notebook_client):
     created = notebook_client.post(
         "/api/notes", json={"raw_text": "secret stuff", "sensitive": True}
     ).json()
     r = notebook_client.post(f"/api/notes/{created['id']}/promote")
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Event-loop-blocking regression (2026-07-07) — every notes.py-touching route
+# below must run its synchronous file I/O via asyncio.to_thread. Reported
+# symptom: notebook_add_resolution/notebook_update calls intermittently
+# returned "timed out" even though the write had already landed — a classic
+# blocked-event-loop signature (see performance.md: "No blocking I/O in
+# async handlers"). These tests assert a SLOW synchronous notes.py call does
+# NOT stall a concurrent, otherwise-instant request on the same app —
+# proving the blocking work actually left the event loop, not just that the
+# route eventually returns the right value (every other test here already
+# covers correctness).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def async_notebook_client(isolated_state, monkeypatch):
+    import importlib
+
+    import httpx
+    from fastapi import FastAPI
+    from khimaira.monitor import notebook_pipeline as pipeline_mod
+    from khimaira.monitor import notebook_training as training_mod
+    from khimaira.monitor import notes as notes_mod
+    from khimaira.monitor.api import notebook as notebook_api
+
+    importlib.reload(notes_mod)
+    importlib.reload(pipeline_mod)
+    importlib.reload(training_mod)
+    importlib.reload(notebook_api)
+    monkeypatch.setattr(notebook_api.notebook_training, "schedule_promote", lambda record: None)
+
+    app = FastAPI()
+    app.include_router(notebook_api.build_router(), prefix="/api")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client, notebook_api
+
+
+class TestEventLoopNotBlocked:
+    """Methodology note: the timer MUST start before either task is created,
+    and both tasks MUST be created back-to-back with no intervening `await`.
+    An earlier draft of these tests used `asyncio.create_task(slow)` then
+    `await asyncio.sleep(0.05)` as a "head start" before timing the fast
+    request — that's wrong and produces a false pass: `asyncio.sleep`'s own
+    resumption ALSO needs the event loop, so if the slow task's raw
+    `time.sleep` grabs the thread first, the sleep(0.05) call doesn't
+    return until the block already cleared — meaning the timer starts
+    AFTER the blocking already happened, measuring nothing. Verified this
+    exact failure mode with a minimal repro before rewriting these tests
+    (a bare `time.sleep()` route "passed" the old-style test at 0.001s
+    elapsed — clearly wrong for something with an 0.5s blocking sleep in
+    its path)."""
+
+    async def test_slow_update_note_does_not_stall_concurrent_get(self, async_notebook_client):
+        import asyncio
+        import time
+
+        client, notebook_api = async_notebook_client
+        created = (await client.post("/api/notes", json={"raw_text": "hi"})).json()
+        other = (await client.post("/api/notes", json={"raw_text": "unrelated"})).json()
+
+        real_update_note = notebook_api.notes.update_note
+
+        def slow_update_note(note_id, **fields):
+            time.sleep(0.5)  # a REAL blocking sleep — simulates slow disk I/O
+            return real_update_note(note_id, **fields)
+
+        original = notebook_api.notes.update_note
+        notebook_api.notes.update_note = slow_update_note
+        try:
+            fast_start = time.monotonic()  # captured BEFORE either task exists
+            slow_task = asyncio.create_task(
+                client.patch(f"/api/notes/{created['id']}", json={"title": "renamed"})
+            )
+            fast_task = asyncio.create_task(client.get(f"/api/notes/{other['id']}"))
+
+            fast_resp = await fast_task
+            fast_elapsed = time.monotonic() - fast_start
+
+            assert fast_resp.status_code == 200
+            # The whole point: a concurrent GET must return in well under the
+            # slow PATCH's 0.5s sleep — if the event loop were blocked (the
+            # pre-fix bug), this GET would queue behind the sleep instead.
+            assert fast_elapsed < 0.3
+
+            slow_resp = await slow_task
+            assert slow_resp.status_code == 200
+        finally:
+            notebook_api.notes.update_note = original
+
+    async def test_slow_add_resolution_does_not_stall_concurrent_get(self, async_notebook_client):
+        import asyncio
+        import time
+
+        client, notebook_api = async_notebook_client
+        created = (await client.post("/api/notes", json={"raw_text": "hi"})).json()
+        other = (await client.post("/api/notes", json={"raw_text": "unrelated"})).json()
+
+        real_add_resolution = notebook_api.notes.add_resolution
+
+        def slow_add_resolution(note_id, resolution, resolved_by=""):
+            time.sleep(0.5)
+            return real_add_resolution(note_id, resolution, resolved_by=resolved_by)
+
+        original = notebook_api.notes.add_resolution
+        notebook_api.notes.add_resolution = slow_add_resolution
+        try:
+            fast_start = time.monotonic()  # captured BEFORE either task exists
+            slow_task = asyncio.create_task(
+                client.post(f"/api/notes/{created['id']}/resolution", json={"resolution": "done"})
+            )
+            fast_task = asyncio.create_task(client.get(f"/api/notes/{other['id']}"))
+
+            fast_resp = await fast_task
+            fast_elapsed = time.monotonic() - fast_start
+
+            assert fast_resp.status_code == 200
+            assert fast_elapsed < 0.3
+
+            slow_resp = await slow_task
+            assert slow_resp.status_code == 200
+        finally:
+            notebook_api.notes.add_resolution = original

@@ -122,6 +122,7 @@ class UpdateNoteReq(BaseModel):
     priority: str | None = None
     pinned_placement: bool | None = None
     starred: bool | None = None
+    test_status: str | None = None
 
 
 class AddResolutionReq(BaseModel):
@@ -200,8 +201,10 @@ def build_router():
             # are somehow given.
             tab_id = req.tab_id
             if req.collection:
-                tab_id = notes.get_or_create_collection(req.collection)["id"]
-            record = notes.add_study_guide(
+                collection = await asyncio.to_thread(notes.get_or_create_collection, req.collection)
+                tab_id = collection["id"]
+            record = await asyncio.to_thread(
+                notes.add_study_guide,
                 req.raw_text,
                 tab_id=tab_id,
                 title=req.title,
@@ -213,7 +216,8 @@ def build_router():
             notebook_retrieval.schedule_upsert(record)
             return record
 
-        record = notes.add_note(
+        record = await asyncio.to_thread(
+            notes.add_note,
             req.raw_text,
             tab_id=req.tab_id,
             title=req.title,
@@ -225,7 +229,7 @@ def build_router():
             # (notebook_pipeline._personal_context) — no structuring, no
             # embed (notebook_retrieval.upsert_note already refuses to
             # embed them too; this just avoids the wasted structuring call).
-            record = notes.update_note(record["id"], status="processed")
+            record = await asyncio.to_thread(notes.update_note, record["id"], status="processed")
         else:
             trigger_pipeline(record["id"])
             notebook_retrieval.schedule_upsert(record)
@@ -238,6 +242,7 @@ def build_router():
         kind: str | None = None,
         priority: str | None = None,
         starred: bool | None = None,
+        test_status: str | None = None,
         sort: str | None = None,
     ) -> dict:
         """`repo`, when given, scopes to that repo plus the "General" bucket
@@ -248,12 +253,19 @@ def build_router():
 
         `priority`, when given, scopes to one priority value. `starred`
         (FILE-MANAGER, 2026-07-04), when given, scopes to that starred
-        state — the Starred rail. `sort` (`"priority"` or `"-priority"`)
-        orders the result by urgent > high > normal > low (or the
-        reverse) — a presentation concern, so it's applied here rather
-        than inside notes.list_notes."""
-        result = notes.list_notes(
-            tab_id=tab_id, repo=repo, kind=kind, priority=priority, starred=starred
+        state — the Starred rail. `test_status` (2026-07-07), when given,
+        scopes to one testing-workflow status value. `sort`
+        (`"priority"` or `"-priority"`) orders the result by urgent > high >
+        normal > low (or the reverse) — a presentation concern, so it's
+        applied here rather than inside notes.list_notes."""
+        result = await asyncio.to_thread(
+            notes.list_notes,
+            tab_id=tab_id,
+            repo=repo,
+            kind=kind,
+            priority=priority,
+            starred=starred,
+            test_status=test_status,
         )
         if sort in ("priority", "-priority"):
             result = sorted(
@@ -271,7 +283,7 @@ def build_router():
         Review the manifest before ever calling with dry_run=False; a real
         import creates a note per file (idempotent via source_path — safe
         to re-run) and schedules each one's structuring pipeline async."""
-        return notebook_import.import_dir(req.root, repo=req.repo, dry_run=req.dry_run)
+        return await asyncio.to_thread(notebook_import.import_dir, req.root, repo=req.repo, dry_run=req.dry_run)
 
     @router.get("/notes/search")
     async def search_notes(
@@ -350,7 +362,7 @@ def build_router():
     async def update_note(note_id: str, req: UpdateNoteReq) -> dict:
         fields = req.model_dump(exclude_unset=True)
         try:
-            record = notes.update_note(note_id, **fields)
+            record = await asyncio.to_thread(notes.update_note, note_id, **fields)
         except ValueError as e:
             msg = str(e)
             status = 404 if "No note with id" in msg else 422
@@ -374,7 +386,7 @@ def build_router():
     @router.delete("/notes/{note_id}")
     async def delete_note(note_id: str) -> dict:
         try:
-            result = notes.delete_note(note_id)
+            result = await asyncio.to_thread(notes.delete_note, note_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
         notebook_retrieval.schedule_delete(note_id)
@@ -383,7 +395,7 @@ def build_router():
     @router.post("/notes/{note_id}/promote")
     async def promote_note(note_id: str) -> dict:
         try:
-            return notes.promote_note(note_id)
+            return await asyncio.to_thread(notes.promote_note, note_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 
@@ -397,7 +409,9 @@ def build_router():
         request (see notebook_training.promote_resolved's fail-open contract).
         """
         try:
-            updated = notes.add_resolution(note_id, req.resolution, resolved_by=req.resolved_by)
+            updated = await asyncio.to_thread(
+                notes.add_resolution, note_id, req.resolution, resolved_by=req.resolved_by
+            )
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
         if updated.get("resolution"):
@@ -490,7 +504,7 @@ def build_router():
 
     @router.get("/tabs")
     async def list_tabs() -> dict:
-        return {"tabs": notes.list_tabs()}
+        return {"tabs": await asyncio.to_thread(notes.list_tabs)}
 
     @router.post("/tabs")
     async def create_tab(req: CreateTabReq) -> dict:
@@ -500,7 +514,9 @@ def build_router():
         collision — notes.TabValidationError), 404 for a dangling
         parent_id (plain ValueError, mirrors get_tab)."""
         try:
-            return notes.add_tab(title=req.title, kind=req.kind, parent_id=req.parent_id)
+            return await asyncio.to_thread(
+                notes.add_tab, title=req.title, kind=req.kind, parent_id=req.parent_id
+            )
         except notes.TabValidationError as e:
             raise fastapi.HTTPException(422, str(e)) from e
         except ValueError as e:
@@ -514,7 +530,7 @@ def build_router():
         ValueError, mirrors get_tab)."""
         fields = req.model_dump(exclude_unset=True)
         try:
-            return notes.update_tab(tab_id, **fields)
+            return await asyncio.to_thread(notes.update_tab, tab_id, **fields)
         except notes.TabValidationError as e:
             raise fastapi.HTTPException(422, str(e)) from e
         except ValueError as e:
@@ -526,7 +542,7 @@ def build_router():
         parent) AND direct member notes (to this tab's parent, or the
         default tab at root) — "never lose a guide." See notes.delete_tab."""
         try:
-            return notes.delete_tab(tab_id)
+            return await asyncio.to_thread(notes.delete_tab, tab_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 
