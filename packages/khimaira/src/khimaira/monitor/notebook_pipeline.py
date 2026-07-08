@@ -621,7 +621,16 @@ async def _invoke_claude_agentic(
             final_result = event.get("result")
             total_cost_usd = event.get("total_cost_usd")
 
-    if not isinstance(final_result, str):
+    if not final_result:
+        # Catches BOTH a missing "result" event (final_result stays None) AND
+        # a "result" event whose result field is "" — the latter previously
+        # slipped past `isinstance(x, str)` (an empty string IS a str) and
+        # returned successfully, only to blow up downstream as a MISLEADING
+        # json.loads("") "failed to parse" error — masking the real cause
+        # (the agentic call produced zero output, most likely from hitting
+        # max_budget_usd before writing an answer) as a JSON malformation
+        # bug. Raising here routes it through the correct, already-existing
+        # "agentic invocation failed" log category instead.
         raise ValueError("agentic claude -p produced no final result envelope")
 
     return {"result": final_result, "web_grounded": web_grounded, "total_cost_usd": total_cost_usd}

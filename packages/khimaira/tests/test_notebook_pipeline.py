@@ -2037,6 +2037,21 @@ async def test_invoke_claude_agentic_missing_result_raises(pipeline, monkeypatch
         await pipeline._invoke_claude_agentic("q", "i")
 
 
+async def test_invoke_claude_agentic_empty_string_result_raises(pipeline, monkeypatch):
+    """2026-07-08 regression: a "result" event with `result: ""` (e.g. the
+    agentic call hit max_budget_usd before writing an answer) previously
+    slipped past `isinstance(final_result, str)` — an empty string IS a
+    str — and returned successfully, only to blow up downstream in
+    `_invoke_agentic_grounded` as a MISLEADING `json.loads("")` "failed to
+    parse" error, masking that the call produced zero output at all. Must
+    raise here instead, so the failure is logged under the correct
+    "agentic invocation failed" category."""
+    stdout = _stream_stdout(_result_event(""))
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(stdout)])
+    with pytest.raises(ValueError, match="no final result"):
+        await pipeline._invoke_claude_agentic("q", "i")
+
+
 async def test_invoke_claude_agentic_passes_allowed_tools_and_add_dir(
     pipeline, monkeypatch, tmp_path
 ):
