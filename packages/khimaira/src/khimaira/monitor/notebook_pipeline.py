@@ -621,16 +621,20 @@ async def _invoke_claude_agentic(
             final_result = event.get("result")
             total_cost_usd = event.get("total_cost_usd")
 
-    if not final_result:
-        # Catches BOTH a missing "result" event (final_result stays None) AND
-        # a "result" event whose result field is "" — the latter previously
-        # slipped past `isinstance(x, str)` (an empty string IS a str) and
-        # returned successfully, only to blow up downstream as a MISLEADING
-        # json.loads("") "failed to parse" error — masking the real cause
-        # (the agentic call produced zero output, most likely from hitting
-        # max_budget_usd before writing an answer) as a JSON malformation
-        # bug. Raising here routes it through the correct, already-existing
-        # "agentic invocation failed" log category instead.
+    if not final_result or not final_result.strip():
+        # Catches a missing "result" event (final_result stays None), a
+        # "result" event whose result field is "" (previously slipped past
+        # `isinstance(x, str)` — an empty string IS a str), AND (2026-07-10,
+        # sibling gap in the first fix) a WHITESPACE-ONLY result — Python
+        # treats "   "/"\n" as truthy, so `if not final_result` alone let it
+        # through; _strip_fence()'s own .strip() then reduced it to "" two
+        # lines downstream, hitting the exact same misleading
+        # json.loads("") "failed to parse" error the first fix was
+        # supposed to eliminate. Must check the STRIPPED value, not the
+        # raw one, to close this — the real cause (the agentic call
+        # produced no substantive output, most likely from hitting
+        # max_budget_usd before writing an answer) now correctly routes
+        # through the existing "agentic invocation failed" log category.
         raise ValueError("agentic claude -p produced no final result envelope")
 
     return {"result": final_result, "web_grounded": web_grounded, "total_cost_usd": total_cost_usd}

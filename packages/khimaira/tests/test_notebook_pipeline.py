@@ -2052,6 +2052,21 @@ async def test_invoke_claude_agentic_empty_string_result_raises(pipeline, monkey
         await pipeline._invoke_claude_agentic("q", "i")
 
 
+async def test_invoke_claude_agentic_whitespace_only_result_raises(pipeline, monkeypatch):
+    """2026-07-10 regression: sibling gap in the empty-string fix above.
+    Python treats a whitespace-only string ("   ", "\\n") as truthy, so
+    `if not final_result` alone let it through here — only for
+    `_strip_fence()`'s own `.strip()` to reduce it to "" two lines
+    downstream, hitting the exact same misleading `json.loads("")`
+    "failed to parse" error the first fix was supposed to eliminate.
+    Reproduced live against the real daemon logs (note f33b2eee4963's
+    chat, 2026-07-10 18:00:07 UTC) before writing this fix."""
+    stdout = _stream_stdout(_result_event("   \n  "))
+    _queue_responses(pipeline, monkeypatch, [_FakeProc(stdout)])
+    with pytest.raises(ValueError, match="no final result"):
+        await pipeline._invoke_claude_agentic("q", "i")
+
+
 async def test_invoke_claude_agentic_passes_allowed_tools_and_add_dir(
     pipeline, monkeypatch, tmp_path
 ):

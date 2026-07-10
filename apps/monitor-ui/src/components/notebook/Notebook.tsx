@@ -1895,7 +1895,15 @@ function OriginalPanel({ noteId, rawMode }: { noteId: string | null; rawMode: bo
       <div className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
         {note ? (
           rawMode ? (
-            <pre className="min-w-0 overflow-x-auto whitespace-pre-wrap break-words text-[11px] text-muted-foreground [overflow-wrap:anywhere]">
+            // whitespace-pre-wrap (not break-words/overflow-wrap:anywhere,
+            // 2026-07-10): prose still wraps softly at word boundaries as
+            // before, but a run with no break opportunity — a pasted
+            // box-drawing ASCII table, a long token — now overflows into
+            // the horizontal scrollbar (overflow-x-auto, already present)
+            // instead of being force-broken mid-character. Forced breaking
+            // was shredding box-drawing tables (┌─┬─┐ style) into an
+            // unreadable mess, since it has no problem breaking mid-glyph.
+            <pre className="min-w-0 overflow-x-auto whitespace-pre-wrap text-[11px] text-muted-foreground">
               {note.raw_text}
             </pre>
           ) : (
