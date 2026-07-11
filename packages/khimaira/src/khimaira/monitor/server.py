@@ -93,6 +93,35 @@ def build_app():
         title="Khimaira Monitor", docs_url="/api/docs", openapi_url="/api/openapi.json"
     )
 
+    # Real incident (2026-07-10): a long-running dispatch.runners.run_subprocess
+    # call (a headless `claude` CLI invocation, up to 600s) waits via
+    # `asyncio.to_thread` — BY DESIGN, so it doesn't block the event loop (see
+    # that function's own docstring). But `asyncio.to_thread` draws from
+    # Python's PROCESS-WIDE default executor, sized `min(32, cpu_count+4)` —
+    # 20 workers on this machine. Every notebook write route (api/notebook.py)
+    # and /api/version ALSO now go through that same pool (both fixed today
+    # for the same underlying class: sync I/O blocking the loop). A worker
+    # held for up to 10 minutes by one metadata scan is a worker every OTHER
+    # to_thread call — including trivial ones — has to queue behind once the
+    # pool saturates; from the outside this reads as "the whole daemon is
+    # frozen," even though the event loop itself was never blocked. Fix is
+    # capacity, not logic: a bigger dedicated executor. Must be set from
+    # INSIDE a startup event (not here, at build_app()-call time) —
+    # build_app() runs before uvicorn establishes the real serving loop, so
+    # asyncio.get_event_loop() here would grab the wrong loop (or create a
+    # throwaway one) and silently have no effect on the loop that actually
+    # serves requests. Registered FIRST among startup handlers so no other
+    # startup work can need an executor before this runs. 64 is comfortably
+    # above the concurrent long-held-thread count we've actually observed
+    # (2 simultaneous metadata scans) plus headroom for everything else.
+    @app.on_event("startup")
+    async def _size_default_executor() -> None:
+        import concurrent.futures
+
+        asyncio.get_running_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=64, thread_name_prefix="khimaira-io")
+        )
+
     # Deployment fingerprint, captured ONCE at boot — this is the code the
     # daemon actually loaded into memory. /api/version compares it to the live
     # source tree so a verifier can detect the "edited daemon code but didn't
