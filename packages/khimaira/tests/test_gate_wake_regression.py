@@ -122,20 +122,25 @@ def patched_worker(chats, monkeypatch):
         chats.sessions_mod, "summary",
         lambda sid: {"last_active_age_s": 9999},
     )
-    monkeypatch.setattr(
-        rr, "_discover_roster_windows",
-        lambda: [
+    async def _discover():
+        return [
             {"window_id": 1, "role": "master", "raw_name": "muther-0"},
             {"window_id": 2, "role": "agent", "raw_name": "muther"},
-        ],
-    )
-    monkeypatch.setattr(rr, "_get_screen", lambda wid: "idle prompt")
+        ]
+
+    async def _screen(wid):
+        return "idle prompt"
+
+    monkeypatch.setattr(rr, "_discover_roster_windows", _discover)
+    monkeypatch.setattr(rr, "_get_screen", _screen)
     monkeypatch.setattr(rr, "_is_busy", lambda screen: False)
     injected: list[int] = []
-    monkeypatch.setattr(
-        rr, "_inject_text_and_submit",
-        lambda wid, text, title="": injected.append(wid) or True,
-    )
+
+    async def _inject(wid, text, title=""):
+        injected.append(wid)
+        return True
+
+    monkeypatch.setattr(rr, "_inject_text_and_submit", _inject)
     return chats, injected
 
 
@@ -292,8 +297,14 @@ async def test_undeliverable_wake_escalates_when_no_window(monkeypatch):
     # master is idle past the wake threshold
     monkeypatch.setattr(sessions_mod, "summary", lambda sid: {"last_active_age_s": 9999})
     # no master window discoverable, scoped OR unscoped → undeliverable
-    monkeypatch.setattr(rr, "_discover_roster_windows", lambda: [])
-    monkeypatch.setattr(rr, "_window_for_session_name", lambda name: None)
+    async def _discover_empty():
+        return []
+
+    async def _window_none(name):
+        return None
+
+    monkeypatch.setattr(rr, "_discover_roster_windows", _discover_empty)
+    monkeypatch.setattr(rr, "_window_for_session_name", _window_none)
 
     posted: list[tuple[str, str]] = []
 
@@ -322,8 +333,14 @@ async def test_undeliverable_alert_is_rate_limited(monkeypatch):
 
     ad._last_master_unreachable_alert.clear()
     monkeypatch.setattr(sessions_mod, "summary", lambda sid: {"last_active_age_s": 9999})
-    monkeypatch.setattr(rr, "_discover_roster_windows", lambda: [])
-    monkeypatch.setattr(rr, "_window_for_session_name", lambda name: None)
+    async def _discover_empty():
+        return []
+
+    async def _window_none(name):
+        return None
+
+    monkeypatch.setattr(rr, "_discover_roster_windows", _discover_empty)
+    monkeypatch.setattr(rr, "_window_for_session_name", _window_none)
 
     posted: list = []
 

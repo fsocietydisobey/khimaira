@@ -26,7 +26,11 @@ TASK_ID = "task-0123456789ab"
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run() creates a FRESH loop each call — robust to test ordering.
+    # get_event_loop().run_until_complete broke when an earlier async test in
+    # the same session closed the shared loop (see test_process_window_wake_
+    # integration.py's _drive_process_window for the same fix).
+    return asyncio.run(coro)
 
 
 def _gate() -> dict:
@@ -60,17 +64,25 @@ def test_wake_text_override_and_cooldown(monkeypatch):
         "khimaira.monitor.sessions.summary",
         lambda sid: {"last_active_age_s": 9999.0},  # idle long enough
     )
+    async def _discover():
+        return [{"role": "master", "window_id": 7, "raw_name": "khimaira-0"}]
+
+    async def _screen(wid):
+        return ""
+
+    async def _inject(wid, text, name=""):
+        injected.append(text)
+        return True
+
     monkeypatch.setattr(
-        "khimaira.monitor.roster_recovery._discover_roster_windows",
-        lambda: [{"role": "master", "window_id": 7, "raw_name": "khimaira-0"}],
+        "khimaira.monitor.roster_recovery._discover_roster_windows", _discover
     )
-    monkeypatch.setattr("khimaira.monitor.roster_recovery._get_screen", lambda wid: "")
+    monkeypatch.setattr("khimaira.monitor.roster_recovery._get_screen", _screen)
     monkeypatch.setattr(
         "khimaira.monitor.roster_recovery._is_busy", lambda screen: False
     )
     monkeypatch.setattr(
-        "khimaira.monitor.roster_recovery._inject_text_and_submit",
-        lambda wid, text, name="": injected.append(text) or True,
+        "khimaira.monitor.roster_recovery._inject_text_and_submit", _inject
     )
 
     ad._last_master_wake.pop(MASTER_UUID, None)  # clear cooldown state
@@ -94,9 +106,12 @@ def test_active_master_not_woken(monkeypatch):
         "khimaira.monitor.sessions.summary",
         lambda sid: {"last_active_age_s": 5.0},  # active
     )
+    async def _inject(wid, text, name=""):
+        injected.append(text)
+        return True
+
     monkeypatch.setattr(
-        "khimaira.monitor.roster_recovery._inject_text_and_submit",
-        lambda wid, text, name="": injected.append(text) or True,
+        "khimaira.monitor.roster_recovery._inject_text_and_submit", _inject
     )
     ad._last_master_wake.pop(MASTER_UUID, None)
 

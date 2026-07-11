@@ -211,7 +211,7 @@ def _session_opt_out(session_id: str) -> bool:
 _RESOLVED_LISTEN: str | None = None  # cache of a discovered kitty control socket
 
 
-def _resolve_listen_socket() -> str | None:
+async def _resolve_listen_socket() -> str | None:
     """Find a live kitty control socket when ``KITTY_LISTEN_ON`` isn't in the env.
 
     The daemon inherits ``KITTY_LISTEN_ON`` only when it is launched from INSIDE
@@ -222,6 +222,15 @@ def _resolve_listen_socket() -> str | None:
     cutover). kitty's ``listen_on unix:/tmp/kitty`` config yields a per-instance
     socket ``/tmp/kitty-<pid>``; discover + cache a live one and re-probe it on
     failure. Glob overridable via ``KHIMAIRA_KITTY_SOCKET_GLOB``.
+
+    Async (2026-07-11, freeze-class fix): each probe is a real subprocess call
+    (up to 3.0s timeout), one per candidate socket found by the glob — this used
+    to run inline on whatever thread called it, which was fine when every caller
+    offloaded via `run_in_executor`/a dedicated thread, but silently reintroduced
+    the daemon-freeze bug class the moment a NEW caller forgot to. Making this
+    `async def` (subprocess call wrapped in `asyncio.to_thread`) makes that
+    mistake a SyntaxError instead of a silent freeze — see roster_recovery.py's
+    module docstring / the bug-class enumeration in chat-102d8b5fd82f.
     """
     import glob
 
@@ -237,7 +246,8 @@ def _resolve_listen_socket() -> str | None:
     for sock in sorted(glob.glob(pattern)):
         listen = f"unix:{sock}"
         try:
-            r = subprocess.run(
+            r = await asyncio.to_thread(
+                subprocess.run,
                 ["kitty", "@", f"--to={listen}", "ls"],
                 capture_output=True,
                 text=True,
@@ -252,7 +262,7 @@ def _resolve_listen_socket() -> str | None:
     return None
 
 
-def _kitty(
+async def _kitty(
     *args: str,
     input_text: str | None = None,
     timeout: float = 5.0,
@@ -263,14 +273,24 @@ def _kitty(
     trying to open /dev/tty: prefers an inherited ``KITTY_LISTEN_ON`` (daemon
     launched inside kitty), else discovers a live ``/tmp/kitty-*`` socket (daemon
     under systemd, no TTY/env — see ``_resolve_listen_socket``).
+
+    Async (2026-07-11, freeze-class fix): this IS the chokepoint. Every caller in
+    this module and its siblings (registry_gc.py, api/chats.py) funnels through
+    here for the actual `subprocess.run(["kitty", ...])` — wrapping it in
+    `asyncio.to_thread` here, once, means a caller can no longer accidentally run
+    it inline on the event loop: calling an `async def` without `await` is a
+    SyntaxError from a sync function, not a silent multi-second daemon freeze.
+    See the bug-class enumeration posted in chat-102d8b5fd82f (2026-07-11) for
+    the 5 call chains audited and why this is a chokepoint fix, not another arm.
     """
-    listen = os.environ.get("KITTY_LISTEN_ON") or _resolve_listen_socket()
+    listen = os.environ.get("KITTY_LISTEN_ON") or await _resolve_listen_socket()
     if listen:
         cmd = ["kitty", "@", f"--to={listen}", *args]
     else:
         cmd = ["kitty", "@", *args]
     try:
-        r = subprocess.run(
+        r = await asyncio.to_thread(
+            subprocess.run,
             cmd,
             input=input_text,
             capture_output=True,
@@ -304,7 +324,7 @@ def _get_roster_member_ids() -> frozenset[str]:
     return frozenset()  # fail-open: return empty set → all windows pass filter until canonical lands
 
 
-def _discover_roster_windows() -> list[dict[str, Any]]:
+async def _discover_roster_windows() -> list[dict[str, Any]]:
     """Return roster claude-chat windows as ``[{window_id, role, cmdline}]``.
 
     Handles both bare names (``agent-1``) and prefixed names (``jp-agent-1``,
@@ -317,7 +337,7 @@ def _discover_roster_windows() -> list[dict[str, Any]]:
     active_roster_member_ids() (this daemon's roster) are included. jp-*
     windows from other projects are excluded.
     """
-    raw = _kitty("ls")
+    raw = await _kitty("ls")
     if not raw:
         return []
     try:
@@ -443,7 +463,7 @@ def _discover_roster_windows() -> list[dict[str, Any]]:
     return roster
 
 
-def _window_for_session_name(name: str) -> dict[str, Any] | None:
+async def _window_for_session_name(name: str) -> dict[str, Any] | None:
     """Find ONE kitty window for session `name`, UNSCOPED by roster.
 
     For TARGETED wakes where the exact target session is known. Unlike
@@ -458,7 +478,7 @@ def _window_for_session_name(name: str) -> dict[str, Any] | None:
     like "✳ " that break exact title-match) OR a `-n/-r <name>` token in the
     window cmdline (drift-proof — set at launch).
     """
-    raw = _kitty("ls")
+    raw = await _kitty("ls")
     if not raw:
         return None
     try:
@@ -512,7 +532,7 @@ def _roster_role_map() -> dict[str, Any]:
     return out
 
 
-def _union_registered_windows(
+async def _union_registered_windows(
     windows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Add identity-registered windows the title-discovery pass missed.
@@ -550,7 +570,7 @@ def _union_registered_windows(
     # One kitty-ls pass → live window_id → window json (for is_focused). A registered
     # wid absent here is stale (window closed / kitty renumbered) and is skipped.
     live: dict[int, dict[str, Any]] = {}
-    raw = _kitty("ls")
+    raw = await _kitty("ls")
     if raw:
         try:
             data = json.loads(raw)
@@ -610,9 +630,9 @@ def _union_registered_windows(
     return windows
 
 
-def _get_screen(window_id: int) -> str | None:
+async def _get_screen(window_id: int) -> str | None:
     """Read current screen text for a kitty window."""
-    return _kitty("get-text", f"--match=id:{window_id}")
+    return await _kitty("get-text", f"--match=id:{window_id}")
 
 
 def _compute_context_pct(session_id: str) -> int | None:
@@ -880,7 +900,7 @@ def _window_is_live(win: dict[str, Any]) -> bool:
     return False
 
 
-def _reap_duplicate_windows() -> int:
+async def _reap_duplicate_windows() -> int:
     """Reap stale duplicate-titled windows so title-match is deterministic.
 
     Returns the number of windows reaped. Safe-by-construction: a title's stale
@@ -888,7 +908,7 @@ def _reap_duplicate_windows() -> int:
     title. Ambiguous cases (no live, or multiple live) are loud-logged and left
     untouched — never guess which to close. Fail-open (kitty errors → 0).
     """
-    raw = _kitty("ls")
+    raw = await _kitty("ls")
     if not raw:
         return 0
     try:
@@ -912,7 +932,7 @@ def _reap_duplicate_windows() -> int:
         stale = [w for w in wins if not _window_is_live(w)]
         if len(live) == 1 and stale:
             for w in stale:
-                if _kitty("close-window", f"--match=id:{w['id']}") is not None:
+                if await _kitty("close-window", f"--match=id:{w['id']}") is not None:
                     reaped += 1
                     _log.warning(
                         "roster-recovery: reaped STALE duplicate window id=%d "
@@ -929,10 +949,10 @@ def _reap_duplicate_windows() -> int:
     return reaped
 
 
-def _count_title_windows(window_title: str) -> int:
+async def _count_title_windows(window_title: str) -> int:
     """Count live kitty windows whose title exactly matches. -1 if kitty
     can't answer (caller treats unknown conservatively)."""
-    raw = _kitty("ls", _title_match_arg(window_title))
+    raw = await _kitty("ls", _title_match_arg(window_title))
     if raw is None:
         return -1
     try:
@@ -960,7 +980,7 @@ def _input_line_contains(buffer: str, nonce: str) -> bool:
     return nonce in _PROMPT_NORM.sub("", "".join(lines[last_prompt:]))
 
 
-def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -> bool:
+async def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -> bool:
     """Inject ``text`` into a kitty window and submit with Enter.
 
     Prefers title-match (``--match=title:<window_title>``) over id-match when
@@ -1004,10 +1024,10 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     #          ambiguous rather than inject into the wrong/both windows.
     use_title = False
     if window_title:
-        n = _count_title_windows(window_title)
+        n = await _count_title_windows(window_title)
         if n > 1:
-            _reap_duplicate_windows()
-            n = _count_title_windows(window_title)
+            await _reap_duplicate_windows()
+            n = await _count_title_windows(window_title)
         if n > 1:
             _log.error(
                 "roster-recovery: REFUSING inject into %r — %d windows share "
@@ -1032,8 +1052,8 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     # input line in Claude Code's TUI without affecting conversation history).
     # This prevents accumulated nudge text from prior aborted cycles from causing
     # TOCTOU false-positives (observed: 6× repeat accumulation in muther roster).
-    _kitty("send-key", id_match, "ctrl+u")
-    time.sleep(0.05)
+    await _kitty("send-key", id_match, "ctrl+u")
+    await asyncio.sleep(0.05)
 
     # Step 2: send text WITH a unique verification nonce appended. The nonce makes the
     # TOCTOU check robust to a SATURATED window — a long-running, high-context session
@@ -1048,7 +1068,7 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     # marker rides along in the submitted prompt — the agent ignores it.
     nonce = f"wk{int(time.time()) % 100000:05d}"
     inject = f"{text}  (sync {nonce})"
-    if _kitty("send-text", match_arg, "--", inject) is None:
+    if await _kitty("send-text", match_arg, "--", inject) is None:
         _log.warning(
             "roster-recovery: send-text failed for window %d (%s)", window_id, match_arg
         )
@@ -1069,8 +1089,8 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     buffer: str | None = None
     last_read_failed = False
     for _ in range(12):  # 12 × 0.15s ≈ 1.8s ceiling
-        time.sleep(0.15)
-        buffer = _get_screen(window_id)
+        await asyncio.sleep(0.15)
+        buffer = await _get_screen(window_id)
         if buffer is None:
             last_read_failed = True
             continue
@@ -1084,7 +1104,7 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
             break
     else:
         # Nonce never echoed within the poll ceiling — abort safely.
-        _kitty("send-key", id_match, "ctrl+c")
+        await _kitty("send-key", id_match, "ctrl+c")
         if last_read_failed or buffer is None:
             _log.warning(
                 "roster-recovery: TOCTOU verify read failed for window %d — aborted",
@@ -1111,14 +1131,14 @@ def _inject_text_and_submit(window_id: int, text: str, window_title: str = "") -
     # immune to title decoration. Then CONFIRM the input actually cleared and RETRY the
     # enter if it's still sitting (don't report a false success).
     for attempt in range(3):
-        if _kitty("send-key", id_match, "enter") is None:
+        if await _kitty("send-key", id_match, "enter") is None:
             _log.warning(
                 "roster-recovery: send-key enter failed for window %d (id-match)", window_id
             )
             return False
         for _ in range(6):  # up to ~0.9s for the submit to render
-            time.sleep(0.15)
-            buf = _get_screen(window_id)
+            await asyncio.sleep(0.15)
+            buf = await _get_screen(window_id)
             if buf is not None and not _input_line_contains(buf, nonce):
                 return True  # input cleared → submitted
         _log.info(
@@ -1696,7 +1716,7 @@ def _is_read_only_safe(raw_block: str) -> bool:
     return True
 
 
-def _handle_hitl_prompt(
+async def _handle_hitl_prompt(
     window_id: int,
     session_id: str,
     role: str,
@@ -1739,7 +1759,7 @@ def _handle_hitl_prompt(
         return "escalated"
 
     # All guards passed — inject the answer
-    submitted = _inject_text_and_submit(window_id, answer_key, window_title)
+    submitted = await _inject_text_and_submit(window_id, answer_key, window_title)
     if submitted:
         _log.info(
             "roster-hitl: ANSWERED window=%d role=%s session=%s key=%r kind=%s",
@@ -1929,13 +1949,13 @@ def _detect_server_429(text: str) -> bool:
     return bool(_SERVER_429_RE.search(text))
 
 
-def _get_screen_scrollback(window_id: int, tail_lines: int = 220) -> str | None:
+async def _get_screen_scrollback(window_id: int, tail_lines: int = 220) -> str | None:
     """Read a generous slice of the window's SCROLLBACK (not just the visible
     screen). A rate-limit error scrolls off-screen the moment chat messages
     arrive (observed: agent-2's error was ~180 lines above the visible tail
     after the Guard-5 flood), so the visible screen alone misses it. Returns
     the last ``tail_lines`` of the full buffer, or None on read failure."""
-    full = _kitty("get-text", f"--match=id:{window_id}", "--extent=all")
+    full = await _kitty("get-text", f"--match=id:{window_id}", "--extent=all")
     if full is None:
         return None
     lines = full.splitlines()
@@ -2058,7 +2078,7 @@ async def _process_window(win: dict[str, Any]) -> None:
         return
 
     # Read window screen
-    text = await asyncio.get_running_loop().run_in_executor(None, _get_screen, window_id)
+    text = await _get_screen(window_id)
     if text is None:
         return
 
@@ -2069,9 +2089,7 @@ async def _process_window(win: dict[str, Any]) -> None:
     # -----------------------------------------------------------------------
     rl_action = (window_id, "ratelimit")
     if time.time() - _DEBOUNCE.get(rl_action, 0.0) >= _RATE_LIMIT_COOLDOWN_S:
-        scrollback = await asyncio.get_running_loop().run_in_executor(
-            None, _get_screen_scrollback, window_id
-        )
+        scrollback = await _get_screen_scrollback(window_id)
         if scrollback and _detect_rate_limit(scrollback):
             await asyncio.get_running_loop().run_in_executor(
                 None, _escalate_rate_limit, window_id, session_id, role
@@ -2097,8 +2115,8 @@ async def _process_window(win: dict[str, Any]) -> None:
                         window_id, role,
                     )
                 else:
-                    result = await asyncio.get_running_loop().run_in_executor(
-                        None, _handle_hitl_prompt, window_id, session_id, role, hitl_prompt, raw_name
+                    result = await _handle_hitl_prompt(
+                        window_id, session_id, role, hitl_prompt, raw_name
                     )
                     _DEBOUNCE[action_key] = time.time()
                     if result == "escalated":
@@ -2217,9 +2235,7 @@ async def _process_window(win: dict[str, Any]) -> None:
         await _distill_session(session_id, role)
 
         # Guard (b): re-check after async distill — session may have started work
-        text_after = await asyncio.get_running_loop().run_in_executor(
-            None, _get_screen, window_id
-        )
+        text_after = await _get_screen(window_id)
         if text_after and _is_busy(text_after):
             _log.info(
                 "roster-recovery: window %d became busy during distill — aborting compact",
@@ -2228,9 +2244,7 @@ async def _process_window(win: dict[str, Any]) -> None:
             return
 
         # Guard (b) + TOCTOU: inject /compact with buffer-verify before submit
-        submitted = await asyncio.get_running_loop().run_in_executor(
-            None, _inject_text_and_submit, window_id, "/compact", raw_name
-        )
+        submitted = await _inject_text_and_submit(window_id, "/compact", raw_name)
         # STORM GUARD: cool down on EVERY attempt, success or abort. A failed
         # actuation (TOCTOU mismatch / transient-busy) previously left the debounce
         # unset, so it retried every 60s sweep — the muther-intake storm 2026-06-18.
@@ -2393,9 +2407,7 @@ async def _process_window(win: dict[str, Any]) -> None:
                 window_id, role, session_id[:8],
             )
             return
-        submitted = await asyncio.get_running_loop().run_in_executor(
-            None, _inject_text_and_submit, window_id, wake_msg, raw_name
-        )
+        submitted = await _inject_text_and_submit(window_id, wake_msg, raw_name)
         # STORM GUARD: cool down on EVERY attempt, success or abort (see compact
         # path). A wake that TOCTOU-aborts (e.g. the target window re-rendered)
         # must NOT retry every 60s sweep — it cools down like a successful one.
@@ -2432,14 +2444,13 @@ async def check_once() -> None:
     """Single sweep of all discovered roster windows."""
     if not _env_enabled():
         return
-    loop = asyncio.get_running_loop()
     # Reap stale duplicate-titled windows FIRST so every title-anchored op this
     # sweep (and every external nudge/busy-read) resolves to exactly one window.
-    await loop.run_in_executor(None, _reap_duplicate_windows)
-    windows = await loop.run_in_executor(None, _discover_roster_windows)
+    await _reap_duplicate_windows()
+    windows = await _discover_roster_windows()
     # ADDITIVE: union in identity-registered windows the title pass missed (non-role-
     # shaped titles). Title-discovered windows above are untouched.
-    windows = await loop.run_in_executor(None, _union_registered_windows, windows)
+    windows = await _union_registered_windows(windows)
     for win in windows:
         try:
             await _process_window(win)

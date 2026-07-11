@@ -26,12 +26,23 @@ def _wire(c, monkeypatch, *, idle_s, windows, screen=""):
     import khimaira.monitor.sessions as sess
     monkeypatch.setattr(sess, "summary", lambda sid: {"last_active_age_s": idle_s})
     import khimaira.monitor.roster_recovery as rr
-    monkeypatch.setattr(rr, "_discover_roster_windows", lambda: windows)
-    monkeypatch.setattr(rr, "_get_screen", lambda wid: screen)
+
+    async def _discover():
+        return windows
+
+    async def _screen(wid):
+        return screen
+
+    monkeypatch.setattr(rr, "_discover_roster_windows", _discover)
+    monkeypatch.setattr(rr, "_get_screen", _screen)
     monkeypatch.setattr(rr, "_is_busy", lambda s: "esc to interrupt" in (s or "").lower())
     injected = []
-    monkeypatch.setattr(rr, "_inject_text_and_submit",
-                        lambda wid, text, title="": injected.append((wid, text, title)) or True)
+
+    async def _inject(wid, text, title=""):
+        injected.append((wid, text, title))
+        return True
+
+    monkeypatch.setattr(rr, "_inject_text_and_submit", _inject)
     return injected
 
 

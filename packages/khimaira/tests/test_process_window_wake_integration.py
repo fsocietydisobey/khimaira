@@ -100,14 +100,19 @@ def _drive_process_window(
     injected: list[tuple[int, str]] = []
 
     monkeypatch.setattr(rr, "_resolve_session_by_name", lambda name: SEAT_SID)
+
     # A benign idle screen → not busy, no HITL prompt, no rate-limit, no context %.
-    monkeypatch.setattr(rr, "_get_screen", lambda wid: "> \n(idle prompt)\n")
+    async def _screen(wid):
+        return "> \n(idle prompt)\n"
+
+    monkeypatch.setattr(rr, "_get_screen", _screen)
     monkeypatch.setattr(rr, "_session_has_recent_wip", lambda *a, **k: False)
-    monkeypatch.setattr(
-        rr,
-        "_inject_text_and_submit",
-        lambda wid, text, name="": (injected.append((wid, text)), inject_result)[1],
-    )
+
+    async def _inject(wid, text, name=""):
+        injected.append((wid, text))
+        return inject_result
+
+    monkeypatch.setattr(rr, "_inject_text_and_submit", _inject)
 
     win = {
         "window_id": WINDOW_ID,

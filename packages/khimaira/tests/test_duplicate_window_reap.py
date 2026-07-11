@@ -35,104 +35,148 @@ def test_window_is_live(rr):
     assert not rr._window_is_live(_win(2, "agent-1", live=False))
 
 
-def test_reaps_stale_duplicate(rr, monkeypatch):
+async def test_reaps_stale_duplicate(rr, monkeypatch):
     calls = []
-    def fake_kitty(*args):
+    async def fake_kitty(*args):
         calls.append(args)
         if args[0] == "ls":
             return _ls(_win(10, "muther-critic-1", live=True),
                        _win(11, "muther-critic-1", live=False))
         return ""  # close-window succeeds
     monkeypatch.setattr(rr, "_kitty", fake_kitty)
-    reaped = rr._reap_duplicate_windows()
+    reaped = await rr._reap_duplicate_windows()
     assert reaped == 1
     # the STALE one (id 11) was closed, not the live one
     close_calls = [c for c in calls if c[0] == "close-window"]
     assert close_calls == [("close-window", "--match=id:11")]
 
 
-def test_no_reap_when_no_duplicates(rr, monkeypatch):
-    monkeypatch.setattr(rr, "_kitty",
-                        lambda *a: _ls(_win(1, "a", live=True), _win(2, "b", live=True)) if a[0]=="ls" else "")
-    assert rr._reap_duplicate_windows() == 0
+async def test_no_reap_when_no_duplicates(rr, monkeypatch):
+    async def fake_kitty(*a):
+        return _ls(_win(1, "a", live=True), _win(2, "b", live=True)) if a[0] == "ls" else ""
+    monkeypatch.setattr(rr, "_kitty", fake_kitty)
+    assert await rr._reap_duplicate_windows() == 0
 
 
-def test_ambiguous_two_live_not_reaped(rr, monkeypatch):
+async def test_ambiguous_two_live_not_reaped(rr, monkeypatch):
     closed = []
-    def fk(*a):
+    async def fk(*a):
         if a[0] == "ls":
             return _ls(_win(1, "dup", live=True), _win(2, "dup", live=True))
         closed.append(a); return ""
     monkeypatch.setattr(rr, "_kitty", fk)
-    assert rr._reap_duplicate_windows() == 0
+    assert await rr._reap_duplicate_windows() == 0
     assert closed == [], "two live windows → ambiguous → reap nothing"
 
 
-def test_ambiguous_zero_live_not_reaped(rr, monkeypatch):
+async def test_ambiguous_zero_live_not_reaped(rr, monkeypatch):
     closed = []
-    def fk(*a):
+    async def fk(*a):
         if a[0] == "ls":
             return _ls(_win(1, "dup", live=False), _win(2, "dup", live=False))
         closed.append(a); return ""
     monkeypatch.setattr(rr, "_kitty", fk)
-    assert rr._reap_duplicate_windows() == 0
+    assert await rr._reap_duplicate_windows() == 0
     assert closed == []
 
 
-def test_inject_refuses_ambiguous_title(rr, monkeypatch):
+async def test_inject_refuses_ambiguous_title(rr, monkeypatch):
     # _count_title_windows returns 2 even after a reap attempt → inject aborts
-    monkeypatch.setattr(rr, "_count_title_windows", lambda t: 2)
-    monkeypatch.setattr(rr, "_reap_duplicate_windows", lambda: 0)
+    async def _count(t):
+        return 2
+    async def _reap():
+        return 0
     sent = []
-    monkeypatch.setattr(rr, "_kitty", lambda *a, **k: sent.append(a) or "")
-    ok = rr._inject_text_and_submit(5, "hi", "muther-critic-1")
+    async def _kitty(*a, **k):
+        sent.append(a)
+        return ""
+    monkeypatch.setattr(rr, "_count_title_windows", _count)
+    monkeypatch.setattr(rr, "_reap_duplicate_windows", _reap)
+    monkeypatch.setattr(rr, "_kitty", _kitty)
+    ok = await rr._inject_text_and_submit(5, "hi", "muther-critic-1")
     assert ok is False
     assert sent == [], "must not inject when title is ambiguous"
 
 
-def test_inject_proceeds_after_reap_resolves(rr, monkeypatch):
+async def test_inject_proceeds_after_reap_resolves(rr, monkeypatch):
     counts = iter([2, 1])  # ambiguous → reap → now unique
-    monkeypatch.setattr(rr, "_count_title_windows", lambda t: next(counts))
-    monkeypatch.setattr(rr, "_reap_duplicate_windows", lambda: 1)
-    # TOCTOU reads buffer via _get_screen; last non-empty line must == our text
-    monkeypatch.setattr(rr, "_get_screen", lambda wid: "previous\n/compact")
-    monkeypatch.setattr(rr, "_kitty", lambda *a, **k: "")  # all kitty ops succeed
-    ok = rr._inject_text_and_submit(5, "/compact", "muther-critic-1")
+    async def _count(t):
+        return next(counts)
+    async def _reap():
+        return 1
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(rr.asyncio, "sleep", _no_sleep)  # skip real poll waits
+
+    # TOCTOU reads buffer via _get_screen and checks for the nonce _kitty's
+    # send-text call was given — a static screen (no nonce) always aborts,
+    # regardless of timing. Capture+echo it, same pattern as
+    # TestInjectTextAndSubmit._drive.
+    state = {"inject": None, "enters": 0}
+
+    async def _kitty(*args, **kw):
+        op = args[0] if args else ""
+        if op == "send-text":
+            state["inject"] = args[-1]
+        elif op == "send-key" and "enter" in args:
+            state["enters"] += 1
+        return ""  # all kitty ops succeed
+
+    async def _get_screen(wid):
+        if state["enters"] == 0:
+            return f"previous\n{state['inject'] or ''}"  # nonce present, not yet submitted
+        return "✶ Working…\n❯ "  # input cleared → submitted
+
+    monkeypatch.setattr(rr, "_count_title_windows", _count)
+    monkeypatch.setattr(rr, "_reap_duplicate_windows", _reap)
+    monkeypatch.setattr(rr, "_get_screen", _get_screen)
+    monkeypatch.setattr(rr, "_kitty", _kitty)
+    ok = await rr._inject_text_and_submit(5, "/compact", "muther-critic-1")
     assert ok is True, "after reap resolves the duplicate, inject proceeds"
 
 
 # --- _window_for_session_name: unscoped targeted lookup (muther note-2 fix) ----
 
-def test_window_for_session_name_matches_title(rr, monkeypatch):
+async def test_window_for_session_name_matches_title(rr, monkeypatch):
     ls = [{"tabs": [{"windows": [
         {"id": 1, "title": "muther-agent-1", "cmdline": ["bash", "-ic", "claude-chat -n muther-agent-1"]},
         {"id": 2, "title": "other", "cmdline": ["bash"]},
     ]}]}]
-    monkeypatch.setattr(rr, "_kitty", lambda *a: json.dumps(ls))
-    w = rr._window_for_session_name("muther-agent-1")
+    async def _kitty(*a):
+        return json.dumps(ls)
+    monkeypatch.setattr(rr, "_kitty", _kitty)
+    w = await rr._window_for_session_name("muther-agent-1")
     assert w and w["window_id"] == 1
 
 
-def test_window_for_session_name_strips_activity_marker(rr, monkeypatch):
+async def test_window_for_session_name_strips_activity_marker(rr, monkeypatch):
     # kitty prepends "✳ " to active windows — must still match (the muther agent-3 case)
     ls = [{"tabs": [{"windows": [
         {"id": 5, "title": "✳ muther-agent-3", "cmdline": ["bash", "--posix"]},
     ]}]}]
-    monkeypatch.setattr(rr, "_kitty", lambda *a: json.dumps(ls))
-    w = rr._window_for_session_name("muther-agent-3")
+    async def _kitty(*a):
+        return json.dumps(ls)
+    monkeypatch.setattr(rr, "_kitty", _kitty)
+    w = await rr._window_for_session_name("muther-agent-3")
     assert w and w["window_id"] == 5
 
 
-def test_window_for_session_name_matches_cmdline_when_title_drifts(rr, monkeypatch):
+async def test_window_for_session_name_matches_cmdline_when_title_drifts(rr, monkeypatch):
     ls = [{"tabs": [{"windows": [
         {"id": 7, "title": "totally-drifted", "cmdline": ["bash", "-ic", "cd x && claude-chat -n muther"]},
     ]}]}]
-    monkeypatch.setattr(rr, "_kitty", lambda *a: json.dumps(ls))
-    w = rr._window_for_session_name("muther")
+    async def _kitty(*a):
+        return json.dumps(ls)
+    monkeypatch.setattr(rr, "_kitty", _kitty)
+    w = await rr._window_for_session_name("muther")
     assert w and w["window_id"] == 7
 
 
-def test_window_for_session_name_no_match(rr, monkeypatch):
+async def test_window_for_session_name_no_match(rr, monkeypatch):
     ls = [{"tabs": [{"windows": [{"id": 1, "title": "a", "cmdline": ["bash"]}]}]}]
-    monkeypatch.setattr(rr, "_kitty", lambda *a: json.dumps(ls))
-    assert rr._window_for_session_name("nonexistent") is None
+    async def _kitty(*a):
+        return json.dumps(ls)
+    monkeypatch.setattr(rr, "_kitty", _kitty)
+    assert await rr._window_for_session_name("nonexistent") is None

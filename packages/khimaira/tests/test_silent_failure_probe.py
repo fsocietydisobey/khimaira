@@ -299,55 +299,68 @@ def _mock_classify_env(monkeypatch, *, active, name, windows, screen):
     import khimaira.monitor.sessions as sess_mod
     monkeypatch.setattr(sess_mod, "state", lambda sid, recent=0: {"name": name})
     import khimaira.monitor.roster_recovery as rr
-    monkeypatch.setattr(rr, "_discover_roster_windows", lambda: windows)
-    monkeypatch.setattr(rr, "_get_screen", lambda wid: screen)
+
+    # _discover_roster_windows / _get_screen are `async def` (2026-07-11
+    # freeze-class fix) — mocks must be awaitable too.
+    async def _windows(*_a, **_k):
+        return windows
+
+    async def _screen(*_a, **_k):
+        return screen
+
+    monkeypatch.setattr(rr, "_discover_roster_windows", _windows)
+    monkeypatch.setattr(rr, "_get_screen", _screen)
 
 
-def test_classify_active(monkeypatch):
+async def test_classify_active(monkeypatch):
     _mock_classify_env(monkeypatch, active=True, name="agent-1", windows=[], screen=None)
-    assert api_chats._classify_unresponsive("to-sid") == "active"
+    assert await api_chats._classify_unresponsive("to-sid") == "active"
 
 
-def test_classify_busy_window_running_pytest(monkeypatch):
+async def test_classify_busy_window_running_pytest(monkeypatch):
     # window present + spinner marker → BUSY (the verifier-at-365s false positive)
     wins = [{"window_id": 9, "raw_name": "verifier-1", "role": "verifier"}]
     _mock_classify_env(
         monkeypatch, active=False, name="verifier-1", windows=wins,
         screen="Running pytest…\n  esc to interrupt",
     )
-    assert api_chats._classify_unresponsive("to-sid") == "busy"
+    assert await api_chats._classify_unresponsive("to-sid") == "busy"
 
 
-def test_classify_deaf_idle_window(monkeypatch):
+async def test_classify_deaf_idle_window(monkeypatch):
     wins = [{"window_id": 9, "raw_name": "agent-1", "role": "agent"}]
     _mock_classify_env(
         monkeypatch, active=False, name="agent-1", windows=wins,
         screen="❯ \n  ? for shortcuts",  # idle prompt, no busy marker
     )
-    assert api_chats._classify_unresponsive("to-sid") == "deaf"
+    assert await api_chats._classify_unresponsive("to-sid") == "deaf"
 
 
-def test_classify_dead_no_window(monkeypatch):
+async def test_classify_dead_no_window(monkeypatch):
     # named session has no kitty window → genuinely gone
     wins = [{"window_id": 9, "raw_name": "someone-else", "role": "agent"}]
     _mock_classify_env(
         monkeypatch, active=False, name="agent-1", windows=wins, screen="x",
     )
-    assert api_chats._classify_unresponsive("to-sid") == "dead"
+    assert await api_chats._classify_unresponsive("to-sid") == "dead"
 
 
-def test_classify_unknown_when_kitty_unavailable(monkeypatch):
+async def test_classify_unknown_when_kitty_unavailable(monkeypatch):
     _mock_classify_env(
         monkeypatch, active=False, name="agent-1", windows=[], screen=None,
     )
-    assert api_chats._classify_unresponsive("to-sid") == "unknown"
+    assert await api_chats._classify_unresponsive("to-sid") == "unknown"
 
 
 @pytest.mark.asyncio
 async def test_busy_session_not_flagged_dead(monkeypatch):
     """Phase 3: a BUSY session reschedules instead of firing a death notice."""
     probes, notices = _setup_mocks(monkeypatch, active=False)
-    monkeypatch.setattr(api_chats, "_classify_unresponsive", lambda sid: "busy")
+
+    async def _busy(sid):
+        return "busy"
+
+    monkeypatch.setattr(api_chats, "_classify_unresponsive", _busy)
     ts_now = time.time()
     key = ("to-sid", "from-sid")
     entry = {"ts": ts_now - 200, "from": "from-sid", "to": "to-sid",
@@ -362,7 +375,11 @@ async def test_busy_session_not_flagged_dead(monkeypatch):
 async def test_deaf_session_gets_nudge_notice_not_death(monkeypatch):
     """Phase 3: a DEAF session gets an actionable IDLE/DEAF notice, not PRESUMED-DEAD."""
     probes, notices = _setup_mocks(monkeypatch, active=False)
-    monkeypatch.setattr(api_chats, "_classify_unresponsive", lambda sid: "deaf")
+
+    async def _deaf(sid):
+        return "deaf"
+
+    monkeypatch.setattr(api_chats, "_classify_unresponsive", _deaf)
     ts_now = time.time()
     key = ("to-sid", "from-sid")
     entry = {"ts": ts_now - 200, "from": "from-sid", "to": "to-sid",
@@ -379,7 +396,11 @@ async def test_deaf_session_gets_nudge_notice_not_death(monkeypatch):
 async def test_dead_session_fires_presumed_dead(monkeypatch):
     """Phase 3: a DEAD session (no window) still fires PRESUMED-DEAD."""
     probes, notices = _setup_mocks(monkeypatch, active=False)
-    monkeypatch.setattr(api_chats, "_classify_unresponsive", lambda sid: "dead")
+
+    async def _dead(sid):
+        return "dead"
+
+    monkeypatch.setattr(api_chats, "_classify_unresponsive", _dead)
     ts_now = time.time()
     key = ("to-sid", "from-sid")
     entry = {"ts": ts_now - 200, "from": "from-sid", "to": "to-sid",

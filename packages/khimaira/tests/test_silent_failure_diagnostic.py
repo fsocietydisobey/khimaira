@@ -177,7 +177,10 @@ async def test_b2_proc_fallback_downgrades_unknown_to_deaf(monkeypatch):
     from khimaira.monitor import chats as chats_mod
 
     # Monkeypatch the kitty classifier to return "unknown".
-    monkeypatch.setattr(api_chats, "_classify_unresponsive", lambda sid: "unknown")
+    async def _classify_unknown(sid):
+        return "unknown"
+
+    monkeypatch.setattr(api_chats, "_classify_unresponsive", _classify_unknown)
     # /proc confirms the process is alive.
     monkeypatch.setattr(api_chats, "_is_process_alive_for_session", lambda sid: True)
     # Phase-1 liveness check must NOT short-circuit (we want to reach Phase 3).

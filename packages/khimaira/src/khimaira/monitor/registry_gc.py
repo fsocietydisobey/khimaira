@@ -113,18 +113,24 @@ def _iso_to_epoch(raw: str | None) -> float | None:
         return None
 
 
-def _kitty_ls_data() -> list | None:
+async def _kitty_ls_data() -> list | None:
     """Fetch + parse `kitty @ ls` JSON once. Returns None if kitty is
     unavailable or the response can't be parsed.
 
     Shared by `_live_window_identities` (name-based liveness) and
     `_live_window_ids` (id-based liveness, 2026-07-03) so both checks read the
     same snapshot instead of shelling out to kitty twice per sweep.
+
+    Async (2026-07-11, freeze-class fix): this used to run a blocking
+    `subprocess.run` inline on `registry_gc_loop`'s event-loop turn, on every
+    GC sweep — the dominant confirmed instance of the daemon-freeze bug class
+    audited in chat-102d8b5fd82f. `roster_recovery._kitty` is now itself
+    `async def` (the chokepoint); this just has to await it.
     """
     try:
         from khimaira.monitor import roster_recovery as rr
 
-        raw = rr._kitty("ls")
+        raw = await rr._kitty("ls")
     except Exception:
         return None
     if not raw:
@@ -135,7 +141,7 @@ def _kitty_ls_data() -> list | None:
         return None
 
 
-def _live_window_identities() -> set[str] | None:
+async def _live_window_identities() -> set[str] | None:
     """Return the set of identities (names) that prove a LIVE window, or None if
     kitty is UNAVAILABLE (the no-op signal — caller must reap nothing).
 
@@ -149,7 +155,7 @@ def _live_window_identities() -> set[str] | None:
     also skips — the daemon's own tooling keeps ≥1 window, so empty almost always
     means a transient kitty hiccup, not a genuinely empty desktop.
     """
-    data = _kitty_ls_data()
+    data = await _kitty_ls_data()
     if data is None:
         return None
 
@@ -179,7 +185,7 @@ def _live_window_identities() -> set[str] | None:
     return names
 
 
-def _live_window_ids() -> set[int] | None:
+async def _live_window_ids() -> set[int] | None:
     """Return the set of kitty window IDs currently live, or None if kitty is
     UNAVAILABLE (same no-op signal as `_live_window_identities`).
 
@@ -199,7 +205,7 @@ def _live_window_ids() -> set[int] | None:
     so an empty id set here just means "no additional id-based protection",
     not "kitty is lying".
     """
-    data = _kitty_ls_data()
+    data = await _kitty_ls_data()
     if data is None:
         return None
 
@@ -267,7 +273,7 @@ def _accepted_member_skip_reason(session_id: str) -> str | None:
     return None  # accepted member but idle past the activity window → genuinely dead
 
 
-def reap_windowless_sessions() -> dict:
+async def reap_windowless_sessions() -> dict:
     """One GC pass. Reap registry records whose window is gone AND idle past
     the threshold. Returns a summary dict (no raise — fail-open).
 
@@ -282,7 +288,7 @@ def reap_windowless_sessions() -> dict:
       - it has been idle >= _REAP_IDLE_MIN_S,
       - it is not the daemon's own session (delete_session enforces this too).
     """
-    live = _live_window_identities()
+    live = await _live_window_identities()
     if live is None:
         return {"reaped": 0, "skipped": "kitty-unavailable"}
     if not live:
@@ -297,7 +303,7 @@ def reap_windowless_sessions() -> dict:
     # lack thereof) never matches. A failed id enumeration degrades gracefully
     # to the pre-fix name-only behavior instead of blocking the whole sweep —
     # it's additive protection, not a new no-op gate.
-    live_window_ids = _live_window_ids()
+    live_window_ids = await _live_window_ids()
     if live_window_ids is None:
         log.debug(
             "registry_gc: live window-id enumeration failed — falling back to name-only liveness"
@@ -590,10 +596,12 @@ async def registry_gc_loop() -> None:
     )
     while True:
         try:
-            reap_windowless_sessions()
+            await reap_windowless_sessions()
         except Exception:
             log.exception("registry_gc: sweep error")
         try:
+            # Genuinely kitty-independent (no _kitty_ls_data call anywhere in
+            # its body) — stays sync, no freeze risk from this one.
             reap_stale_window_duplicates()
         except Exception:
             log.exception("registry_gc: dup-reap sweep error")

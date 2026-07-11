@@ -58,7 +58,7 @@ class TestResolveListenSocket:
     def teardown_method(self):
         rr._RESOLVED_LISTEN = None
 
-    def test_discovers_live_socket_via_glob(self, monkeypatch):
+    async def test_discovers_live_socket_via_glob(self, monkeypatch):
         monkeypatch.delenv("KITTY_LISTEN_ON", raising=False)
         import glob as _glob
 
@@ -67,9 +67,9 @@ class TestResolveListenSocket:
             rr.subprocess, "run",
             lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr=""),
         )
-        assert rr._resolve_listen_socket() == "unix:/tmp/kitty-6285"
+        assert await rr._resolve_listen_socket() == "unix:/tmp/kitty-6285"
 
-    def test_skips_dead_socket_tries_next(self, monkeypatch):
+    async def test_skips_dead_socket_tries_next(self, monkeypatch):
         monkeypatch.delenv("KITTY_LISTEN_ON", raising=False)
         import glob as _glob
 
@@ -80,9 +80,9 @@ class TestResolveListenSocket:
             return subprocess.CompletedProcess(cmd, rc, stdout="[]", stderr="dead")
 
         monkeypatch.setattr(rr.subprocess, "run", fake_run)
-        assert rr._resolve_listen_socket() == "unix:/tmp/kitty-2"
+        assert await rr._resolve_listen_socket() == "unix:/tmp/kitty-2"
 
-    def test_kitty_uses_discovered_socket_headless(self, monkeypatch):
+    async def test_kitty_uses_discovered_socket_headless(self, monkeypatch):
         monkeypatch.delenv("KITTY_LISTEN_ON", raising=False)
         rr._RESOLVED_LISTEN = "unix:/tmp/kitty-6285"  # pre-cached
         monkeypatch.setattr(rr.os.path, "exists", lambda p: True)
@@ -93,7 +93,7 @@ class TestResolveListenSocket:
             return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
 
         monkeypatch.setattr(rr.subprocess, "run", fake_run)
-        assert rr._kitty("ls") == "ok"
+        assert await rr._kitty("ls") == "ok"
         assert "--to=unix:/tmp/kitty-6285" in seen["cmd"]
 
 
@@ -105,12 +105,12 @@ class TestDiscoverRosterWindows:
     """Tests use _get_roster_member_ids=frozenset() (fail-open/no scoping) so
     role-parsing tests are independent of live session state."""
 
-    def test_parses_role_from_cmdline(self):
+    async def test_parses_role_from_cmdline(self):
         with (
-            patch.object(rr, "_kitty", return_value=SAMPLE_KITTY_LS),
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=SAMPLE_KITTY_LS),
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
         ):
-            windows = rr._discover_roster_windows()
+            windows = await rr._discover_roster_windows()
         ids = {w["window_id"] for w in windows}
         roles = {w["role"] for w in windows}
         assert 10 in ids
@@ -120,25 +120,25 @@ class TestDiscoverRosterWindows:
         assert "agent" in roles
         assert "master" in roles
 
-    def test_returns_empty_when_kitty_unavailable(self):
-        with patch.object(rr, "_kitty", return_value=None):
-            assert rr._discover_roster_windows() == []
+    async def test_returns_empty_when_kitty_unavailable(self):
+        with patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=None):
+            assert await rr._discover_roster_windows() == []
 
-    def test_returns_empty_on_bad_json(self):
-        with patch.object(rr, "_kitty", return_value="not-json"):
-            assert rr._discover_roster_windows() == []
+    async def test_returns_empty_on_bad_json(self):
+        with patch.object(rr, "_kitty", new_callable=AsyncMock, return_value="not-json"):
+            assert await rr._discover_roster_windows() == []
 
-    def test_skips_windows_without_role_flag(self):
+    async def test_skips_windows_without_role_flag(self):
         data = json.dumps([{"tabs": [{"windows": [
             {"id": 20, "cmdline": ["claude"]},  # no -r flag
         ]}]}])
         with (
-            patch.object(rr, "_kitty", return_value=data),
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=data),
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
         ):
-            assert rr._discover_roster_windows() == []
+            assert await rr._discover_roster_windows() == []
 
-    def test_normalizes_prefixed_names(self):
+    async def test_normalizes_prefixed_names(self):
         """Prefixed WORKER → base role (jp-agent-1 → agent); registered prefixed
         LEAD keeps its prefix (jp-frontend-lead-1 → jp-frontend-lead)."""
         data = json.dumps([{"tabs": [{"windows": [
@@ -146,10 +146,10 @@ class TestDiscoverRosterWindows:
             {"id": 31, "cmdline": ["claude-chat", "-r", "jp-frontend-lead-1"]},
         ]}]}])
         with (
-            patch.object(rr, "_kitty", return_value=data),
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=data),
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
         ):
-            windows = rr._discover_roster_windows()
+            windows = await rr._discover_roster_windows()
         by_id = {w["window_id"]: w["role"] for w in windows}
         # Prefix-tolerant resolver: jp-agent-1's prefix isn't a registry role, so
         # it strips to the base "agent" (was dropped → role=None before the fix).
@@ -157,7 +157,7 @@ class TestDiscoverRosterWindows:
         # A registered prefixed lead resolves directly (full-name match wins first).
         assert by_id.get(31) == "jp-frontend-lead"
 
-    def test_resolves_arbitrary_prefix_worker_roles(self):
+    async def test_resolves_arbitrary_prefix_worker_roles(self):
         """muther ISSUE 1/2 Path A regression: a roster with an unregistered prefix
         (muther-*) must still have its WORKER seats discovered. Before the fix,
         infer_role_from_name('muther-critic-1') → None → every window dropped →
@@ -174,10 +174,10 @@ class TestDiscoverRosterWindows:
              "cmdline": ["bash", "-ic", "claude-chat -n muther-agent-2"]},
         ]}]}])
         with (
-            patch.object(rr, "_kitty", return_value=data),
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=data),
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
         ):
-            windows = rr._discover_roster_windows()
+            windows = await rr._discover_roster_windows()
         by_id = {w["window_id"]: w["role"] for w in windows}
         assert by_id.get(40) == "critic"
         assert by_id.get(41) == "verifier"
@@ -202,18 +202,18 @@ class TestUnionRegisteredWindows:
 
     SID = "livyatan-sid-0000"
 
-    def test_wake_by_registered_window_id(self):
+    async def test_wake_by_registered_window_id(self):
         """A non-role-titled member with a LIVE registered window + role is unioned in."""
         with (
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
-            patch.object(rr, "_kitty", return_value=_kitty_ls((99, False))),
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=_kitty_ls((99, False))),
             patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
             patch("khimaira.monitor.sessions.get_session_window",
                   side_effect=lambda s: 99 if s == self.SID else None),
             patch("khimaira.monitor.sessions.list_sessions",
                   return_value=[{"session_id": self.SID, "name": "livyatan"}]),
         ):
-            out = rr._union_registered_windows([])  # title pass found nothing
+            out = await rr._union_registered_windows([])  # title pass found nothing
         assert len(out) == 1
         w = out[0]
         assert w["window_id"] == 99
@@ -222,65 +222,65 @@ class TestUnionRegisteredWindows:
         assert w["registered"] is True
         assert w["is_focused"] is False
 
-    def test_title_discovery_still_primary(self):
+    async def test_title_discovery_still_primary(self):
         """A title-discovered window with NO registration is untouched (no regression)."""
         title_win = {"window_id": 10, "role": "agent", "raw_name": "agent-1", "is_focused": False}
         with (
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset({"agent-1-sid"})),
-            patch.object(rr, "_kitty", return_value=_kitty_ls((10, False))),
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=_kitty_ls((10, False))),
             patch.object(rr, "_roster_role_map", return_value={"agent-1-sid": "agent"}),
             patch("khimaira.monitor.sessions.get_session_window", side_effect=lambda s: None),
             patch("khimaira.monitor.sessions.list_sessions",
                   return_value=[{"session_id": "agent-1-sid", "name": "agent-1"}]),
         ):
-            out = rr._union_registered_windows([dict(title_win)])
+            out = await rr._union_registered_windows([dict(title_win)])
         assert len(out) == 1
         assert out[0]["window_id"] == 10
         assert "registered" not in out[0]  # the live title path is untouched
 
-    def test_dedup_title_and_registered(self):
+    async def test_dedup_title_and_registered(self):
         """A window BOTH title-discovered AND registered appears once (no double-wake)."""
         title_win = {"window_id": 10, "role": "agent", "raw_name": "agent-1", "is_focused": False}
         with (
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
-            patch.object(rr, "_kitty", return_value=_kitty_ls((10, False))),
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=_kitty_ls((10, False))),
             patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
             patch("khimaira.monitor.sessions.get_session_window",
                   side_effect=lambda s: 10 if s == self.SID else None),
             patch("khimaira.monitor.sessions.list_sessions",
                   return_value=[{"session_id": self.SID, "name": "livyatan"}]),
         ):
-            out = rr._union_registered_windows([dict(title_win)])
+            out = await rr._union_registered_windows([dict(title_win)])
         assert [w["window_id"] for w in out] == [10]  # exactly once
 
-    def test_stale_registered_window_skipped(self):
+    async def test_stale_registered_window_skipped(self):
         """LIVENESS gate: a registered wid NOT live in kitty is never synthesized
         (window_ids renumber on kitty restart → stale wid must not be woken)."""
         with (
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
-            patch.object(rr, "_kitty", return_value=_kitty_ls((10, False))),  # 77 not live
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=_kitty_ls((10, False))),  # 77 not live
             patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
             patch("khimaira.monitor.sessions.get_session_window",
                   side_effect=lambda s: 77 if s == self.SID else None),
             patch("khimaira.monitor.sessions.list_sessions",
                   return_value=[{"session_id": self.SID, "name": "livyatan"}]),
         ):
-            out = rr._union_registered_windows([])
+            out = await rr._union_registered_windows([])
         assert out == []  # stale wid dropped
 
-    def test_registered_window_carries_is_focused(self):
+    async def test_registered_window_carries_is_focused(self):
         """is_focused carried from kitty-ls so the human-presence guard applies to
         identity-discovered windows identically (never inject into a focused window)."""
         with (
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset({self.SID})),
-            patch.object(rr, "_kitty", return_value=_kitty_ls((99, True))),  # user focused
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=_kitty_ls((99, True))),  # user focused
             patch.object(rr, "_roster_role_map", return_value={self.SID: "agent"}),
             patch("khimaira.monitor.sessions.get_session_window",
                   side_effect=lambda s: 99 if s == self.SID else None),
             patch("khimaira.monitor.sessions.list_sessions",
                   return_value=[{"session_id": self.SID, "name": "livyatan"}]),
         ):
-            out = rr._union_registered_windows([])
+            out = await rr._union_registered_windows([])
         assert out[0]["is_focused"] is True
 
 
@@ -296,13 +296,13 @@ class TestDiscoverRosterWindowsScoping:
             "cd '/home/_3ntropy/dev/khimaira' && claude-chat -r khimaira-0 --model opus"]},
     ]}]}])
 
-    def test_roster_scoped_excludes_other_project(self):
+    async def test_roster_scoped_excludes_other_project(self):
         """When roster_ids is populated, only sessions in the set pass."""
         # agent-1 is in the roster; jp-backend-lead-1 is NOT.
         roster_ids = frozenset(["uuid-agent-1", "uuid-master"])
         from khimaira.monitor import sessions as sess_mod
         with (
-            patch.object(rr, "_kitty", return_value=self.KITTY_WITH_MIXED),
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=self.KITTY_WITH_MIXED),
             patch.object(rr, "_get_roster_member_ids", return_value=roster_ids),
             patch.object(sess_mod, "list_sessions", return_value=[
                 {"name": "agent-1", "session_id": "uuid-agent-1"},
@@ -310,19 +310,19 @@ class TestDiscoverRosterWindowsScoping:
                 {"name": "master", "session_id": "uuid-master"},
             ]),
         ):
-            windows = rr._discover_roster_windows()
+            windows = await rr._discover_roster_windows()
         ids = {w["window_id"] for w in windows}
         assert 10 in ids, "agent-1 (roster member) must be included"
         assert 20 not in ids, "jp-backend-lead-1 (other project) must be excluded"
         assert 30 in ids, "khimaira-0 (roster member) must be included"
 
-    def test_empty_roster_ids_passes_all(self):
+    async def test_empty_roster_ids_passes_all(self):
         """Fail-open: empty roster_ids (canonical unavailable) → all windows pass."""
         with (
-            patch.object(rr, "_kitty", return_value=self.KITTY_WITH_MIXED),
+            patch.object(rr, "_kitty", new_callable=AsyncMock, return_value=self.KITTY_WITH_MIXED),
             patch.object(rr, "_get_roster_member_ids", return_value=frozenset()),
         ):
-            windows = rr._discover_roster_windows()
+            windows = await rr._discover_roster_windows()
         ids = {w["window_id"] for w in windows}
         # All windows with a valid role pass when roster_ids is empty
         assert 10 in ids
@@ -553,18 +553,18 @@ class TestInjectTextAndSubmit:
         # These tests exercise the inject MECHANICS; assume a unique title so the
         # 2026-06-11 duplicate-guard (_count_title_windows) is a clean pass-through
         # and doesn't consume the fixed _kitty side_effect sequences.
-        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
+        monkeypatch.setattr(rr, "_count_title_windows", AsyncMock(return_value=1))
 
-    def _drive(self, monkeypatch, screen_tmpl, *, send_fails=False, read_fails=False,
+    async def _drive(self, monkeypatch, screen_tmpl, *, send_fails=False, read_fails=False,
                text="/compact", title=""):
         """Stateful mock: capture the send-text inject (incl. the runtime verification
         nonce) and ECHO it into the get-text screen via screen_tmpl(inject) — mirrors
         reality, where the window renders what was typed. Returns (result, kitty_calls)."""
-        monkeypatch.setattr(rr.time, "sleep", lambda _s: None)  # skip real poll waits
+        monkeypatch.setattr(rr.asyncio, "sleep", AsyncMock(return_value=None))  # skip real poll waits
         state = {"inject": None}
         kitty_calls = []
 
-        def fake_kitty(*args, **kw):
+        async def fake_kitty(*args, **kw):
             kitty_calls.append(args)
             op = args[0] if args else ""
             if op == "send-text":
@@ -574,19 +574,19 @@ class TestInjectTextAndSubmit:
                 return ""
             return ""  # ctrl+u, send-key enter, ctrl+c
 
-        def fake_get_screen(_wid):
+        async def fake_get_screen(_wid):
             return None if read_fails else screen_tmpl(state["inject"] or "")
 
         monkeypatch.setattr(rr, "_kitty", fake_kitty)
         monkeypatch.setattr(rr, "_get_screen", fake_get_screen)
-        result = rr._inject_text_and_submit(window_id=10, text=text, window_title=title)
+        result = await rr._inject_text_and_submit(window_id=10, text=text, window_title=title)
         return result, kitty_calls
 
-    def test_submits_when_inject_lands(self, monkeypatch):
-        r, _ = self._drive(monkeypatch, lambda inj: f"previous lines\n{inj}")
+    async def test_submits_when_inject_lands(self, monkeypatch):
+        r, _ = await self._drive(monkeypatch, lambda inj: f"previous lines\n{inj}")
         assert r is True
 
-    def test_submits_on_SATURATED_window(self, monkeypatch):
+    async def test_submits_on_SATURATED_window(self, monkeypatch):
         """THE 520k-token case (2026-06-20): a high-context session shows a big task
         panel + "/clear to save Nk tokens" footer, pushing the input (w/ inject) FAR
         above the last screen lines. The old last-15-lines scan missed it → wake never
@@ -596,34 +596,34 @@ class TestInjectTextAndSubmit:
             footer = ("  ⏵⏵ auto mode on (shift+tab to cycle) · ctrl+t to hide tasks · "
                       "← for agents                   new task? /clear to save 520.8k tokens")
             return f"> {inj}\n{panel}\n{footer}"
-        r, _ = self._drive(monkeypatch, tmpl, text="⏰ resume: call chat_my_chats + act")
+        r, _ = await self._drive(monkeypatch, tmpl, text="⏰ resume: call chat_my_chats + act")
         assert r is True
 
-    def test_submits_with_chrome_after_our_text(self, monkeypatch):
-        r, _ = self._drive(
+    async def test_submits_with_chrome_after_our_text(self, monkeypatch):
+        r, _ = await self._drive(
             monkeypatch,
             lambda inj: f"> {inj}\n  ⏵⏵ auto mode on (shift+tab to cycle)",
         )
         assert r is True
 
-    def test_submits_when_nonce_echoes_late(self, monkeypatch):
+    async def test_submits_when_nonce_echoes_late(self, monkeypatch):
         """THE livyatan window-978 case (2026-06-20): at 520k tokens the Claude Code TUI
         re-renders slowly, so the injected nonce isn't painted into the screen buffer on
         the FIRST read — a single fixed-delay readback raced the render and false-aborted.
         The poll re-reads until the echo appears. Here the first 4 reads show the
         pre-inject screen (no nonce); the 5th echoes it. Must still submit."""
-        monkeypatch.setattr(rr.time, "sleep", lambda _s: None)  # don't actually wait ~1.8s
+        monkeypatch.setattr(rr.asyncio, "sleep", AsyncMock(return_value=None))  # don't actually wait ~1.8s
         state = {"inject": None, "reads": 0}
         calls = []
 
-        def fake_kitty(*args, **kw):
+        async def fake_kitty(*args, **kw):
             calls.append(args)
             if args and args[0] == "send-text":
                 state["inject"] = args[-1]
                 return ""
             return ""
 
-        def fake_get_screen(_wid):
+        async def fake_get_screen(_wid):
             state["reads"] += 1
             if state["reads"] < 5:
                 return "  ⏵⏵ auto mode on (shift+tab to cycle) · ctrl+t to hide tasks"
@@ -631,34 +631,34 @@ class TestInjectTextAndSubmit:
 
         monkeypatch.setattr(rr, "_kitty", fake_kitty)
         monkeypatch.setattr(rr, "_get_screen", fake_get_screen)
-        r = rr._inject_text_and_submit(window_id=978, text="⏰ resume", window_title="")
+        r = await rr._inject_text_and_submit(window_id=978, text="⏰ resume", window_title="")
         assert r is True, "late echo within the poll ceiling must still submit"
         assert any(c and c[0] == "send-key" and "enter" in c for c in calls), "must press enter"
 
-    def test_aborts_when_inject_absent(self, monkeypatch):
+    async def test_aborts_when_inject_absent(self, monkeypatch):
         """Inject didn't land (window unresponsive) → nonce absent → abort safely."""
-        r, _ = self._drive(
+        r, _ = await self._drive(
             monkeypatch,
             lambda inj: "previous\n  ⏵⏵ auto mode on\n  3% until auto-compact",
         )
         assert r is False
 
-    def test_aborts_when_get_text_fails(self, monkeypatch):
-        r, _ = self._drive(monkeypatch, lambda inj: "x", read_fails=True)
+    async def test_aborts_when_get_text_fails(self, monkeypatch):
+        r, _ = await self._drive(monkeypatch, lambda inj: "x", read_fails=True)
         assert r is False
 
-    def test_aborts_when_send_text_fails(self, monkeypatch):
-        r, _ = self._drive(monkeypatch, lambda inj: "x", send_fails=True)
+    async def test_aborts_when_send_text_fails(self, monkeypatch):
+        r, _ = await self._drive(monkeypatch, lambda inj: "x", send_fails=True)
         assert r is False
 
-    def test_title_match_for_text_but_fresh_id_for_enter(self, monkeypatch):
+    async def test_title_match_for_text_but_fresh_id_for_enter(self, monkeypatch):
         # send-text uses the restart-stable anchored title-match, but the SUBMIT enter
         # actuates by FRESH id: kitty decorates a live Claude title with a dynamic activity
         # marker that FLICKERS during the nonce-poll; an anchored title-match enter then
         # matches 0 windows and kitty send-key SILENTLY no-ops (rc=0), leaving the text
         # unsubmitted at the prompt (2026-06-23 verifier-1/critic-1 bug). id is fresh this
         # sweep + immune to title decoration.
-        r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}", title="agent-3")
+        r, calls = await self._drive(monkeypatch, lambda inj: f"> {inj}", title="agent-3")
         assert r is True
         send_text = next(c for c in calls if c and c[0] == "send-text")
         send_enter = next(c for c in calls if c and c[0] == "send-key" and "enter" in c)
@@ -666,32 +666,32 @@ class TestInjectTextAndSubmit:
         assert "--match=id:10" in send_enter, "send-key enter must actuate by FRESH id"
         assert "title:" not in str(send_enter), "enter must NOT title-match (decoration flicker no-ops)"
 
-    def test_falls_back_to_id_when_title_matches_no_window(self, monkeypatch):
+    async def test_falls_back_to_id_when_title_matches_no_window(self, monkeypatch):
         """THE livyatan window-978 root cause (2026-06-20): the union path passes the
         clean session name 'livyatan' as window_title, but kitty's real title is
         '✳ livyatan' (dynamic activity marker), so the anchored ^livyatan$ title-match
         finds ZERO windows and send-text silently no-ops (rc=0) → every wake aborts.
         With a known window_id, fall back to id-match so the inject actually lands."""
-        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 0)  # decorated title misses
-        r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}", title="livyatan")
+        monkeypatch.setattr(rr, "_count_title_windows", AsyncMock(return_value=0))  # decorated title misses
+        r, calls = await self._drive(monkeypatch, lambda inj: f"> {inj}", title="livyatan")
         assert r is True, "must fall back to id-match and submit when title matches no window"
         send_text = next(c for c in calls if c and c[0] == "send-text")
         assert "--match=id:10" in str(send_text), "send-text must use id-match on title no-match"
         assert "title:" not in str(send_text), "must NOT use the (non-matching) title-match"
 
-    def test_uses_id_match_when_title_empty(self, monkeypatch):
-        r, calls = self._drive(monkeypatch, lambda inj: f"> {inj}")
+    async def test_uses_id_match_when_title_empty(self, monkeypatch):
+        r, calls = await self._drive(monkeypatch, lambda inj: f"> {inj}")
         assert r is True
         assert any("id:10" in str(c) for c in calls), "id-match must be used when no title given"
 
-    def _drive_submit_confirm(self, monkeypatch, clears_after_enters):
+    async def _drive_submit_confirm(self, monkeypatch, clears_after_enters):
         """Drive inject where the input stays at the ❯ prompt until the Nth enter, then
         clears (submitted). Returns (result, enter_count)."""
-        monkeypatch.setattr(rr.time, "sleep", lambda _s: None)
-        monkeypatch.setattr(rr, "_count_title_windows", lambda t: 1)
+        monkeypatch.setattr(rr.asyncio, "sleep", AsyncMock(return_value=None))
+        monkeypatch.setattr(rr, "_count_title_windows", AsyncMock(return_value=1))
         state = {"inject": "", "enters": 0}
 
-        def fake_kitty(*args, **kw):
+        async def fake_kitty(*args, **kw):
             op = args[0] if args else ""
             if op == "send-text":
                 state["inject"] = args[-1]
@@ -699,7 +699,7 @@ class TestInjectTextAndSubmit:
                 state["enters"] += 1
             return ""
 
-        def fake_get_screen(_wid):
+        async def fake_get_screen(_wid):
             inj = state["inject"]
             if state["enters"] < clears_after_enters:
                 return f"history line\n❯ {inj}"   # nonce still on the input line
@@ -707,26 +707,26 @@ class TestInjectTextAndSubmit:
 
         monkeypatch.setattr(rr, "_kitty", fake_kitty)
         monkeypatch.setattr(rr, "_get_screen", fake_get_screen)
-        r = rr._inject_text_and_submit(window_id=10, text="hi", window_title="")
+        r = await rr._inject_text_and_submit(window_id=10, text="hi", window_title="")
         return r, state["enters"]
 
-    def test_enter_retries_until_submitted(self, monkeypatch):
+    async def test_enter_retries_until_submitted(self, monkeypatch):
         # first enter doesn't take (text still at ❯); retry submits it.
-        r, enters = self._drive_submit_confirm(monkeypatch, clears_after_enters=2)
+        r, enters = await self._drive_submit_confirm(monkeypatch, clears_after_enters=2)
         assert r is True
         assert enters == 2, "must retry the enter when the text is still sitting at the prompt"
 
-    def test_enter_gives_up_after_retries_returns_false(self, monkeypatch):
+    async def test_enter_gives_up_after_retries_returns_false(self, monkeypatch):
         # text never clears → honest False after 3 attempts (no false success).
-        r, enters = self._drive_submit_confirm(monkeypatch, clears_after_enters=99)
+        r, enters = await self._drive_submit_confirm(monkeypatch, clears_after_enters=99)
         assert r is False
         assert enters == 3, "must cap retries and report failure rather than a false success"
 
-    def test_title_match_absent_title_fails_loudly(self, monkeypatch):
+    async def test_title_match_absent_title_fails_loudly(self, monkeypatch):
         """Title-match returning None (rc!=0 = window not found) → False, not silent."""
-        monkeypatch.setattr(rr, "_kitty", lambda *a, **k: None)
-        monkeypatch.setattr(rr, "_get_screen", lambda _wid: None)
-        result = rr._inject_text_and_submit(window_id=99, text="wake", window_title="dead-agent")
+        monkeypatch.setattr(rr, "_kitty", AsyncMock(return_value=None))
+        monkeypatch.setattr(rr, "_get_screen", AsyncMock(return_value=None))
+        result = await rr._inject_text_and_submit(window_id=99, text="wake", window_title="dead-agent")
         assert result is False
 
 
@@ -738,7 +738,13 @@ class TestAutoWakeFreshEnumerate:
         """check_once() calls _discover_roster_windows each time (not cached)."""
         with (
             patch.object(rr, "_env_enabled", return_value=True),
-            patch.object(rr, "_discover_roster_windows", return_value=[]) as mock_discover,
+            # check_once() also calls _reap_duplicate_windows/_union_registered_windows
+            # — must mock these too, else they make a REAL `kitty @ ls` subprocess call
+            # against whatever live kitty socket happens to exist on the test machine
+            # (slow, and reaches outside the test's isolation boundary).
+            patch.object(rr, "_reap_duplicate_windows", new_callable=AsyncMock, return_value=0),
+            patch.object(rr, "_union_registered_windows", new_callable=AsyncMock, side_effect=lambda w: w),
+            patch.object(rr, "_discover_roster_windows", new_callable=AsyncMock, return_value=[]) as mock_discover,
         ):
             await rr.check_once()
             await rr.check_once()
@@ -768,10 +774,10 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=87),
             patch.object(rr, "_distill_session", new_callable=AsyncMock),
-            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_called_once_with(10, "/compact", "")
@@ -793,10 +799,10 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=92),
             patch.object(rr, "_distill_session", side_effect=mock_distill),
-            patch.object(rr, "_inject_text_and_submit", side_effect=mock_inject),
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, side_effect=mock_inject),
         ):
             await rr._process_window(self._win())
 
@@ -811,9 +817,9 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=88),
-            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -825,9 +831,9 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=70),
-            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -841,9 +847,9 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=90),
-            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -861,11 +867,11 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=87),
             patch.object(rr, "_count_compact_summaries", return_value=2),  # unchanged → no-op
             patch.object(rr, "_distill_session", new_callable=AsyncMock),
-            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -881,11 +887,11 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=90),
             patch.object(rr, "_count_compact_summaries", return_value=3),  # +1 → it ran
             patch.object(rr, "_distill_session", new_callable=AsyncMock),
-            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_called_once_with(10, "/compact", "")
@@ -902,11 +908,11 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=90),
             patch.object(rr, "_count_compact_summaries", return_value=2),  # still no effect
             patch.object(rr, "_distill_session", new_callable=AsyncMock),
-            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_called_once_with(10, "/compact", "")
@@ -924,9 +930,9 @@ class TestProcessWindow:
             # auto-HITL OFF → the upstream HITL path doesn't pre-empt; proves the
             # compact-path dialog guard stands on its own.
             patch.object(rr, "_env_auto_hitl_enabled", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=90),
-            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -940,11 +946,11 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=88),
             patch.object(rr, "_count_compact_summaries", return_value=1),
             patch.object(rr, "_distill_session", new_callable=AsyncMock),
-            patch.object(rr, "_inject_text_and_submit", return_value=True),
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True),
         ):
             await rr._process_window(self._win())
         assert rr._COMPACT_PENDING.get("uuid-1234") is not None
@@ -966,8 +972,8 @@ class TestProcessWindow:
         with (
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value=None),
-            patch.object(rr, "_get_screen", return_value=screen),
-            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -980,8 +986,8 @@ class TestProcessWindow:
         with (
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value=None),
-            patch.object(rr, "_get_screen", return_value=screen),
-            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -993,8 +999,8 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=True),
-            patch.object(rr, "_get_screen", return_value=screen),
-            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -1014,10 +1020,10 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", side_effect=screens),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, side_effect=screens),
             patch.object(rr, "_compute_context_pct", return_value=90),
             patch.object(rr, "_distill_session", side_effect=mock_distill),
-            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -1031,12 +1037,12 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=60),
             patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
             patch.object(rr, "_session_has_pending_task", return_value=True),
             patch.object(rr, "_session_has_pending_invite", return_value=False),
-            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True) as mock_inject,
             patch("khimaira.monitor.sessions.list_sessions", return_value=[
                 {"session_id": "uuid-1234", "last_active_age_s": 400}
             ]),
@@ -1053,12 +1059,12 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=60),
             patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
             patch.object(rr, "_session_has_pending_task", return_value=False),
             patch.object(rr, "_session_has_pending_invite", return_value=True),
-            patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True) as mock_inject,
             patch("khimaira.monitor.sessions.list_sessions", return_value=[
                 {"session_id": "uuid-1234", "last_active_age_s": 400}
             ]),
@@ -1075,12 +1081,12 @@ class TestProcessWindow:
             patch.object(rr, "_env_enabled", return_value=True),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
             patch.object(rr, "_compute_context_pct", return_value=60),
             patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
             patch.object(rr, "_session_has_pending_task", return_value=False),
             patch.object(rr, "_session_has_pending_invite", return_value=False),
-            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject,
         ):
             await rr._process_window(self._win())
         mock_inject.assert_not_called()
@@ -1108,14 +1114,14 @@ class TestKittySocketInjection:
             return r
         return fake_run
 
-    def test_cmd_includes_to_when_listen_on_set(self):
+    async def test_cmd_includes_to_when_listen_on_set(self):
         """When KITTY_LISTEN_ON is set, cmd must contain --to=<value>."""
         captured: list = []
         with (
             patch.dict(os.environ, {"KITTY_LISTEN_ON": "unix:/tmp/kitty-test"}, clear=False),
             patch("subprocess.run", side_effect=self._fake_run_ok(captured)),
         ):
-            result = rr._kitty("ls")
+            result = await rr._kitty("ls")
         assert result == "[]"
         assert captured, "subprocess.run was not called"
         cmd = captured[0]
@@ -1124,7 +1130,7 @@ class TestKittySocketInjection:
         )
         assert "ls" in cmd
 
-    def test_cmd_no_to_when_no_socket_anywhere(self):
+    async def test_cmd_no_to_when_no_socket_anywhere(self):
         """With neither KITTY_LISTEN_ON nor a discoverable /tmp/kitty-* socket,
         cmd falls back to bare `kitty @ ls` (no --to). When a socket IS
         discoverable, --to is added — that path is covered by
@@ -1134,17 +1140,17 @@ class TestKittySocketInjection:
         rr._RESOLVED_LISTEN = None  # clear discovery cache
         with (
             patch.dict(os.environ, env_without, clear=True),
-            patch.object(rr, "_resolve_listen_socket", return_value=None),
+            patch.object(rr, "_resolve_listen_socket", new_callable=AsyncMock, return_value=None),
             patch("subprocess.run", side_effect=self._fake_run_ok(captured)),
         ):
-            result = rr._kitty("ls")
+            result = await rr._kitty("ls")
         assert result == "[]"
         cmd = captured[0]
         assert not any(a.startswith("--to=") for a in cmd), (
             f"--to= should NOT appear when no socket is discoverable: {cmd}"
         )
 
-    def test_daemon_path_uses_socket_not_tty(self):
+    async def test_daemon_path_uses_socket_not_tty(self):
         """Simulate daemon call: KITTY_LISTEN_ON set → socket path used."""
         captured: list = []
         socket_val = "unix:/tmp/kitty-daemontest"
@@ -1152,14 +1158,14 @@ class TestKittySocketInjection:
             patch.dict(os.environ, {"KITTY_LISTEN_ON": socket_val}, clear=False),
             patch("subprocess.run", side_effect=self._fake_run_ok(captured)),
         ):
-            result = rr._kitty("ls")
+            result = await rr._kitty("ls")
         assert result is not None, "_kitty returned None — socket injection failed"
         cmd = captured[0]
         assert f"--to={socket_val}" in cmd, (
             f"Daemon path must have --to= in cmd: {cmd}"
         )
 
-    def test_failure_logged_at_warning_not_debug(self):
+    async def test_failure_logged_at_warning_not_debug(self):
         """Kitty failure must be logged at WARNING (not DEBUG) so daemon issues are visible."""
         def fake_run_fail(cmd, **kwargs):
             r = MagicMock()
@@ -1174,7 +1180,7 @@ class TestKittySocketInjection:
             patch.object(rr._log, "warning") as mock_warn,
             patch.object(rr._log, "debug") as mock_debug,
         ):
-            result = rr._kitty("ls")
+            result = await rr._kitty("ls")
 
         assert result is None
         mock_warn.assert_called_once()
@@ -1295,30 +1301,30 @@ class TestHandleHitlPrompt:
     def _make_prompt(self, raw=NUMBERED_PROMPT):
         return rr._detect_hitl_prompt(raw)
 
-    def test_benign_in_scope_answered(self):
+    async def test_benign_in_scope_answered(self):
         prompt = self._make_prompt(NUMBERED_PROMPT)
         with (
             patch.object(rr, "_check_destructive", return_value=None),
             patch.object(rr, "_get_session_active_task_body", return_value=TASK_BODY_THEMIS),
             patch.object(rr, "_is_in_task_scope", return_value=True),
             patch.object(rr, "_role_blocks_file_edit", return_value=False),
-            patch.object(rr, "_inject_text_and_submit", return_value=True),
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True),
         ):
-            result = rr._handle_hitl_prompt(100, "uuid-1234", "agent", prompt)
+            result = await rr._handle_hitl_prompt(100, "uuid-1234", "agent", prompt)
         assert result == "answered"
 
-    def test_destructive_marker_escalated(self):
+    async def test_destructive_marker_escalated(self):
         prompt = self._make_prompt(DESTRUCTIVE_PROMPT)
         with (
             patch.object(rr, "_check_destructive", return_value="rm -rf"),
             patch.object(rr, "_escalate_hitl") as mock_esc,
         ):
-            result = rr._handle_hitl_prompt(100, "uuid-1234", "agent", prompt)
+            result = await rr._handle_hitl_prompt(100, "uuid-1234", "agent", prompt)
         assert result == "escalated"
         mock_esc.assert_called_once()
         assert "destructive-marker" in mock_esc.call_args[0][4]
 
-    def test_out_of_scope_escalated(self):
+    async def test_out_of_scope_escalated(self):
         prompt = self._make_prompt(OUT_OF_SCOPE_PROMPT)
         with (
             patch.object(rr, "_check_destructive", return_value=None),
@@ -1326,11 +1332,11 @@ class TestHandleHitlPrompt:
             patch.object(rr, "_is_in_task_scope", return_value=False),
             patch.object(rr, "_escalate_hitl") as mock_esc,
         ):
-            result = rr._handle_hitl_prompt(100, "uuid-1234", "agent", prompt)
+            result = await rr._handle_hitl_prompt(100, "uuid-1234", "agent", prompt)
         assert result == "escalated"
         mock_esc.assert_called_once()
 
-    def test_role_mismatch_escalated(self):
+    async def test_role_mismatch_escalated(self):
         prompt = self._make_prompt()
         with (
             patch.object(rr, "_check_destructive", return_value=None),
@@ -1339,11 +1345,11 @@ class TestHandleHitlPrompt:
             patch.object(rr, "_role_blocks_file_edit", return_value=True),
             patch.object(rr, "_escalate_hitl") as mock_esc,
         ):
-            result = rr._handle_hitl_prompt(100, "uuid-1234", "analyst", prompt)
+            result = await rr._handle_hitl_prompt(100, "uuid-1234", "analyst", prompt)
         assert result == "escalated"
         mock_esc.assert_called_once()
 
-    def test_unknown_prompt_kind_escalated(self):
+    async def test_unknown_prompt_kind_escalated(self):
         unknown_prompt = {"raw_block": "some text\nDo you want", "answer_key": "1", "kind": "unknown"}
         with (
             patch.object(rr, "_check_destructive", return_value=None),
@@ -1352,7 +1358,7 @@ class TestHandleHitlPrompt:
             patch.object(rr, "_role_blocks_file_edit", return_value=False),
             patch.object(rr, "_escalate_hitl") as mock_esc,
         ):
-            result = rr._handle_hitl_prompt(100, "uuid-1234", "agent", unknown_prompt)
+            result = await rr._handle_hitl_prompt(100, "uuid-1234", "agent", unknown_prompt)
         assert result == "escalated"
         mock_esc.assert_called_once()
 
@@ -1382,9 +1388,9 @@ class TestProcessWindowHitl:
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_session_hitl_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
-            patch.object(rr, "_handle_hitl_prompt", return_value="answered") as mock_hitl,
-            patch.object(rr, "_inject_text_and_submit") as mock_inject,
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt", new_callable=AsyncMock, return_value="answered") as mock_hitl,
+            patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject,
         ):
             await rr._process_window(self._win())
 
@@ -1404,8 +1410,8 @@ class TestProcessWindowHitl:
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_session_hitl_opt_out", return_value=True),
-            patch.object(rr, "_get_screen", return_value=screen),
-            patch.object(rr, "_handle_hitl_prompt") as mock_hitl,
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt", new_callable=AsyncMock) as mock_hitl,
         ):
             await rr._process_window(self._win())
 
@@ -1421,8 +1427,8 @@ class TestProcessWindowHitl:
             patch.object(rr, "_env_auto_hitl_enabled", return_value=False),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
-            patch.object(rr, "_handle_hitl_prompt") as mock_hitl,
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt", new_callable=AsyncMock) as mock_hitl,
         ):
             await rr._process_window(self._win())
 
@@ -1441,8 +1447,8 @@ class TestProcessWindowHitl:
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-1234"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_session_hitl_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
-            patch.object(rr, "_handle_hitl_prompt", return_value="answered"),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt", new_callable=AsyncMock, return_value="answered"),
             patch.object(rr._log, "info") as mock_log,
         ):
             await rr._process_window(self._win())
@@ -1502,8 +1508,8 @@ class TestHitlEscalationDedupe:
             patch.object(rr, "_resolve_session_by_name", return_value="3cf5ee30-uuid"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_session_hitl_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=screen),
-            patch.object(rr, "_handle_hitl_prompt", return_value=handle_result),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=screen),
+            patch.object(rr, "_handle_hitl_prompt", new_callable=AsyncMock, return_value=handle_result),
         )
 
     @pytest.mark.asyncio
@@ -1671,7 +1677,7 @@ class TestProcessWindowNameResolution:
             patch.object(rr, "_resolve_session_by_name", return_value="uuid-agent-2") as mock_name,
             patch.object(rr, "_resolve_session_for_role") as mock_role,
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=">"),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=">"),
             patch.object(rr, "_compute_context_pct", return_value=50),
             patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
             patch.object(rr, "_session_has_pending_task", return_value=False),
@@ -1690,7 +1696,7 @@ class TestProcessWindowNameResolution:
             patch.object(rr, "_resolve_session_by_name", return_value=None),
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-via-role") as mock_role,
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=">"),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=">"),
             patch.object(rr, "_compute_context_pct", return_value=50),
             patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
             patch.object(rr, "_session_has_pending_task", return_value=False),
@@ -1709,7 +1715,7 @@ class TestProcessWindowNameResolution:
             patch.object(rr, "_resolve_session_by_name") as mock_name,
             patch.object(rr, "_resolve_session_for_role", return_value="uuid-via-role"),
             patch.object(rr, "_session_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value=">"),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value=">"),
             patch.object(rr, "_compute_context_pct", return_value=50),
             patch("khimaira.monitor.api.chats._get_session_obligations", return_value=[]),
             patch.object(rr, "_session_has_pending_task", return_value=False),
@@ -1980,7 +1986,7 @@ class TestProcessWindowWakeDiskWIP:
             patch.object(rr, "_resolve_session_by_name", return_value="session-uuid"),
             patch.object(rr, "_session_opt_out", return_value=False),
             patch.object(rr, "_session_hitl_opt_out", return_value=False),
-            patch.object(rr, "_get_screen", return_value="agent idle\n"),
+            patch.object(rr, "_get_screen", new_callable=AsyncMock, return_value="agent idle\n"),
             patch.object(rr, "_compute_context_pct", return_value=None),
             patch("khimaira.monitor.api.chats._get_session_obligations",
                   return_value=[{"type": "task"}] if has_obligations else []),
@@ -2005,7 +2011,7 @@ class TestProcessWindowWakeDiskWIP:
         with (patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
               patches[6], patches[7], patches[8], patches[9], patches[10], patches[11],
               patch.object(sessions_mod, "list_sessions", return_value=[row]),
-              patch.object(rr, "_inject_text_and_submit") as mock_inject):
+              patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject):
             await rr._process_window(self._win())
 
         mock_inject.assert_not_called()
@@ -2020,7 +2026,7 @@ class TestProcessWindowWakeDiskWIP:
         with (patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
               patches[6], patches[7], patches[8], patches[9], patches[10], patches[11],
               patch.object(sessions_mod, "list_sessions", return_value=[row]),
-              patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject):
+              patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True) as mock_inject):
             await rr._process_window(self._win())
 
         mock_inject.assert_called_once()
@@ -2037,7 +2043,7 @@ class TestProcessWindowWakeDiskWIP:
         with (patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
               patches[6], patches[7], patches[8], patches[9], patches[10], patches[11],
               patch.object(sessions_mod, "list_sessions", return_value=[row]),
-              patch.object(rr, "_inject_text_and_submit") as mock_inject):
+              patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock) as mock_inject):
             await rr._process_window(self._win())
 
         mock_inject.assert_not_called()
@@ -2056,7 +2062,7 @@ class TestProcessWindowWakeDiskWIP:
         with (patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
               patches[6], patches[7], patches[8], patches[9], patches[10], patches[11],
               patch.object(sessions_mod, "list_sessions", return_value=[row]),
-              patch.object(rr, "_inject_text_and_submit", return_value=True) as mock_inject):
+              patch.object(rr, "_inject_text_and_submit", new_callable=AsyncMock, return_value=True) as mock_inject):
             await rr._process_window(self._win())
 
         # B must be woken — A's edits in the shared repo do NOT suppress B's wake

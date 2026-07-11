@@ -1714,10 +1714,36 @@ def _dispatch_wake_worker(
     cooldown_key: str | None = None,
     role_hint: str | None = None,
 ) -> None:
-    """Wake one idle target via kitty. Runs in a daemon thread so the send never
-    pays the ~0.3s inject latency. Conservative: idle-only (active sessions see
-    the push), window busy-check (don't inject over a spinner), and a cooldown
-    (don't re-wake on a burst). `message` overrides the default dispatch text.
+    """Thread entry point for `_dispatch_wake_worker_async` (see there for the
+    contract). Runs in a bare `threading.Thread` with no event loop of its own
+    (both call sites use `threading.Thread(target=_dispatch_wake_worker, ...)`),
+    so it opens a fresh loop via `asyncio.run` to drive the async roster_recovery
+    kitty chain (`_discover_roster_windows`/`_get_screen`/`_inject_text_and_submit`
+    are `async def` — see the kitty-in-async-loop chokepoint fix).
+    """
+    import asyncio
+
+    asyncio.run(
+        _dispatch_wake_worker_async(
+            target_id, target_name, message,
+            cooldown_key=cooldown_key, role_hint=role_hint,
+        )
+    )
+
+
+async def _dispatch_wake_worker_async(
+    target_id: str,
+    target_name: str,
+    message: str | None = None,
+    *,
+    cooldown_key: str | None = None,
+    role_hint: str | None = None,
+) -> None:
+    """Wake one idle target via kitty. Runs in a daemon thread (via the
+    `_dispatch_wake_worker` sync entry point) so the send never pays the ~0.3s
+    inject latency. Conservative: idle-only (active sessions see the push),
+    window busy-check (don't inject over a spinner), and a cooldown (don't
+    re-wake on a burst). `message` overrides the default dispatch text.
 
     Observability (F1, muther GAP #1 2026-06-11): EVERY suppression path logs its
     reason at INFO. The prior silent `return`s made a non-firing wake impossible to
@@ -1749,7 +1775,7 @@ def _dispatch_wake_worker(
 
         from khimaira.monitor import roster_recovery as rr
 
-        wins = rr._discover_roster_windows()
+        wins = await rr._discover_roster_windows()
         win = None
         if role_hint:
             win = next((w for w in wins if w.get("role") == role_hint), None)
@@ -1760,7 +1786,7 @@ def _dispatch_wake_worker(
             # daemon's roster, so a targeted wake for another roster's session
             # (one daemon, many rosters) finds nothing. Look the exact session up
             # unscoped by name (muther note-2: dual-verdict wakes hit 0 windows).
-            win = rr._window_for_session_name(target_name)
+            win = await rr._window_for_session_name(target_name)
         if win is None:
             log.info(
                 "chats: wake skipped — no window for %s (name=%r role=%r, %d roster windows)",
@@ -1768,11 +1794,11 @@ def _dispatch_wake_worker(
             )
             return
         wid = win["window_id"]
-        screen = rr._get_screen(wid)
+        screen = await rr._get_screen(wid)
         if screen is not None and rr._is_busy(screen):
             log.info("chats: wake skipped — window busy %s", target_name)
             return
-        if rr._inject_text_and_submit(wid, message or _DEFAULT_DISPATCH_WAKE_MSG, target_name):
+        if await rr._inject_text_and_submit(wid, message or _DEFAULT_DISPATCH_WAKE_MSG, target_name):
             _last_dispatch_wake[ck] = now
             log.info(
                 "chats: wake → %s (%s, idle %.0fs, key=%s)",

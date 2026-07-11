@@ -120,7 +120,7 @@ def _session_active_within(session_id: str, window_s: float) -> bool:
     return False
 
 
-def _classify_unresponsive(session_id: str) -> str:
+async def _classify_unresponsive(session_id: str) -> str:
     """Classify WHY a session hasn't replied — deaf vs busy vs dead vs active.
 
     The old presumed-dead heuristic ("no SSE heartbeat / no tool activity in
@@ -142,6 +142,14 @@ def _classify_unresponsive(session_id: str) -> str:
                  prior conservative behavior (fire presumed-dead).
 
     Fail-open: any error returns "unknown" so we never crash the sweep.
+
+    Async (2026-07-11, freeze-class fix): this was the DOMINANT confirmed
+    instance of the daemon-freeze bug class (chat-102d8b5fd82f audit) — called
+    directly, synchronously, from `_diagnose_and_dispose` (itself `async def`,
+    reached via `_overdue_watcher`'s background task), up to twice per overdue
+    candidate per 30s tick, with zero offload. `roster_recovery._discover_
+    roster_windows`/`_get_screen` are now themselves `async def` (the
+    chokepoint); this just has to await them.
     """
     try:
         if _session_active_within(session_id, _LIVENESS_WINDOW_S):
@@ -167,7 +175,7 @@ def _classify_unresponsive(session_id: str) -> str:
         if not name:
             return "unknown"
 
-        windows = _rr._discover_roster_windows()
+        windows = await _rr._discover_roster_windows()
         if not windows:
             return "unknown"  # kitty unreachable — don't assert dead
 
@@ -175,7 +183,7 @@ def _classify_unresponsive(session_id: str) -> str:
         if win is None:
             return "dead"  # window for this named session is gone
 
-        screen = _rr._get_screen(win["window_id"])
+        screen = await _rr._get_screen(win["window_id"])
         if screen is None:
             return "unknown"  # couldn't read — stay conservative
         return "busy" if _rr._is_busy(screen) else "deaf"
@@ -342,7 +350,7 @@ async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:
     threshold = entry.get("threshold_s", _REPLY_OVERDUE_DEFAULT_S)
 
     # Phase 1: liveness check
-    if _classify_unresponsive(to_id) in ("active", "busy"):
+    if await _classify_unresponsive(to_id) in ("active", "busy"):
         async with _REGISTRY_LOCK:
             existing = _EXPECTED_REPLIES.get(key)
             if existing is not None:
@@ -364,7 +372,7 @@ async def _diagnose_and_dispose(key: tuple, entry: dict, ts_now: float) -> None:
     # Phase 3: probe was sent on prior tick, X still silent on the chat channel.
     # Classify WHY before alarming the master — deaf/busy/dead are different
     # problems with different remedies (2026-06-08 muther false-positive fix).
-    classification = _classify_unresponsive(to_id)
+    classification = await _classify_unresponsive(to_id)
 
     # B2 — kitty-independent fallback: when the window classifier can't tell
     # (kitty unavailable → "unknown"), don't default to a death alarm if /proc

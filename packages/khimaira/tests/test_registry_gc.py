@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib
 from datetime import UTC
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -39,7 +40,7 @@ def gc_mod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from khimaira.monitor import roster_recovery as rr
 
     monkeypatch.setattr(
-        rr, "_kitty", lambda *a, **k: None
+        rr, "_kitty", AsyncMock(return_value=None)
     )  # kitty unavailable → _live_window_ids() None
     monkeypatch.setattr(chats_mod, "my_chats", lambda sid: [])  # no accepted chat memberships
     yield gc, sess
@@ -52,25 +53,24 @@ def _rows(*specs):
     return [{"session_id": s, "name": n, "last_active_age_s": a} for s, n, a in specs]
 
 
-def test_noop_when_kitty_unavailable(gc_mod, monkeypatch):
+async def test_noop_when_kitty_unavailable(gc_mod, monkeypatch):
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: None)  # kitty down
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value=None))  # kitty down
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-1", "agent-1", 99999)))
     monkeypatch.setattr(
         sess, "delete_session", lambda *a, **k: deleted.append(a) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert res["skipped"] == "kitty-unavailable"
     assert deleted == [], "MUST NOT reap when kitty is unavailable"
 
 
-def test_reaps_windowless_idle_session(gc_mod, monkeypatch):
+async def test_reaps_windowless_idle_session(gc_mod, monkeypatch):
     gc, sess = gc_mod
-    monkeypatch.setattr(
-        gc, "_live_window_identities", lambda: {"agent-1", "master"}
-    )  # agent-2 gone
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"agent-1", "master"}
+    ))  # agent-2 gone
     deleted = []
     monkeypatch.setattr(
         sess,
@@ -80,29 +80,29 @@ def test_reaps_windowless_idle_session(gc_mod, monkeypatch):
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 1
     assert deleted == ["uuid-2"], "only the windowless session is reaped"
 
 
-def test_keeps_live_window_session(gc_mod, monkeypatch):
+async def test_keeps_live_window_session(gc_mod, monkeypatch):
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"agent-1"}))
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-1", "agent-1", 99999)))
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == []
 
 
-def test_keeps_fresh_session_even_if_windowless(gc_mod, monkeypatch):
+async def test_keeps_fresh_session_even_if_windowless(gc_mod, monkeypatch):
     """A just-launched session may not have bound its window yet — the idle
     threshold protects it from being reaped mid-boot."""
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"master"})
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"master"}))
     deleted = []
     monkeypatch.setattr(
         sess, "list_sessions", lambda **k: _rows(("uuid-new", "agent-9", 5))
@@ -110,36 +110,35 @@ def test_keeps_fresh_session_even_if_windowless(gc_mod, monkeypatch):
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == [], "fresh session must not be reaped (window not bound yet)"
 
 
-def test_empty_set_is_noop_not_mass_reap(gc_mod, monkeypatch):
+async def test_empty_set_is_noop_not_mass_reap(gc_mod, monkeypatch):
     """muther symptom 2 fix: an empty kitty result is a transient hiccup, not a
     real empty desktop. Reaping the whole registry on it was a mass false
     positive — now treated as can't-tell (skip)."""
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: set())
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value=set()))
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-1", "agent-1", 99999)))
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert res["skipped"] == "kitty-empty-suspicious"
     assert deleted == [], "empty set must NOT reap (transient kitty hiccup)"
 
 
-def test_title_drift_not_reaped_when_cmdline_name_matches(gc_mod, monkeypatch):
+async def test_title_drift_not_reaped_when_cmdline_name_matches(gc_mod, monkeypatch):
     """THE muther symptom 2 case: a live agent whose window TITLE drifted from its
     session name must NOT be reaped — its launch `-n` name still proves it live."""
     gc, sess = gc_mod
     # window title is something unrelated, but cmdline carries -n muther-agent-3
-    monkeypatch.setattr(
-        gc, "_live_window_identities", lambda: {"some-drifted-title", "muther-agent-3"}
-    )
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"some-drifted-title", "muther-agent-3"}
+    ))
     deleted = []
     monkeypatch.setattr(
         sess, "list_sessions", lambda **k: _rows(("uuid-3", "muther-agent-3", 99999))
@@ -147,7 +146,7 @@ def test_title_drift_not_reaped_when_cmdline_name_matches(gc_mod, monkeypatch):
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == [], "launch -n name proves liveness despite title drift"
 
@@ -164,7 +163,7 @@ def test_name_from_cmdline_variants(gc_mod):
     assert gc._name_from_cmdline([]) is None
 
 
-def test_live_identities_includes_title_and_cmdline_name(gc_mod, monkeypatch):
+async def test_live_identities_includes_title_and_cmdline_name(gc_mod, monkeypatch):
     gc, _ = gc_mod
     import json as _json
 
@@ -186,12 +185,12 @@ def test_live_identities_includes_title_and_cmdline_name(gc_mod, monkeypatch):
     ]
     from khimaira.monitor import roster_recovery as rr
 
-    monkeypatch.setattr(rr, "_kitty", lambda *a: _json.dumps(ls))
-    ids = gc._live_window_identities()
+    monkeypatch.setattr(rr, "_kitty", AsyncMock(return_value=_json.dumps(ls)))
+    ids = await gc._live_window_identities()
     assert "drifted-title" in ids and "muther-agent-3" in ids
 
 
-def test_decorated_title_yields_de_decorated_identity(gc_mod, monkeypatch):
+async def test_decorated_title_yields_de_decorated_identity(gc_mod, monkeypatch):
     """THE 2026-06-21 muther drop: kitty decorates the live window title with an
     activity marker (✳ idle / ⠂ thinking / * bell). Plain .strip() leaves the
     marker, so "✳ muther" != "muther" and the reaper false-deletes the LIVE
@@ -216,23 +215,23 @@ def test_decorated_title_yields_de_decorated_identity(gc_mod, monkeypatch):
     ]
     from khimaira.monitor import roster_recovery as rr
 
-    monkeypatch.setattr(rr, "_kitty", lambda *a: _json.dumps(ls))
-    ids = gc._live_window_identities()
+    monkeypatch.setattr(rr, "_kitty", AsyncMock(return_value=_json.dumps(ls)))
+    ids = await gc._live_window_identities()
     assert "muther" in ids, "de-decorated title must mark the session live"
 
 
-def test_decorated_window_session_not_reaped(gc_mod, monkeypatch):
+async def test_decorated_window_session_not_reaped(gc_mod, monkeypatch):
     """End-to-end: a live session whose only liveness proof is a decorated
     window title ("⠂ muther") must NOT be reaped. Regression guard for the
     cascade that dropped muther from her jeevy roster chat twice."""
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"muther"})  # de-decorated
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"muther"}))  # de-decorated
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-m", "muther", 99999)))
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == [], "decorated-title live session must survive the reaper"
 
@@ -590,7 +589,7 @@ def test_no_migration_when_guard_skips_reap(gc_mod, monkeypatch):
 # closes the gap by cross-checking the session's registered window_id.
 
 
-def test_live_window_ids_from_kitty_ls(gc_mod, monkeypatch):
+async def test_live_window_ids_from_kitty_ls(gc_mod, monkeypatch):
     gc, _ = gc_mod
     import json as _json
 
@@ -608,25 +607,25 @@ def test_live_window_ids_from_kitty_ls(gc_mod, monkeypatch):
     ]
     from khimaira.monitor import roster_recovery as rr
 
-    monkeypatch.setattr(rr, "_kitty", lambda *a: _json.dumps(ls))
-    assert gc._live_window_ids() == {42, 7}
+    monkeypatch.setattr(rr, "_kitty", AsyncMock(return_value=_json.dumps(ls)))
+    assert await gc._live_window_ids() == {42, 7}
 
 
-def test_live_window_ids_none_when_kitty_unavailable(gc_mod, monkeypatch):
+async def test_live_window_ids_none_when_kitty_unavailable(gc_mod, monkeypatch):
     gc, _ = gc_mod
     from khimaira.monitor import roster_recovery as rr
 
-    monkeypatch.setattr(rr, "_kitty", lambda *a: None)
-    assert gc._live_window_ids() is None
+    monkeypatch.setattr(rr, "_kitty", AsyncMock(return_value=None))
+    assert await gc._live_window_ids() is None
 
 
-def test_id_split_session_not_reaped_when_window_live(gc_mod, monkeypatch):
+async def test_id_split_session_not_reaped_when_window_live(gc_mod, monkeypatch):
     """THE load-bearing test: an unnamed post-/clear session shares its live
     agent's kitty window. Its name never matches a live title, but its
     registered window_id proves it alive — must NOT be reaped."""
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
-    monkeypatch.setattr(gc, "_live_window_ids", lambda: {42})
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"agent-1"}))
+    monkeypatch.setattr(gc, "_live_window_ids", AsyncMock(return_value={42}))
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-unnamed", "", 99999)))
     monkeypatch.setattr(
@@ -635,35 +634,35 @@ def test_id_split_session_not_reaped_when_window_live(gc_mod, monkeypatch):
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == [], "window_id liveness must protect the unnamed id-split session"
 
 
-def test_genuinely_windowless_session_still_reaped(gc_mod, monkeypatch):
+async def test_genuinely_windowless_session_still_reaped(gc_mod, monkeypatch):
     """The id-split fix is additive protection, not a blanket amnesty — a session
     with neither a live name NOR a live window is still cleaned up."""
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
-    monkeypatch.setattr(gc, "_live_window_ids", lambda: {42})
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"agent-1"}))
+    monkeypatch.setattr(gc, "_live_window_ids", AsyncMock(return_value={42}))
     deleted = []
     monkeypatch.setattr(sess, "list_sessions", lambda **k: _rows(("uuid-dead", "old-name", 99999)))
     monkeypatch.setattr(sess, "get_session_window", lambda sid: None)
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 1
     assert deleted == ["uuid-dead"], "no live name, no live window → cleanup still works"
 
 
-def test_window_id_enumeration_failure_falls_back_to_name_only(gc_mod, monkeypatch):
+async def test_window_id_enumeration_failure_falls_back_to_name_only(gc_mod, monkeypatch):
     """If _live_window_ids can't tell (kitty id-enumeration failed) but the name
     check already succeeded, the sweep degrades to name-only behavior instead of
     aborting entirely — the id check is additive, not a new no-op gate."""
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
-    monkeypatch.setattr(gc, "_live_window_ids", lambda: None)
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"agent-1"}))
+    monkeypatch.setattr(gc, "_live_window_ids", AsyncMock(return_value=None))
     deleted = []
     monkeypatch.setattr(
         sess,
@@ -674,7 +673,7 @@ def test_window_id_enumeration_failure_falls_back_to_name_only(gc_mod, monkeypat
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 1
     assert deleted == ["uuid-2"], "id-enum failure degrades to name-only, doesn't block the sweep"
 
@@ -705,15 +704,15 @@ def test_accepted_member_skip_reason_fails_open_on_membership_error(gc_mod, monk
     assert gc._accepted_member_skip_reason("some-sid") == "membership-check-failed"
 
 
-def test_accepted_member_with_recent_activity_not_reaped(gc_mod, monkeypatch):
+async def test_accepted_member_with_recent_activity_not_reaped(gc_mod, monkeypatch):
     """An accepted chat member with a tool call inside the activity window is
     protected even though it's otherwise windowless/name-mismatched."""
     gc, sess = gc_mod
     import time
     from datetime import datetime
 
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
-    monkeypatch.setattr(gc, "_live_window_ids", lambda: set())
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"agent-1"}))
+    monkeypatch.setattr(gc, "_live_window_ids", AsyncMock(return_value=set()))
     deleted = []
     monkeypatch.setattr(
         sess, "list_sessions", lambda **k: _rows(("uuid-member", "old-name", 99999))
@@ -734,17 +733,17 @@ def test_accepted_member_with_recent_activity_not_reaped(gc_mod, monkeypatch):
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 0
     assert deleted == [], "accepted chat member with recent tool activity must not be reap-cascaded"
 
 
-def test_accepted_member_truly_dead_still_reaped(gc_mod, monkeypatch):
+async def test_accepted_member_truly_dead_still_reaped(gc_mod, monkeypatch):
     """A genuinely-dead accepted member (no window, no recent activity, idle long)
     is still legitimate cleanup — the guard doesn't grant blanket immunity."""
     gc, sess = gc_mod
-    monkeypatch.setattr(gc, "_live_window_identities", lambda: {"agent-1"})
-    monkeypatch.setattr(gc, "_live_window_ids", lambda: set())
+    monkeypatch.setattr(gc, "_live_window_identities", AsyncMock(return_value={"agent-1"}))
+    monkeypatch.setattr(gc, "_live_window_ids", AsyncMock(return_value=set()))
     deleted = []
     monkeypatch.setattr(
         sess, "list_sessions", lambda **k: _rows(("uuid-stale-member", "old-name", 99999))
@@ -760,7 +759,7 @@ def test_accepted_member_truly_dead_still_reaped(gc_mod, monkeypatch):
     monkeypatch.setattr(
         sess, "delete_session", lambda sid, **k: deleted.append(sid) or {"deleted": True}
     )
-    res = gc.reap_windowless_sessions()
+    res = await gc.reap_windowless_sessions()
     assert res["reaped"] == 1
     assert deleted == ["uuid-stale-member"], (
         "accepted but genuinely dead member is still cleaned up"

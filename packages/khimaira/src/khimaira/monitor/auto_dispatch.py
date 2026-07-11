@@ -419,7 +419,7 @@ async def _maybe_wake_idle_master(
     try:
         from khimaira.monitor import roster_recovery as rr
 
-        wins = await loop.run_in_executor(None, rr._discover_roster_windows)
+        wins = await rr._discover_roster_windows()
         master_win = next((w for w in wins if w.get("role") == "master"), None)
         if master_win is None and master_name:
             # Cross-roster fallback (#19 class applied to the reconcile wake):
@@ -428,9 +428,7 @@ async def _maybe_wake_idle_master(
             # finds 0 windows. Look the exact master up unscoped by name — strips
             # kitty's ✳ activity-marker too. This is what let muther's commit-wake
             # skip "no master window" while her window was live.
-            master_win = await loop.run_in_executor(
-                None, rr._window_for_session_name, master_name
-            )
+            master_win = await rr._window_for_session_name(master_name)
         if master_win is None:
             # Owed work but NO live window to wake → undeliverable, not a benign
             # skip. Escalate (the master session is likely dead/closed).
@@ -440,7 +438,7 @@ async def _maybe_wake_idle_master(
             )
             return
         wid = master_win["window_id"]
-        screen = await loop.run_in_executor(None, lambda: rr._get_screen(wid))
+        screen = await rr._get_screen(wid)
         if screen is not None and rr._is_busy(screen):
             _log.info("auto-dispatch: master-wake skipped — master window busy")
             return
@@ -463,10 +461,7 @@ async def _maybe_wake_idle_master(
                 "the next item (assign + BEGIN) or, if nothing is actionable, surface "
                 "'roster idle — here's what's next' to Joseph. Don't wait for an event."
             )
-        ok = await loop.run_in_executor(
-            None,
-            lambda: rr._inject_text_and_submit(wid, text, master_win.get("raw_name", "")),
-        )
+        ok = await rr._inject_text_and_submit(wid, text, master_win.get("raw_name", ""))
         if ok:
             _last_master_wake[master_id] = now
             _log.info(
