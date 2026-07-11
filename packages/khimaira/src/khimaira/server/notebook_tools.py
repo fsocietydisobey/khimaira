@@ -423,3 +423,207 @@ async def notebook_delete(note_id: str) -> str:
         f"🗑️ deleted `{note_id}` — **{title}** "
         f"(repo={existing.get('repo', '?')}, tab={existing.get('tab_id', '?')})."
     )
+
+
+# ---------------------------------------------------------------------------
+# Tickets (2026-07-11) — local mirror of Linear issues. Own resource surface
+# (/api/tickets*, not /api/notes*) since its filters (project/state/
+# assignee/label) and read-only-synced-field semantics on a linear-pulled
+# ticket don't apply to notes/guides. See khimaira.monitor.notes' "Public
+# API — tickets" section for the storage-layer contract.
+# ---------------------------------------------------------------------------
+
+_TICKET_STATE_BADGE = {
+    "Backlog": "📋",
+    "Todo": "📝",
+    "In Progress": "🚧",
+    "In Review": "👀",
+    "Done": "✅",
+    "Cancelled": "🚫",
+}
+
+
+def _ticket_qs(project: str = "", state: str = "", assignee: str = "", label: str = "") -> str:
+    params = []
+    if project:
+        params.append(f"project={urllib.parse.quote(project)}")
+    if state:
+        params.append(f"state={urllib.parse.quote(state)}")
+    if assignee:
+        params.append(f"assignee={urllib.parse.quote(assignee)}")
+    if label:
+        params.append(f"label={urllib.parse.quote(label)}")
+    return f"?{'&'.join(params)}" if params else ""
+
+
+async def ticket_list(project: str = "", state: str = "", assignee: str = "", label: str = "") -> str:
+    """List local tickets (the Linear mirror) — filter by project/state/
+    assignee/label. `assignee` is a SECONDARY filter over the already-
+    project-scoped set (resync pulls by project, not by assignee)."""
+    data = _get(f"/api/tickets{_ticket_qs(project, state, assignee, label)}")
+    if isinstance(data, str):
+        return data
+    tickets = data.get("tickets", [])
+    if not tickets:
+        scope = f" (project={project!r})" if project else ""
+        return f"📭 no tickets{scope}."
+    lines = [f"🎫 **{len(tickets)} ticket(s)**{f' — project={project!r}' if project else ''}:\n"]
+    for t in tickets:
+        badge = _TICKET_STATE_BADGE.get(t.get("state", ""), "❓")
+        assignee_name = (t.get("assignee") or {}).get("name") or "unassigned"
+        lines.append(
+            f"{badge} `{t['id']}` **{t.get('title', '?')}** [{t.get('state', '?')}] "
+            f"project={t.get('project', '?')} assignee={assignee_name}"
+        )
+    lines.append("\nUse `ticket_get(ticket_id)` to read one in full.")
+    return "\n".join(lines)
+
+
+async def ticket_get(ticket_id: str) -> str:
+    """Read one ticket in full — description, state, priority, assignee,
+    labels, comments, and (if linear-pulled) sync provenance."""
+    if not ticket_id:
+        return "❌ ticket_get requires a ticket_id — get one from ticket_list."
+    data = _get(f"/api/tickets/{urllib.parse.quote(ticket_id, safe='')}")
+    if isinstance(data, str):
+        return data
+    badge = _TICKET_STATE_BADGE.get(data.get("state", ""), "❓")
+    assignee_name = (data.get("assignee") or {}).get("name") or "unassigned"
+    lines = [
+        f"{badge} **{data.get('title', '?')}**  `{data['id']}`  [{data.get('state', '?')}]",
+        f"project={data.get('project', '?')}  assignee={assignee_name}  "
+        f"priority={data.get('linear_priority', '?')}  labels={', '.join(data.get('labels') or []) or 'none'}",
+        f"origin={data.get('origin', '?')}  sync_state={data.get('sync_state', '?')}"
+        + (f"  linear_ref={data.get('linear_ref')}" if data.get("linear_ref") else "")
+        + "\n",
+        f"**Description:**\n{data.get('raw_text', '')}\n",
+    ]
+    comments = data.get("comments") or []
+    if comments:
+        lines.append(f"**Comments ({len(comments)}):**")
+        for c in comments:
+            lines.append(f"  • {c.get('author') or '(unattributed)'} @ {c.get('ts', '?')}: {c.get('text', '')}")
+    if data.get("origin") == "linear-pulled":
+        lines.append(
+            "\n_This ticket is a read-only Linear mirror — title/state/priority/"
+            "assignee/labels are synced from Linear and can't be edited locally "
+            "(comments and filing still can). Use `ticket_comment` to annotate it._"
+        )
+    return "\n".join(lines)
+
+
+async def ticket_create(
+    title: str,
+    description: str = "",
+    state: str = "",
+    project: str = "",
+    labels: str = "",
+) -> str:
+    """Author a NEW local ticket — always `origin="local-created"` (never
+    a Linear mirror; those come from `ticket_bulk_upsert` only).
+
+    `labels` is a comma-separated string (MCP-friendly — avoids a list
+    param); split/stripped before sending. v1 has no push-to-Linear, so a
+    local-created ticket stays local until increment 2 ships.
+    """
+    if not title.strip():
+        return "❌ ticket_create requires a non-empty title."
+    body: dict[str, Any] = {"title": title, "description": description}
+    if state:
+        body["state"] = state
+    if project:
+        body["project"] = project
+    if labels:
+        body["labels"] = [s.strip() for s in labels.split(",") if s.strip()]
+    data = _post("/api/tickets", body)
+    if isinstance(data, str):
+        return data
+    return (
+        f"🎫 created `{data['id']}` — **{data.get('title', '?')}** "
+        f"[{data.get('state', '?')}]  project={data.get('project', '?')}."
+    )
+
+
+async def ticket_update(
+    ticket_id: str,
+    title: str = "",
+    description: str = "",
+    state: str = "",
+    tab_id: str = "",
+) -> str:
+    """Edit a LOCAL-CREATED ticket's title/description/state/filing. Fails
+    (422) on a linear-pulled ticket's synced fields (title/description/
+    state included) — those are read-only mirrors until increment 2; use
+    `ticket_comment` to annotate a linear-pulled ticket instead."""
+    if not ticket_id:
+        return "❌ ticket_update requires a ticket_id."
+    body: dict[str, Any] = {}
+    if title:
+        body["title"] = title
+    if description:
+        body["raw_text"] = description
+    if state:
+        body["state"] = state
+    if tab_id:
+        body["tab_id"] = tab_id
+    if not body:
+        return "❌ ticket_update needs at least one field to change."
+    data = _patch(f"/api/tickets/{urllib.parse.quote(ticket_id, safe='')}", body)
+    if isinstance(data, str):
+        return data
+    return f"✅ `{data['id']}` updated — **{data.get('title', '?')}** [{data.get('state', '?')}]."
+
+
+async def ticket_comment(ticket_id: str, text: str, author: str = "") -> str:
+    """Append a local comment to a ticket — works on BOTH local-created and
+    linear-pulled tickets (a comment is never a Linear-synced field)."""
+    if not ticket_id:
+        return "❌ ticket_comment requires a ticket_id."
+    if not text.strip():
+        return "❌ ticket_comment requires non-empty text."
+    data = _post(f"/api/tickets/{urllib.parse.quote(ticket_id, safe='')}/comments", {"text": text, "author": author})
+    if isinstance(data, str):
+        return data
+    return f"💬 comment added to `{data['id']}` — **{data.get('title', '?')}** ({len(data.get('comments') or [])} total)."
+
+
+async def ticket_close(ticket_id: str) -> str:
+    """Convenience wrapper: sets a LOCAL-CREATED ticket's state to "Done".
+    Fails (422) on a linear-pulled ticket — its state is Linear-authoritative;
+    close it in Linear and resync instead."""
+    if not ticket_id:
+        return "❌ ticket_close requires a ticket_id."
+    data = _patch(f"/api/tickets/{urllib.parse.quote(ticket_id, safe='')}", {"state": "Done"})
+    if isinstance(data, str):
+        return data
+    return f"✅ `{data['id']}` closed — **{data.get('title', '?')}** [Done]."
+
+
+async def ticket_bulk_upsert(project: str, tickets: list[dict[str, Any]]) -> str:
+    """Idempotent write path for a Linear resync — upserts already-fetched-
+    and-mapped issues, never talks to Linear itself.
+
+    **2-step contract — do this yourself before calling this tool:**
+    1. Call `mcp__linear__list_issues` (project filter = the target Linear
+       project) yourself to fetch the raw issues.
+    2. Map each issue onto: `{linear_ref (Linear issue id, REQUIRED), title,
+       description, state (Backlog|Todo|In Progress|In Review|Done|
+       Cancelled), linear_priority (0-4), assignee ({id,name}), labels
+       ([str]), parent_id, links ([str])}`. Omit a key you don't have data
+       for — a partial map leaves that field untouched on an existing
+       ticket rather than clearing it.
+    3. Call this tool with `project` (the resync scope) and the mapped list.
+
+    Idempotent: re-running with the same `linear_ref`s never creates
+    duplicates — only updates the synced fields. Local annotations
+    (resolution/comments/tab_id) are never touched by a resync.
+    """
+    if not tickets:
+        return "❌ ticket_bulk_upsert requires a non-empty tickets list — fetch via mcp__linear__list_issues first."
+    data = _post("/api/tickets/bulk-upsert", {"project": project, "tickets": tickets})
+    if isinstance(data, str):
+        return data
+    return (
+        f"🔄 resynced project={project!r}: {data.get('pulled', 0)} pulled, "
+        f"{data.get('created', 0)} created, {data.get('updated', 0)} updated."
+    )

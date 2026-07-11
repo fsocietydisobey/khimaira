@@ -163,6 +163,57 @@ class NotebookChatReq(BaseModel):
     refs: list[str] = []
 
 
+class CreateTicketReq(BaseModel):
+    title: str
+    description: str = ""
+    state: str = ""
+    linear_priority: int = 0
+    assignee: dict | None = None
+    labels: list[str] | None = None
+    project: str = ""
+    parent_id: str | None = None
+    links: list[str] | None = None
+    tab_id: str = ""
+
+
+class UpdateTicketReq(BaseModel):
+    title: str | None = None
+    raw_text: str | None = None
+    state: str | None = None
+    linear_priority: int | None = None
+    assignee: dict | None = None
+    labels: list[str] | None = None
+    project: str | None = None
+    parent_id: str | None = None
+    links: list[str] | None = None
+    tab_id: str | None = None
+
+
+class AddTicketCommentReq(BaseModel):
+    text: str
+    author: str = ""
+
+
+class MappedLinearIssue(BaseModel):
+    """One already-fetched-and-mapped Linear issue — see bulk_upsert_tickets'
+    docstring for the fetch-then-push contract this shape belongs to."""
+
+    linear_ref: str
+    title: str | None = None
+    description: str | None = None
+    state: str | None = None
+    linear_priority: int | None = None
+    assignee: dict | None = None
+    labels: list[str] | None = None
+    parent_id: str | None = None
+    links: list[str] | None = None
+
+
+class BulkUpsertTicketsReq(BaseModel):
+    project: str
+    tickets: list[MappedLinearIssue]
+
+
 class CreateTabReq(BaseModel):
     title: str = ""
     kind: str = ""
@@ -354,7 +405,7 @@ def build_router():
     @router.get("/notes/{note_id}")
     async def get_note(note_id: str) -> dict:
         try:
-            return notes.get_note(note_id)
+            return await asyncio.to_thread(notes.get_note, note_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 
@@ -407,6 +458,16 @@ def build_router():
         resolution} pair when a non-empty resolution lands — never blocks
         the response, and mnemosyne being unreachable never fails this
         request (see notebook_training.promote_resolved's fail-open contract).
+
+        Tickets (kind="ticket", 2026-07-11) are excluded from training
+        promotion even when resolved — a ticket resolution is a work-
+        tracking closure ("duplicate of X", "fixed in PR #123"), not a
+        curated {problem, technical solution} pair, and linear-pulled
+        tickets can carry team/project-internal text never meant for the
+        shared oracle corpus. Same category of exclusion as the existing
+        sensitive=True hard-exclusion, different trigger. Reversible (the
+        guard can be dropped later); baking ticket text into an already-
+        trained oracle is not — see chat-102d8b5fd82f task-8191e0a1672b.
         """
         try:
             updated = await asyncio.to_thread(
@@ -414,7 +475,7 @@ def build_router():
             )
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
-        if updated.get("resolution"):
+        if updated.get("resolution") and updated.get("kind") != "ticket":
             notebook_training.schedule_promote(updated)
         return updated
 
@@ -480,7 +541,7 @@ def build_router():
         """Load a record's persistent chat history — the frontend calls this
         on open so the conversation survives reopen."""
         try:
-            notes.get_note(note_id)
+            await asyncio.to_thread(notes.get_note, note_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
         return {"history": notebook_chat.get_chat_history(note_id)}
@@ -545,5 +606,117 @@ def build_router():
             return await asyncio.to_thread(notes.delete_tab, tab_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
+
+    # -------------------------------------------------------------------
+    # Tickets (2026-07-11) — local mirror of Linear issues. Same store as
+    # notes/tabs (kind="ticket"), a separate resource surface (not folded
+    # into /notes) since its filters (project/state/assignee/label) and
+    # read-only-synced-field semantics don't apply to notes/guides.
+    # -------------------------------------------------------------------
+
+    @router.post("/tickets")
+    async def create_ticket(req: CreateTicketReq) -> dict:
+        """Create a LOCAL ticket — always `origin="local-created"`.
+        `origin`/`linear_ref` are never caller-settable here; a
+        linear-pulled ticket can only be created via POST
+        /tickets/bulk-upsert (the resync path)."""
+        try:
+            return await asyncio.to_thread(
+                notes.add_ticket,
+                req.title,
+                req.description,
+                state=req.state,
+                linear_priority=req.linear_priority,
+                assignee=req.assignee,
+                labels=req.labels,
+                project=req.project,
+                parent_id=req.parent_id,
+                links=req.links,
+                tab_id=req.tab_id,
+            )
+        except ValueError as e:
+            raise fastapi.HTTPException(422, str(e)) from e
+
+    @router.get("/tickets")
+    async def list_tickets_endpoint(
+        project: str | None = None,
+        state: str | None = None,
+        assignee: str | None = None,
+        label: str | None = None,
+    ) -> dict:
+        return {
+            "tickets": await asyncio.to_thread(
+                notes.list_tickets, project=project, state=state, assignee=assignee, label=label
+            )
+        }
+
+    @router.post("/tickets/bulk-upsert")
+    async def bulk_upsert_tickets(req: BulkUpsertTicketsReq) -> dict:
+        """The resync write path — idempotent create-or-update of already-
+        fetched-and-mapped Linear issues, keyed on each entry's
+        `linear_ref`. Registered BEFORE /tickets/{ticket_id} (literal path
+        before path param, matching this file's existing /notes/search
+        convention) so "bulk-upsert" is never swallowed as a ticket_id.
+
+        This does NOT talk to Linear. The caller (an agent) fetches the
+        target project's issues via `mcp__linear__list_issues`/`get_issue`
+        itself, maps each onto the shape below, and posts the mapped list
+        here — the perceive (LLM fetch+map) / dispose (deterministic
+        upsert) split from khimaira's own ai-engineering conventions. See
+        the `ticket_bulk_upsert` MCP tool, which documents this 2-step
+        contract for whoever calls it.
+
+        Re-running with the same `linear_ref`s never creates duplicates —
+        only updates the synced fields (title/state/priority/assignee/
+        labels/parent_id/links/description) plus `project`/`sync_state`;
+        resolution/comments/tab_id are untouched regardless of how many
+        times this runs."""
+        created = 0
+        updated = 0
+        for issue in req.tickets:
+            try:
+                _, was_created = await asyncio.to_thread(
+                    notes.upsert_ticket_from_linear, issue.model_dump(exclude_unset=True), project=req.project
+                )
+            except ValueError as e:
+                raise fastapi.HTTPException(422, str(e)) from e
+            if was_created:
+                created += 1
+            else:
+                updated += 1
+        return {"pulled": len(req.tickets), "created": created, "updated": updated}
+
+    @router.get("/tickets/{ticket_id}")
+    async def get_ticket(ticket_id: str) -> dict:
+        try:
+            record = await asyncio.to_thread(notes.get_note, ticket_id)
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+        if record.get("kind") != "ticket":
+            raise fastapi.HTTPException(404, f"No ticket with id={ticket_id!r}.")
+        return record
+
+    @router.patch("/tickets/{ticket_id}")
+    async def update_ticket_route(ticket_id: str, req: UpdateTicketReq) -> dict:
+        """422 on an unknown field, an invalid state/linear_priority, or an
+        attempt to mutate a linear-pulled ticket's synced fields — see
+        notes.update_ticket's docstring. 404 on an unknown ticket_id or an
+        id that isn't a ticket."""
+        fields = req.model_dump(exclude_unset=True)
+        try:
+            return await asyncio.to_thread(notes.update_ticket, ticket_id, **fields)
+        except ValueError as e:
+            msg = str(e)
+            status = 404 if "is not a ticket" in msg or "No note with id" in msg else 422
+            raise fastapi.HTTPException(status, msg) from e
+
+    @router.post("/tickets/{ticket_id}/comments")
+    async def add_ticket_comment_route(ticket_id: str, req: AddTicketCommentReq) -> dict:
+        try:
+            return await asyncio.to_thread(notes.add_ticket_comment, ticket_id, req.text, req.author)
+        except ValueError as e:
+            msg = str(e)
+            status = 404 if "is not a ticket" in msg or "No note with id" in msg else 422
+            raise fastapi.HTTPException(status, msg) from e
 
     return router

@@ -249,6 +249,54 @@ def test_index_stub_carries_priority(notes_store):
     assert listed[0]["priority"] == "high"
 
 
+# ---------------------------------------------------------------------------
+# Testing-workflow status (2026-07-07)
+# ---------------------------------------------------------------------------
+
+
+def test_add_note_defaults_test_status_untested(notes_store):
+    note = notes_store.add_note("raw")
+    assert note["test_status"] == "untested"
+
+
+def test_add_study_guide_defaults_test_status_untested(notes_store):
+    guide = notes_store.add_study_guide("# G\n\nbody")
+    assert guide["test_status"] == "untested"
+
+
+def test_update_note_test_status_round_trips(notes_store):
+    note = notes_store.add_note("raw")
+    updated = notes_store.update_note(note["id"], test_status="in_review")
+    assert updated["test_status"] == "in_review"
+    assert notes_store.get_note(note["id"])["test_status"] == "in_review"
+
+
+def test_update_note_rejects_invalid_test_status(notes_store):
+    note = notes_store.add_note("raw")
+    with pytest.raises(ValueError, match="Invalid test_status"):
+        notes_store.update_note(note["id"], test_status="done")
+
+
+def test_list_notes_test_status_filter(notes_store):
+    notes_store.add_note("a", tab_id="t1")
+    tested = notes_store.add_note("b", tab_id="t1")
+    notes_store.update_note(tested["id"], test_status="tested")
+
+    tested_only = notes_store.list_notes(test_status="tested")
+    assert len(tested_only) == 1
+    assert tested_only[0]["id"] == tested["id"]
+
+    all_notes = notes_store.list_notes()
+    assert len(all_notes) == 2
+
+
+def test_index_stub_carries_test_status(notes_store):
+    note = notes_store.add_note("raw")
+    notes_store.update_note(note["id"], test_status="needs_testing")
+    listed = notes_store.list_notes()
+    assert listed[0]["test_status"] == "needs_testing"
+
+
 def test_apply_validation_current_no_history_churn(notes_store):
     note = notes_store.add_note("raw")
     notes_store.set_pipeline(note["id"], {"summary": "s1"})
@@ -1384,3 +1432,265 @@ def test_compact_index_survives_concurrent_append(notes_store, monkeypatch):
     # call's result, or present on disk for the next read to pick up.
     on_disk = notes_store._fold_index()
     assert note_b["id"] in folded or note_b["id"] in on_disk
+
+
+# ---------------------------------------------------------------------------
+# Tickets (2026-07-11) — local mirror of Linear issues, kind="ticket".
+# Mirrors the study_guide test section above: own kind, own defaults, own
+# validation, plus the read-only-synced-field + resync-idempotency
+# invariants that make this a distinct sub-kind rather than a bare note.
+# ---------------------------------------------------------------------------
+
+
+def test_add_ticket_sets_kind_and_defaults(notes_store):
+    ticket = notes_store.add_ticket("Fix the reaper race")
+    assert ticket["kind"] == "ticket"
+    assert ticket["title"] == "Fix the reaper race"
+    assert ticket["raw_text"] == ""
+    assert ticket["state"] == "Backlog"
+    assert ticket["linear_priority"] == 0
+    assert ticket["assignee"] is None
+    assert ticket["labels"] == []
+    assert ticket["project"] == ""
+    assert ticket["parent_id"] is None
+    assert ticket["origin"] == "local-created"
+    assert ticket["linear_ref"] is None
+    assert ticket["sync_state"] == "local-only"
+    assert ticket["comments"] == []
+    assert ticket["repo"] == notes_store.GENERAL_REPO
+
+
+def test_add_ticket_local_created_needs_no_linear_ref(notes_store):
+    ticket = notes_store.add_ticket("Local idea", origin="local-created")
+    assert ticket["linear_ref"] is None
+    assert ticket["sync_state"] == "local-only"
+
+
+def test_add_ticket_linear_pulled_requires_linear_ref(notes_store):
+    with pytest.raises(ValueError, match="require linear_ref"):
+        notes_store.add_ticket("Mirrored", origin="linear-pulled")
+
+
+def test_add_ticket_linear_pulled_defaults_sync_state_synced(notes_store):
+    ticket = notes_store.add_ticket("Mirrored", origin="linear-pulled", linear_ref="LIN-1")
+    assert ticket["sync_state"] == "synced"
+    assert ticket["origin"] == "linear-pulled"
+
+
+def test_add_ticket_rejects_invalid_state(notes_store):
+    with pytest.raises(ValueError, match="Invalid ticket state"):
+        notes_store.add_ticket("X", state="Nonsense")
+
+
+def test_add_ticket_rejects_invalid_linear_priority(notes_store):
+    with pytest.raises(ValueError, match="Invalid ticket linear_priority"):
+        notes_store.add_ticket("X", linear_priority=9)
+
+
+def test_add_ticket_rejects_invalid_origin(notes_store):
+    with pytest.raises(ValueError, match="Invalid ticket origin"):
+        notes_store.add_ticket("X", origin="bogus")
+
+
+def test_add_ticket_priority_field_untouched_from_ticket_linear_priority(notes_store):
+    """The base `priority` field (str enum, notebook_list's own filter) must
+    stay independent of `linear_priority` (int, Linear's own scale) — no
+    collision, no cross-contamination (chat-102d8b5fd82f task-8191e0a1672b)."""
+    ticket = notes_store.add_ticket("X", linear_priority=4)
+    assert ticket["priority"] == notes_store._DEFAULT_PRIORITY
+    assert ticket["linear_priority"] == 4
+
+
+def test_list_tickets_excludes_notes_and_guides(notes_store):
+    ticket = notes_store.add_ticket("A ticket")
+    notes_store.add_note("A note")
+    notes_store.add_study_guide("A guide")
+
+    tickets = notes_store.list_tickets()
+    assert [t["id"] for t in tickets] == [ticket["id"]]
+
+
+def test_list_tickets_project_filter(notes_store):
+    a = notes_store.add_ticket("A", project="Langgraph")
+    notes_store.add_ticket("B", project="Other")
+
+    scoped = notes_store.list_tickets(project="Langgraph")
+    assert [t["id"] for t in scoped] == [a["id"]]
+
+
+def test_list_tickets_state_filter(notes_store):
+    a = notes_store.add_ticket("A", state="In Progress")
+    notes_store.add_ticket("B", state="Backlog")
+
+    scoped = notes_store.list_tickets(state="In Progress")
+    assert [t["id"] for t in scoped] == [a["id"]]
+
+
+def test_list_tickets_assignee_filter_matches_id_or_name(notes_store):
+    a = notes_store.add_ticket("A", assignee={"id": "u1", "name": "Priya"})
+    notes_store.add_ticket("B", assignee={"id": "u2", "name": "Sam"})
+
+    by_name = notes_store.list_tickets(assignee="priya")  # case-insensitive
+    assert [t["id"] for t in by_name] == [a["id"]]
+
+    by_id = notes_store.list_tickets(assignee="u1")
+    assert [t["id"] for t in by_id] == [a["id"]]
+
+
+def test_list_tickets_label_filter(notes_store):
+    a = notes_store.add_ticket("A", labels=["bug", "frontend"])
+    notes_store.add_ticket("B", labels=["docs"])
+
+    scoped = notes_store.list_tickets(label="bug")
+    assert [t["id"] for t in scoped] == [a["id"]]
+
+
+def test_update_ticket_local_created_edits_synced_fields(notes_store):
+    ticket = notes_store.add_ticket("Local", origin="local-created")
+    updated = notes_store.update_ticket(ticket["id"], title="Renamed", state="In Progress")
+    assert updated["title"] == "Renamed"
+    assert updated["state"] == "In Progress"
+
+
+def test_update_ticket_linear_pulled_rejects_synced_field(notes_store):
+    ticket = notes_store.add_ticket("Mirrored", origin="linear-pulled", linear_ref="LIN-2")
+    with pytest.raises(ValueError, match="read-only"):
+        notes_store.update_ticket(ticket["id"], title="Local rename attempt")
+
+
+def test_update_ticket_linear_pulled_still_allows_tab_id(notes_store):
+    """Filing (tab_id) is always a local concern, even on a mirrored ticket."""
+    ticket = notes_store.add_ticket("Mirrored", origin="linear-pulled", linear_ref="LIN-3")
+    tab = notes_store.add_tab(title="My tickets")
+    updated = notes_store.update_ticket(ticket["id"], tab_id=tab["id"])
+    assert updated["tab_id"] == tab["id"]
+
+
+def test_update_ticket_rejects_unknown_field(notes_store):
+    ticket = notes_store.add_ticket("X")
+    with pytest.raises(ValueError, match="Unknown ticket field"):
+        notes_store.update_ticket(ticket["id"], bogus_field="y")
+
+
+def test_update_ticket_rejects_non_ticket_note(notes_store):
+    note = notes_store.add_note("just a note")
+    with pytest.raises(ValueError, match="is not a ticket"):
+        notes_store.update_ticket(note["id"], title="x")
+
+
+def test_add_ticket_comment_round_trip(notes_store):
+    ticket = notes_store.add_ticket("X")
+    updated = notes_store.add_ticket_comment(ticket["id"], "Looks good", author="reviewer-1")
+    assert len(updated["comments"]) == 1
+    assert updated["comments"][0]["text"] == "Looks good"
+    assert updated["comments"][0]["author"] == "reviewer-1"
+
+
+def test_add_ticket_comment_allowed_on_linear_pulled(notes_store):
+    """Comments are local annotations — never a synced field, so allowed
+    regardless of origin."""
+    ticket = notes_store.add_ticket("Mirrored", origin="linear-pulled", linear_ref="LIN-4")
+    updated = notes_store.add_ticket_comment(ticket["id"], "local note", author="me")
+    assert len(updated["comments"]) == 1
+
+
+def test_add_ticket_comment_rejects_empty_text(notes_store):
+    ticket = notes_store.add_ticket("X")
+    with pytest.raises(ValueError, match="non-empty text"):
+        notes_store.add_ticket_comment(ticket["id"], "   ")
+
+
+def test_find_ticket_by_linear_ref_finds_and_misses(notes_store):
+    ticket = notes_store.add_ticket("Mirrored", origin="linear-pulled", linear_ref="LIN-5")
+    found = notes_store.find_ticket_by_linear_ref("LIN-5")
+    assert found is not None
+    assert found["id"] == ticket["id"]
+    assert notes_store.find_ticket_by_linear_ref("does-not-exist") is None
+
+
+def test_upsert_ticket_from_linear_creates_on_first_pull(notes_store):
+    mapped = {"linear_ref": "LIN-10", "title": "New issue", "state": "Todo"}
+    record, created = notes_store.upsert_ticket_from_linear(mapped, project="Langgraph")
+    assert created is True
+    assert record["kind"] == "ticket"
+    assert record["origin"] == "linear-pulled"
+    assert record["title"] == "New issue"
+    assert record["state"] == "Todo"
+    assert record["project"] == "Langgraph"
+    assert record["sync_state"] == "synced"
+
+
+def test_upsert_ticket_from_linear_requires_linear_ref(notes_store):
+    with pytest.raises(ValueError, match="requires mapped\\['linear_ref'\\]"):
+        notes_store.upsert_ticket_from_linear({"title": "no ref"}, project="Langgraph")
+
+
+def test_upsert_ticket_from_linear_is_idempotent_no_duplicates(notes_store):
+    """Resync idempotency — the core invariant task-8191e0a1672b asked for:
+    running the same mapped issue twice must never create a second ticket,
+    and the second run must only update, not re-create."""
+    mapped = {"linear_ref": "LIN-11", "title": "Original title", "state": "Backlog"}
+    first, first_created = notes_store.upsert_ticket_from_linear(mapped, project="Langgraph")
+    assert first_created is True
+
+    updated_mapped = {"linear_ref": "LIN-11", "title": "Renamed upstream", "state": "In Progress"}
+    second, second_created = notes_store.upsert_ticket_from_linear(updated_mapped, project="Langgraph")
+    assert second_created is False
+    assert second["id"] == first["id"]
+    assert second["title"] == "Renamed upstream"
+    assert second["state"] == "In Progress"
+
+    all_tickets = notes_store.list_tickets(project="Langgraph")
+    assert len(all_tickets) == 1, "resync must never create a duplicate ticket for the same linear_ref"
+
+
+def test_upsert_ticket_from_linear_partial_map_leaves_other_fields_untouched(notes_store):
+    """A resync entry missing a key (e.g. no `labels` in this pull's payload)
+    must not clear that field on the existing ticket — only keys actually
+    present in `mapped` are applied."""
+    first_mapped = {"linear_ref": "LIN-12", "title": "T", "labels": ["bug"]}
+    notes_store.upsert_ticket_from_linear(first_mapped, project="Langgraph")
+
+    partial_mapped = {"linear_ref": "LIN-12", "title": "T renamed"}  # no "labels" key
+    second, _ = notes_store.upsert_ticket_from_linear(partial_mapped, project="Langgraph")
+    assert second["title"] == "T renamed"
+    assert second["labels"] == ["bug"], "missing key in the resync payload must not clear it"
+
+
+def test_upsert_ticket_from_linear_never_touches_local_annotations(notes_store):
+    """resolution/comments/tab_id are local — a resync must never overwrite
+    them, no matter how many times it runs."""
+    mapped = {"linear_ref": "LIN-13", "title": "T"}
+    record, _ = notes_store.upsert_ticket_from_linear(mapped, project="Langgraph")
+    notes_store.add_ticket_comment(record["id"], "local note")
+    notes_store.add_resolution(record["id"], "worked around it")
+    tab = notes_store.add_tab(title="Filed")
+    notes_store.update_ticket(record["id"], tab_id=tab["id"])
+
+    resynced, created = notes_store.upsert_ticket_from_linear(mapped, project="Langgraph")
+    assert created is False
+    assert len(resynced["comments"]) == 1
+    assert resynced["resolution"] == "worked around it"
+    assert resynced["tab_id"] == tab["id"]
+
+
+def test_index_stub_projects_ticket_fields(notes_store):
+    ticket = notes_store.add_ticket(
+        "X", state="In Progress", linear_priority=2, project="Langgraph", labels=["bug"]
+    )
+    stub = notes_store._index_stub(ticket)
+    assert stub["state"] == "In Progress"
+    assert stub["linear_priority"] == 2
+    assert stub["project"] == "Langgraph"
+    assert stub["labels"] == ["bug"]
+    assert stub["comments_count"] == 0
+
+
+def test_index_stub_ticket_fields_harmless_on_notes(notes_store):
+    """A regular note's stub must carry the same ticket-only keys (defaulted
+    None/[]/0), not KeyError — the projection is unconditional across kinds."""
+    note = notes_store.add_note("regular note")
+    stub = notes_store._index_stub(note)
+    assert stub["state"] is None
+    assert stub["labels"] == []
+    assert stub["comments_count"] == 0

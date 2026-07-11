@@ -558,3 +558,162 @@ def test_personal_tab_id_matches_notes_module():
     from khimaira.monitor import notes
 
     assert nt._PERSONAL_TAB_ID == notes.PERSONAL_TAB_ID
+
+
+# ---------------------------------------------------------------------------
+# ticket_* — same thin-HTTP-client contract as notebook_*, tested the same way.
+# ---------------------------------------------------------------------------
+
+
+def _ticket(**overrides) -> dict:
+    base = {
+        "id": "ticket-1",
+        "title": "Fix the reaper race",
+        "state": "Backlog",
+        "linear_priority": 0,
+        "assignee": None,
+        "labels": [],
+        "project": "Langgraph",
+        "origin": "local-created",
+        "sync_state": "local-only",
+        "linear_ref": None,
+        "raw_text": "",
+        "comments": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_ticket_list_happy_path():
+    with patch.object(nt, "_get", return_value={"tickets": [_ticket()]}) as mock_get:
+        out = _run(nt.ticket_list())
+    assert "1 ticket(s)" in out
+    assert "ticket-1" in out
+    assert "Fix the reaper race" in out
+    mock_get.assert_called_once_with("/api/tickets")
+
+
+def test_ticket_list_empty():
+    with patch.object(nt, "_get", return_value={"tickets": []}):
+        out = _run(nt.ticket_list(project="Langgraph"))
+    assert "no tickets" in out.lower()
+    assert "Langgraph" in out
+
+
+def test_ticket_list_filters_reach_query_params():
+    with patch.object(nt, "_get", return_value={"tickets": []}) as mock_get:
+        _run(nt.ticket_list(project="Langgraph", state="Todo", assignee="priya", label="bug"))
+    qs = mock_get.call_args[0][0]
+    assert "project=Langgraph" in qs
+    assert "state=Todo" in qs
+    assert "assignee=priya" in qs
+    assert "label=bug" in qs
+
+
+def test_ticket_get_happy_path():
+    with patch.object(nt, "_get", return_value=_ticket()) as mock_get:
+        out = _run(nt.ticket_get("ticket-1"))
+    assert "Fix the reaper race" in out
+    assert "Backlog" in out
+    mock_get.assert_called_once_with("/api/tickets/ticket-1")
+
+
+def test_ticket_get_rejects_empty_id():
+    with patch.object(nt, "_get") as mock_get:
+        out = _run(nt.ticket_get(""))
+    assert "❌" in out
+    mock_get.assert_not_called()
+
+
+def test_ticket_get_shows_readonly_notice_for_linear_pulled():
+    payload = _ticket(origin="linear-pulled", sync_state="synced", linear_ref="LIN-1")
+    with patch.object(nt, "_get", return_value=payload):
+        out = _run(nt.ticket_get("ticket-1"))
+    assert "read-only" in out.lower()
+
+
+def test_ticket_get_error_passthrough():
+    with patch.object(nt, "_get", return_value="khimaira-monitor → HTTP 404: No ticket with id"):
+        out = _run(nt.ticket_get("no-such-ticket"))
+    assert "HTTP 404" in out
+
+
+def test_ticket_create_happy_path():
+    with patch.object(nt, "_post", return_value=_ticket()) as mock_post:
+        out = _run(nt.ticket_create("Fix the reaper race", labels="bug, frontend"))
+    assert "created" in out.lower()
+    assert "ticket-1" in out
+    body = mock_post.call_args[0][1]
+    assert body["labels"] == ["bug", "frontend"]
+
+
+def test_ticket_create_rejects_empty_title():
+    with patch.object(nt, "_post") as mock_post:
+        out = _run(nt.ticket_create("   "))
+    assert "❌" in out
+    mock_post.assert_not_called()
+
+
+def test_ticket_update_happy_path():
+    with patch.object(nt, "_patch", return_value=_ticket(state="In Progress")) as mock_patch:
+        out = _run(nt.ticket_update("ticket-1", state="In Progress"))
+    assert "updated" in out.lower()
+    assert mock_patch.call_args[0][0] == "/api/tickets/ticket-1"
+    assert mock_patch.call_args[0][1] == {"state": "In Progress"}
+
+
+def test_ticket_update_rejects_no_fields():
+    with patch.object(nt, "_patch") as mock_patch:
+        out = _run(nt.ticket_update("ticket-1"))
+    assert "❌" in out
+    mock_patch.assert_not_called()
+
+
+def test_ticket_update_error_passthrough_on_readonly_field():
+    with patch.object(
+        nt, "_patch", return_value="khimaira-monitor → HTTP 422: synced field(s) ['title'] are read-only"
+    ):
+        out = _run(nt.ticket_update("ticket-1", title="nope"))
+    assert "read-only" in out
+
+
+def test_ticket_comment_happy_path():
+    with patch.object(nt, "_post", return_value=_ticket(comments=[{"text": "lgtm", "author": "me"}])) as mock_post:
+        out = _run(nt.ticket_comment("ticket-1", "lgtm", author="me"))
+    assert "comment added" in out.lower()
+    assert mock_post.call_args[0][0] == "/api/tickets/ticket-1/comments"
+
+
+def test_ticket_comment_rejects_empty_text():
+    with patch.object(nt, "_post") as mock_post:
+        out = _run(nt.ticket_comment("ticket-1", "   "))
+    assert "❌" in out
+    mock_post.assert_not_called()
+
+
+def test_ticket_close_happy_path():
+    with patch.object(nt, "_patch", return_value=_ticket(state="Done")) as mock_patch:
+        out = _run(nt.ticket_close("ticket-1"))
+    assert "closed" in out.lower()
+    assert mock_patch.call_args[0][1] == {"state": "Done"}
+
+
+def test_ticket_bulk_upsert_happy_path():
+    payload = {"pulled": 2, "created": 1, "updated": 1}
+    with patch.object(nt, "_post", return_value=payload) as mock_post:
+        out = _run(
+            nt.ticket_bulk_upsert(
+                "Langgraph",
+                [{"linear_ref": "LIN-1", "title": "A"}, {"linear_ref": "LIN-2", "title": "B"}],
+            )
+        )
+    assert "1 created" in out
+    assert "1 updated" in out
+    assert mock_post.call_args[0][0] == "/api/tickets/bulk-upsert"
+
+
+def test_ticket_bulk_upsert_rejects_empty_tickets_list():
+    with patch.object(nt, "_post") as mock_post:
+        out = _run(nt.ticket_bulk_upsert("Langgraph", []))
+    assert "❌" in out
+    mock_post.assert_not_called()

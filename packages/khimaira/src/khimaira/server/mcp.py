@@ -3048,6 +3048,137 @@ async def notebook_delete(note_id: str) -> str:
     return await _notebook_tools.notebook_delete(note_id)
 
 
+# ---------------------------------------------------------------------------
+# Tickets (2026-07-11) — local mirror of Linear issues in the notebook.
+# v1: read-only pull from Linear + locally-authored tickets. See
+# khimaira.server.notebook_tools' "Tickets" section for the HTTP-client
+# implementations these wrap.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@logged_tool("ticket_list")
+async def ticket_list(project: str = "", state: str = "", assignee: str = "", label: str = "") -> str:
+    """List local tickets (the Linear mirror) — filter by project/state/
+    assignee/label.
+
+    Args:
+        project: scope to one Linear project (e.g. "Langgraph"). Omit for all.
+        state: scope to one state (Backlog|Todo|In Progress|In Review|Done|Cancelled).
+        assignee: secondary filter (matches assignee id or name) over the
+            already project-scoped set — resync pulls by project, not assignee.
+        label: scope to tickets carrying this label.
+    """
+    return await _notebook_tools.ticket_list(project, state, assignee, label)
+
+
+@mcp.tool()
+@logged_tool("ticket_get")
+async def ticket_get(ticket_id: str) -> str:
+    """Read one ticket in full — description, state, priority, assignee,
+    labels, comments, and (if linear-pulled) sync provenance.
+
+    Args:
+        ticket_id: the ticket id, from ticket_list.
+    """
+    return await _notebook_tools.ticket_get(ticket_id)
+
+
+@mcp.tool()
+@logged_tool("ticket_create")
+async def ticket_create(
+    title: str, description: str = "", state: str = "", project: str = "", labels: str = ""
+) -> str:
+    """Author a NEW local ticket. Always local-created — v1 has no push to
+    Linear, so this never touches your real Linear board. Use
+    `ticket_bulk_upsert` (with data fetched via mcp__linear__list_issues)
+    to pull real Linear issues instead.
+
+    Args:
+        title: the ticket title.
+        description: the ticket body (markdown).
+        state: Backlog|Todo|In Progress|In Review|Done|Cancelled (default Backlog).
+        project: which project/board this belongs to (e.g. "Langgraph").
+        labels: comma-separated label list, e.g. "bug,frontend".
+    """
+    return await _notebook_tools.ticket_create(title, description, state, project, labels)
+
+
+@mcp.tool()
+@logged_tool("ticket_update")
+async def ticket_update(ticket_id: str, title: str = "", description: str = "", state: str = "", tab_id: str = "") -> str:
+    """Edit a LOCAL-CREATED ticket's title/description/state/filing.
+
+    Fails on a linear-pulled ticket's synced fields (title/description/state
+    included) — those mirror Linear and are read-only until push-to-Linear
+    ships. Use `ticket_comment` to annotate a linear-pulled ticket instead.
+
+    Args:
+        ticket_id: the ticket id, from ticket_list.
+        title: new title, if changing.
+        description: new description body, if changing.
+        state: new state, if changing.
+        tab_id: re-file into a different tab, if changing (always allowed,
+            even on a linear-pulled ticket — filing is a local concern).
+    """
+    return await _notebook_tools.ticket_update(ticket_id, title, description, state, tab_id)
+
+
+@mcp.tool()
+@logged_tool("ticket_comment")
+async def ticket_comment(ticket_id: str, text: str, author: str = "") -> str:
+    """Append a local comment to a ticket — works on both local-created and
+    linear-pulled tickets (a comment is never a Linear-synced field).
+
+    Args:
+        ticket_id: the ticket id, from ticket_list.
+        text: the comment body.
+        author: who's commenting (your session name/id), for attribution.
+    """
+    return await _notebook_tools.ticket_comment(ticket_id, text, author)
+
+
+@mcp.tool()
+@logged_tool("ticket_close")
+async def ticket_close(ticket_id: str) -> str:
+    """Convenience: sets a LOCAL-CREATED ticket's state to "Done". Fails on
+    a linear-pulled ticket — close it in Linear and resync instead.
+
+    Args:
+        ticket_id: the ticket id, from ticket_list.
+    """
+    return await _notebook_tools.ticket_close(ticket_id)
+
+
+@mcp.tool()
+@logged_tool("ticket_bulk_upsert")
+async def ticket_bulk_upsert(project: str, tickets: list[dict]) -> str:
+    """Resync write path — idempotent upsert of Linear issues YOU'VE
+    ALREADY FETCHED. This tool never talks to Linear itself.
+
+    **Do this yourself first:**
+    1. Call `mcp__linear__list_issues` (filtered to the target project) to
+       fetch the raw issues.
+    2. Map each one onto: `{linear_ref (Linear issue id, REQUIRED), title,
+       description, state (Backlog|Todo|In Progress|In Review|Done|
+       Cancelled), linear_priority (0-4), assignee ({id, name}), labels
+       ([str]), parent_id, links ([str])}`. Omit a key you have no data for
+       — a partial map leaves that field untouched on an existing ticket,
+       never clears it.
+    3. Call this tool with the project name and your mapped list.
+
+    Idempotent — re-running with the same `linear_ref`s never creates
+    duplicates, only updates the synced fields. Resolution/comments/tab_id
+    (local annotations) are never touched by a resync.
+
+    Args:
+        project: the resync scope (e.g. "Langgraph") — stamped onto every
+            upserted ticket's `project` field.
+        tickets: the mapped issue list from step 2 above.
+    """
+    return await _notebook_tools.ticket_bulk_upsert(project, tickets)
+
+
 @mcp.tool()
 @logged_tool("session_wait_for_answer")
 async def session_wait_for_answer(

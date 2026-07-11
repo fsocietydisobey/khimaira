@@ -839,6 +839,24 @@ def test_add_resolution_empty_string_does_not_schedule_training_promote(
     assert scheduled == []
 
 
+def test_add_resolution_on_ticket_does_not_schedule_training_promote(notebook_client, monkeypatch):
+    """Tickets (2026-07-11) are excluded from training promotion even when
+    resolved — a ticket resolution is a work-tracking closure, not a
+    curated {problem, solution} pair, and linear-pulled tickets can carry
+    team/project-internal text never meant for the oracle corpus. See
+    chat-102d8b5fd82f task-8191e0a1672b."""
+    from khimaira.monitor.api import notebook as notebook_api
+
+    scheduled: list[dict] = []
+    monkeypatch.setattr(notebook_api.notebook_training, "schedule_promote", scheduled.append)
+
+    ticket = notebook_client.post("/api/tickets", json={"title": "Fix the reaper race"}).json()
+    r = notebook_client.post(f"/api/notes/{ticket['id']}/resolution", json={"resolution": "fixed in PR #123"})
+    assert r.status_code == 200
+    assert r.json()["resolution"] == "fixed in PR #123"
+    assert scheduled == [], "a resolved ticket must never enter the training-promotion path"
+
+
 def test_import_guides_route_dry_run_default_writes_nothing(notebook_client, tmp_path):
     (tmp_path / "onboarding").mkdir()
     (tmp_path / "onboarding" / "start.md").write_text("# Start\n\nwelcome")
@@ -1274,3 +1292,100 @@ class TestEventLoopNotBlocked:
             assert slow_resp.status_code == 200
         finally:
             notebook_api.notes.add_resolution = original
+
+
+# ---------------------------------------------------------------------------
+# Tickets (2026-07-11) — /api/tickets*
+# ---------------------------------------------------------------------------
+
+
+def test_create_ticket_is_local_created(notebook_client):
+    r = notebook_client.post("/api/tickets", json={"title": "Fix the reaper race"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["kind"] == "ticket"
+    assert body["origin"] == "local-created"
+    assert body["state"] == "Backlog"
+
+
+def test_list_tickets_project_filter(notebook_client):
+    notebook_client.post("/api/tickets", json={"title": "A", "project": "Langgraph"})
+    notebook_client.post("/api/tickets", json={"title": "B", "project": "Other"})
+
+    r = notebook_client.get("/api/tickets", params={"project": "Langgraph"})
+    assert r.status_code == 200
+    tickets = r.json()["tickets"]
+    assert len(tickets) == 1
+    assert tickets[0]["title"] == "A"
+
+
+def test_get_ticket_404_for_non_ticket_note(notebook_client):
+    note = notebook_client.post("/api/notes", json={"raw_text": "a plain note"}).json()
+    r = notebook_client.get(f"/api/tickets/{note['id']}")
+    assert r.status_code == 404
+
+
+def test_get_ticket_404_for_unknown_id(notebook_client):
+    r = notebook_client.get("/api/tickets/does-not-exist")
+    assert r.status_code == 404
+
+
+def test_update_ticket_local_created_succeeds(notebook_client):
+    created = notebook_client.post("/api/tickets", json={"title": "Local"}).json()
+    r = notebook_client.patch(f"/api/tickets/{created['id']}", json={"state": "In Progress"})
+    assert r.status_code == 200
+    assert r.json()["state"] == "In Progress"
+
+
+def test_update_ticket_rejects_synced_field_on_linear_pulled(notebook_client):
+    upsert = notebook_client.post(
+        "/api/tickets/bulk-upsert",
+        json={"project": "Langgraph", "tickets": [{"linear_ref": "LIN-1", "title": "Mirrored"}]},
+    )
+    assert upsert.status_code == 200
+    tickets = notebook_client.get("/api/tickets", params={"project": "Langgraph"}).json()["tickets"]
+    ticket_id = tickets[0]["id"]
+
+    r = notebook_client.patch(f"/api/tickets/{ticket_id}", json={"title": "local rename attempt"})
+    assert r.status_code == 422
+
+
+def test_add_ticket_comment(notebook_client):
+    created = notebook_client.post("/api/tickets", json={"title": "X"}).json()
+    r = notebook_client.post(
+        f"/api/tickets/{created['id']}/comments", json={"text": "looks good", "author": "reviewer"}
+    )
+    assert r.status_code == 200
+    assert len(r.json()["comments"]) == 1
+
+
+def test_bulk_upsert_tickets_is_idempotent(notebook_client):
+    """The resync idempotency invariant at the HTTP layer: running the same
+    linear_ref twice must never create a duplicate ticket, and the summary
+    counts must reflect create-then-update, not create-then-create."""
+    payload = {
+        "project": "Langgraph",
+        "tickets": [{"linear_ref": "LIN-100", "title": "Original", "state": "Backlog"}],
+    }
+    first = notebook_client.post("/api/tickets/bulk-upsert", json=payload)
+    assert first.status_code == 200
+    assert first.json() == {"pulled": 1, "created": 1, "updated": 0}
+
+    payload["tickets"][0]["title"] = "Renamed upstream"
+    payload["tickets"][0]["state"] = "In Progress"
+    second = notebook_client.post("/api/tickets/bulk-upsert", json=payload)
+    assert second.status_code == 200
+    assert second.json() == {"pulled": 1, "created": 0, "updated": 1}
+
+    tickets = notebook_client.get("/api/tickets", params={"project": "Langgraph"}).json()["tickets"]
+    assert len(tickets) == 1
+    assert tickets[0]["title"] == "Renamed upstream"
+    assert tickets[0]["state"] == "In Progress"
+
+
+def test_bulk_upsert_tickets_rejects_missing_linear_ref(notebook_client):
+    r = notebook_client.post(
+        "/api/tickets/bulk-upsert",
+        json={"project": "Langgraph", "tickets": [{"title": "no ref"}]},
+    )
+    assert r.status_code == 422

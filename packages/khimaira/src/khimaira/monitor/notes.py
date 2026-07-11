@@ -92,8 +92,37 @@ PERSONAL_TAB_ID = "personal"
 # REVISE — a later phase). Every derived artifact (pipeline={abstract, toc,
 # tags, entities}, collection, currency drift) sits alongside raw_text,
 # never in place of it. See add_study_guide / set_study_guide_pipeline.
-_VALID_KINDS = frozenset({"note", "study_guide"})
+#
+# Ticket (2026-07-11): a local mirror of a Linear issue — see "Public API —
+# tickets" below for the full field set. `raw_text` doubles as its
+# description, matching how study_guide reuses raw_text as its body.
+_VALID_KINDS = frozenset({"note", "study_guide", "ticket"})
 _DEFAULT_KIND = "note"
+
+# Ticket fields (2026-07-11, design locked with chimera-0/jeevy master):
+# states verbatim from Linear so a resync is a clean field-for-field map.
+_VALID_TICKET_STATES = frozenset(
+    {"Backlog", "Todo", "In Progress", "In Review", "Done", "Cancelled"}
+)
+_DEFAULT_TICKET_STATE = "Backlog"
+
+# Linear's own priority (0=None, 1=Urgent, 2=High, 3=Medium, 4=Low) — stored
+# under `linear_priority`, DELIBERATELY NOT the existing `priority` field
+# (str enum low/normal/high/urgent, used by list_notes' own filter/validation
+# and _VALID_PRIORITIES). Overloading one key with a kind-discriminated type
+# is a landmine that breaks the first time list_notes(priority=...) or
+# update_note's validation runs against a mixed note+ticket result — see
+# chat-102d8b5fd82f task-8191e0a1672b for the discussion.
+_VALID_TICKET_LINEAR_PRIORITIES = frozenset({0, 1, 2, 3, 4})
+_DEFAULT_TICKET_LINEAR_PRIORITY = 0
+
+# origin: which side owns this ticket's synced fields (title/state/priority/
+# assignee/labels/project/parent_id/links). "linear-pulled" tickets are a
+# READ-ONLY mirror — update_ticket refuses to touch synced fields on them
+# (see update_ticket) until push-to-Linear ships (increment 2). sync_state is
+# DERIVED from origin at creation, not caller-supplied — see add_ticket.
+_VALID_TICKET_ORIGINS = frozenset({"linear-pulled", "local-created"})
+_VALID_TICKET_SYNC_STATES = frozenset({"local-only", "synced", "drifted"})
 
 # Tab kind: "folder" groups regular notes; "collection" groups study guides
 # in the Library view. A collection IS a tab — no separate store.
@@ -180,7 +209,14 @@ def derive_lifecycle(record: dict[str, Any]) -> str:
     finished deliverables to house, not problems to resolve, so
     "resolution" doesn't apply: "housed" (imported/created, not yet
     organized) -> "organized" (`organized_at` is set, i.e. the organizer
-    has placed/checked it in a real collection)."""
+    has placed/checked it in a real collection).
+
+    Tickets (kind="ticket") don't have a meaningful lifecycle here either —
+    their workflow state is `state` (Linear's Backlog/Todo/.../Done), not
+    this note-pipeline concept — so they fall through to the note branch
+    below unused (harmless: nothing reads `lifecycle` for tickets, mirrors
+    how `status`/`pipeline` are carried-but-unused on ticket records too,
+    for schema uniformity with the generic _index_stub projection)."""
     if record.get("kind") == "study_guide":
         return "organized" if record.get("organized_at") else "housed"
     if record.get("resolution"):
@@ -260,6 +296,22 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "deleted": deleted,
         "pinned_placement": record.get("pinned_placement", False),
         "starred": record.get("starred", False),
+        # Ticket-only fields (2026-07-11) — present (defaulted) on every stub
+        # so list_tickets can filter/read straight from the folded index with
+        # no N+1 get_note() per ticket, same rationale as every other field
+        # in this projection. Meaningless-but-harmless on note/study_guide
+        # stubs (always None/[]/default there).
+        "state": record.get("state"),
+        "linear_priority": record.get("linear_priority"),
+        "assignee": record.get("assignee"),
+        "labels": record.get("labels") or [],
+        "project": record.get("project"),
+        "parent_id": record.get("parent_id"),
+        "origin": record.get("origin"),
+        "linear_ref": record.get("linear_ref"),
+        "sync_state": record.get("sync_state"),
+        "created_by": record.get("created_by"),
+        "comments_count": len(record.get("comments") or []),
     }
 
 
@@ -969,6 +1021,330 @@ def backfill_drop_spurious_heals_all() -> list[str]:
         if len(updated.get("history") or []) != before:
             changed.append(stub["id"])
     return changed
+
+
+# ---------------------------------------------------------------------------
+# Public API — tickets (Linear mirror, 2026-07-11)
+#
+# A local, read-mostly mirror of Linear issues so Joseph can browse/track
+# them without opening Linear — design locked with chimera-0 (jeevy master).
+# v1 scope: read-only pull from Linear (`origin="linear-pulled"`) plus
+# locally-authored tickets (`origin="local-created"`) that never push back.
+# `origin`/`linear_ref`/`sync_state` are what make push-to-Linear
+# (increment 2) possible later without a schema change.
+#
+# Same storage substrate as notes/study guides (index.jsonl stub + full
+# record file, self-compacting) — no separate store. `raw_text` doubles as
+# the ticket's description, same convention as study_guide's body.
+# ---------------------------------------------------------------------------
+
+
+def add_ticket(
+    title: str,
+    description: str = "",
+    *,
+    state: str = "",
+    linear_priority: int = _DEFAULT_TICKET_LINEAR_PRIORITY,
+    assignee: dict[str, str] | None = None,
+    labels: list[str] | None = None,
+    project: str = "",
+    parent_id: str | None = None,
+    links: list[str] | None = None,
+    origin: str = "local-created",
+    linear_ref: str | None = None,
+    created_by: str = "",
+    tab_id: str = "",
+) -> dict[str, Any]:
+    """Create a ticket — `kind="ticket"`.
+
+    `origin="linear-pulled"` requires `linear_ref` (the Linear issue id —
+    the sync join key `upsert_ticket_from_linear` matches on) and is meant
+    to be called ONLY from `upsert_ticket_from_linear`, never directly by a
+    human/agent create flow — see `ticket_create`'s docstring at the MCP
+    layer, which never exposes `origin`/`linear_ref` as caller-settable.
+
+    `sync_state` is DERIVED from `origin`, not a parameter: "synced" for a
+    fresh linear-pulled ticket (it was JUST pulled), "local-only" for a
+    local-created one (nothing to sync yet — that's increment 2).
+
+    `repo` is always `GENERAL_REPO` — tickets aren't code-grounded/
+    revalidated like notes (`revalidate_note`/`answer_question` already skip
+    GENERAL_REPO entirely), so this keeps tickets out of that pipeline by
+    construction rather than requiring every future code-grounding caller to
+    remember to exclude `kind="ticket"`.
+    """
+    if origin not in _VALID_TICKET_ORIGINS:
+        raise ValueError(
+            f"Invalid ticket origin {origin!r}; must be one of {sorted(_VALID_TICKET_ORIGINS)}."
+        )
+    state = state or _DEFAULT_TICKET_STATE
+    if state not in _VALID_TICKET_STATES:
+        raise ValueError(
+            f"Invalid ticket state {state!r}; must be one of {sorted(_VALID_TICKET_STATES)}."
+        )
+    if linear_priority not in _VALID_TICKET_LINEAR_PRIORITIES:
+        raise ValueError(
+            f"Invalid ticket linear_priority {linear_priority!r}; "
+            f"must be one of {sorted(_VALID_TICKET_LINEAR_PRIORITIES)}."
+        )
+    if origin == "linear-pulled" and not linear_ref:
+        raise ValueError(
+            "linear-pulled tickets require linear_ref (the Linear issue id "
+            "— the sync join key)."
+        )
+
+    ticket_id = _new_id()
+    now = _now_iso()
+    record: dict[str, Any] = {
+        "id": ticket_id,
+        "created_at": now,
+        "updated_at": now,
+        "title": title or "Untitled ticket",
+        "tab_id": tab_id or _DEFAULT_TAB_ID,
+        "raw_text": description,
+        "status": "draft",
+        "pipeline": None,
+        "embedding_id": None,
+        "training": {
+            "promoted": False,
+            "promoted_at": None,
+            "domain": "khimaira:notes",
+            "distilled_pairs": 0,
+        },
+        "links": list(links) if links else [],
+        "repo": GENERAL_REPO,
+        "history": [],
+        "last_validated_at": None,
+        "validated_git_sha": None,
+        "structured_at": None,
+        "resolution": "",
+        "resolved_by": "",
+        "resolved_at": None,
+        "kind": "ticket",
+        "source_path": None,
+        "organized_at": None,
+        "sensitive": False,
+        "llm_text": None,
+        "redactions": None,
+        "priority": _DEFAULT_PRIORITY,
+        "pinned_placement": False,
+        "starred": False,
+        "test_status": _DEFAULT_TEST_STATUS,
+        # Ticket-only fields:
+        "state": state,
+        "linear_priority": linear_priority,
+        "assignee": dict(assignee) if assignee else None,
+        "labels": list(labels) if labels else [],
+        "project": project,
+        "parent_id": parent_id,
+        "origin": origin,
+        "linear_ref": linear_ref,
+        "sync_state": "synced" if origin == "linear-pulled" else "local-only",
+        "created_by": created_by,
+        "comments": [],
+    }
+    _write_note_atomic(ticket_id, record)
+    _append_index_stub(record)
+    log.info(
+        "notes: added ticket %s (%s) origin=%s project=%s", ticket_id, record["title"], origin, project
+    )
+    return record
+
+
+def list_tickets(
+    project: str | None = None,
+    state: str | None = None,
+    assignee: str | None = None,
+    label: str | None = None,
+) -> list[dict[str, Any]]:
+    """Newest-created first, `kind="ticket"` only.
+
+    `assignee`, when given, matches either the assignee dict's `id` or
+    `name` (case-insensitive) — a secondary filter applied to the already-
+    scoped set, per the sync design (resync pulls by project, not by
+    assignee). `label`, when given, matches membership in the ticket's
+    `labels` list (case-insensitive)."""
+    stubs = [s for s in _fold_index().values() if s.get("kind") == "ticket"]
+    if project is not None:
+        stubs = [s for s in stubs if s.get("project") == project]
+    if state is not None:
+        stubs = [s for s in stubs if s.get("state") == state]
+    if assignee is not None:
+        needle = assignee.strip().lower()
+        stubs = [s for s in stubs if _ticket_assignee_matches(s, needle)]
+    if label is not None:
+        needle = label.strip().lower()
+        stubs = [s for s in stubs if needle in [entry.lower() for entry in (s.get("labels") or [])]]
+    stubs.sort(key=lambda s: s["created_at"], reverse=True)
+    return stubs
+
+
+def _ticket_assignee_matches(stub: dict[str, Any], needle: str) -> bool:
+    assignee = stub.get("assignee") or {}
+    return (assignee.get("id") or "").lower() == needle or (assignee.get("name") or "").lower() == needle
+
+
+# Synced fields: authoritative from Linear once a ticket is `linear-pulled`
+# — see update_ticket. tab_id is deliberately NOT in this set: filing a
+# ticket into a local tab is always a local concern, even for a mirrored one.
+_TICKET_SYNCED_FIELDS = frozenset(
+    {
+        "title",
+        "raw_text",
+        "state",
+        "linear_priority",
+        "assignee",
+        "labels",
+        "project",
+        "parent_id",
+        "links",
+    }
+)
+_TICKET_MUTABLE_FIELDS = _TICKET_SYNCED_FIELDS | frozenset({"tab_id"})
+
+
+def update_ticket(ticket_id: str, **fields: Any) -> dict[str, Any]:
+    """Edit a ticket's title/description(raw_text)/state/linear_priority/
+    assignee/labels/project/parent_id/links/tab_id.
+
+    A `linear-pulled` ticket refuses any of the SYNCED fields (everything
+    but `tab_id`) — those are Linear-authoritative until push-to-Linear
+    (increment 2) exists; mutating them locally would silently diverge from
+    the source of truth with no way to reconcile. Raises ValueError rather
+    than silently no-op'ing the locked fields, matching update_note's own
+    fail-loud-on-invalid-field convention. `local-created` tickets have no
+    such restriction — they're fully local until increment 2.
+
+    Use `add_ticket_comment` for comments and the existing `add_resolution`
+    for a resolution — both are local-only annotations, allowed on a
+    linear-pulled ticket regardless of origin, so they don't go through here."""
+    record = get_note(ticket_id)
+    if record.get("kind") != "ticket":
+        raise ValueError(f"{ticket_id!r} is not a ticket (kind={record.get('kind')!r}).")
+    unknown = set(fields) - _TICKET_MUTABLE_FIELDS
+    if unknown:
+        raise ValueError(
+            f"Unknown ticket field(s): {sorted(unknown)}. "
+            f"Mutable fields: {sorted(_TICKET_MUTABLE_FIELDS)}."
+        )
+    if record.get("origin") == "linear-pulled":
+        locked = set(fields) & _TICKET_SYNCED_FIELDS
+        if locked:
+            raise ValueError(
+                f"Ticket {ticket_id!r} is linear-pulled — synced field(s) "
+                f"{sorted(locked)} are read-only until push-to-Linear "
+                "(increment 2) ships. Local-only fields (tab_id) can still "
+                "be edited; use add_ticket_comment/add_resolution for notes."
+            )
+    if "state" in fields and fields["state"] not in _VALID_TICKET_STATES:
+        raise ValueError(
+            f"Invalid ticket state {fields['state']!r}; "
+            f"must be one of {sorted(_VALID_TICKET_STATES)}."
+        )
+    if "linear_priority" in fields and fields["linear_priority"] not in _VALID_TICKET_LINEAR_PRIORITIES:
+        raise ValueError(
+            f"Invalid ticket linear_priority {fields['linear_priority']!r}; "
+            f"must be one of {sorted(_VALID_TICKET_LINEAR_PRIORITIES)}."
+        )
+    record.update(fields)
+    record["updated_at"] = _now_iso()
+    _write_note_atomic(ticket_id, record)
+    _append_index_stub(record)
+    return record
+
+
+def add_ticket_comment(ticket_id: str, text: str, author: str = "") -> dict[str, Any]:
+    """Append a local, append-only comment to a ticket — allowed regardless
+    of `origin` (a comment is never a Linear-synced field). v1 keeps this
+    simple (a plain list on the record, no edit/delete) per the dispatch's
+    own "don't over-build" guidance; a real activity-thread primitive can
+    replace this later without a schema migration (`comments` stays a list)."""
+    record = get_note(ticket_id)
+    if record.get("kind") != "ticket":
+        raise ValueError(f"{ticket_id!r} is not a ticket (kind={record.get('kind')!r}).")
+    if not text.strip():
+        raise ValueError("add_ticket_comment requires non-empty text.")
+    now = _now_iso()
+    record.setdefault("comments", []).append({"text": text, "author": author, "ts": now})
+    record["updated_at"] = now
+    _write_note_atomic(ticket_id, record)
+    _append_index_stub(record)
+    return record
+
+
+def find_ticket_by_linear_ref(linear_ref: str) -> dict[str, Any] | None:
+    """Find an existing ticket by its Linear issue id — the idempotency
+    join key `upsert_ticket_from_linear` uses to decide create-vs-update.
+    Full-scan (mirrors find_by_source_path's own approach); fine at the
+    scale a single Linear project's issue count implies."""
+    for stub in list_tickets():
+        if stub.get("linear_ref") == linear_ref:
+            return get_note(stub["id"])
+    return None
+
+
+def upsert_ticket_from_linear(mapped: dict[str, Any], *, project: str) -> tuple[dict[str, Any], bool]:
+    """Idempotent create-or-update of one `linear-pulled` ticket, keyed on
+    `mapped["linear_ref"]`. Pure deterministic write — this is the
+    disposal half of the perceive/dispose split: the CALLER (an agent,
+    orchestrating via `mcp__linear__list_issues`/`get_issue`) has already
+    fetched and mapped a Linear issue's shape onto the ticket fields below;
+    this function never talks to Linear itself.
+
+    `mapped` accepts: title, description, state, linear_priority, assignee,
+    labels, parent_id, links, linear_ref (required — the join key). Missing
+    keys are left at their existing/default value on update/create
+    respectively — a partial map (e.g. no `labels` key) does not clear the
+    field.
+
+    Never touches `resolution`/`comments`/`tab_id` — those are local
+    annotations, untouched by a resync regardless of how many times it runs.
+
+    Returns `(record, created)` — `created=True` on first pull for this
+    `linear_ref`, `False` on every subsequent resync (an update). Re-running
+    with the same `mapped["linear_ref"]` never creates a duplicate."""
+    linear_ref = mapped.get("linear_ref")
+    if not linear_ref:
+        raise ValueError(
+            "upsert_ticket_from_linear requires mapped['linear_ref'] (the "
+            "Linear issue id) as the idempotency join key."
+        )
+    existing = find_ticket_by_linear_ref(linear_ref)
+    if existing is None:
+        record = add_ticket(
+            title=mapped.get("title") or "Untitled ticket",
+            description=mapped.get("description", ""),
+            state=mapped.get("state") or _DEFAULT_TICKET_STATE,
+            linear_priority=mapped.get("linear_priority", _DEFAULT_TICKET_LINEAR_PRIORITY),
+            assignee=mapped.get("assignee"),
+            labels=mapped.get("labels"),
+            project=project,
+            parent_id=mapped.get("parent_id"),
+            links=mapped.get("links"),
+            origin="linear-pulled",
+            linear_ref=linear_ref,
+        )
+        return record, True
+
+    field_map = {
+        "title": "title",
+        "description": "raw_text",
+        "state": "state",
+        "linear_priority": "linear_priority",
+        "assignee": "assignee",
+        "labels": "labels",
+        "parent_id": "parent_id",
+        "links": "links",
+    }
+    for src_key, record_key in field_map.items():
+        if src_key in mapped:
+            existing[record_key] = mapped[src_key]
+    existing["project"] = project
+    existing["sync_state"] = "synced"
+    existing["updated_at"] = _now_iso()
+    _write_note_atomic(existing["id"], existing)
+    _append_index_stub(existing)
+    return existing, False
 
 
 # ---------------------------------------------------------------------------
