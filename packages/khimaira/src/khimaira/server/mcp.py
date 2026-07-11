@@ -2892,7 +2892,9 @@ async def notebook_ask(question: str, project: str = "") -> str:
 
 @mcp.tool()
 @logged_tool("notebook_add_resolution")
-async def notebook_add_resolution(note_id: str, resolution: str, resolved_by: str = "") -> str:
+async def notebook_add_resolution(
+    note_id: str, resolution: str, resolved_by: str = "", idempotency_key: str = ""
+) -> str:
     """Write a resolution back to a note — call this once you've finished
     working the problem/task it describes.
 
@@ -2906,8 +2908,12 @@ async def notebook_add_resolution(note_id: str, resolution: str, resolved_by: st
         note_id: the note id you were working.
         resolution: markdown describing what was done / found / decided.
         resolved_by: your session name or id (attribution).
+        idempotency_key: if you're retrying a call that may have already
+            landed (e.g. after a timeout), pass the SAME key you used on
+            the first attempt — a repeat returns the cached result instead
+            of re-scheduling a redundant training distill. Omit otherwise.
     """
-    return await _notebook_tools.notebook_add_resolution(note_id, resolution, resolved_by)
+    return await _notebook_tools.notebook_add_resolution(note_id, resolution, resolved_by, idempotency_key)
 
 
 @mcp.tool()
@@ -2957,6 +2963,7 @@ async def notebook_create(
     raw_text: str = "",
     title: str = "",
     tab: str = "",
+    idempotency_key: str = "",
 ) -> str:
     """Capture a NEW note into the notebook — the roster loop's write-IN half.
 
@@ -2982,8 +2989,12 @@ async def notebook_create(
         title: optional title; the pipeline derives one if omitted.
         tab: optional folder; omit for the General bucket. The 'personal'
             tab is rejected — it's the user-owned behavior/voice folder.
+        idempotency_key: if this call might time out and you'd retry it,
+            generate a key BEFORE the first attempt and pass the SAME key on
+            the retry — a repeat returns the SAME note instead of creating a
+            duplicate. Omit for a normal one-shot call.
     """
-    return await _notebook_tools.notebook_create(project, raw_text, title, tab)
+    return await _notebook_tools.notebook_create(project, raw_text, title, tab, idempotency_key)
 
 
 @mcp.tool()
@@ -2993,6 +3004,7 @@ async def notebook_create_study_guide(
     raw_text: str = "",
     title: str = "",
     collection: str = "",
+    idempotency_key: str = "",
 ) -> str:
     """Author a NEW study guide directly into the grimoire — the roster's
     write-IN path for a finished, long-form deliverable (as opposed to
@@ -3012,8 +3024,16 @@ async def notebook_create_study_guide(
         collection: optional collection (folder) name — an existing name
             reuses that collection, a new one creates it; omit it to let
             the organizer place the guide automatically a few seconds later.
+        idempotency_key: if this call might time out and you'd retry it,
+            generate a key BEFORE the first attempt and pass the SAME key on
+            the retry — a repeat returns the SAME guide instead of creating
+            a duplicate (this is the exact bug chimera-0 hit: 3 copies of
+            the same guide from retries after a client-side timeout). Omit
+            for a normal one-shot call.
     """
-    return await _notebook_tools.notebook_create_study_guide(project, raw_text, title, collection)
+    return await _notebook_tools.notebook_create_study_guide(
+        project, raw_text, title, collection, idempotency_key
+    )
 
 
 @mcp.tool()
@@ -3087,7 +3107,12 @@ async def ticket_get(ticket_id: str) -> str:
 @mcp.tool()
 @logged_tool("ticket_create")
 async def ticket_create(
-    title: str, description: str = "", state: str = "", project: str = "", labels: str = ""
+    title: str,
+    description: str = "",
+    state: str = "",
+    project: str = "",
+    labels: str = "",
+    idempotency_key: str = "",
 ) -> str:
     """Author a NEW local ticket. Always local-created — v1 has no push to
     Linear, so this never touches your real Linear board. Use
@@ -3100,8 +3125,12 @@ async def ticket_create(
         state: Backlog|Todo|In Progress|In Review|Done|Cancelled (default Backlog).
         project: which project/board this belongs to (e.g. "Langgraph").
         labels: comma-separated label list, e.g. "bug,frontend".
+        idempotency_key: if this call might time out and you'd retry it,
+            generate a key BEFORE the first attempt and pass the SAME key on
+            the retry — a repeat returns the SAME ticket instead of creating
+            a duplicate. Omit for a normal one-shot call.
     """
-    return await _notebook_tools.ticket_create(title, description, state, project, labels)
+    return await _notebook_tools.ticket_create(title, description, state, project, labels, idempotency_key)
 
 
 @mcp.tool()

@@ -75,6 +75,9 @@ heal from inside notebook_pipeline itself.
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
+from typing import Any, Callable
 
 from pydantic import BaseModel
 
@@ -93,6 +96,71 @@ from .._optional import require
 _PRIORITY_SORT_ORDER = {"urgent": 3, "high": 2, "normal": 1, "low": 0}
 
 
+# ---------------------------------------------------------------------------
+# Idempotency-key chokepoint (2026-07-11, chat-102d8b5fd82f task-6f8d92534e3d)
+#
+# Bug class: notebook_create, notebook_create_study_guide, notebook_add_
+# resolution, and ticket_create are all a non-idempotent POST behind an MCP
+# client that can time out — the write can land server-side while the
+# caller sees a timeout and retries, producing duplicate records (chimera-0
+# reported 3 copies of the same study guide, twice in one night) or, for
+# add_resolution, a redundant mnemosyne schedule_promote fire.
+#
+# Fix is a CHOKEPOINT, not four separate patches: every vulnerable route
+# funnels its create/mutate + side-effects through `_idempotent_op` below.
+# Client-supplied `idempotency_key`, NOT server-side title+kind+project
+# heuristic dedup — a heuristic can silently drop two legitimately-similar
+# creates, which is worse than an occasional visible duplicate (fail-loud >
+# fail-silent). No key -> unchanged behavior (always runs — a normal
+# one-shot call has nothing to dedup against); a caller opts in by passing
+# a key it intends to reuse across a retry of the SAME logical attempt.
+#
+# In-memory + short TTL (not a durable sidecar) — this only needs to
+# survive a client's own retry window (seconds to low minutes), not a
+# daemon restart. Deliberately simple for v1.
+# ---------------------------------------------------------------------------
+
+_IDEMPOTENCY_TTL_S = 300.0
+_idempotency_lock = threading.Lock()
+_idempotency_store: dict[str, tuple[float, Any]] = {}
+
+
+def _prune_idempotency_store_locked(now: float) -> None:
+    """MUST be called while holding _idempotency_lock."""
+    expired = [k for k, (ts, _) in _idempotency_store.items() if now - ts > _IDEMPOTENCY_TTL_S]
+    for k in expired:
+        del _idempotency_store[k]
+
+
+def _idempotent_op(idempotency_key: str | None, op: Callable[[], Any]) -> tuple[Any, bool]:
+    """Run `op()` at most once per `idempotency_key` within the TTL window.
+
+    Returns `(result, was_fresh)` — `was_fresh=True` means `op()` actually
+    ran this call (a route should only fire follow-on side effects —
+    trigger_pipeline, schedule_upsert, schedule_promote — when `was_fresh`,
+    so a deduped retry doesn't re-trigger them). Holds the lock across the
+    ENTIRE check+run+cache sequence (not just the cache read) so two
+    near-concurrent calls with the same key can't both slip past the "not
+    cached yet" check and both run `op()` — the second one blocks until the
+    first finishes, then returns its cached result.
+
+    Sync by design — always called via `asyncio.to_thread` from the route
+    handler, same as every other notes.* call in this file, so the lock
+    (held only briefly, or for one create's file-I/O duration) never blocks
+    the event loop."""
+    if not idempotency_key:
+        return op(), True
+    now = time.monotonic()
+    with _idempotency_lock:
+        _prune_idempotency_store_locked(now)
+        cached = _idempotency_store.get(idempotency_key)
+        if cached is not None:
+            return cached[1], False
+        result = op()
+        _idempotency_store[idempotency_key] = (now, result)
+        return result, True
+
+
 class CreateNoteReq(BaseModel):
     raw_text: str
     tab_id: str = ""
@@ -102,6 +170,7 @@ class CreateNoteReq(BaseModel):
     source_path: str | None = None
     collection: str = ""
     sensitive: bool = False
+    idempotency_key: str = ""
 
 
 class ImportGuidesReq(BaseModel):
@@ -128,6 +197,7 @@ class UpdateNoteReq(BaseModel):
 class AddResolutionReq(BaseModel):
     resolution: str
     resolved_by: str = ""
+    idempotency_key: str = ""
 
 
 class AskReq(BaseModel):
@@ -173,6 +243,7 @@ class CreateTicketReq(BaseModel):
     project: str = ""
     parent_id: str | None = None
     links: list[str] | None = None
+    idempotency_key: str = ""
     tab_id: str = ""
 
 
@@ -237,6 +308,13 @@ def build_router():
 
     @router.post("/notes")
     async def create_note(req: CreateNoteReq) -> dict:
+        """`idempotency_key` (2026-07-11, task-6f8d92534e3d): when given,
+        dedups via `_idempotent_op` — a retry with the same key returns the
+        SAME record instead of creating a duplicate. Side effects
+        (trigger_pipeline/schedule_upsert/the personal-tab status flip) only
+        fire when `was_fresh` — they call `asyncio.create_task` internally,
+        which requires the EVENT LOOP thread, so they stay here in the route
+        body rather than inside the `asyncio.to_thread`-run op closure."""
         if req.kind == "study_guide":
             # Grimoire: study guides are housed + rendered, never
             # re-expressed — structuring only ever generates
@@ -254,36 +332,44 @@ def build_router():
             if req.collection:
                 collection = await asyncio.to_thread(notes.get_or_create_collection, req.collection)
                 tab_id = collection["id"]
-            record = await asyncio.to_thread(
-                notes.add_study_guide,
-                req.raw_text,
-                tab_id=tab_id,
-                title=req.title,
-                repo=req.repo,
-                source_path=req.source_path,
-                sensitive=req.sensitive,
+            record, was_fresh = await asyncio.to_thread(
+                _idempotent_op,
+                req.idempotency_key,
+                lambda: notes.add_study_guide(
+                    req.raw_text,
+                    tab_id=tab_id,
+                    title=req.title,
+                    repo=req.repo,
+                    source_path=req.source_path,
+                    sensitive=req.sensitive,
+                ),
             )
-            trigger_pipeline(record["id"])
-            notebook_retrieval.schedule_upsert(record)
+            if was_fresh:
+                trigger_pipeline(record["id"])
+                notebook_retrieval.schedule_upsert(record)
             return record
 
-        record = await asyncio.to_thread(
-            notes.add_note,
-            req.raw_text,
-            tab_id=req.tab_id,
-            title=req.title,
-            repo=req.repo,
-            sensitive=req.sensitive,
+        record, was_fresh = await asyncio.to_thread(
+            _idempotent_op,
+            req.idempotency_key,
+            lambda: notes.add_note(
+                req.raw_text,
+                tab_id=req.tab_id,
+                title=req.title,
+                repo=req.repo,
+                sensitive=req.sensitive,
+            ),
         )
-        if record["tab_id"] == notes.PERSONAL_TAB_ID:
-            # Personal/Behavior folder notes are read as raw_text directly
-            # (notebook_pipeline._personal_context) — no structuring, no
-            # embed (notebook_retrieval.upsert_note already refuses to
-            # embed them too; this just avoids the wasted structuring call).
-            record = await asyncio.to_thread(notes.update_note, record["id"], status="processed")
-        else:
-            trigger_pipeline(record["id"])
-            notebook_retrieval.schedule_upsert(record)
+        if was_fresh:
+            if record["tab_id"] == notes.PERSONAL_TAB_ID:
+                # Personal/Behavior folder notes are read as raw_text directly
+                # (notebook_pipeline._personal_context) — no structuring, no
+                # embed (notebook_retrieval.upsert_note already refuses to
+                # embed them too; this just avoids the wasted structuring call).
+                record = await asyncio.to_thread(notes.update_note, record["id"], status="processed")
+            else:
+                trigger_pipeline(record["id"])
+                notebook_retrieval.schedule_upsert(record)
         return record
 
     @router.get("/notes")
@@ -468,14 +554,20 @@ def build_router():
         sensitive=True hard-exclusion, different trigger. Reversible (the
         guard can be dropped later); baking ticket text into an already-
         trained oracle is not — see chat-102d8b5fd82f task-8191e0a1672b.
+
+        `idempotency_key` (task-6f8d92534e3d): a retry with the same key
+        returns the cached result without re-running add_resolution or
+        re-scheduling a redundant mnemosyne distill.
         """
         try:
-            updated = await asyncio.to_thread(
-                notes.add_resolution, note_id, req.resolution, resolved_by=req.resolved_by
+            updated, was_fresh = await asyncio.to_thread(
+                _idempotent_op,
+                req.idempotency_key,
+                lambda: notes.add_resolution(note_id, req.resolution, resolved_by=req.resolved_by),
             )
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
-        if updated.get("resolution") and updated.get("kind") != "ticket":
+        if was_fresh and updated.get("resolution") and updated.get("kind") != "ticket":
             notebook_training.schedule_promote(updated)
         return updated
 
@@ -619,23 +711,30 @@ def build_router():
         """Create a LOCAL ticket — always `origin="local-created"`.
         `origin`/`linear_ref` are never caller-settable here; a
         linear-pulled ticket can only be created via POST
-        /tickets/bulk-upsert (the resync path)."""
+        /tickets/bulk-upsert (the resync path).
+
+        `idempotency_key` (task-6f8d92534e3d): a retry with the same key
+        returns the same ticket instead of creating a duplicate."""
         try:
-            return await asyncio.to_thread(
-                notes.add_ticket,
-                req.title,
-                req.description,
-                state=req.state,
-                linear_priority=req.linear_priority,
-                assignee=req.assignee,
-                labels=req.labels,
-                project=req.project,
-                parent_id=req.parent_id,
-                links=req.links,
-                tab_id=req.tab_id,
+            record, _ = await asyncio.to_thread(
+                _idempotent_op,
+                req.idempotency_key,
+                lambda: notes.add_ticket(
+                    req.title,
+                    req.description,
+                    state=req.state,
+                    linear_priority=req.linear_priority,
+                    assignee=req.assignee,
+                    labels=req.labels,
+                    project=req.project,
+                    parent_id=req.parent_id,
+                    links=req.links,
+                    tab_id=req.tab_id,
+                ),
             )
         except ValueError as e:
             raise fastapi.HTTPException(422, str(e)) from e
+        return record
 
     @router.get("/tickets")
     async def list_tickets_endpoint(

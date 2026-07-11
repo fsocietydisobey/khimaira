@@ -206,7 +206,9 @@ async def notebook_ask(question: str, project: str = "") -> str:
     return "\n".join(lines)
 
 
-async def notebook_add_resolution(note_id: str, resolution: str, resolved_by: str = "") -> str:
+async def notebook_add_resolution(
+    note_id: str, resolution: str, resolved_by: str = "", idempotency_key: str = ""
+) -> str:
     """Write a resolution back to a note — call this once you've finished
     working the problem it describes.
 
@@ -215,15 +217,21 @@ async def notebook_add_resolution(note_id: str, resolution: str, resolved_by: st
     fire-and-forget mnemosyne distill so it feeds the next oracle re-bake.
     `resolved_by` should be your session name/id — it's attributed on the
     note and carried into the training pair's provenance.
+
+    `idempotency_key` (2026-07-11): if this call might time out and you'd
+    retry it, generate a key (any stable string, e.g. a UUID) BEFORE the
+    first attempt and pass the SAME key on the retry — a repeat with the
+    same key returns the cached result instead of re-scheduling a redundant
+    mnemosyne distill. Omit for a normal one-shot call.
     """
     if not note_id:
         return "❌ notebook_add_resolution requires a note_id."
     if not resolution.strip():
         return "❌ notebook_add_resolution requires a non-empty resolution."
-    data = _post(
-        f"/api/notes/{urllib.parse.quote(note_id, safe='')}/resolution",
-        {"resolution": resolution, "resolved_by": resolved_by},
-    )
+    body: dict[str, Any] = {"resolution": resolution, "resolved_by": resolved_by}
+    if idempotency_key:
+        body["idempotency_key"] = idempotency_key
+    data = _post(f"/api/notes/{urllib.parse.quote(note_id, safe='')}/resolution", body)
     if isinstance(data, str):
         return data
     return (
@@ -305,6 +313,7 @@ async def notebook_create(
     raw_text: str = "",
     title: str = "",
     tab: str = "",
+    idempotency_key: str = "",
 ) -> str:
     """Capture a NEW note into the notebook — the roster loop's write-IN half.
 
@@ -320,6 +329,14 @@ async def notebook_create(
     The note returns immediately as a draft — the structuring pipeline
     (summary / organized / technical / plain + a derived title) runs async,
     exactly like a UI paste, so this call does not block on the LLM transform.
+
+    `idempotency_key` (2026-07-11): if this call might time out and you'd
+    retry it, generate a key (any stable string, e.g. a UUID) BEFORE the
+    first attempt and pass the SAME key on the retry — a repeat with the
+    same key returns the SAME note instead of creating a duplicate (this is
+    exactly the bug chimera-0 hit: a timed-out create landed server-side
+    anyway, then the retry created a second copy). Omit for a normal
+    one-shot call.
     """
     if not raw_text.strip():
         return "❌ notebook_create requires non-empty raw_text — the note body to capture."
@@ -337,6 +354,8 @@ async def notebook_create(
         body["tab_id"] = tab
     if project:
         body["repo"] = project
+    if idempotency_key:
+        body["idempotency_key"] = idempotency_key
     data = _post("/api/notes", body)
     if isinstance(data, str):
         return data
@@ -354,6 +373,7 @@ async def notebook_create_study_guide(
     raw_text: str = "",
     title: str = "",
     collection: str = "",
+    idempotency_key: str = "",
 ) -> str:
     """Author a NEW study guide directly into the grimoire — the roster's
     write-IN path for a finished, long-form deliverable (as opposed to
@@ -371,6 +391,11 @@ async def notebook_create_study_guide(
     collection, a new one creates it; omit it to let the organizer place the
     guide automatically once it's cataloged (a few seconds later, not
     instant — pass `collection` when you already know where it belongs).
+
+    `idempotency_key` (2026-07-11): if this call might time out and you'd
+    retry it, generate a key BEFORE the first attempt and pass the SAME key
+    on the retry — a repeat with the same key returns the SAME guide instead
+    of creating a duplicate. Omit for a normal one-shot call.
     """
     if not raw_text.strip():
         return "❌ notebook_create_study_guide requires non-empty raw_text — the guide's body."
@@ -381,6 +406,8 @@ async def notebook_create_study_guide(
         body["repo"] = project
     if collection:
         body["collection"] = collection
+    if idempotency_key:
+        body["idempotency_key"] = idempotency_key
     data = _post("/api/notes", body)
     if isinstance(data, str):
         return data
@@ -518,6 +545,7 @@ async def ticket_create(
     state: str = "",
     project: str = "",
     labels: str = "",
+    idempotency_key: str = "",
 ) -> str:
     """Author a NEW local ticket — always `origin="local-created"` (never
     a Linear mirror; those come from `ticket_bulk_upsert` only).
@@ -525,6 +553,11 @@ async def ticket_create(
     `labels` is a comma-separated string (MCP-friendly — avoids a list
     param); split/stripped before sending. v1 has no push-to-Linear, so a
     local-created ticket stays local until increment 2 ships.
+
+    `idempotency_key` (2026-07-11): if this call might time out and you'd
+    retry it, generate a key BEFORE the first attempt and pass the SAME key
+    on the retry — a repeat with the same key returns the SAME ticket
+    instead of creating a duplicate. Omit for a normal one-shot call.
     """
     if not title.strip():
         return "❌ ticket_create requires a non-empty title."
@@ -535,6 +568,8 @@ async def ticket_create(
         body["project"] = project
     if labels:
         body["labels"] = [s.strip() for s in labels.split(",") if s.strip()]
+    if idempotency_key:
+        body["idempotency_key"] = idempotency_key
     data = _post("/api/tickets", body)
     if isinstance(data, str):
         return data

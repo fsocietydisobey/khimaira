@@ -1389,3 +1389,105 @@ def test_bulk_upsert_tickets_rejects_missing_linear_ref(notebook_client):
         json={"project": "Langgraph", "tickets": [{"title": "no ref"}]},
     )
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Idempotency-key chokepoint (2026-07-11, task-6f8d92534e3d) — the class fix
+# for chimera-0's duplicate-study-guide report: a client-side timeout can
+# land the write server-side anyway; the retry must not create a second
+# record. These tests prove the CLASS (same key -> same record, across all
+# four vulnerable routes), not just a config-shape check.
+# ---------------------------------------------------------------------------
+
+
+def test_create_note_idempotency_key_dedupes(notebook_client):
+    key = "attempt-abc-123"
+    first = notebook_client.post("/api/notes", json={"raw_text": "hello", "idempotency_key": key})
+    second = notebook_client.post("/api/notes", json={"raw_text": "hello", "idempotency_key": key})
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["id"] == second.json()["id"], "same idempotency_key must return the same note, not a duplicate"
+
+    all_notes = notebook_client.get("/api/notes").json()["notes"]
+    assert len(all_notes) == 1, "a retried create with the same key must never produce a second record"
+
+
+def test_create_note_without_idempotency_key_is_unchanged(notebook_client):
+    """Omitting the key preserves today's behavior — every call creates a
+    genuinely new note. Guards against the chokepoint accidentally becoming
+    the new default (heuristic dedup was explicitly rejected)."""
+    first = notebook_client.post("/api/notes", json={"raw_text": "hello"})
+    second = notebook_client.post("/api/notes", json={"raw_text": "hello"})
+    assert first.json()["id"] != second.json()["id"]
+
+    all_notes = notebook_client.get("/api/notes").json()["notes"]
+    assert len(all_notes) == 2
+
+
+def test_create_note_idempotency_key_does_not_double_schedule_pipeline(notebook_client, monkeypatch):
+    """The cache-hit path must skip trigger_pipeline/schedule_upsert too —
+    not just avoid a duplicate record — since those call asyncio.create_task
+    and re-firing them on every retry would waste an LLM structuring pass
+    per retry."""
+    from khimaira.monitor.api import notebook as notebook_api
+
+    triggered: list[str] = []
+    monkeypatch.setattr(notebook_api, "trigger_pipeline", lambda note_id: triggered.append(note_id))
+
+    key = "attempt-pipeline-1"
+    notebook_client.post("/api/notes", json={"raw_text": "hello", "idempotency_key": key})
+    notebook_client.post("/api/notes", json={"raw_text": "hello", "idempotency_key": key})
+    assert len(triggered) == 1, "a deduped retry must not re-trigger the structuring pipeline"
+
+
+def test_create_study_guide_idempotency_key_dedupes(notebook_client):
+    key = "attempt-guide-1"
+    body = {"raw_text": "# Guide\n\nbody", "kind": "study_guide", "idempotency_key": key}
+    first = notebook_client.post("/api/notes", json=body)
+    second = notebook_client.post("/api/notes", json=body)
+    assert first.json()["id"] == second.json()["id"]
+
+    guides = notebook_client.get("/api/notes", params={"kind": "study_guide"}).json()["notes"]
+    assert len(guides) == 1
+
+
+def test_add_resolution_idempotency_key_dedupes_and_skips_second_promote(notebook_client, monkeypatch):
+    from khimaira.monitor.api import notebook as notebook_api
+
+    scheduled: list[dict] = []
+    monkeypatch.setattr(notebook_api.notebook_training, "schedule_promote", scheduled.append)
+
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+    key = "attempt-resolve-1"
+    body = {"resolution": "fixed it", "idempotency_key": key}
+    first = notebook_client.post(f"/api/notes/{created['id']}/resolution", json=body)
+    second = notebook_client.post(f"/api/notes/{created['id']}/resolution", json=body)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json() == second.json()
+    assert len(scheduled) == 1, "a deduped retry must not re-schedule a redundant training distill"
+
+
+def test_create_ticket_idempotency_key_dedupes(notebook_client):
+    key = "attempt-ticket-1"
+    body = {"title": "Fix the reaper race", "idempotency_key": key}
+    first = notebook_client.post("/api/tickets", json=body)
+    second = notebook_client.post("/api/tickets", json=body)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["id"] == second.json()["id"]
+
+    tickets = notebook_client.get("/api/tickets").json()["tickets"]
+    assert len(tickets) == 1, "a retried ticket create with the same key must never produce a duplicate"
+
+
+def test_different_idempotency_keys_create_separate_records(notebook_client):
+    """Distinct keys are genuinely distinct creation attempts — the guard
+    must not over-dedup two legitimately different creates."""
+    first = notebook_client.post("/api/tickets", json={"title": "A", "idempotency_key": "key-a"})
+    second = notebook_client.post("/api/tickets", json={"title": "B", "idempotency_key": "key-b"})
+    assert first.json()["id"] != second.json()["id"]
+
+    tickets = notebook_client.get("/api/tickets").json()["tickets"]
+    assert len(tickets) == 2
