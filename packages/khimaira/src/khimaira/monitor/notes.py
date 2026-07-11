@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +46,7 @@ _NOTE_MUTABLE_FIELDS = frozenset(
         "priority",
         "pinned_placement",
         "starred",
+        "test_status",
     }
 )
 _DEFAULT_TAB_ID = "default"
@@ -56,6 +58,19 @@ _DEFAULT_REPO = "khimaira"
 # mark_organized — it only ever sets tab_id/organized_at).
 _VALID_PRIORITIES = frozenset({"low", "normal", "high", "urgent"})
 _DEFAULT_PRIORITY = "normal"
+
+# Testing-workflow status (2026-07-07, Joseph): a HUMAN-set label distinct
+# from every other status-like field — `status` is the automated structuring
+# pipeline's lifecycle, `lifecycle` (derive_lifecycle, below) is a read-only
+# projection of status/resolution/kind, neither has anything to do with
+# whether a human has verified a note's content. Mirrors _VALID_PRIORITIES
+# exactly (independent field, own default, own mutable-fields entry).
+# Notes-only by design decision — study guides keep their own housed/
+# organized lifecycle for a different concept (library placement); guide
+# records still carry this field (for schema uniformity across add_note/
+# add_study_guide) but no UI surface exposes it for guides.
+_VALID_TEST_STATUSES = frozenset({"untested", "needs_testing", "in_review", "tested"})
+_DEFAULT_TEST_STATUS = "untested"
 
 # "General" — a repo value meaning "no codebase to validate against" (cross-
 # cutting notes). revalidate_note() and answer_question()'s code-grounding
@@ -240,6 +255,7 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
         "sensitive": is_sensitive,
         "redactions": record.get("redactions"),
         "priority": record.get("priority", _DEFAULT_PRIORITY),
+        "test_status": record.get("test_status", _DEFAULT_TEST_STATUS),
         "lifecycle": derive_lifecycle(record),
         "deleted": deleted,
         "pinned_placement": record.get("pinned_placement", False),
@@ -247,25 +263,132 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
     }
 
 
-def _fold_index() -> dict[str, dict[str, Any]]:
-    """Fold index.jsonl to the latest stub per note id, dropping deleted ones."""
+_INDEX_LOCK = threading.Lock()
+_TABS_LOCK = threading.Lock()
+
+# Compact once the raw line count exceeds the folded (deduped) count by this
+# many stale entries. Small/lightly-churned libraries never cross this and
+# never pay a compaction write; a library under heavy churn (bulk resolution
+# passes, repeated organize sweeps) self-heals on the next read instead of
+# growing unboundedly. See _fold_index's docstring for the incident this closes.
+_COMPACT_EXCESS_LINES = 50
+
+
+def _append_index_stub(record: dict[str, Any], *, deleted: bool = False) -> None:
+    """Append a stub to index.jsonl. MUST be the only append path — sharing
+    _INDEX_LOCK with _compact_index_locked is what makes compaction safe
+    under concurrent writers (see _fold_index's docstring)."""
+    with _INDEX_LOCK:
+        _append_jsonl(_index_path(), _index_stub(record, deleted=deleted))
+
+
+def _append_tab_record(record: dict[str, Any]) -> None:
+    """Append a record to tabs.jsonl. Same lock-sharing contract as
+    _append_index_stub, for _compact_tabs_locked."""
+    with _TABS_LOCK:
+        _append_jsonl(_tabs_path(), record)
+
+
+def _atomic_replace_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    """Rewrite `path` to contain exactly `records`, one JSON object per line.
+    Unique-per-call tmp name (pid + thread + random) — a fixed name races
+    under concurrent writers (see sessions._atomic_write_json's docstring
+    for the confirmed failure mode this pattern closes)."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    tmp.replace(path)
+
+
+def _compact_index_locked() -> list[dict[str, Any]]:
+    """Rewrite index.jsonl to exactly the folded (latest-per-id, non-deleted)
+    state. MUST be called while holding _INDEX_LOCK, and does its OWN fresh
+    read under that lock — a concurrent _append_index_stub can only land
+    strictly before or after this read (both threads share _INDEX_LOCK), so
+    an in-flight append can never be silently dropped by the rewrite.
+    Returns the survivor stubs actually written, so callers don't need a
+    third read to get fresh state."""
+    raw = _read_jsonl(_index_path())
     folded: dict[str, dict[str, Any]] = {}
-    for line in _read_jsonl(_index_path()):
+    for line in raw:
+        note_id = line.get("id")
+        if note_id:
+            folded[note_id] = line
+    survivors = [stub for stub in folded.values() if not stub.get("deleted")]
+    _atomic_replace_jsonl(_index_path(), survivors)
+    log.info("notes: compacted index.jsonl %d -> %d line(s)", len(raw), len(survivors))
+    return survivors
+
+
+def _compact_tabs_locked() -> list[dict[str, Any]]:
+    """tabs.jsonl sibling of _compact_index_locked — same contract, guarded
+    by _TABS_LOCK instead."""
+    raw = _read_jsonl(_tabs_path())
+    folded: dict[str, dict[str, Any]] = {}
+    for line in raw:
+        tab_id = line.get("id")
+        if tab_id:
+            folded[tab_id] = line
+    survivors = [rec for rec in folded.values() if not rec.get("deleted")]
+    _atomic_replace_jsonl(_tabs_path(), survivors)
+    log.info("notes: compacted tabs.jsonl %d -> %d line(s)", len(raw), len(survivors))
+    return survivors
+
+
+def _fold_index() -> dict[str, dict[str, Any]]:
+    """Fold index.jsonl to the latest stub per note id, dropping deleted ones.
+
+    Self-compacting (2026-07-11): index.jsonl is append-only — every note
+    mutation appends a FULL new stub, raw_text included (see _index_stub's
+    docstring — the stub carries raw_text so listing avoids an N+1 get_note()
+    per item), so a note touched N times over its life carries N copies of
+    its own content in the file even though only the LATEST is ever read.
+    Confirmed live (2026-07-11 production incident): a 70MB/3700-line index
+    folding to ~150 live notes made every list_notes()/list_tabs() call a
+    multi-second synchronous parse, which is what made organize_library's
+    freeze-class bug (see notebook_organizer.py) catastrophic instead of
+    just slow, and degraded the daemon under any bulk-write workload (a
+    stress test bulk-adding resolutions) even with that fix in place.
+
+    Folding is provably lossless — the fold below already discards every-
+    thing but the latest entry per id — so once the raw line count mean-
+    ingfully exceeds the folded count, persist the fold back to disk. No
+    behavior changes for callers; this is pure garbage collection of
+    already-dead history that was never read again."""
+    raw = _read_jsonl(_index_path())
+    folded: dict[str, dict[str, Any]] = {}
+    for line in raw:
         note_id = line.get("id")
         if not note_id:
             continue
         folded[note_id] = line
+
+    if len(raw) - len(folded) > _COMPACT_EXCESS_LINES:
+        with _INDEX_LOCK:
+            survivors = _compact_index_locked()
+        return {stub["id"]: stub for stub in survivors}
+
     return {nid: stub for nid, stub in folded.items() if not stub.get("deleted")}
 
 
 def _fold_tabs() -> dict[str, dict[str, Any]]:
-    """Fold tabs.jsonl to the latest record per tab id, dropping deleted ones."""
+    """Fold tabs.jsonl to the latest record per tab id, dropping deleted
+    ones. Self-compacting sibling of _fold_index — same rationale, much
+    smaller file today, but the same append-only growth pattern applies."""
+    raw = _read_jsonl(_tabs_path())
     folded: dict[str, dict[str, Any]] = {}
-    for line in _read_jsonl(_tabs_path()):
+    for line in raw:
         tab_id = line.get("id")
         if not tab_id:
             continue
         folded[tab_id] = line
+
+    if len(raw) - len(folded) > _COMPACT_EXCESS_LINES:
+        with _TABS_LOCK:
+            survivors = _compact_tabs_locked()
+        return {rec["id"]: rec for rec in survivors}
+
     return {tid: rec for tid, rec in folded.items() if not rec.get("deleted")}
 
 
@@ -352,9 +475,10 @@ def add_note(
         "priority": _DEFAULT_PRIORITY,
         "pinned_placement": False,
         "starred": False,
+        "test_status": _DEFAULT_TEST_STATUS,
     }
     _write_note_atomic(note_id, record)
-    _append_jsonl(_index_path(), _index_stub(record))
+    _append_index_stub(record)
     log.info("notes: added %s in tab=%s repo=%s", note_id, record["tab_id"], record["repo"])
     return record
 
@@ -430,9 +554,10 @@ def add_study_guide(
         "priority": _DEFAULT_PRIORITY,
         "pinned_placement": False,
         "starred": False,
+        "test_status": _DEFAULT_TEST_STATUS,
     }
     _write_note_atomic(note_id, record)
-    _append_jsonl(_index_path(), _index_stub(record))
+    _append_index_stub(record)
     log.info(
         "notes: added study guide %s in tab=%s repo=%s source_path=%s",
         note_id,
@@ -467,6 +592,7 @@ def list_notes(
     kind: str | None = None,
     priority: str | None = None,
     starred: bool | None = None,
+    test_status: str | None = None,
 ) -> list[dict[str, Any]]:
     """Newest-created first. Sorted by created_at (not updated_at) so a
     revalidate/heal pass — which only bumps updated_at — doesn't reshuffle
@@ -489,7 +615,11 @@ def list_notes(
     `starred`, when given, scopes to that starred state (FILE-MANAGER,
     2026-07-04 — the Starred rail). Filters on the folded index STUB, not a
     fresh get_note() per note — see _index_stub, which projects `starred`
-    for exactly this reason."""
+    for exactly this reason.
+
+    `test_status`, when given, scopes to that testing-workflow status
+    ("untested"|"needs_testing"|"in_review"|"tested"). `test_status=None`
+    returns all."""
     stubs = list(_fold_index().values())
     if tab_id is not None:
         stubs = [s for s in stubs if s["tab_id"] == tab_id]
@@ -501,6 +631,8 @@ def list_notes(
         stubs = [s for s in stubs if s.get("priority", _DEFAULT_PRIORITY) == priority]
     if starred is not None:
         stubs = [s for s in stubs if s.get("starred", False) == starred]
+    if test_status is not None:
+        stubs = [s for s in stubs if s.get("test_status", _DEFAULT_TEST_STATUS) == test_status]
     stubs.sort(key=lambda s: s["created_at"], reverse=True)
     return stubs
 
@@ -542,6 +674,11 @@ def update_note(note_id: str, **fields: Any) -> dict[str, Any]:
         raise ValueError(
             f"Invalid priority {fields['priority']!r}; must be one of {sorted(_VALID_PRIORITIES)}."
         )
+    if "test_status" in fields and fields["test_status"] not in _VALID_TEST_STATUSES:
+        raise ValueError(
+            f"Invalid test_status {fields['test_status']!r}; "
+            f"must be one of {sorted(_VALID_TEST_STATUSES)}."
+        )
     if "repo" in fields and fields["repo"] != record.get("repo"):
         record["validated_git_sha"] = None
         record["last_validated_at"] = None
@@ -571,7 +708,7 @@ def update_note(note_id: str, **fields: Any) -> dict[str, Any]:
         record["pipeline"] = merged
     record["updated_at"] = _now_iso()
     _write_note_atomic(note_id, record)
-    _append_jsonl(_index_path(), _index_stub(record))
+    _append_index_stub(record)
     return record
 
 
@@ -594,7 +731,7 @@ def set_pipeline(
     # <time>" from this, and a fresh reprocess visibly bumps it.
     record["structured_at"] = now
     _write_note_atomic(note_id, record)
-    _append_jsonl(_index_path(), _index_stub(record))
+    _append_index_stub(record)
     return record
 
 
@@ -643,7 +780,7 @@ def mark_organized(note_id: str, tab_id: str | None = None) -> dict[str, Any]:
     record["organized_at"] = now
     record["updated_at"] = now
     _write_note_atomic(note_id, record)
-    _append_jsonl(_index_path(), _index_stub(record))
+    _append_index_stub(record)
     return record
 
 
@@ -686,7 +823,7 @@ def apply_validation(
     record["validated_git_sha"] = git_sha
     record["updated_at"] = now
     _write_note_atomic(note_id, record)
-    _append_jsonl(_index_path(), _index_stub(record))
+    _append_index_stub(record)
     return record
 
 
@@ -712,7 +849,7 @@ def add_resolution(note_id: str, resolution: str, resolved_by: str = "") -> dict
     record["resolved_at"] = now if resolution else None
     record["updated_at"] = now
     _write_note_atomic(note_id, record)
-    _append_jsonl(_index_path(), _index_stub(record))
+    _append_index_stub(record)
     log.info("notes: resolution added to %s by=%s", note_id, resolved_by or "(unattributed)")
     return record
 
@@ -736,14 +873,14 @@ def promote_note(note_id: str) -> dict[str, Any]:
     record["status"] = "promoted"
     record["updated_at"] = now
     _write_note_atomic(note_id, record)
-    _append_jsonl(_index_path(), _index_stub(record))
+    _append_index_stub(record)
     return record
 
 
 def delete_note(note_id: str) -> dict[str, Any]:
     record = get_note(note_id)
     _note_path(note_id).unlink(missing_ok=True)
-    _append_jsonl(_index_path(), _index_stub(record, deleted=True))
+    _append_index_stub(record, deleted=True)
     log.info("notes: deleted %s", note_id)
     return {"id": note_id, "deleted": True}
 
@@ -809,7 +946,7 @@ def backfill_drop_spurious_heals(note_id: str) -> dict[str, Any]:
 
     record["history"] = kept
     _write_note_atomic(note_id, record)
-    _append_jsonl(_index_path(), _index_stub(record))
+    _append_index_stub(record)
     log.info(
         "notes: backfill dropped %d spurious heal entr%s from %s",
         len(history) - len(kept),
@@ -920,7 +1057,7 @@ def add_tab(title: str = "", *, kind: str = "", parent_id: str | None = None) ->
         "updated_at": now,
         "deleted": False,
     }
-    _append_jsonl(_tabs_path(), record)
+    _append_tab_record(record)
     return _with_note_ids(record)
 
 
@@ -991,7 +1128,7 @@ def update_tab(tab_id: str, **fields: Any) -> dict[str, Any]:
     existing.update(fields)
     existing["updated_at"] = _now_iso()
     existing["deleted"] = False
-    _append_jsonl(_tabs_path(), existing)
+    _append_tab_record(existing)
     return _with_note_ids(existing)
 
 
@@ -1033,7 +1170,7 @@ def delete_tab(tab_id: str) -> dict[str, Any]:
             child["parent_id"] = fallback_parent_id
             child["updated_at"] = _now_iso()
             child["deleted"] = False
-            _append_jsonl(_tabs_path(), child)
+            _append_tab_record(child)
 
     for note_stub in list_notes(tab_id=tab_id):
         update_note(note_stub["id"], tab_id=fallback_note_tab_id, pinned_placement=False)
@@ -1042,7 +1179,7 @@ def delete_tab(tab_id: str) -> dict[str, Any]:
     existing.pop("note_ids", None)
     existing["deleted"] = True
     existing["updated_at"] = now
-    _append_jsonl(_tabs_path(), existing)
+    _append_tab_record(existing)
     log.info(
         "notes: deleted tab %s (children+notes reparented to %s)", tab_id, fallback_note_tab_id
     )

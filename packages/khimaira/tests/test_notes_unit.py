@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import threading
+import time
 
 import pytest
 
@@ -1281,3 +1283,104 @@ def test_update_note_pinned_placement_and_starred_round_trip(notes_store):
     stub = next(s for s in notes_store.list_notes() if s["id"] == note["id"])
     assert stub["pinned_placement"] is True
     assert stub["starred"] is True
+
+
+# ---------------------------------------------------------------------------
+# Index self-compaction (2026-07-11) — live production incident: index.jsonl
+# is append-only and _index_stub carries full raw_text, so a note touched N
+# times over its life keeps N copies of its own content on disk even though
+# only the latest is ever read. A 70MB/3700-line index (folding to ~150 live
+# notes) made every list_notes() call a multi-second synchronous parse. Fold
+# is provably lossless (already discards everything but the latest per id),
+# so _fold_index persists that fold back to disk once raw lines meaningfully
+# exceed the folded count. These tests prove: (1) it fires past the
+# threshold and preserves exact content, (2) it does NOT fire under it (no
+# gratuitous writes on a healthy library), (3) a concurrent append during
+# compaction is never dropped — the actual failure mode a naive read-fold-
+# then-blind-rewrite would have under the real production write pattern
+# (many concurrent add_resolution calls, per this session's stress test).
+# ---------------------------------------------------------------------------
+
+
+def test_fold_index_compacts_past_threshold_and_preserves_latest_state(notes_store):
+    note = notes_store.add_note("v1")
+    for i in range(notes_store._COMPACT_EXCESS_LINES + 5):
+        notes_store.update_note(note["id"], title=f"v{i}")
+
+    raw_before = notes_store._read_jsonl(notes_store._index_path())
+    assert len(raw_before) > notes_store._COMPACT_EXCESS_LINES  # bloated, pre-compaction
+
+    folded = notes_store._fold_index()
+
+    raw_after = notes_store._read_jsonl(notes_store._index_path())
+    assert len(raw_after) == 1  # compacted to exactly the one surviving note
+    assert folded[note["id"]]["title"] == f"v{notes_store._COMPACT_EXCESS_LINES + 4}"
+    # get_note (reads notes/<id>.json directly, unaffected by index compaction)
+    # still agrees — compaction never touched the source-of-truth note body.
+    assert notes_store.get_note(note["id"])["title"] == f"v{notes_store._COMPACT_EXCESS_LINES + 4}"
+
+
+def test_fold_index_does_not_compact_under_threshold(notes_store):
+    note = notes_store.add_note("v1")
+    notes_store.update_note(note["id"], title="v2")  # 2 raw lines, well under threshold
+
+    raw_before = notes_store._read_jsonl(notes_store._index_path())
+    notes_store._fold_index()
+    raw_after = notes_store._read_jsonl(notes_store._index_path())
+
+    assert len(raw_after) == len(raw_before) == 2  # untouched — no gratuitous rewrite
+
+
+def test_compact_index_survives_concurrent_append(notes_store, monkeypatch):
+    """The race a naive compact (read -> fold -> blind rewrite, no lock)
+    would lose: an _append_index_stub landing between the read and the
+    rename. Real _INDEX_LOCK sharing between the two must prevent it."""
+    note_a = notes_store.add_note("a")
+    for i in range(notes_store._COMPACT_EXCESS_LINES + 5):
+        notes_store.update_note(note_a["id"], title=f"a{i}")
+
+    real_read_jsonl = notes_store._read_jsonl
+    entered_compaction = threading.Event()
+    index_reads = {"count": 0}
+
+    def _gated_read_jsonl(path):
+        result = real_read_jsonl(path)
+        if path == notes_store._index_path():
+            index_reads["count"] += 1
+            # The FIRST call is _fold_index's own outer bloat-check read,
+            # before _INDEX_LOCK is even acquired — pausing there proves
+            # nothing about the lock. Gate the SECOND call: the fresh read
+            # inside _compact_index_locked, taken while (correctly) holding
+            # _INDEX_LOCK. A bounded sleep here (not an event the appender
+            # must complete first — that would deadlock against the lock
+            # the appender needs) opens exactly the race window a
+            # concurrent append must not be able to land in un-serialized:
+            # in the FIXED impl the appender blocks on _INDEX_LOCK for this
+            # whole window; in a BROKEN (unlocked-append) impl it lands
+            # immediately, right before this call's rewrite clobbers it.
+            if index_reads["count"] == 2:
+                entered_compaction.set()
+                time.sleep(0.2)
+        return result
+
+    monkeypatch.setattr(notes_store, "_read_jsonl", _gated_read_jsonl)
+
+    note_b_holder: list[dict] = []
+
+    def _concurrent_append():
+        entered_compaction.wait(timeout=5.0)
+        note_b_holder.append(notes_store.add_note("b"))
+
+    t = threading.Thread(target=_concurrent_append)
+    t.start()
+    try:
+        folded = notes_store._fold_index()
+    finally:
+        t.join(timeout=5.0)
+
+    assert note_b_holder, "concurrent append thread never ran"
+    note_b = note_b_holder[0]
+    # The concurrent append must survive — either folded directly into this
+    # call's result, or present on disk for the next read to pick up.
+    on_disk = notes_store._fold_index()
+    assert note_b["id"] in folded or note_b["id"] in on_disk
