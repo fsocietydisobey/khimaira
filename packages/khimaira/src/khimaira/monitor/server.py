@@ -111,15 +111,25 @@ def build_app():
     # asyncio.get_event_loop() here would grab the wrong loop (or create a
     # throwaway one) and silently have no effect on the loop that actually
     # serves requests. Registered FIRST among startup handlers so no other
-    # startup work can need an executor before this runs. 64 is comfortably
-    # above the concurrent long-held-thread count we've actually observed
-    # (2 simultaneous metadata scans) plus headroom for everything else.
+    # startup work can need an executor before this runs.
+    #
+    # Bumped 64->128 (2026-07-11): 64 was sized against 2 simultaneous
+    # metadata scans; live-reproduced a 5-concurrent-request hard timeout
+    # (all 5 capped at exactly the chat-mcp watchdog's 10s subprocess
+    # timeout — see _start_chat_mcp_watchdog below) under combined load
+    # from that watchdog + roster_recovery's now-async kitty chain (ca89f97)
+    # + a concurrent notebook bulk-write stress test. Every one of those
+    # is correctly asyncio.to_thread-offloaded already — this isn't a new
+    # blocking-call bug, it's the shared pool's capacity being exceeded by
+    # legitimate concurrent demand. 128 is cheap (threads here are I/O-
+    # bound, mostly blocked, not CPU-bound) and gives real headroom instead
+    # of guessing at a second number without evidence.
     @app.on_event("startup")
     async def _size_default_executor() -> None:
         import concurrent.futures
 
         asyncio.get_running_loop().set_default_executor(
-            concurrent.futures.ThreadPoolExecutor(max_workers=64, thread_name_prefix="khimaira-io")
+            concurrent.futures.ThreadPoolExecutor(max_workers=128, thread_name_prefix="khimaira-io")
         )
 
     # Deployment fingerprint, captured ONCE at boot — this is the code the

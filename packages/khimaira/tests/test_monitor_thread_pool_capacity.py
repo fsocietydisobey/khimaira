@@ -15,7 +15,7 @@ itself was never blocked — the bottleneck was thread-pool CAPACITY, not
 event-loop scheduling.
 
 Fix: server.py's build_app() registers a startup handler that replaces the
-process default executor with a larger, dedicated one (64 workers) before
+process default executor with a larger, dedicated one (128 workers) before
 any other startup work runs. These tests verify (1) the handler actually
 installs a bigger executor, and (2) the CAPACITY property it exists for:
 several long-held threads don't starve a fast to_thread caller when the
@@ -39,7 +39,7 @@ def _build_test_app(*, max_workers: int) -> FastAPI:
     same registration pattern (first @app.on_event("startup") handler,
     asyncio.get_running_loop().set_default_executor), parameterized on
     max_workers so the same app-shape can prove both the broken (tiny
-    default) and fixed (64) cases."""
+    default) and fixed (128) cases."""
     app = FastAPI()
 
     @app.on_event("startup")
@@ -64,7 +64,7 @@ def _build_test_app(*, max_workers: int) -> FastAPI:
 
 
 def test_startup_handler_installs_a_sized_executor():
-    app = _build_test_app(max_workers=64)
+    app = _build_test_app(max_workers=128)
     with TestClient(app) as client:
         # Route into the running loop to inspect its executor — the handler
         # only runs once uvicorn/TestClient's lifespan actually starts it.
@@ -74,7 +74,7 @@ def test_startup_handler_installs_a_sized_executor():
 
 class TestThreadPoolCapacity:
     """Behavioral proof, not just a config-value check: with the daemon's
-    real 64-worker sizing, N long-held threads (simulating N concurrent
+    real 128-worker sizing, N long-held threads (simulating N concurrent
     metadata scans / subprocess waits) leave enough headroom that a fast
     to_thread caller still returns quickly. With the tiny stdlib default,
     the same N long-held threads starve it — reproducing the actual
@@ -105,9 +105,9 @@ class TestThreadPoolCapacity:
 
     async def test_sized_pool_keeps_fast_call_responsive_under_load(self):
         # 10 concurrent "metadata scans" (2s each, standing in for the real
-        # up-to-600s subprocess wait) against the daemon's real 64-worker
+        # up-to-600s subprocess wait) against the daemon's real 128-worker
         # sizing — comfortable headroom, fast call should return quickly.
-        elapsed = await self._time_fast_route_under_load(max_workers=64, concurrent_slow=10)
+        elapsed = await self._time_fast_route_under_load(max_workers=128, concurrent_slow=10)
         assert elapsed < 1.0
 
     async def test_tiny_default_pool_starves_fast_call_under_the_same_load(self):
