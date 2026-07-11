@@ -7,8 +7,10 @@ a plain unit test, no mocking of claude -p needed.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -549,3 +551,71 @@ async def test_organize_after_structuring_reentrancy_guard_skips_when_already_or
 async def test_organize_sweep_loop_returns_immediately_when_disabled(organizer, monkeypatch):
     monkeypatch.setattr(organizer, "_SWEEP_ENABLED", False)
     await organizer.organize_sweep_loop()  # must return, not hang
+
+
+# ---------------------------------------------------------------------------
+# Freeze-class invariant (2026-07-11) — same bug class + same live-caught
+# instance as chat-102d8b5fd82f's kitty audit (test_kitty_freeze_class_
+# invariant.py), but in the library-organize sweep instead of roster_recovery:
+# organize_library() called notes.list_notes/list_tabs/get_or_create_folder
+# (each a full synchronous JSONL reparse) directly on the event loop, once
+# per reassigned item. On the hourly full-library sweep (note_ids=None) this
+# pinned the daemon's MainThread for the entire duration — caught live via
+# `py-spy dump` mid-incident (MainThread stuck in json.loads, called via
+# organize_library -> get_or_create_folder -> list_tabs -> list_notes ->
+# _fold_index -> _read_jsonl), not by inspection. Every existing test above
+# mocks notes.list_notes/list_tabs implicitly through the real (but tiny,
+# instant) isolated_state fixture, so none of them would have caught a
+# missing asyncio.to_thread wrap — this test proves the CLASS (event loop
+# stays live during the call), not just a return value.
+# ---------------------------------------------------------------------------
+
+
+async def test_organize_library_offloads_list_notes_without_blocking_loop(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+
+    async def fake_transform_note(content, *, instruction, schema):
+        return {"placements": []}
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+
+    release = threading.Event()
+    entered = threading.Event()
+    real_list_notes = notes_store.list_notes
+
+    def _blocking_list_notes(*args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=5.0):
+            raise AssertionError("test never released the blocking list_notes call")
+        return real_list_notes(*args, **kwargs)
+
+    monkeypatch.setattr(notes_store, "list_notes", _blocking_list_notes)
+    try:
+        task = asyncio.create_task(organizer.organize_library())
+
+        for _ in range(500):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set(), "organize_library never reached the list_notes call"
+
+        # PROOF: the background thread is still parked inside list_notes
+        # (release not yet set), yet the event loop keeps running other work.
+        ticked = False
+        for _ in range(5):
+            await asyncio.sleep(0)
+            ticked = True
+        assert ticked
+        assert not task.done(), (
+            "organize_library completed while list_notes should still be "
+            "blocked — this means the call ran SYNCHRONOUSLY on the event "
+            "loop instead of being offloaded, i.e. the freeze-class bug is back"
+        )
+
+        release.set()
+        result = await asyncio.wait_for(task, timeout=5.0)
+        assert result == {"considered": 0, "reassigned": [], "new_collections": []}
+    finally:
+        release.set()  # in case of an early failure, don't leave the thread parked

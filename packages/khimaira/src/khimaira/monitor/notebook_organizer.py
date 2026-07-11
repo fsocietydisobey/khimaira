@@ -193,7 +193,7 @@ async def organize_library(note_ids: list[str] | None = None) -> dict[str, Any]:
     """
     from khimaira.monitor import notebook_pipeline
 
-    all_notes = notes.list_notes()
+    all_notes = await asyncio.to_thread(notes.list_notes)
     organizable = [
         n
         for n in all_notes
@@ -203,7 +203,7 @@ async def organize_library(note_ids: list[str] | None = None) -> dict[str, Any]:
     if not targets:
         return {"considered": 0, "reassigned": [], "new_collections": []}
 
-    tabs = notes.list_tabs()
+    tabs = await asyncio.to_thread(notes.list_tabs)
     tabs_by_id = {t["id"]: t for t in tabs}
     existing_collections = sorted({t["title"] for t in tabs if t.get("kind") == "collection"})
     existing_folders = sorted({t["title"] for t in tabs if t.get("kind") == "folder"})
@@ -243,11 +243,13 @@ async def organize_library(note_ids: list[str] | None = None) -> dict[str, Any]:
             continue  # hallucinated/unknown note_id or empty location — discard
 
         is_guide = record["kind"] == "study_guide"
-        tab = get_or_create_collection(location) if is_guide else get_or_create_folder(location)
+        tab = await asyncio.to_thread(
+            get_or_create_collection if is_guide else get_or_create_folder, location
+        )
         if tab["id"] == record["tab_id"]:
-            notes.mark_organized(note_id)  # still correctly placed — just refresh the check
+            await asyncio.to_thread(notes.mark_organized, note_id)  # still correctly placed
             continue
-        notes.mark_organized(note_id, tab_id=tab["id"])
+        await asyncio.to_thread(notes.mark_organized, note_id, tab_id=tab["id"])
         reassigned.append(note_id)
         if location.lower() not in existing_lower_by_kind[record["kind"]]:
             new_collections.append(location)
