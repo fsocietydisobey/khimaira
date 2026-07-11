@@ -111,7 +111,7 @@ def build_app():
         committed or edited since boot without a restart — the running process
         is serving OLD code, so restart khimaira-monitor before trusting any
         live-daemon verification."""
-        current = _deploy_fp.code_fingerprint()
+        current = await asyncio.to_thread(_deploy_fp.code_fingerprint)
         return {
             "boot": _boot_fingerprint,
             "boot_time": _boot_time,
