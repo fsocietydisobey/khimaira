@@ -13,6 +13,13 @@ export type NoteStatus = "draft" | "processed" | "promoted" | "failed";
  *  backend's `_VALID_PRIORITIES`; default "normal". */
 export type NotePriority = "low" | "normal" | "high" | "urgent";
 
+/** Human testing-workflow status — distinct from `NoteStatus` (the automated
+ *  structuring pipeline's lifecycle) and from the read-only `lifecycle`
+ *  projection. Mirrors the backend's `_VALID_TEST_STATUSES`; default
+ *  "untested". Notes only by design — study guides carry the field (schema
+ *  uniformity) but no UI surface exposes it for guides. */
+export type NoteTestStatus = "untested" | "needs_testing" | "in_review" | "tested";
+
 /** What got masked in a sensitive note's `llm_text` twin — never the secret
  *  value itself, only its placeholder + kind (for the reader's "what's
  *  hidden" panel). */
@@ -106,6 +113,9 @@ export interface Note {
   organized_at: string | null;
   /** User-set importance; independent of `status`. Default "normal". */
   priority: NotePriority;
+  /** Human testing-workflow status; independent of `status`/`lifecycle`.
+   *  Default "untested". */
+  test_status: NoteTestStatus;
   /** True if this note contains credentials — its LLM egress (structuring,
    *  embedding, chat, training export) is redacted; `raw_text` (this field)
    *  stays the real, human-readable text. Default false on new records —
@@ -149,6 +159,77 @@ export function isStudyGuidePipeline(
   pipeline: NotePipeline | StudyGuidePipeline | null,
 ): pipeline is StudyGuidePipeline {
   return pipeline !== null && "toc" in pipeline;
+}
+
+// ---------------------------------------------------------------------------
+// Tickets (2026-07-11) — local mirror of Linear issues, kind="ticket" on the
+// same note store (packages/khimaira/.../monitor/notes.py "Public API —
+// tickets"). Served at /api/tickets*, a separate resource surface from
+// /api/notes* — its filters (project/state/assignee/label) and read-only-
+// synced-field semantics don't apply to notes/guides.
+// ---------------------------------------------------------------------------
+
+/** Verbatim Linear states, so a resync is a clean field-for-field map. */
+export type TicketState =
+  | "Backlog"
+  | "Todo"
+  | "In Progress"
+  | "In Review"
+  | "Done"
+  | "Cancelled";
+
+/** Which side owns a ticket's SYNCED fields (title/description/state/
+ *  linear_priority/assignee/labels/project/parent_id/links). "linear-pulled"
+ *  is a READ-ONLY mirror — updateTicket rejects synced-field edits on these
+ *  until push-to-Linear (increment 2) ships; comments and tab/filing stay
+ *  editable regardless of origin. */
+export type TicketOrigin = "linear-pulled" | "local-created";
+
+export type TicketSyncState = "local-only" | "synced" | "drifted";
+
+export interface TicketAssignee {
+  id?: string | null;
+  name?: string | null;
+}
+
+/** Append-only, local-only annotation — never a Linear-synced field, so
+ *  always addable regardless of a ticket's origin. */
+export interface TicketComment {
+  text: string;
+  author: string;
+  ts: string;
+}
+
+export interface Ticket {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  title: string;
+  /** The ticket's description/body — same field name as a note's raw_text
+   *  (kind="ticket" reuses the base record shape). */
+  raw_text: string;
+  tab_id: string;
+  state: TicketState;
+  /** Linear's own 0-4 priority scale (0=None, 1=Urgent, 2=High, 3=Medium,
+   *  4=Low) — DELIBERATELY a separate field from `Note.priority` (the str
+   *  enum low/normal/high/urgent), so the two schemas never collide. */
+  linear_priority: number;
+  assignee: TicketAssignee | null;
+  labels: string[];
+  project: string;
+  parent_id: string | null;
+  links: string[];
+  origin: TicketOrigin;
+  /** The Linear issue id — the resync join key. Null for local-created tickets. */
+  linear_ref: string | null;
+  sync_state: TicketSyncState;
+  created_by: string;
+  comments: TicketComment[];
+  /** Reuses the existing note-resolution mechanism verbatim — local-only,
+   *  never a Linear-synced field, so editable regardless of origin. */
+  resolution: string;
+  resolved_by: string;
+  resolved_at: string | null;
 }
 
 /** A code chunk (Séance semantic search, or a grep fallback) cited in an ask answer. */

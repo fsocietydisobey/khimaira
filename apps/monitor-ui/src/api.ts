@@ -9,6 +9,10 @@ import type {
   NoteKind,
   NotePriority,
   NoteStatus,
+  NoteTestStatus,
+  Ticket,
+  TicketAssignee,
+  TicketState,
 } from "@/components/notebook/notebookTypes";
 
 export interface Connection {
@@ -220,7 +224,7 @@ export interface CorrelationResponse {
 export const monitorApi = createApi({
   reducerPath: "monitorApi",
   baseQuery: fetchBaseQuery({ baseUrl: "/api" }),
-  tagTypes: ["Projects", "Topology", "Threads", "Notes", "Tabs", "ChatHistory"],
+  tagTypes: ["Projects", "Topology", "Threads", "Notes", "Tabs", "ChatHistory", "Tickets"],
   endpoints: (build) => ({
     listProjects: build.query<Project[], void>({
       query: () => "/projects",
@@ -293,6 +297,8 @@ export const monitorApi = createApi({
           sort?: string;
           /** File-manager Starred rail. */
           starred?: boolean;
+          /** Human testing-workflow status (notes only). */
+          testStatus?: NoteTestStatus;
         }
       | void
     >({
@@ -304,6 +310,7 @@ export const monitorApi = createApi({
         if (arg?.priority) params.set("priority", arg.priority);
         if (arg?.sort) params.set("sort", arg.sort);
         if (arg?.starred) params.set("starred", "true");
+        if (arg?.testStatus) params.set("test_status", arg.testStatus);
         const qs = params.toString();
         return qs ? `/notes?${qs}` : "/notes";
       },
@@ -366,6 +373,8 @@ export const monitorApi = createApi({
         pinned_placement?: boolean;
         /** File-manager — the Starred rail toggle. */
         starred?: boolean;
+        /** Human testing-workflow status, independent of `status`. Notes only. */
+        test_status?: NoteTestStatus;
       }
     >({
       query: ({ id, ...body }) => ({ url: `/notes/${encodeURIComponent(id)}`, method: "PATCH", body }),
@@ -491,6 +500,91 @@ export const monitorApi = createApi({
       query: (id) => ({ url: `/tabs/${encodeURIComponent(id)}`, method: "DELETE" }),
       invalidatesTags: [{ type: "Tabs", id: "LIST" }, { type: "Notes", id: "LIST" }],
     }),
+
+    // -----------------------------------------------------------------------
+    // Tickets (2026-07-11) — local mirror of Linear issues (kind="ticket"),
+    // its own resource surface (/api/tickets*, not folded into /notes*) since
+    // its filters and read-only-synced-field semantics don't apply to notes/
+    // guides. See notebookTypes.ts's Ticket section for the field contract.
+    // -----------------------------------------------------------------------
+    listTickets: build.query<
+      { tickets: Ticket[] },
+      { project?: string; state?: TicketState; assignee?: string; label?: string } | void
+    >({
+      query: (arg) => {
+        const params = new URLSearchParams();
+        if (arg?.project) params.set("project", arg.project);
+        if (arg?.state) params.set("state", arg.state);
+        if (arg?.assignee) params.set("assignee", arg.assignee);
+        if (arg?.label) params.set("label", arg.label);
+        const qs = params.toString();
+        return qs ? `/tickets?${qs}` : "/tickets";
+      },
+      providesTags: (result) =>
+        result
+          ? [
+              ...result.tickets.map((t) => ({ type: "Tickets" as const, id: t.id })),
+              { type: "Tickets" as const, id: "LIST" },
+            ]
+          : [{ type: "Tickets" as const, id: "LIST" }],
+    }),
+    getTicket: build.query<Ticket, string>({
+      query: (id) => `/tickets/${encodeURIComponent(id)}`,
+      providesTags: (_r, _e, id) => [{ type: "Tickets", id }],
+    }),
+    // `idempotency_key` (2026-07-11, c3f0ccf): always sent — the daemon
+    // dedups a retry with the same key instead of creating a duplicate (the
+    // exact bug chimera-0 hit on notebook_create_study_guide). Callers pass
+    // a fresh key per logical create attempt (e.g. crypto.randomUUID()) and
+    // MUST reuse the same key if they retry after a failed/timed-out call.
+    createTicket: build.mutation<
+      Ticket,
+      {
+        title: string;
+        description?: string;
+        state?: TicketState;
+        project?: string;
+        labels?: string[];
+        idempotency_key: string;
+      }
+    >({
+      query: (body) => ({ url: "/tickets", method: "POST", body }),
+      invalidatesTags: [{ type: "Tickets", id: "LIST" }],
+    }),
+    // 422 (linear-pulled synced-field is read-only) surfaces as
+    // `err.data.detail` on the rejected `.unwrap()` promise, same convention
+    // as updateTab's cycle/kind/sibling-uniqueness errors — callers must
+    // catch and show it, RTK Query won't do that for you.
+    updateTicket: build.mutation<
+      Ticket,
+      {
+        id: string;
+        title?: string;
+        raw_text?: string;
+        state?: TicketState;
+        linear_priority?: number;
+        assignee?: TicketAssignee | null;
+        labels?: string[];
+        project?: string;
+        parent_id?: string | null;
+        links?: string[];
+        tab_id?: string;
+      }
+    >({
+      query: ({ id, ...body }) => ({ url: `/tickets/${encodeURIComponent(id)}`, method: "PATCH", body }),
+      invalidatesTags: (_r, _e, { id }) => [
+        { type: "Tickets", id },
+        { type: "Tickets", id: "LIST" },
+      ],
+    }),
+    addTicketComment: build.mutation<Ticket, { id: string; text: string; author?: string }>({
+      query: ({ id, ...body }) => ({
+        url: `/tickets/${encodeURIComponent(id)}/comments`,
+        method: "POST",
+        body,
+      }),
+      invalidatesTags: (_r, _e, { id }) => [{ type: "Tickets", id }],
+    }),
   }),
 });
 
@@ -520,4 +614,9 @@ export const {
   useCreateTabMutation,
   useUpdateTabMutation,
   useDeleteTabMutation,
+  useListTicketsQuery,
+  useGetTicketQuery,
+  useCreateTicketMutation,
+  useUpdateTicketMutation,
+  useAddTicketCommentMutation,
 } = monitorApi;

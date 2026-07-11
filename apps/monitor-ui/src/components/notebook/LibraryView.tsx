@@ -18,9 +18,19 @@ import { useMemo, useRef, useState } from "react";
 import { Grid3x3, List, Star } from "lucide-react";
 import { ChevronLeft, Search } from "lucide-react";
 
-import { useCreateNoteMutation, useListNotesQuery, useListTabsQuery, useUpdateNoteMutation } from "@/api";
+import {
+  useCreateNoteMutation,
+  useListNotesQuery,
+  useListTabsQuery,
+  useUpdateNoteMutation,
+} from "@/api";
+import { CopyRawMarkdownButton } from "@/components/notebook/CopyRawMarkdownButton";
 import { IdChip } from "@/components/notebook/IdChip";
-import { ChatBody, ChatHeaderControls, useRecordChat } from "@/components/notebook/ChatPanel";
+import {
+  ChatBody,
+  ChatHeaderControls,
+  useRecordChat,
+} from "@/components/notebook/ChatPanel";
 import {
   ancestorChain,
   DRAG_MIME,
@@ -32,8 +42,18 @@ import {
   useTabTree,
 } from "@/components/notebook/FileManagerSidebar";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
-import { NoteCaptureBox, relativeTime, SidePanelShell, usePersistedBoolean } from "@/components/notebook/Notebook";
-import { isStudyGuidePipeline, type Note, type NotebookTab, type NotePriority } from "@/components/notebook/notebookTypes";
+import {
+  NoteCaptureBox,
+  relativeTime,
+  SidePanelShell,
+  usePersistedBoolean,
+} from "@/components/notebook/Notebook";
+import {
+  isStudyGuidePipeline,
+  type Note,
+  type NotebookTab,
+  type NotePriority,
+} from "@/components/notebook/notebookTypes";
 import { PrioritySelector } from "@/components/notebook/PrioritySelector";
 import { SensitiveBanner } from "@/components/notebook/SensitiveBadge";
 import { Badge } from "@/components/ui/badge";
@@ -57,8 +77,12 @@ export function Library() {
   const { data: tabsData } = useListTabsQuery();
 
   const guides = guidesData?.notes ?? [];
-  const collections = (tabsData?.tabs ?? []).filter((t) => t.kind === "collection");
-  const selectedGuide = selectedGuideId ? (guides.find((g) => g.id === selectedGuideId) ?? null) : null;
+  const collections = (tabsData?.tabs ?? []).filter(
+    (t) => t.kind === "collection",
+  );
+  const selectedGuide = selectedGuideId
+    ? (guides.find((g) => g.id === selectedGuideId) ?? null)
+    : null;
 
   if (selectedGuideId && !selectedGuide && !isLoading) {
     // Guide vanished from underneath us (deleted elsewhere) — fall back to
@@ -67,7 +91,10 @@ export function Library() {
   }
 
   return selectedGuide ? (
-    <GuideReader guide={selectedGuide} onBack={() => setSelectedGuideId(null)} />
+    <GuideReader
+      guide={selectedGuide}
+      onBack={() => setSelectedGuideId(null)}
+    />
   ) : (
     <FileManager
       guides={guides}
@@ -89,7 +116,9 @@ function GuideStatusBadge({ guide }: { guide: Note }) {
       variant="outline"
       className={cn(
         "text-[9px]",
-        organized ? "border-emerald-500/40 text-emerald-400" : "border-amber-500/40 text-amber-400",
+        organized
+          ? "border-emerald-500/40 text-emerald-400"
+          : "border-amber-500/40 text-amber-400",
       )}
     >
       {organized ? "organized" : "housed"}
@@ -134,7 +163,8 @@ function FileManager({
     return Array.from(tags).sort();
   }, [guides]);
 
-  const breadcrumbs = rail.kind === "tab" ? ancestorChain(rail.tabId, tabsById) : [];
+  const breadcrumbs =
+    rail.kind === "tab" ? ancestorChain(rail.tabId, tabsById) : [];
 
   const items = useMemo(() => {
     let filtered = filterRecordsByRail(guides, rail);
@@ -151,7 +181,8 @@ function FileManager({
         );
       });
     }
-    if (priorityFilter) filtered = filtered.filter((g) => g.priority === priorityFilter);
+    if (priorityFilter)
+      filtered = filtered.filter((g) => g.priority === priorityFilter);
 
     return filtered;
   }, [rail, guides, selectedTags, search, priorityFilter]);
@@ -181,7 +212,10 @@ function FileManager({
   };
 
   const handleDragStartGuide = (e: React.DragEvent, guideId: string) => {
-    const ids = selected.has(guideId) && selected.size > 0 ? Array.from(selected) : [guideId];
+    const ids =
+      selected.has(guideId) && selected.size > 0
+        ? Array.from(selected)
+        : [guideId];
     e.dataTransfer.setData(DRAG_MIME, JSON.stringify(ids));
     e.dataTransfer.effectAllowed = "move";
   };
@@ -200,7 +234,10 @@ function FileManager({
     }).unwrap();
   };
 
-  const railLabel = rail.kind === "tab" ? (breadcrumbs.at(-1)?.title ?? "all collections") : rail.kind;
+  const railLabel =
+    rail.kind === "tab"
+      ? (breadcrumbs.at(-1)?.title ?? "all collections")
+      : rail.kind;
 
   return (
     <div className="flex flex-1 overflow-hidden">
@@ -224,7 +261,11 @@ function FileManager({
               onSelect={(tabId) => setRail({ kind: "tab", tabId })}
             />
             <div className="flex shrink-0 items-center gap-2">
-              <TagFilterInput allTags={allTags} selected={selectedTags} onChange={setSelectedTags} />
+              <TagFilterInput
+                allTags={allTags}
+                selected={selectedTags}
+                onChange={setSelectedTags}
+              />
               <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5">
                 <button
                   type="button"
@@ -232,7 +273,9 @@ function FileManager({
                   onClick={() => setGrid(false)}
                   className={cn(
                     "rounded p-1",
-                    !grid ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+                    !grid
+                      ? "bg-accent text-foreground"
+                      : "text-muted-foreground hover:text-foreground",
                   )}
                 >
                   <List className="h-3.5 w-3.5" />
@@ -243,7 +286,9 @@ function FileManager({
                   onClick={() => setGrid(true)}
                   className={cn(
                     "rounded p-1",
-                    grid ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+                    grid
+                      ? "bg-accent text-foreground"
+                      : "text-muted-foreground hover:text-foreground",
                   )}
                 >
                   <Grid3x3 className="h-3.5 w-3.5" />
@@ -270,7 +315,9 @@ function FileManager({
             </div>
             <select
               value={priorityFilter}
-              onChange={(e) => setPriorityFilter(e.target.value as NotePriority | "")}
+              onChange={(e) =>
+                setPriorityFilter(e.target.value as NotePriority | "")
+              }
               title="Filter by priority"
               className="h-8 shrink-0 rounded-md border border-input bg-background px-1.5 text-[11px] text-muted-foreground hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             >
@@ -285,7 +332,9 @@ function FileManager({
             <BulkActionBar
               count={selected.size}
               collections={collections}
-              onMove={(tabId) => void moveGuidesToTab(Array.from(selected), tabId)}
+              onMove={(tabId) =>
+                void moveGuidesToTab(Array.from(selected), tabId)
+              }
               onClear={clearSelection}
             />
           ) : null}
@@ -345,7 +394,9 @@ function Breadcrumbs({
   onSelect: (tabId: string | null) => void;
 }) {
   if (rail.kind !== "tab") {
-    return <h3 className="truncate text-sm font-medium capitalize">{railLabel}</h3>;
+    return (
+      <h3 className="truncate text-sm font-medium capitalize">{railLabel}</h3>
+    );
   }
   return (
     <div className="flex min-w-0 items-center gap-1 text-sm">
@@ -354,7 +405,9 @@ function Breadcrumbs({
         onClick={() => onSelect(null)}
         className={cn(
           "shrink-0 font-medium",
-          rail.tabId === null ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+          rail.tabId === null
+            ? "text-foreground"
+            : "text-muted-foreground hover:text-foreground",
         )}
       >
         all collections
@@ -367,7 +420,9 @@ function Breadcrumbs({
             onClick={() => onSelect(tab.id)}
             className={cn(
               "min-w-0 truncate font-medium",
-              rail.tabId === tab.id ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+              rail.tabId === tab.id
+                ? "text-foreground"
+                : "text-muted-foreground hover:text-foreground",
             )}
             title={tab.title}
           >
@@ -407,7 +462,11 @@ function BulkActionBar({
           </option>
         ))}
       </select>
-      <button type="button" onClick={onClear} className="ml-auto text-muted-foreground hover:text-foreground">
+      <button
+        type="button"
+        onClick={onClear}
+        className="ml-auto text-muted-foreground hover:text-foreground"
+      >
         clear
       </button>
     </div>
@@ -417,8 +476,12 @@ function BulkActionBar({
 function GuideMetaRow({ guide }: { guide: Note }) {
   return (
     <div className="flex shrink-0 items-center gap-1">
-      {guide.starred ? <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400" /> : null}
-      {guide.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
+      {guide.starred ? (
+        <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400" />
+      ) : null}
+      {guide.sensitive ? (
+        <span title="Sensitive — the assistant sees a redacted copy">🔒</span>
+      ) : null}
       <IdChip id={guide.id} />
     </div>
   );
@@ -516,7 +579,10 @@ function GuideCard({
         className="absolute left-2 top-2 z-10"
       />
       <CardHeader className="flex-row items-start justify-between gap-2 space-y-0 p-3 pb-1.5 pl-7">
-        <h4 className="min-w-0 truncate text-xs font-medium" title={guide.title}>
+        <h4
+          className="min-w-0 truncate text-xs font-medium"
+          title={guide.title}
+        >
           {guide.title}
         </h4>
         <div className="flex shrink-0 flex-col items-end gap-1">
@@ -534,7 +600,9 @@ function GuideCard({
             {pipeline.abstract}
           </p>
         ) : (
-          <p className="text-[11px] italic text-muted-foreground/60">not yet structured…</p>
+          <p className="text-[11px] italic text-muted-foreground/60">
+            not yet structured…
+          </p>
         )}
         {pipeline && pipeline.tags.length > 0 ? (
           <div className="mt-2 flex flex-wrap gap-1">
@@ -557,8 +625,14 @@ function GuideCard({
  *  Joseph only needs raw/original for NOTES, where comparing structured-
  *  vs-original matters. */
 function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
-  const [tocCollapsed, setTocCollapsed] = usePersistedBoolean("library-toc-collapsed", false);
-  const [chatCollapsed, setChatCollapsed] = usePersistedBoolean("library-chat-collapsed", false);
+  const [tocCollapsed, setTocCollapsed] = usePersistedBoolean(
+    "library-toc-collapsed",
+    false,
+  );
+  const [chatCollapsed, setChatCollapsed] = usePersistedBoolean(
+    "library-chat-collapsed",
+    false,
+  );
   const pipeline = isStudyGuidePipeline(guide.pipeline) ? guide.pipeline : null;
   const contentRef = useRef<HTMLDivElement>(null);
   const chat = useRecordChat(guide.id);
@@ -609,7 +683,9 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
               ))}
             </ul>
           ) : (
-            <p className="px-1.5 py-1 text-[10px] text-muted-foreground/60">no table of contents.</p>
+            <p className="px-1.5 py-1 text-[10px] text-muted-foreground/60">
+              no table of contents.
+            </p>
           )}
         </nav>
       </SidePanelShell>
@@ -635,33 +711,51 @@ function GuideReader({ guide, onBack }: { guide: Note; onBack: () => void }) {
               <button
                 type="button"
                 title={guide.starred ? "Unstar" : "Star"}
-                onClick={() => updateNote({ id: guide.id, starred: !guide.starred })}
+                onClick={() =>
+                  updateNote({ id: guide.id, starred: !guide.starred })
+                }
               >
                 <Star
                   className={cn(
                     "h-3.5 w-3.5",
-                    guide.starred ? "fill-amber-400 text-amber-400" : "text-muted-foreground",
+                    guide.starred
+                      ? "fill-amber-400 text-amber-400"
+                      : "text-muted-foreground",
                   )}
                 />
               </button>
-              {guide.sensitive ? <span title="Sensitive — the assistant sees a redacted copy">🔒</span> : null}
+              {guide.sensitive ? (
+                <span title="Sensitive — the assistant sees a redacted copy">
+                  🔒
+                </span>
+              ) : null}
+              <CopyRawMarkdownButton text={guide.raw_text} />
               <IdChip id={guide.id} />
             </div>
             <PrioritySelector
               priority={guide.priority}
-              onChange={(priority: NotePriority) => updateNote({ id: guide.id, priority })}
+              onChange={(priority: NotePriority) =>
+                updateNote({ id: guide.id, priority })
+              }
             />
             <GuideStatusBadge guide={guide} />
           </div>
         </div>
-        <div ref={contentRef} className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4">
+        <div
+          ref={contentRef}
+          className="min-w-0 min-h-0 flex-1 overflow-y-auto p-4"
+        >
           {pipeline ? (
             <>
-              {guide.sensitive ? <SensitiveBanner redactions={guide.redactions} /> : null}
+              {guide.sensitive ? (
+                <SensitiveBanner redactions={guide.redactions} />
+              ) : null}
               <MarkdownView content={guide.raw_text} slugHeadings />
             </>
           ) : (
-            <p className="text-xs italic text-muted-foreground/60">not yet structured…</p>
+            <p className="text-xs italic text-muted-foreground/60">
+              not yet structured…
+            </p>
           )}
         </div>
       </div>
