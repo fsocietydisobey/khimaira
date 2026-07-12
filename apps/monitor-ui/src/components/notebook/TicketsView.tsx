@@ -264,6 +264,11 @@ function TicketRow({
           📝
         </span>
       )}
+      {ticket.linear_ref ? (
+        <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+          {ticket.linear_ref}
+        </span>
+      ) : null}
       <span className="min-w-0 flex-1 truncate font-medium" title={ticket.title}>
         {ticket.title}
       </span>
@@ -655,7 +660,14 @@ function TicketFields({ ticket }: { ticket: Ticket }) {
   return (
     <div className="mb-4">
       <div className="flex items-start justify-between gap-2">
-        <h2 className="min-w-0 text-base font-semibold">{ticket.title}</h2>
+        <div className="min-w-0">
+          {ticket.linear_ref ? (
+            <div className="font-mono text-[11px] text-muted-foreground">
+              {ticket.linear_ref}
+            </div>
+          ) : null}
+          <h2 className="min-w-0 text-base font-semibold">{ticket.title}</h2>
+        </div>
         {editable ? (
           <Button
             type="button"
