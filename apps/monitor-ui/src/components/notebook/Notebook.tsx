@@ -429,15 +429,32 @@ export function Notebook() {
   // into the regular list/grid/reader/@-mention flow, matching the backend
   // excluding them from embedding + ask retrieval. Study guides are a
   // distinct KIND (grimoire) — housed in the Library, kind-filtered out here
-  // the same way personal notes are.
+  // the same way personal notes are. Tickets (2026-07-11) are a third
+  // distinct KIND — housed in the Tickets view — same exclusion; this filter
+  // predates tickets and was leaking them into the regular notes list/grid
+  // until Joseph caught it live (they render with status="draft" since
+  // tickets never enter the structuring pipeline, which read as "stuck
+  // processing" in the UI).
   const notesExcludingPersonal = (notesData?.notes ?? []).filter(
     (n) => n.tab_id !== PERSONAL_TAB_ID,
   );
-  const notes = notesExcludingPersonal.filter((n) => n.kind !== "study_guide");
-  // Files-mode's own record set — same personal/guide exclusions, sourced
-  // from the unscoped query above.
+  // `Note.kind` types as `NoteKind` ("note" | "study_guide") — it doesn't
+  // model "ticket" because a ticket isn't conceptually a note kind, it's a
+  // separate record type that happens to share the same unscoped /api/notes
+  // storage. The runtime data can still contain kind="ticket" here (this
+  // query has no kind filter), so the comparison is cast to string rather
+  // than widening NoteKind itself (which would wrongly imply "ticket" is a
+  // valid notebook_create kind param).
+  const notes = notesExcludingPersonal.filter(
+    (n) => n.kind !== "study_guide" && (n.kind as string) !== "ticket",
+  );
+  // Files-mode's own record set — same personal/guide/ticket exclusions,
+  // sourced from the unscoped query above.
   const filesNotes = (filesNotesData?.notes ?? []).filter(
-    (n) => n.tab_id !== PERSONAL_TAB_ID && n.kind !== "study_guide",
+    (n) =>
+      n.tab_id !== PERSONAL_TAB_ID &&
+      n.kind !== "study_guide" &&
+      (n.kind as string) !== "ticket",
   );
   // Guides ARE askable/@-mentionable (unlike personal notes) — only excluded
   // from the browsing grid/list above, per void-null's settled contract.
