@@ -645,6 +645,198 @@ def test_contract_gate_env_strict_default(graph_mod, monkeypatch):
     assert r.status_code == 502
 
 
+# ---------------------------------------------------------------------------
+# SCAFFOLDING routes (2026-07-13, task-f4220ba84f33) — the jeevy-side
+# endpoints these proxy to don't exist yet; these tests verify only the
+# khimaira-side plumbing (URL derivation, param forwarding, shared 404/502
+# handling via the same _adapter_or_404/_proxy_get helpers every other route
+# uses) — NOT a real adapter contract, which is unconfirmed.
+# ---------------------------------------------------------------------------
+
+_SUBGRAPH_CONTRACT = {
+    "data": {
+        "nodes": [{"id": "n1", "type": "task", "label": "Cut sheet"}],
+        "edges": [],
+        "center": "n1",
+        "hops": 2,
+    }
+}
+
+
+def test_graph_subgraph_proxies_to_subgraph_subpath(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_SUBGRAPH_CONTRACT)),
+    )
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal/node/n1/subgraph", params={"scope": "shop:10", "hops": 3}
+    )
+    assert r.status_code == 200
+    assert r.json() == _SUBGRAPH_CONTRACT
+    assert _FakeClient.last_url == "http://x/internal/kg/node/n1/subgraph"
+    assert _FakeClient.last_params == {"hops": 3, "scope": "shop:10"}
+
+
+def test_graph_subgraph_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/node/n1/subgraph")
+    assert r.status_code == 404
+
+
+_ANOMALIES_CONTRACT = {
+    "data": {
+        "orphans": [{"id": "n2", "type": "user", "label": "Ghost"}],
+        "danglingEdges": [],
+        "schemaViolations": [],
+    }
+}
+
+
+def test_graph_anomalies_proxies_to_anomalies_subpath(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_ANOMALIES_CONTRACT)),
+    )
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal/anomalies", params={"scope": "shop:10", "since": "2026-01-01"}
+    )
+    assert r.status_code == 200
+    assert r.json() == _ANOMALIES_CONTRACT
+    assert _FakeClient.last_url == "http://x/internal/kg/anomalies"
+    assert _FakeClient.last_params == {"scope": "shop:10", "since": "2026-01-01"}
+
+
+def test_graph_anomalies_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/anomalies")
+    assert r.status_code == 404
+
+
+_EDGES_FILTER_CONTRACT = {"data": {"edges": [{"id": "e1", "type": "assigned"}], "total": 1}}
+
+
+def test_graph_edges_filter_proxies_and_forwards_predicates(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_EDGES_FILTER_CONTRACT)),
+    )
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal/edges",
+        params={
+            "scope": "shop:10",
+            "link_type": "assigned_to",
+            "match_method": "fuzzy",
+            "weight_min": 0.1,
+            "weight_max": 0.5,
+            "status": "active",
+            "source": "extractor",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json() == _EDGES_FILTER_CONTRACT
+    assert _FakeClient.last_url == "http://x/internal/kg/edges"
+    assert _FakeClient.last_params == {
+        "link_type": "assigned_to",
+        "match_method": "fuzzy",
+        "weight_min": 0.1,
+        "weight_max": 0.5,
+        "status": "active",
+        "source": "extractor",
+        "scope": "shop:10",
+    }
+
+
+def test_graph_edges_filter_omits_unset_predicates(graph_mod, monkeypatch):
+    """Only predicates the caller actually passed reach the adapter — no
+    None/empty-string noise in the forwarded params."""
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_EDGES_FILTER_CONTRACT)),
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/edges")
+    assert r.status_code == 200
+    assert _FakeClient.last_params == {}
+
+
+def test_graph_edges_filter_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/edges")
+    assert r.status_code == 404
+
+
+_PATH_FOUND = {
+    "data": {
+        "found": True,
+        "hops": 2,
+        "path": [
+            {"id": "n1", "type": "job", "label": "Job A"},
+            {"type": "assigned_to", "from": "n1", "to": "n2"},
+            {"id": "n2", "type": "user", "label": "Priya"},
+        ],
+    }
+}
+_PATH_NOT_FOUND = {"data": {"found": False, "reason": "no route within 5 hops"}}
+
+
+def test_graph_path_proxies_and_forwards_endpoints(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_PATH_FOUND)),
+    )
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal/path",
+        params={"from_node": "n1", "to_node": "n2", "max_hops": 3, "scope": "shop:10"},
+    )
+    assert r.status_code == 200
+    assert r.json() == _PATH_FOUND
+    assert _FakeClient.last_url == "http://x/internal/kg/path"
+    assert _FakeClient.last_params == {"from": "n1", "to": "n2", "max_hops": 3, "scope": "shop:10"}
+
+
+def test_graph_path_not_found_passthrough(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_PATH_NOT_FOUND)),
+    )
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal/path", params={"from_node": "n1", "to_node": "n99"}
+    )
+    assert r.status_code == 200
+    assert r.json()["data"]["found"] is False
+
+
+def test_graph_path_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal/path", params={"from_node": "n1", "to_node": "n2"}
+    )
+    assert r.status_code == 404
+
+
 def test_runtime_field_constants_match_kgtypes_source(graph_mod):
     """Drift-pin: the runtime-cheap field sets in graph.py MUST equal the contract
     parsed from kgTypes.ts (the source of truth). If kgTypes.ts changes, this fails

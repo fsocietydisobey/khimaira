@@ -2805,6 +2805,117 @@ async def kg_scopes(project: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# SCAFFOLDING (2026-07-13, task-f4220ba84f33, griffin-0 handoff) — 4 new
+# kg_* tools whose jeevy-side endpoints DON'T EXIST YET. Each will 502 until
+# griffin-0's endpoint lands (docstrings say so explicitly). kg_export is
+# NOT registered — its pagination-ownership design question is unresolved
+# (see monitor_tools.py's _kg_export_design_question docstring).
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@logged_tool("kg_subgraph")
+async def kg_subgraph(project: str = "", node_id: str = "", hops: int = 2, scope: str = "") -> str:
+    """⚠️ SCAFFOLDING — jeevy-side endpoint not live yet, will 502 until
+    griffin-0's endpoint lands (task-f4220ba84f33).
+
+    Ego-subgraph: `node_id` + its `hops`-hop neighborhood, provenance-
+    enriched. Cheaper than `kg_graph` (whole graph) when you already know
+    the node you care about — "show me what's around this."
+
+    Args:
+        project: attached project with a registered KG adapter. Omit when
+            exactly one is registered — it auto-resolves.
+        node_id: the center node's opaque id — get one from kg_search/kg_graph.
+        hops: neighborhood radius (default 2).
+        scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
+    """
+    return await _monitor_tools.kg_subgraph(project, node_id, hops, scope)
+
+
+@mcp.tool()
+@logged_tool("kg_anomalies")
+async def kg_anomalies(project: str = "", scope: str = "", since: str = "") -> str:
+    """⚠️ SCAFFOLDING — jeevy-side endpoint not live yet, will 502 until
+    griffin-0's endpoint lands (task-f4220ba84f33).
+
+    Itemized anomaly rows (orphans / dangling edges / schema violations) —
+    the row-level sibling of `kg_health`'s aggregate counts. Reach for this
+    AFTER kg_health flags a nonzero count and you need the actual ids to
+    act on.
+
+    Args:
+        project: attached project with a registered KG adapter. Omit when
+            exactly one is registered — it auto-resolves.
+        scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
+        since: ISO timestamp — scopes to first-appearance ≥ ts.
+    """
+    return await _monitor_tools.kg_anomalies(project, scope, since)
+
+
+@mcp.tool()
+@logged_tool("kg_edges_filter")
+async def kg_edges_filter(
+    project: str = "",
+    scope: str = "",
+    link_type: str = "",
+    match_method: str = "",
+    weight_min: float | None = None,
+    weight_max: float | None = None,
+    status: str = "",
+    source: str = "",
+    limit: int = 50,
+) -> str:
+    """⚠️ SCAFFOLDING — jeevy-side endpoint not live yet, will 502 until
+    griffin-0's endpoint lands (task-f4220ba84f33). Whether the adapter
+    honors these predicates server-side (vs. the daemon filtering client-
+    side after a full fetch) is also unconfirmed.
+
+    Predicate-filtered edge list — the itemized sibling of
+    `kg_edges_audit`'s aggregate histograms. Reach for this when you know
+    which slice you want (e.g. every fuzzy-matched edge under weight 0.5).
+
+    Args:
+        project: attached project with a registered KG adapter. Omit when
+            exactly one is registered — it auto-resolves.
+        scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
+        link_type: filter to one edge type.
+        match_method: filter to one match method (e.g. "exact", "fuzzy", "llm").
+        weight_min: minimum edge weight (inclusive).
+        weight_max: maximum edge weight (inclusive).
+        status: filter to one edge status, if the adapter tracks one.
+        source: filter to one provenance source.
+        limit: max edges to render (default 50).
+    """
+    return await _monitor_tools.kg_edges_filter(
+        project, scope, link_type, match_method, weight_min, weight_max, status, source, limit
+    )
+
+
+@mcp.tool()
+@logged_tool("kg_path")
+async def kg_path(
+    project: str = "", from_node: str = "", to_node: str = "", max_hops: int = 5, scope: str = ""
+) -> str:
+    """⚠️ SCAFFOLDING — jeevy-side endpoint not live yet, will 502 until
+    griffin-0's endpoint lands (task-f4220ba84f33).
+
+    Pathfinding between two opaque node ids, capped at max_hops (≤5) —
+    "how are these two entities connected?", answered as an actual route
+    instead of manually walking kg_node edges hop by hop.
+
+    Args:
+        project: attached project with a registered KG adapter. Omit when
+            exactly one is registered — it auto-resolves.
+        from_node: starting node's opaque id.
+        to_node: destination node's opaque id.
+        max_hops: max path length to search (default 5, hard cap 5).
+        scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
+    """
+    return await _monitor_tools.kg_path(project, from_node, to_node, max_hops, scope)
+
+
+# ---------------------------------------------------------------------------
 # Notebook tools — the "roster loop" shared knowledge/task surface. Joseph
 # pastes a note (often a problem/task); master + the agent roster read it,
 # work it, and write a RESOLUTION back. The resolution is the training-

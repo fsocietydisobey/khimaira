@@ -257,6 +257,7 @@ def build_router():
         url: str,
         scope: str,
         since: str = "",
+        extra_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Proxy a GET to the adapter URL with auth + scope; return its JSON.
 
@@ -264,9 +265,17 @@ def build_router():
         (502 unreachable / error-status / non-JSON). `since` (ISO timestamp) is
         forwarded verbatim when set — the adapter decides which created_at
         column it filters (first-appearance); the daemon stays code-agnostic.
+
+        `extra_params` (2026-07-13, scaffolding for kg_edges_filter/kg_path):
+        forwarded verbatim alongside scope/since — pure pass-through, no
+        contract knowledge needed on the daemon side, so this is safe to
+        wire ahead of confirming what the adapter actually does with each
+        key. Whether the adapter HONORS a given param (vs. the daemon
+        needing to filter client-side after an unfiltered fetch) is exactly
+        the open question flagged at each new route's TODO.
         """
         headers = _auth_headers(adapter)
-        params = {}
+        params: dict[str, Any] = dict(extra_params) if extra_params else {}
         if scope:
             params["scope"] = scope
         if since:
@@ -396,5 +405,134 @@ def build_router():
         """
         adapter = _adapter_or_404(project)
         return await _proxy_get(project, adapter, _sub_url(adapter["url"], "scopes"), "")
+
+    # -------------------------------------------------------------------
+    # SCAFFOLDING (2026-07-13, task-f4220ba84f33, griffin-0 handoff) — the
+    # jeevy-side sibling endpoints these 4 proxy to DON'T EXIST YET. Every
+    # `_sub_url(...)` call below is my best-guess sub-path, marked TODO, and
+    # every response shape assumed in the corresponding monitor_tools.py
+    # kg_* function is UNCONFIRMED — do not treat either as a settled
+    # contract. Wire the real path/shape in once griffin-0 answers (see the
+    # chat-102d8b5fd82f task-f4220ba84f33 thread for the open-question list
+    # per tool). kg_export is deliberately NOT scaffolded here — its
+    # pagination-ownership question (proxy loops server-side vs. tool
+    # exposes a cursor) is unresolved; building either half now risks an
+    # expensive-to-unwind wrong assumption.
+    # -------------------------------------------------------------------
+
+    @router.get("/graph/{project}/node/{node_id}/subgraph")
+    async def get_graph_subgraph(
+        project: str, node_id: str, hops: int = 2, scope: str = "", since: str = ""
+    ) -> dict[str, Any]:
+        """Ego-subgraph proxy: `node_id` + its `hops`-hop neighborhood,
+        provenance-enriched (edges carry the same `meta` shape as
+        `/edge/{id}`). The opaque node_id passes through verbatim.
+
+        TODO(griffin-0): confirm the real jeevy sub-path — guessed as a
+        sibling of `node/{id}` (mirrors the existing `node/{id}/source`
+        convention) rather than a top-level `subgraph/{id}`; either is
+        plausible. ASSUMED response shape (UNCONFIRMED):
+        `{"data": {"nodes": [...GraphNode], "edges": [...GraphEdge],
+        "center": node_id, "hops": N}}` — same generic contract as
+        `/graph/{project}` (kgTypes.ts GraphNode/GraphEdge), just pre-
+        filtered to one node's neighborhood instead of the whole graph.
+        `hops` IS forwarded as `?hops=N` below — TODO(griffin-0): confirm
+        the adapter actually honors it (vs. a fixed server-side default)
+        before treating it as load-bearing."""
+        adapter = _adapter_or_404(project)
+        return await _proxy_get(
+            project,
+            adapter,
+            _sub_url(adapter["url"], f"node/{node_id}/subgraph"),
+            scope,
+            since,
+            extra_params={"hops": hops},
+        )
+
+    @router.get("/graph/{project}/anomalies")
+    async def get_graph_anomalies(
+        project: str, scope: str = "", since: str = ""
+    ) -> dict[str, Any]:
+        """Itemized anomaly rows — the ROW-level sibling of `/health`'s
+        aggregate counts (orphan/dangling/schema-violation COUNTS there;
+        the actual offending nodes/edges here, so an agent can act on
+        them without a follow-up kg_search per suspect).
+
+        TODO(griffin-0): confirm the real jeevy sub-path (guessed
+        `anomalies`, a plural-noun sibling of `edges-audit`) and whether
+        it needs its own cap/truncation params (edges-audit's suspect
+        list is capped server-side — this probably needs the same).
+        ASSUMED response shape (UNCONFIRMED): `{"data": {"orphans":
+        [{id,type,label}...], "danglingEdges": [{id,from,to,type}...],
+        "schemaViolations": [{...}], "truncated": bool}}` — mirrors
+        health's three categories, itemized instead of counted."""
+        adapter = _adapter_or_404(project)
+        return await _proxy_get(project, adapter, _sub_url(adapter["url"], "anomalies"), scope, since)
+
+    @router.get("/graph/{project}/edges")
+    async def get_graph_edges_filter(
+        project: str,
+        scope: str = "",
+        link_type: str = "",
+        match_method: str = "",
+        weight_min: float | None = None,
+        weight_max: float | None = None,
+        status: str = "",
+        source: str = "",
+    ) -> dict[str, Any]:
+        """Predicate-filtered edge list — the itemized sibling of
+        `/edges-audit`'s aggregate histograms, filterable on any single
+        predicate or a combination.
+
+        TODO(griffin-0): confirm the real jeevy sub-path (guessed `edges`,
+        a plural-noun sibling of `edge/{id}`) and which of these predicates
+        the adapter actually supports server-side vs. which the daemon
+        would need to filter client-side after an unfiltered fetch (an
+        important cost question on a ~5k-edge graph). ASSUMED response
+        shape (UNCONFIRMED): `{"data": {"edges": [...GraphEdge-with-meta],
+        "total": N, "truncated": bool}}`."""
+        adapter = _adapter_or_404(project)
+        extra: dict[str, Any] = {}
+        if link_type:
+            extra["link_type"] = link_type
+        if match_method:
+            extra["match_method"] = match_method
+        if weight_min is not None:
+            extra["weight_min"] = weight_min
+        if weight_max is not None:
+            extra["weight_max"] = weight_max
+        if status:
+            extra["status"] = status
+        if source:
+            extra["source"] = source
+        return await _proxy_get(
+            project, adapter, _sub_url(adapter["url"], "edges"), scope, extra_params=extra
+        )
+
+    @router.get("/graph/{project}/path")
+    async def get_graph_path(
+        project: str, from_node: str, to_node: str, max_hops: int = 5, scope: str = ""
+    ) -> dict[str, Any]:
+        """Pathfinding proxy between two opaque node ids, capped at
+        `max_hops` (≤5 per spec — the adapter should refuse/cap higher,
+        not the daemon, since it owns the traversal).
+
+        TODO(griffin-0): confirm the real jeevy sub-path (guessed `path`)
+        and the query param names for the two endpoints (`from`/`to` used
+        here as placeholders — `from` is a Python keyword-adjacent name,
+        renamed `from_node`/`to_node` on this side; confirm what the
+        adapter expects on the wire). ASSUMED response shape
+        (UNCONFIRMED): `{"data": {"found": bool, "path": [node, edge,
+        node, ...] alternating, "hops": N}}` on success, or `{"data":
+        {"found": false, "reason": "..."}}` (mirrors node/source's
+        graceful-empty convention) when no path exists within max_hops."""
+        adapter = _adapter_or_404(project)
+        # `from`/`to`/`max_hops` are the wire param names used here as
+        # placeholders — TODO(griffin-0): confirm the adapter expects these
+        # exact keys before treating this as load-bearing.
+        extra = {"from": from_node, "to": to_node, "max_hops": max_hops}
+        return await _proxy_get(
+            project, adapter, _sub_url(adapter["url"], "path"), scope, extra_params=extra
+        )
 
     return router

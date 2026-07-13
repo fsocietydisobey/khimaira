@@ -2442,3 +2442,256 @@ async def kg_scopes(project: str = "") -> str:
             f"  {s.get('scope')} · {s.get('nodes')} nodes · {s.get('edges')} edges{label_part}"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# SCAFFOLDING (2026-07-13, task-f4220ba84f33, griffin-0 handoff) — 5 new
+# kg_* tools extending the suite above. The jeevy-side endpoints these proxy
+# to DON'T EXIST YET (griffin-0's own sequencing: jeevy lands first, khimaira
+# wires to it after). Every function below whose docstring says "ASSUMED
+# response shape (UNCONFIRMED)" is pattern-matched from the existing 10
+# tools' contract, NOT verified against a real endpoint — do not treat it as
+# settled. See graph.py's matching routes for the daemon-side TODOs, and the
+# chat-102d8b5fd82f task-f4220ba84f33 thread for the open-question list.
+#
+# kg_export is intentionally NOT implemented/registered here — its
+# pagination-ownership design question (proxy loops server-side and returns
+# one assembled payload, vs. the tool exposes cursor state for the calling
+# agent to loop itself) is unresolved; see its stub below.
+# ---------------------------------------------------------------------------
+
+
+async def kg_subgraph(project: str = "", node_id: str = "", hops: int = 2, scope: str = "") -> str:
+    """Ego-subgraph: `node_id` + its `hops`-hop neighborhood, provenance-
+    enriched — the "show me what's AROUND this node" primitive, cheaper
+    than pulling the whole graph (`kg_graph`) when you already know the
+    node you care about.
+
+    ⚠️ SCAFFOLDING (task-f4220ba84f33): the daemon route
+    (`/graph/{project}/node/{node_id}/subgraph`) proxies to a jeevy-side
+    endpoint that doesn't exist yet — this tool will 502 until griffin-0's
+    endpoint lands. ASSUMED response shape (UNCONFIRMED): `{"data":
+    {"nodes": [...GraphNode], "edges": [...GraphEdge], "center": node_id,
+    "hops": N}}`, same generic contract as `kg_graph`.
+    """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
+    if not node_id:
+        return "❌ kg_subgraph requires a node_id — get one from kg_search or kg_graph."
+    qs_params = [f"hops={hops}"]
+    if scope:
+        qs_params.append(f"scope={urllib.parse.quote(scope)}")
+    resp = _get(
+        f"/api/graph/{urllib.parse.quote(project)}/node/"
+        f"{urllib.parse.quote(node_id, safe='')}/subgraph?{'&'.join(qs_params)}",
+        timeout=30.0,
+    )
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    nodes = body.get("nodes") or []
+    edges = body.get("edges") or []
+    if not nodes:
+        return f"📭 no neighborhood found for `{node_id}` in `{project}` (scope={scope or 'none'})."
+
+    lines = [
+        f"🕸️ **subgraph around `{body.get('center', node_id)}`** ({hops}-hop, "
+        f"scope={scope or 'none'}) — {len(nodes)} nodes, {len(edges)} edges\n"
+    ]
+    for n in nodes:
+        badge = f"  [{n['badge']}]" if n.get("badge") is not None else ""
+        lines.append(f"  `{n.get('id')}`  ({n.get('type', '?')})  {n.get('label', '')}{badge}")
+    if edges:
+        lines.append(f"\n**Edges ({len(edges)}):**")
+        for e in edges:
+            w = f"  w={e['weight']:.2f}" if isinstance(e.get("weight"), (int, float)) else ""
+            lines.append(f"  [{e.get('type', '?')}] `{e.get('from')}` → `{e.get('to')}`{w}")
+    return "\n".join(lines)
+
+
+async def kg_anomalies(project: str = "", scope: str = "", since: str = "") -> str:
+    """Itemized anomaly rows — the row-level sibling of `kg_health`'s
+    aggregate counts. Reach for this AFTER `kg_health` flags a nonzero
+    orphan/dangling/violation count and you need the actual ids to act on,
+    not just the number.
+
+    ⚠️ SCAFFOLDING (task-f4220ba84f33): the daemon route
+    (`/graph/{project}/anomalies`) proxies to a jeevy-side endpoint that
+    doesn't exist yet — this tool will 502 until griffin-0's endpoint
+    lands. ASSUMED response shape (UNCONFIRMED): `{"data": {"orphans":
+    [{id,type,label}...], "danglingEdges": [{id,from,to,type}...],
+    "schemaViolations": [{...}], "truncated": bool}}`.
+    """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
+    resp = _get(
+        f"/api/graph/{urllib.parse.quote(project)}/anomalies{_kg_qs(scope, since)}",
+        timeout=30.0,
+    )
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    orphans = body.get("orphans") or []
+    dangling = body.get("danglingEdges") or []
+    violations = body.get("schemaViolations") or []
+    if not orphans and not dangling and not violations:
+        return f"✅ no anomalies in `{project}` (scope={scope or 'none'})."
+
+    lines = [f"🩺 **KG anomalies `{project}`** (scope={scope or 'none'})\n"]
+    if orphans:
+        lines.append(f"**Orphans ({len(orphans)}, degree-0):**")
+        for o in orphans:
+            lines.append(f"  `{o.get('id')}`  ({o.get('type', '?')})  {o.get('label', '')}")
+    if dangling:
+        lines.append(f"\n**Dangling edges ({len(dangling)}, point at a missing node):**")
+        for e in dangling:
+            lines.append(f"  `{e.get('id')}`  [{e.get('type', '?')}] `{e.get('from')}` → `{e.get('to')}`")
+    if violations:
+        lines.append(f"\n**Schema violations ({len(violations)}):**")
+        for v in violations:
+            lines.append(f"  {v}")
+    if body.get("truncated"):
+        lines.append("\n⚠️ truncated — narrow the scope or raise the cap to see all.")
+    return "\n".join(lines)
+
+
+async def kg_edges_filter(
+    project: str = "",
+    scope: str = "",
+    link_type: str = "",
+    match_method: str = "",
+    weight_min: float | None = None,
+    weight_max: float | None = None,
+    status: str = "",
+    source: str = "",
+    limit: int = 50,
+) -> str:
+    """Predicate-filtered edge list — the itemized sibling of
+    `kg_edges_audit`'s aggregate histograms. Reach for this when you know
+    which slice you want (e.g. "every fuzzy-matched edge under weight
+    0.5") rather than the population-wide view.
+
+    ⚠️ SCAFFOLDING (task-f4220ba84f33): the daemon route
+    (`/graph/{project}/edges`) proxies to a jeevy-side endpoint that
+    doesn't exist yet — this tool will 502 until griffin-0's endpoint
+    lands, AND it's unconfirmed whether the adapter honors these
+    predicates server-side or the daemon will need to filter client-side
+    after a full fetch (a real cost question on a large graph). ASSUMED
+    response shape (UNCONFIRMED): `{"data": {"edges":
+    [...GraphEdge-with-meta], "total": N, "truncated": bool}}`.
+    """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
+    params = []
+    if scope:
+        params.append(f"scope={urllib.parse.quote(scope)}")
+    if link_type:
+        params.append(f"link_type={urllib.parse.quote(link_type)}")
+    if match_method:
+        params.append(f"match_method={urllib.parse.quote(match_method)}")
+    if weight_min is not None:
+        params.append(f"weight_min={weight_min}")
+    if weight_max is not None:
+        params.append(f"weight_max={weight_max}")
+    if status:
+        params.append(f"status={urllib.parse.quote(status)}")
+    if source:
+        params.append(f"source={urllib.parse.quote(source)}")
+    qs = f"?{'&'.join(params)}" if params else ""
+    resp = _get(f"/api/graph/{urllib.parse.quote(project)}/edges{qs}", timeout=30.0)
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    edges = body.get("edges") or []
+    total = body.get("total", len(edges))
+    if not edges:
+        return f"🔍 no edges in `{project}` match the given filter(s) (scope={scope or 'none'})."
+
+    lines = [f"🔗 **{total} edge(s) match** in `{project}` (scope={scope or 'none'}, showing {min(limit, len(edges))}):\n"]
+    for e in edges[:limit]:
+        w = f"  w={e['weight']:.2f}" if isinstance(e.get("weight"), (int, float)) else ""
+        lines.append(f"  `{e.get('id')}` [{e.get('type', '?')}] `{e.get('from')}` → `{e.get('to')}`{w}")
+    if total > len(edges[:limit]):
+        lines.append(f"  … {total - len(edges[:limit])} more (raise `limit` or narrow the filter)")
+    return "\n".join(lines)
+
+
+async def kg_path(
+    project: str = "", from_node: str = "", to_node: str = "", max_hops: int = 5, scope: str = ""
+) -> str:
+    """Pathfinding between two opaque node ids, capped at `max_hops`
+    (≤5) — "how are these two entities connected?", answered as an actual
+    route rather than requiring the agent to manually walk `kg_node`
+    edges hop by hop.
+
+    ⚠️ SCAFFOLDING (task-f4220ba84f33): the daemon route
+    (`/graph/{project}/path`) proxies to a jeevy-side endpoint that
+    doesn't exist yet — this tool will 502 until griffin-0's endpoint
+    lands. ASSUMED response shape (UNCONFIRMED): `{"data": {"found":
+    bool, "path": [node, edge, node, ...] alternating, "hops": N}}` on
+    success, or `{"data": {"found": false, "reason": "..."}}` when no
+    path exists within max_hops.
+    """
+    project, err = _kg_default_project(project)
+    if err:
+        return f"❌ {err}"
+    if not from_node or not to_node:
+        return "❌ kg_path requires both from_node and to_node — get ids from kg_search or kg_graph."
+    if max_hops > 5:
+        return "❌ kg_path caps at max_hops=5 (per spec — pass a smaller value)."
+    qs = (
+        f"?from={urllib.parse.quote(from_node)}&to={urllib.parse.quote(to_node)}"
+        f"&max_hops={max_hops}"
+    )
+    if scope:
+        qs += f"&scope={urllib.parse.quote(scope)}"
+    resp = _get(f"/api/graph/{urllib.parse.quote(project)}/path{qs}", timeout=30.0)
+    body, err = _kg_unwrap(resp)
+    if err:
+        return err
+
+    if not body.get("found"):
+        reason = f" — {body['reason']}" if body.get("reason") else ""
+        return f"🔍 no path found between `{from_node}` and `{to_node}` within {max_hops} hops{reason}."
+
+    path = body.get("path") or []
+    hops = body.get("hops", "?")
+    lines = [f"🛤️ **path found** (`{from_node}` → `{to_node}`, {hops} hop(s)):\n"]
+    for item in path:
+        if "type" in item and ("from" in item or "to" in item):
+            lines.append(f"  --[{item.get('type', '?')}]-->")
+        else:
+            badge = f"  [{item['badge']}]" if item.get("badge") is not None else ""
+            lines.append(f"  `{item.get('id')}`  ({item.get('type', '?')})  {item.get('label', '')}{badge}")
+    return "\n".join(lines)
+
+
+def _kg_export_design_question() -> str:
+    """Placeholder — kg_export is NOT implemented or registered as an MCP
+    tool yet (task-f4220ba84f33). Open design question, unresolved,
+    flagged to griffin-0:
+
+    Cursor-paginated full node/edge dump — does the khimaira proxy LOOP
+    pagination server-side (the daemon calls the adapter repeatedly until
+    exhausted, returns one assembled payload — simple for the calling
+    agent, but risks a very large single response + a long-held HTTP
+    connection for a big graph) OR does the MCP tool expose cursor state
+    for the calling agent to loop itself (bounded per-call response size,
+    but pushes pagination-loop responsibility onto every caller and needs
+    a `kg_export(cursor=...)` signature instead of a single call)?
+
+    A wrong assumption here is expensive to unwind (the whole point of
+    "cursor-paginated" is the shape of the contract between daemon and
+    caller) — do not build either half until griffin-0 answers. Once
+    resolved, this stub becomes the real `kg_export` function + its
+    `/graph/{project}/export` daemon route (graph.py), following the
+    exact pattern of the other 4 SCAFFOLDING tools above."""
+    raise NotImplementedError(
+        "kg_export is unresolved (task-f4220ba84f33) — see this function's docstring."
+    )
