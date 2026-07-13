@@ -953,7 +953,7 @@ def test_graph_export_single_page_no_more(graph_mod, monkeypatch):
     )
     page = _FakeResp(
         status_code=200,
-        json_data={"nodes": [{"id": "n1"}], "edges": [{"id": "e1"}], "next_cursor": None, "has_more": False},
+        json_data={"data": {"nodes": [{"id": "n1"}], "edges": [{"id": "e1"}]}, "meta": {"next_cursor": None, "has_more": False}},
     )
     monkeypatch.setattr(graph_mod.httpx, "AsyncClient", _sequenced_client_for([page]))
     r = _client(graph_mod).get("/api/graph/jeevy_portal/export", params={"scope": "shop:10"})
@@ -967,14 +967,21 @@ def test_graph_export_single_page_no_more(graph_mod, monkeypatch):
 
 
 def test_graph_export_loops_across_pages_and_assembles(graph_mod, monkeypatch):
-    """The daemon loops server-side — 3 pages in, ONE assembled payload out."""
+    """The daemon loops server-side — 3 pages in, ONE assembled payload out.
+    Real jeevy shape (LIVE-VERIFIED 2026-07-13 via direct curl against real
+    shop:10 data): pagination state is `meta.has_more`/`meta.next_cursor`
+    (snake_case, under `meta`) — NOT `data.has_more`/`data.next_cursor`
+    (37c08aa's bug) and NOT camelCase (the FIRST correction's guess, also
+    wrong — direct curl was needed to nail the exact casing). Getting
+    either detail wrong reproduces the same silent single-page-truncation
+    bug: `has_more` reads as always-falsy either way."""
     monkeypatch.setattr(
         graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
     )
     pages = [
-        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n1"}], "edges": [], "next_cursor": "c1", "has_more": True}),
-        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n2"}], "edges": [], "next_cursor": "c2", "has_more": True}),
-        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n3"}], "edges": [], "next_cursor": None, "has_more": False}),
+        _FakeResp(status_code=200, json_data={"data": {"nodes": [{"id": "n1"}], "edges": []}, "meta": {"next_cursor": "c1", "has_more": True}}),
+        _FakeResp(status_code=200, json_data={"data": {"nodes": [{"id": "n2"}], "edges": []}, "meta": {"next_cursor": "c2", "has_more": True}}),
+        _FakeResp(status_code=200, json_data={"data": {"nodes": [{"id": "n3"}], "edges": []}, "meta": {"next_cursor": None, "has_more": False}}),
     ]
     monkeypatch.setattr(graph_mod.httpx, "AsyncClient", _sequenced_client_for(pages))
     r = _client(graph_mod).get("/api/graph/jeevy_portal/export")
@@ -990,14 +997,14 @@ def test_graph_export_loops_across_pages_and_assembles(graph_mod, monkeypatch):
 
 def test_graph_export_truncates_at_item_cap(graph_mod, monkeypatch):
     """A page that pushes the running total past _EXPORT_MAX_ITEMS stops
-    the loop early with truncated=True, even though has_more was still true."""
+    the loop early with truncated=True, even though hasMore was still true."""
     monkeypatch.setattr(
         graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
     )
     monkeypatch.setattr(graph_mod, "_EXPORT_MAX_ITEMS", 2)
     pages = [
-        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n1"}, {"id": "n2"}], "edges": [], "next_cursor": "c1", "has_more": True}),
-        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n3"}], "edges": [], "next_cursor": "c2", "has_more": True}),
+        _FakeResp(status_code=200, json_data={"data": {"nodes": [{"id": "n1"}, {"id": "n2"}], "edges": []}, "meta": {"next_cursor": "c1", "has_more": True}}),
+        _FakeResp(status_code=200, json_data={"data": {"nodes": [{"id": "n3"}], "edges": []}, "meta": {"next_cursor": "c2", "has_more": True}}),
     ]
     monkeypatch.setattr(graph_mod.httpx, "AsyncClient", _sequenced_client_for(pages))
     r = _client(graph_mod).get("/api/graph/jeevy_portal/export")
@@ -1008,7 +1015,7 @@ def test_graph_export_truncates_at_item_cap(graph_mod, monkeypatch):
 
 
 def test_graph_export_truncates_at_page_cap(graph_mod, monkeypatch):
-    """has_more=true forever → stops at _EXPORT_MAX_PAGES, truncated=True
+    """hasMore=true forever → stops at _EXPORT_MAX_PAGES, truncated=True
     (never loops forever on the daemon's dime)."""
     monkeypatch.setattr(
         graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
@@ -1016,7 +1023,7 @@ def test_graph_export_truncates_at_page_cap(graph_mod, monkeypatch):
     monkeypatch.setattr(graph_mod, "_EXPORT_MAX_PAGES", 3)
     page = _FakeResp(
         status_code=200,
-        json_data={"nodes": [{"id": "n"}], "edges": [], "next_cursor": "cN", "has_more": True},
+        json_data={"data": {"nodes": [{"id": "n"}], "edges": []}, "meta": {"next_cursor": "cN", "has_more": True}},
     )
     monkeypatch.setattr(graph_mod.httpx, "AsyncClient", _sequenced_client_for([page]))
     r = _client(graph_mod).get("/api/graph/jeevy_portal/export")

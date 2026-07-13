@@ -489,6 +489,12 @@ def test_since_forwarded_into_request_path():
 
 
 def test_kg_subgraph_happy():
+    """Edges use the SAME plain shape as the base graph contract (type +
+    weight + a nested snake_case meta dict) — LIVE-VERIFIED 2026-07-13 via
+    direct curl against real shop:10 data. This is DIFFERENT from both the
+    original scaffolding guess (link_type/match_method top-level) AND the
+    first correction's guess (camelCase linkType/matchMethod top-level) —
+    neither matched what the live endpoint actually returns."""
     payload = {
         "data": {
             "root": "n1",
@@ -496,7 +502,7 @@ def test_kg_subgraph_happy():
                 {"id": "n1", "type": "job", "depth": 0, "facts": [{"label": "status", "value": "open"}]},
                 {"id": "n2", "type": "task", "depth": 1, "facts": []},
             ],
-            "edges": [{"from": "n2", "to": "n1", "link_type": "belongs_to", "match_method": "exact", "confidence": 1.0, "link_source": "projector", "status": "active"}],
+            "edges": [{"from": "n2", "to": "n1", "type": "belongs_to", "weight": 1.0, "meta": {"match_method": "exact", "link_source": "projector", "status": "active"}}],
         }
     }
     with patch.object(mt, "_get", return_value=payload):
@@ -504,6 +510,7 @@ def test_kg_subgraph_happy():
     assert "n1" in out
     assert "2 nodes, 1 edges" in out
     assert "belongs_to" in out
+    assert "match_method=exact" in out  # meta chips rendered
     assert "status=" in out  # facts rendered
 
 
@@ -582,11 +589,29 @@ def test_kg_anomalies_error_passthrough():
 
 
 def test_kg_anomalies_surfaces_truncation():
-    payload = {"data": {"kind": "orphans", "rows": [{"id": "n1", "type": "user", "label": "X"}], "total": 47, "truncated": True}}
+    """truncated lives under meta, not data — LIVE-VERIFIED 2026-07-13 via
+    direct curl against real shop:10 data. A stray data.truncated must be
+    ignored; meta.truncated is what actually surfaces the warning."""
+    payload = {
+        "data": {"kind": "orphans", "rows": [{"id": "n1", "type": "user", "label": "X"}], "total": 47, "truncated": True},
+        "meta": {"truncated": True},
+    }
     with patch.object(mt, "_get", return_value=payload):
         out = _run(mt.kg_anomalies("jeevy", kind="orphans"))
     assert "truncated" in out.lower()
     assert "47" in out
+
+
+def test_kg_anomalies_data_truncated_field_is_ignored():
+    """A truncated flag placed in `data` (not `meta`) must NOT surface the
+    warning — that's not where the real adapter puts it."""
+    payload = {
+        "data": {"kind": "orphans", "rows": [{"id": "n1", "type": "user", "label": "X"}], "total": 1, "truncated": True},
+        "meta": {"truncated": False},
+    }
+    with patch.object(mt, "_get", return_value=payload):
+        out = _run(mt.kg_anomalies("jeevy", kind="orphans"))
+    assert "truncated" not in out.lower()
 
 
 def test_kg_anomalies_request_path_forwards_kind_and_node_type():
@@ -605,19 +630,25 @@ def test_kg_anomalies_request_path_forwards_kind_and_node_type():
 
 
 def test_kg_duplicates_happy():
-    payload = {"data": {"rows": [{"ids": ["n1", "n2"], "canonical_key": "user:alice", "node_type": "user"}], "total": 1}}
+    """Real field names are nodeType/displayNames/similarity (griffin-0-
+    confirmed, 2026-07-13) — NOT canonical_key/similar_labels/node_type,
+    the guessed shape from commit 37c08aa."""
+    payload = {"data": {"rows": [{"ids": ["n1", "n2"], "nodeType": "user", "displayNames": ["Alice", "Alicia"], "similarity": 0.92}], "total": 1}}
     with patch.object(mt, "_get", return_value=payload):
         out = _run(mt.kg_duplicates("jeevy", scope="shop:10"))
     assert "1 likely-duplicate" in out
     assert "n1" in out and "n2" in out
-    assert "user:alice" in out
+    assert "Alice" in out and "Alicia" in out
+    assert "0.92" in out
 
 
-def test_kg_duplicates_similar_labels_fallback():
-    payload = {"data": {"rows": [{"ids": ["n3", "n4"], "similar_labels": ["Bob", "Bobby"], "node_type": "user"}], "total": 1}}
+def test_kg_duplicates_missing_optional_fields_does_not_crash():
+    """displayNames/similarity are optional — a row with only ids+nodeType
+    must still render, not KeyError."""
+    payload = {"data": {"rows": [{"ids": ["n1", "n2"], "nodeType": "user"}], "total": 1}}
     with patch.object(mt, "_get", return_value=payload):
         out = _run(mt.kg_duplicates("jeevy"))
-    assert "Bob" in out and "Bobby" in out
+    assert "n1" in out and "n2" in out
 
 
 def test_kg_duplicates_none_found():
@@ -648,11 +679,22 @@ def test_kg_duplicates_request_path_forwards_threshold():
 
 
 def test_kg_edges_filter_happy():
-    payload = {"data": {"edges": [{"id": "e1", "type": "assigned", "from": "a", "to": "b"}], "total": 1}}
+    """Real edge shape is camelCase (linkType/matchMethod/confidence) —
+    LIVE-VERIFIED 2026-07-13 via direct curl against real shop:10 data;
+    DIFFERENT from kg_subgraph's edges (type/weight/nested meta)."""
+    payload = {
+        "data": {
+            "edges": [{"id": "e1", "from": "a", "to": "b", "linkType": "assigned", "matchMethod": "normalized", "confidence": 1.0, "linkSource": "kg-outbox", "status": "active"}],
+            "total": 1,
+        }
+    }
     with patch.object(mt, "_get", return_value=payload):
         out = _run(mt.kg_edges_filter("jeevy", "shop:10", link_type="assigned"))
     assert "1 edge(s) match" in out
     assert "e1" in out
+    assert "assigned" in out  # linkType rendered
+    assert "normalized" in out  # matchMethod rendered
+    assert "conf=1.00" in out  # confidence rendered
 
 
 def test_kg_edges_filter_no_matches():
@@ -701,8 +743,33 @@ def test_kg_edges_filter_pagination_hint_uses_offset_not_limit():
     assert "offset=1" in out  # next-page hint, not "raise limit" (old scaffolding wording)
 
 
+def test_kg_edges_filter_reads_truncated_from_meta_not_data():
+    """`truncated` lives under `meta`, not `data` (griffin-0-confirmed,
+    2026-07-13) — a value placed under `data.truncated` instead must be
+    ignored (it's not where the real adapter puts it), and `meta.truncated`
+    must surface the warning."""
+    payload = {
+        "data": {"edges": [{"id": "e1", "type": "rel", "from": "a", "to": "b"}], "total": 1, "truncated": True},
+        "meta": {"truncated": False},
+    }
+    with patch.object(mt, "_get", return_value=payload):
+        out = _run(mt.kg_edges_filter("jeevy"))
+    assert "truncated" not in out.lower()  # data.truncated=True must be ignored
+
+    payload2 = {
+        "data": {"edges": [{"id": "e1", "type": "rel", "from": "a", "to": "b"}], "total": 1},
+        "meta": {"truncated": True},
+    }
+    with patch.object(mt, "_get", return_value=payload2):
+        out2 = _run(mt.kg_edges_filter("jeevy"))
+    assert "truncated" in out2.lower()
+
+
 def test_kg_path_happy_reachable():
-    payload = {"data": {"path": ["n1", "n2", "n3"], "hops": 2, "reachable": True}}
+    """`reachable` lives under `meta`, not `data` — LIVE-VERIFIED
+    2026-07-13 via direct curl (same-node from==to sanity check against
+    real shop:10 data)."""
+    payload = {"data": {"path": ["n1", "n2", "n3"], "hops": 2}, "meta": {"reachable": True}}
     with patch.object(mt, "_get", return_value=payload):
         out = _run(mt.kg_path("jeevy", "n1", "n3"))
     assert "path found" in out.lower()
@@ -710,8 +777,18 @@ def test_kg_path_happy_reachable():
     assert "2 hop" in out
 
 
+def test_kg_path_data_reachable_field_is_ignored():
+    """A `reachable` flag placed in `data` (not `meta`) must be ignored —
+    that's not where the real adapter puts it, and trusting it would
+    reintroduce the always-not-reachable bug this fix targets."""
+    payload = {"data": {"path": ["n1", "n2"], "hops": 1, "reachable": True}, "meta": {"reachable": False}}
+    with patch.object(mt, "_get", return_value=payload):
+        out = _run(mt.kg_path("jeevy", "n1", "n2"))
+    assert "not reachable" in out.lower()
+
+
 def test_kg_path_not_reachable():
-    payload = {"data": {"path": None, "hops": None, "reachable": False}}
+    payload = {"data": {"path": None, "hops": None}, "meta": {"reachable": False}}
     with patch.object(mt, "_get", return_value=payload):
         out = _run(mt.kg_path("jeevy", "n1", "n99"))
     assert "not reachable" in out.lower()
@@ -737,6 +814,13 @@ def test_kg_path_error_passthrough():
 
 
 def test_kg_path_request_path_forwards_endpoints():
+    """Query param names sent to the DAEMON ROUTE are `from_node`/`to_node`
+    (matching get_graph_path's own Python signature in graph.py) — NOT
+    `from`/`to` (the wire names the route uses when it talks to jeevy).
+    Sending `from`/`to` here 422s against the real daemon route; this was a
+    genuine bug, only caught via live in-process integration testing
+    (2026-07-13) since the mocked `_get` unit test never exercised the
+    real route to notice the mismatch."""
     captured = {}
 
     def fake_get(path, **kw):
@@ -746,8 +830,8 @@ def test_kg_path_request_path_forwards_endpoints():
     with patch.object(mt, "_get", side_effect=fake_get):
         _run(mt.kg_path("jeevy", "n1", "n2", max_hops=3, scope="shop:10"))
     path = captured["path"]
-    assert "from=n1" in path
-    assert "to=n2" in path
+    assert "from_node=n1" in path
+    assert "to_node=n2" in path
     assert "max_hops=3" in path
     assert "scope=shop%3A10" in path
 
@@ -809,3 +893,119 @@ def test_kg_export_request_path_forwards_node_type_and_since():
     assert "since=2026-01-01" in path
     assert "scope=shop%3A10" in path
     assert "limit=500" in path
+
+
+# ---------------------------------------------------------------------------
+# Real-route wiring chokepoint (2026-07-13) — a hand-mocked `_get` proves a
+# tool sends the STRING it intends to, but it can't catch a tool/route
+# query-param-name mismatch (kg_path sent `from`/`to`; the real daemon
+# route's own signature is `from_node`/`to_node` — a genuine bug that only
+# surfaced via live integration testing against jeevy, since 422 from
+# FastAPI's own param validation never fires against a mock). These tests
+# wire each tool through the REAL graph.py router (only the outbound
+# httpx call to the adapter is faked) — any future param-name drift
+# between a kg_* tool and its route fails loud HERE, not just in a live
+# integration test someone has to remember to run.
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdapterHttpResp:
+    def __init__(self, json_data):
+        self._json = json_data
+        self.status_code = 200
+
+    def json(self):
+        return self._json
+
+
+class _FakeAdapterHttpClient:
+    def __init__(self, *, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    async def get(self, url, params=None, headers=None):
+        return self._resp
+
+
+def _wire_tool_through_real_router(monkeypatch, adapter_json):
+    """Real graph.py router + real monitor_tools `_get`->route wiring;
+    only the adapter's own HTTP response is faked. A tool/route param-name
+    mismatch shows up as a real FastAPI 422/404 here, not a silent mock
+    match."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from khimaira.monitor.api import graph as graph_api
+
+    app = FastAPI()
+    app.include_router(graph_api.build_router(), prefix="/api")
+    client = TestClient(app)
+    monkeypatch.setattr(graph_api, "get_kg_adapter", lambda _p: {"url": "http://x/api/v1/internal/kg/graph"})
+    monkeypatch.setattr(
+        graph_api.httpx,
+        "AsyncClient",
+        lambda *a, **k: _FakeAdapterHttpClient(resp=_FakeAdapterHttpResp(adapter_json)),
+    )
+
+    def fake_get(path, **kw):
+        r = client.get(path)
+        if r.status_code >= 400:
+            return f"khimaira-monitor → HTTP {r.status_code}: {r.json().get('detail')}"
+        return r.json()
+
+    monkeypatch.setattr(mt, "_get", fake_get)
+    monkeypatch.setattr(mt, "_kg_default_project", lambda p: (p or "jeevy", None))
+
+
+def test_kg_path_tool_reaches_real_route_without_422(monkeypatch):
+    """The exact regression this section exists for."""
+    _wire_tool_through_real_router(
+        monkeypatch, {"data": {"path": ["n1"], "hops": 0}, "meta": {"reachable": True}}
+    )
+    out = _run(mt.kg_path("jeevy", "n1", "n2"))
+    assert "HTTP 422" not in out
+    assert "HTTP 404" not in out
+    assert "path found" in out.lower()
+
+
+def test_kg_subgraph_tool_reaches_real_route_without_422(monkeypatch):
+    _wire_tool_through_real_router(
+        monkeypatch, {"data": {"root": "n1", "nodes": [{"id": "n1", "type": "job", "depth": 0}], "edges": []}}
+    )
+    out = _run(mt.kg_subgraph("jeevy", "n1"))
+    assert "HTTP 422" not in out and "HTTP 404" not in out
+
+
+def test_kg_anomalies_tool_reaches_real_route_without_422(monkeypatch):
+    _wire_tool_through_real_router(
+        monkeypatch, {"data": {"kind": "orphans", "rows": [], "total": 0}, "meta": {"truncated": False}}
+    )
+    out = _run(mt.kg_anomalies("jeevy", kind="orphans"))
+    assert "HTTP 422" not in out and "HTTP 404" not in out
+
+
+def test_kg_duplicates_tool_reaches_real_route_without_422(monkeypatch):
+    _wire_tool_through_real_router(monkeypatch, {"data": {"rows": [], "total": 0}})
+    out = _run(mt.kg_duplicates("jeevy"))
+    assert "HTTP 422" not in out and "HTTP 404" not in out
+
+
+def test_kg_edges_filter_tool_reaches_real_route_without_422(monkeypatch):
+    _wire_tool_through_real_router(
+        monkeypatch, {"data": {"edges": [], "total": 0}, "meta": {"truncated": False}}
+    )
+    out = _run(mt.kg_edges_filter("jeevy"))
+    assert "HTTP 422" not in out and "HTTP 404" not in out
+
+
+def test_kg_export_tool_reaches_real_route_without_422(monkeypatch):
+    _wire_tool_through_real_router(
+        monkeypatch, {"data": {"nodes": [], "edges": []}, "meta": {"next_cursor": None, "has_more": False}}
+    )
+    out = _run(mt.kg_export("jeevy"))
+    assert "HTTP 422" not in out and "HTTP 404" not in out

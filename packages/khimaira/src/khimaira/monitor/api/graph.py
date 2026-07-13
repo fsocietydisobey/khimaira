@@ -435,16 +435,27 @@ def build_router():
         link_types: str = "",
     ) -> dict[str, Any]:
         """Ego-subgraph proxy: `node_id` + its `hops`-hop neighborhood,
-        direction- and link-type-filterable, provenance-enriched (each
-        edge carries match_method/confidence/link_source/status — richer
-        than the generic GraphEdge contract). The opaque node_id passes
-        through verbatim. Endpoint not live yet (griffin-0 lands it in
-        parallel) — will 502 until then.
+        direction- and link-type-filterable. The opaque node_id passes
+        through verbatim.
 
-        Real jeevy path: `GET /internal/kg/node/{id}/subgraph?scope=&
-        hops=&direction=&link_types=`. Response: `{"data": {"root",
-        "nodes": [{id,type,depth,facts}], "edges": [{from,to,link_type,
-        match_method,confidence,link_source,status}]}}`.
+        `direction` accepts `"forward"`/`"backward"`/`"both"` (confirmed
+        by a live 400 response — `"in"`/`"out"` are NOT valid values,
+        despite that being the initial guess).
+
+        Real jeevy path — LIVE-VERIFIED 2026-07-13 via direct curl
+        against real shop:10 data: `GET /api/v1/internal/kg/node/{id}/
+        subgraph?scope=&hops=&direction=&link_types=` (the `api/v1/`
+        prefix comes from the adapter's own registered base URL, see
+        `_sub_url`'s docstring — not hardcoded here). Response: `{"data":
+        {"root", "nodes": [{id,type,depth}], "edges": [{from,to,type,
+        weight,meta:{match_method,link_source,status}}]}}` — this is
+        DIFFERENT from `/edges`' edge shape (camelCase linkType/
+        matchMethod/confidence/linkSource top-level): subgraph's edges
+        use the SAME plain shape as the base `/graph` contract (type +
+        weight + a nested snake_case `meta`), not the richer shape first
+        relayed. `facts` was never observed on any live node in this
+        dataset (may be adapter/optional — handled as absent, not an
+        error, on the tool side).
         """
         adapter = _adapter_or_404(project)
         extra: dict[str, Any] = {"hops": hops}
@@ -467,14 +478,20 @@ def build_router():
         """Itemized anomaly rows for ONE `kind` per call (`orphans` |
         `dangling` | `schema_violations`) — the row-level sibling of
         `/health`'s aggregate counts, so an agent can act on the actual
-        offending nodes/edges instead of just seeing a number. Endpoint
-        not live yet (griffin-0 lands it in parallel) — will 502 until
-        then.
+        offending nodes/edges instead of just seeing a number.
 
-        Real jeevy path: `GET /internal/kg/anomalies?scope=&kind=&
-        node_type=`. Response: `{"data": {"kind", "rows": [...], "total",
-        "truncated"}}`. 422 (not the adapter's fault — a daemon-side input
-        check) when `kind` isn't one of the three valid values.
+        Real jeevy path: `GET /api/v1/internal/kg/anomalies?scope=&kind=&
+        node_type=`. Response — LIVE-VERIFIED 2026-07-13 via direct curl
+        against real shop:10 data: `{"data": {"kind", "rows": [...],
+        "total"}, "meta": {"truncated", ...}}`. `truncated` lives under
+        `meta`, NOT alongside kind/rows/total in `data` (this was NOT
+        caught by the initial relayed correction — found via live
+        testing, same bug shape as kg_export/kg_path's meta-location
+        misses). `orphans` rows are `{id,type}` (no label observed);
+        `dangling` rows are `{fromNode,toNode,linkType}` — camelCase,
+        and NOT the same from/to/type shape as a regular edge. 422 (not
+        the adapter's fault — a daemon-side input check) when `kind`
+        isn't one of the three valid values.
         """
         if kind not in _ANOMALY_KINDS:
             raise fastapi.HTTPException(
@@ -498,9 +515,12 @@ def build_router():
         scope; griffin-0 confirmed it alongside the other 5). Endpoint
         not live yet — will 502 until jeevy ships it.
 
-        Real jeevy path: `GET /internal/kg/duplicates?scope=&node_type=&
-        threshold=`. Response: `{"data": {"rows": [{ids:[...],
-        canonical_key/similar_labels, node_type}], "total"}}`.
+        Real jeevy path: `GET /api/v1/internal/kg/duplicates?scope=&
+        node_type=&threshold=`. Response: `{"data": {"rows": [{nodeType,
+        ids: [...], displayNames: [...], similarity}], "total",
+        "threshold"}}` — camelCase field names, confirmed live
+        2026-07-13 (griffin-0 ec15db67; supersedes the canonical_key/
+        similar_labels guess from commit 37c08aa).
         """
         adapter = _adapter_or_404(project)
         extra: dict[str, Any] = {}
@@ -531,10 +551,12 @@ def build_router():
         aggregate histograms. Endpoint not live yet — will 502 until
         jeevy ships it.
 
-        Real jeevy path: `GET /internal/kg/edges?scope=&link_type&
+        Real jeevy path: `GET /api/v1/internal/kg/edges?scope=&link_type&
         match_method&min_weight&max_weight&status&link_source&limit&
-        offset`. Response: `{"data": {"edges": [...], "total",
-        "truncated"}}`.
+        offset`. Response: `{"data": {"edges": [...], "total"}, "meta":
+        {"truncated"}}` — `truncated` lives under `meta`, NOT alongside
+        edges/total in `data` (confirmed live 2026-07-13, griffin-0
+        ec15db67; the tool layer reads it from the right place).
         """
         adapter = _adapter_or_404(project)
         extra: dict[str, Any] = {"limit": limit, "offset": offset}
@@ -560,15 +582,22 @@ def build_router():
     ) -> dict[str, Any]:
         """Pathfinding proxy between two opaque node ids, capped at
         `max_hops` (≤5 — the adapter enforces the cap, not the daemon,
-        since it owns the traversal). Endpoint not live yet — will 502
-        until jeevy ships it. Note the response is ALWAYS 200 —
+        since it owns the traversal). Note the response is ALWAYS 200 —
         `reachable:false` on no path within `max_hops`, never 404/500 for
         that case (that's a legitimate graph-shape finding, not an error).
 
-        Real jeevy path: `GET /internal/kg/path?scope=&from=&to=&
+        Real jeevy path: `GET /api/v1/internal/kg/path?scope=&from=&to=&
         max_hops=` (from_node/to_node here map to the wire params
-        from/to — confirmed correct). Response: `{"data": {"path":
-        [ids] or null, "hops" or null, "reachable": bool}}`.
+        from/to — confirmed correct). Response — LIVE-VERIFIED
+        2026-07-13 via direct curl (same-node `from==to` sanity check:
+        `{"data":{"path":["id"],"hops":0},"meta":{"reachable":true,...}}`)
+        — is `{"data": {"path": [ids] or null, "hops" or null}, "meta":
+        {"reachable": bool, ...}}`. `reachable` lives under `meta`, NOT
+        alongside path/hops in `data` as first relayed — getting this
+        wrong means the tool always reports "not reachable" regardless
+        of the true answer (same bug shape as kg_export's meta location
+        miss, caught the same way: live testing, not the relayed
+        description).
         """
         adapter = _adapter_or_404(project)
         extra = {"from": from_node, "to": to_node, "max_hops": max_hops}
@@ -597,12 +626,18 @@ def build_router():
         adapter still has more) is surfaced rather than looping forever
         on the daemon's dime or silently dropping data past the cap.
 
-        Real jeevy path (per page): `GET /internal/kg/export?scope=&
-        cursor=&limit=&node_type=&since=`. Per-page response:
-        `{"nodes": [...], "edges": [...], "next_cursor", "has_more"}`
-        (NOT wrapped in a `data` envelope per griffin-0's shape for this
-        one — unwrapped defensively below, mirroring `_kg_unwrap`'s own
-        "no data key → treat the whole dict as body" fallback).
+        Real jeevy path (per page) — LIVE-VERIFIED 2026-07-13 via direct
+        curl against real shop:10 data (not just griffin-0's relayed
+        description, which turned out to have this one detail wrong):
+        `GET /api/v1/internal/kg/export?scope=&cursor=&limit=&node_type=&
+        since=`. Per-page response: `{"data": {"nodes": [...], "edges":
+        [...]}, "meta": {"next_cursor", "has_more"}}` — pagination state
+        lives under `meta` (confirmed correct in the griffin-0 handoff)
+        but the keys are SNAKE_CASE (`has_more`/`next_cursor`), NOT
+        camelCase as first relayed. Either mistake alone reproduces the
+        exact silent-truncation bug this fix targets: `has_more` reads
+        as always-absent/falsy if you look in the wrong place OR use the
+        wrong casing, so the loop stops after page 1 every time.
         """
         adapter = _adapter_or_404(project)
         all_nodes: list[Any] = []
@@ -619,14 +654,17 @@ def build_router():
             if cursor:
                 extra["cursor"] = cursor
             payload = await _proxy_get(project, adapter, export_url, scope, since, extra_params=extra)
-            body = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
-            if not isinstance(body, dict):
+            if not isinstance(payload, dict):
                 return payload  # unexpected shape — let the tool's own unwrap report it
+            body = payload.get("data") if "data" in payload else payload
+            meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+            if not isinstance(body, dict):
+                return payload
 
             all_nodes.extend(body.get("nodes") or [])
             all_edges.extend(body.get("edges") or [])
-            has_more = bool(body.get("has_more"))
-            next_cursor = body.get("next_cursor")
+            has_more = bool(meta.get("has_more"))
+            next_cursor = meta.get("next_cursor")
 
             if len(all_nodes) + len(all_edges) >= _EXPORT_MAX_ITEMS:
                 truncated = True

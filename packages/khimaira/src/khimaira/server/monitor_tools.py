@@ -2474,10 +2474,15 @@ def _kg_facts_str(facts: Any) -> str:
 
 
 def _kg_row_str(row: dict[str, Any]) -> str:
-    """Generic anomaly-row renderer — orphans are node-shaped (id/type/
-    label), dangling edges are edge-shaped (id/type/from/to), and
-    schema_violations' shape isn't specified by the contract, so it falls
-    back to a plain key=value dump (same fallback style as _kg_meta_chips)."""
+    """Generic anomaly-row renderer. Real shapes LIVE-VERIFIED 2026-07-13:
+    orphans are node-shaped `{id,type}` (no label observed); dangling
+    edges are `{fromNode,toNode,linkType}` — camelCase, NOT the usual
+    edge from/to/type. schema_violations' shape wasn't observed (empty
+    in the live test data), so it falls back to a plain key=value dump
+    (same fallback style as _kg_meta_chips) for anything not matching
+    the two known shapes above."""
+    if "fromNode" in row and "toNode" in row:
+        return f"[{row.get('linkType', '?')}] `{row.get('fromNode')}` → `{row.get('toNode')}`"
     if "from" in row and "to" in row:
         w = f"  w={row['weight']:.2f}" if isinstance(row.get("weight"), (int, float)) else ""
         return f"`{row.get('id', '?')}` [{row.get('type', '?')}] `{row.get('from')}` → `{row.get('to')}`{w}"
@@ -2495,15 +2500,20 @@ async def kg_subgraph(
     link_types: str = "",
 ) -> str:
     """Ego-subgraph: `node_id` + its `hops`-hop neighborhood, direction-
-    and link-type-filterable, provenance-enriched (edges carry
-    match_method/confidence/link_source/status) — cheaper than pulling
-    the whole graph (`kg_graph`) when you already know the node you care
-    about.
+    and link-type-filterable — cheaper than pulling the whole graph
+    (`kg_graph`) when you already know the node you care about.
 
-    ⚠️ Endpoint not live yet (jeevy lands it in parallel, task-
-    f4220ba84f33) — will 502 until then. Contract IS confirmed: `{"data":
-    {"root", "nodes": [{id,type,depth,facts}], "edges": [{from,to,
-    link_type,match_method,confidence,link_source,status}]}}`.
+    `direction`: "forward" | "backward" | "both" (confirmed via a live
+    400 on an invalid value — NOT "in"/"out").
+
+    Contract LIVE-VERIFIED 2026-07-13 via direct curl against real
+    shop:10 data: `{"data": {"root", "nodes": [{id,type,depth}], "edges":
+    [{from,to,type,weight,meta:{match_method,link_source,status}}]}}` —
+    edges use the SAME plain shape as the base graph contract (type +
+    weight + a nested meta dict), not a richer camelCase shape (that was
+    the initial guess, and didn't match what the live endpoint returns).
+    `facts` was never observed on a live node — rendered if present,
+    silently omitted if not.
     """
     project, err = _kg_default_project(project)
     if err:
@@ -2544,10 +2554,11 @@ async def kg_subgraph(
     if edges:
         lines.append(f"\n**Edges ({len(edges)}):**")
         for e in edges:
-            conf = f"  conf={e['confidence']:.2f}" if isinstance(e.get("confidence"), (int, float)) else ""
-            method = f"  [{e['match_method']}]" if e.get("match_method") else ""
+            w = f"  w={e['weight']:.2f}" if isinstance(e.get("weight"), (int, float)) else ""
+            chips = _kg_meta_chips(e.get("meta"))
+            chip_str = f"  ·  {chips}" if chips else ""
             lines.append(
-                f"  [{e.get('link_type', '?')}] `{e.get('from')}` → `{e.get('to')}`{method}{conf}"
+                f"  [{e.get('type', '?')}] `{e.get('from')}` → `{e.get('to')}`{w}{chip_str}"
             )
     return "\n".join(lines)
 
@@ -2558,10 +2569,16 @@ async def kg_anomalies(project: str = "", kind: str = "", scope: str = "", node_
     kg_health flags a nonzero orphan/dangling/violation count and you
     need the actual ids to act on.
 
-    ⚠️ Endpoint not live yet (jeevy lands it in parallel, task-
-    f4220ba84f33) — will 502 until then. Contract IS confirmed: one kind
-    per call (`kind="orphans"|"dangling"|"schema_violations"`), response
-    `{"data": {"kind", "rows": [...], "total", "truncated"}}`.
+    Contract LIVE-VERIFIED 2026-07-13 via direct curl against real
+    shop:10 data: one kind per call (`kind="orphans"|"dangling"|
+    "schema_violations"`), response `{"data": {"kind", "rows": [...],
+    "total"}, "meta": {"truncated", ...}}` — `truncated` lives under
+    `meta`, NOT alongside kind/rows/total in `data` (this specific
+    misplacement wasn't caught by the relayed correction — found via
+    live testing). Row shapes differ by kind: `orphans` rows are
+    `{id,type}` (no label observed live); `dangling` rows are
+    `{fromNode,toNode,linkType}` — camelCase, NOT the usual edge
+    from/to/type.
 
     Args mirror kg_health's terminology: "orphans" = degree-0 nodes,
     "dangling" = edges pointing at a missing node, "schema_violations" =
@@ -2581,6 +2598,9 @@ async def kg_anomalies(project: str = "", kind: str = "", scope: str = "", node_
     if scope:
         qs_params.append(f"scope={urllib.parse.quote(scope)}")
     resp = _get(f"/api/graph/{urllib.parse.quote(project)}/anomalies?{'&'.join(qs_params)}", timeout=30.0)
+    # `truncated` lives under `meta`, which `_kg_unwrap` doesn't return —
+    # capture it from the raw response BEFORE unwrapping to `data`.
+    meta = resp.get("meta") if isinstance(resp, dict) else None
     body, err = _kg_unwrap(resp)
     if err:
         return err
@@ -2593,7 +2613,7 @@ async def kg_anomalies(project: str = "", kind: str = "", scope: str = "", node_
     lines = [f"🩺 **{total} {kind} in `{project}`** (scope={scope or 'none'}):\n"]
     for row in rows:
         lines.append(f"  {_kg_row_str(row)}")
-    if body.get("truncated"):
+    if isinstance(meta, dict) and meta.get("truncated"):
         lines.append(f"\n⚠️ truncated — {total} total, showing {len(rows)}. Narrow node_type or re-run.")
     return "\n".join(lines)
 
@@ -2608,8 +2628,11 @@ async def kg_duplicates(
     candidates without hand-scanning kg_search results for near-matches.
 
     ⚠️ Endpoint not live yet (jeevy lands it in parallel) — will 502
-    until then. Contract IS confirmed: `{"data": {"rows": [{ids: [...],
-    canonical_key/similar_labels, node_type}], "total"}}`.
+    until then. Contract IS confirmed (live 2026-07-13, griffin-0
+    ec15db67): `{"data": {"rows": [{nodeType, ids: [...], displayNames:
+    [...], similarity}], "total", "threshold"}}` — camelCase field
+    names, `displayNames`/`similarity` not `canonical_key`/
+    `similar_labels` (that guess from commit 37c08aa was wrong).
 
     Args:
         node_type: narrow the dedup scan to one node type.
@@ -2641,12 +2664,11 @@ async def kg_duplicates(
     for row in rows:
         ids = row.get("ids") or []
         ids_str = ", ".join(f"`{i}`" for i in ids)
-        key_part = (
-            f"  ·  canonical_key={row['canonical_key']!r}"
-            if row.get("canonical_key")
-            else (f"  ·  labels={row['similar_labels']}" if row.get("similar_labels") else "")
-        )
-        lines.append(f"  ({row.get('node_type', '?')})  {ids_str}{key_part}")
+        names = row.get("displayNames") or []
+        names_part = f"  ·  {', '.join(names)}" if names else ""
+        sim = row.get("similarity")
+        sim_part = f"  ·  similarity={sim:.2f}" if isinstance(sim, (int, float)) else ""
+        lines.append(f"  ({row.get('nodeType', '?')})  {ids_str}{names_part}{sim_part}")
     return "\n".join(lines)
 
 
@@ -2668,9 +2690,13 @@ async def kg_edges_filter(
     aggregate histograms. Reach for this when you know which slice you
     want (e.g. every fuzzy-matched edge under weight 0.5).
 
-    ⚠️ Endpoint not live yet (jeevy lands it in parallel, task-
-    f4220ba84f33) — will 502 until then. Contract IS confirmed: `{"data":
-    {"edges": [...], "total", "truncated"}}`.
+    Contract LIVE-VERIFIED 2026-07-13 via direct curl against real
+    shop:10 data: each edge is `{id,from,to,linkType,matchMethod,
+    confidence,linkSource,status}` (camelCase, no `weight`/`type` fields
+    — those belong to a DIFFERENT edge shape, the one `kg_subgraph`
+    actually returns). Response envelope: `{"data": {"edges": [...],
+    "total"}, "meta": {"truncated"}}` — `truncated` lives under `meta`,
+    not alongside edges/total in `data`.
 
     Args:
         min_weight/max_weight: inclusive weight range.
@@ -2697,6 +2723,9 @@ async def kg_edges_filter(
     if link_source:
         params.append(f"link_source={urllib.parse.quote(link_source)}")
     resp = _get(f"/api/graph/{urllib.parse.quote(project)}/edges?{'&'.join(params)}", timeout=30.0)
+    # `truncated` lives under `meta`, which `_kg_unwrap` doesn't return —
+    # capture it from the raw response BEFORE unwrapping to `data`.
+    meta = resp.get("meta") if isinstance(resp, dict) else None
     body, err = _kg_unwrap(resp)
     if err:
         return err
@@ -2713,8 +2742,11 @@ async def kg_edges_filter(
         f"showing {shown_from}-{shown_to} of {total}):\n"
     ]
     for e in edges:
-        w = f"  w={e['weight']:.2f}" if isinstance(e.get("weight"), (int, float)) else ""
-        lines.append(f"  `{e.get('id')}` [{e.get('type', e.get('link_type', '?'))}] `{e.get('from')}` → `{e.get('to')}`{w}")
+        conf = f"  conf={e['confidence']:.2f}" if isinstance(e.get("confidence"), (int, float)) else ""
+        method = f"  [{e['matchMethod']}]" if e.get("matchMethod") else ""
+        lines.append(f"  `{e.get('id')}` [{e.get('linkType', '?')}] `{e.get('from')}` → `{e.get('to')}`{method}{conf}")
+    if isinstance(meta, dict) and meta.get("truncated"):
+        lines.append("\n⚠️ the adapter reports this result set is truncated — narrow the filter for a complete count.")
     if shown_to < total:
         lines.append(f"  … {total - shown_to} more — call again with offset={shown_to} for the next page")
     return "\n".join(lines)
@@ -2727,10 +2759,16 @@ async def kg_path(
     (≤5) — "how are these two entities connected?", answered as an
     actual route instead of manually walking kg_node edges hop by hop.
 
-    ⚠️ Endpoint not live yet (jeevy lands it in parallel, task-
-    f4220ba84f33) — will 502 until then. Contract IS confirmed: `{"data":
-    {"path": [ids] or null, "hops" or null, "reachable": bool}}` — ALWAYS
-    a 200; `reachable=false` (not a 404) means no path within max_hops.
+    Contract LIVE-VERIFIED 2026-07-13 via direct curl against real
+    shop:10 data (same-node sanity check `from==to` → `{"data":
+    {"path":["id"],"hops":0},"meta":{"reachable":true}}`): `{"data":
+    {"path": [ids] or null, "hops" or null}, "meta": {"reachable": bool,
+    ...}}` — `reachable` lives under `meta`, NOT alongside path/hops in
+    `data` as first relayed (this specific misplacement wasn't caught by
+    that correction — found via live testing; getting it wrong means
+    this tool always reports "not reachable" regardless of the true
+    answer). ALWAYS a 200; `reachable=false` (not a 404) means no path
+    within max_hops.
     """
     project, err = _kg_default_project(project)
     if err:
@@ -2739,15 +2777,24 @@ async def kg_path(
         return "❌ kg_path requires both from_node and to_node — get ids from kg_search or kg_graph."
     if max_hops > 5:
         return "❌ kg_path caps at max_hops=5 (per spec — pass a smaller value)."
-    qs = f"?from={urllib.parse.quote(from_node)}&to={urllib.parse.quote(to_node)}&max_hops={max_hops}"
+    # Query param names here are the DAEMON ROUTE's own (from_node/to_node,
+    # matching get_graph_path's Python signature) — NOT the wire names the
+    # route sends on to jeevy (from/to). Sending from/to here 422s against
+    # the real daemon route; caught only via live in-process integration
+    # testing (2026-07-13), not by unit tests that mock _get and never
+    # exercise the real route.
+    qs = f"?from_node={urllib.parse.quote(from_node)}&to_node={urllib.parse.quote(to_node)}&max_hops={max_hops}"
     if scope:
         qs += f"&scope={urllib.parse.quote(scope)}"
     resp = _get(f"/api/graph/{urllib.parse.quote(project)}/path{qs}", timeout=30.0)
+    # `reachable` lives under `meta`, which `_kg_unwrap` doesn't return —
+    # capture it from the raw response BEFORE unwrapping to `data`.
+    meta = resp.get("meta") if isinstance(resp, dict) else None
     body, err = _kg_unwrap(resp)
     if err:
         return err
 
-    if not body.get("reachable"):
+    if not (isinstance(meta, dict) and meta.get("reachable")):
         return f"🔍 `{from_node}` and `{to_node}` are not reachable within {max_hops} hops."
 
     path = body.get("path") or []
