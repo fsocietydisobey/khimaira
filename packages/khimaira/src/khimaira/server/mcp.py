@@ -2805,23 +2805,30 @@ async def kg_scopes(project: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# SCAFFOLDING (2026-07-13, task-f4220ba84f33, griffin-0 handoff) — 4 new
-# kg_* tools whose jeevy-side endpoints DON'T EXIST YET. Each will 502 until
-# griffin-0's endpoint lands (docstrings say so explicitly). kg_export is
-# NOT registered — its pagination-ownership design question is unresolved
-# (see monitor_tools.py's _kg_export_design_question docstring).
+# CONTRACT CONFIRMED (2026-07-13, task-f4220ba84f33) — 6 kg_* tools (5 scoped
+# + kg_duplicates added fresh). Endpoints aren't live yet (jeevy lands them
+# in parallel) — each will 502 until then, but the shape/params are settled,
+# not a guess. Supersedes the scaffolding registrations from commit 6bed449.
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 @logged_tool("kg_subgraph")
-async def kg_subgraph(project: str = "", node_id: str = "", hops: int = 2, scope: str = "") -> str:
-    """⚠️ SCAFFOLDING — jeevy-side endpoint not live yet, will 502 until
-    griffin-0's endpoint lands (task-f4220ba84f33).
+async def kg_subgraph(
+    project: str = "",
+    node_id: str = "",
+    hops: int = 2,
+    scope: str = "",
+    direction: str = "",
+    link_types: str = "",
+) -> str:
+    """⚠️ jeevy-side endpoint not live yet, will 502 until it lands
+    (task-f4220ba84f33) — contract is confirmed, not guessed.
 
-    Ego-subgraph: `node_id` + its `hops`-hop neighborhood, provenance-
-    enriched. Cheaper than `kg_graph` (whole graph) when you already know
-    the node you care about — "show me what's around this."
+    Ego-subgraph: `node_id` + its `hops`-hop neighborhood, direction- and
+    link-type-filterable, provenance-enriched. Cheaper than `kg_graph`
+    (whole graph) when you already know the node you care about — "show
+    me what's around this."
 
     Args:
         project: attached project with a registered KG adapter. Omit when
@@ -2829,28 +2836,56 @@ async def kg_subgraph(project: str = "", node_id: str = "", hops: int = 2, scope
         node_id: the center node's opaque id — get one from kg_search/kg_graph.
         hops: neighborhood radius (default 2).
         scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
+        direction: restrict to "in"/"out"/"both" edges, if the adapter
+            supports it — omit for its default.
+        link_types: comma-separated list to restrict which edge types
+            count as a hop, e.g. "assigned_to,belongs_to".
     """
-    return await _monitor_tools.kg_subgraph(project, node_id, hops, scope)
+    return await _monitor_tools.kg_subgraph(project, node_id, hops, scope, direction, link_types)
 
 
 @mcp.tool()
 @logged_tool("kg_anomalies")
-async def kg_anomalies(project: str = "", scope: str = "", since: str = "") -> str:
-    """⚠️ SCAFFOLDING — jeevy-side endpoint not live yet, will 502 until
-    griffin-0's endpoint lands (task-f4220ba84f33).
+async def kg_anomalies(project: str = "", kind: str = "", scope: str = "", node_type: str = "") -> str:
+    """⚠️ jeevy-side endpoint not live yet, will 502 until it lands
+    (task-f4220ba84f33) — contract is confirmed, not guessed.
 
-    Itemized anomaly rows (orphans / dangling edges / schema violations) —
-    the row-level sibling of `kg_health`'s aggregate counts. Reach for this
-    AFTER kg_health flags a nonzero count and you need the actual ids to
-    act on.
+    Itemized anomaly rows for ONE `kind` per call — the row-level sibling
+    of `kg_health`'s aggregate counts. Reach for this AFTER kg_health
+    flags a nonzero count and you need the actual ids to act on.
+
+    Args:
+        project: attached project with a registered KG adapter. Omit when
+            exactly one is registered — it auto-resolves.
+        kind: REQUIRED — one of "orphans" | "dangling" | "schema_violations".
+        scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
+        node_type: narrow to one node type, if given.
+    """
+    return await _monitor_tools.kg_anomalies(project, kind, scope, node_type)
+
+
+@mcp.tool()
+@logged_tool("kg_duplicates")
+async def kg_duplicates(
+    project: str = "", scope: str = "", node_type: str = "", threshold: float | None = None
+) -> str:
+    """⚠️ jeevy-side endpoint not live yet, will 502 until it lands
+    (task-f4220ba84f33) — a NEW tool added to the kg_* suite alongside
+    the other 5, contract confirmed by griffin-0.
+
+    Likely-duplicate node clusters (e.g. two `user` nodes that are
+    probably the same person under different labels) — find KG identity-
+    fracture candidates without hand-scanning kg_search results.
 
     Args:
         project: attached project with a registered KG adapter. Omit when
             exactly one is registered — it auto-resolves.
         scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
-        since: ISO timestamp — scopes to first-appearance ≥ ts.
+        node_type: narrow the dedup scan to one node type.
+        threshold: similarity threshold (adapter-defined scale) — omit to
+            use the adapter's own default.
     """
-    return await _monitor_tools.kg_anomalies(project, scope, since)
+    return await _monitor_tools.kg_duplicates(project, scope, node_type, threshold)
 
 
 @mcp.tool()
@@ -2860,20 +2895,20 @@ async def kg_edges_filter(
     scope: str = "",
     link_type: str = "",
     match_method: str = "",
-    weight_min: float | None = None,
-    weight_max: float | None = None,
+    min_weight: float | None = None,
+    max_weight: float | None = None,
     status: str = "",
-    source: str = "",
+    link_source: str = "",
     limit: int = 50,
+    offset: int = 0,
 ) -> str:
-    """⚠️ SCAFFOLDING — jeevy-side endpoint not live yet, will 502 until
-    griffin-0's endpoint lands (task-f4220ba84f33). Whether the adapter
-    honors these predicates server-side (vs. the daemon filtering client-
-    side after a full fetch) is also unconfirmed.
+    """⚠️ jeevy-side endpoint not live yet, will 502 until it lands
+    (task-f4220ba84f33) — contract is confirmed, not guessed.
 
-    Predicate-filtered edge list — the itemized sibling of
-    `kg_edges_audit`'s aggregate histograms. Reach for this when you know
-    which slice you want (e.g. every fuzzy-matched edge under weight 0.5).
+    Predicate-filtered, REAL-paginated edge list — the itemized sibling
+    of `kg_edges_audit`'s aggregate histograms. Reach for this when you
+    know which slice you want (e.g. every fuzzy-matched edge under
+    weight 0.5).
 
     Args:
         project: attached project with a registered KG adapter. Omit when
@@ -2881,14 +2916,16 @@ async def kg_edges_filter(
         scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
         link_type: filter to one edge type.
         match_method: filter to one match method (e.g. "exact", "fuzzy", "llm").
-        weight_min: minimum edge weight (inclusive).
-        weight_max: maximum edge weight (inclusive).
+        min_weight: minimum edge weight (inclusive).
+        max_weight: maximum edge weight (inclusive).
         status: filter to one edge status, if the adapter tracks one.
-        source: filter to one provenance source.
-        limit: max edges to render (default 50).
+        link_source: filter to one provenance source.
+        limit: page size (default 50) — real server-side pagination.
+        offset: pagination offset — call again with offset += limit for
+            the next page.
     """
     return await _monitor_tools.kg_edges_filter(
-        project, scope, link_type, match_method, weight_min, weight_max, status, source, limit
+        project, scope, link_type, match_method, min_weight, max_weight, status, link_source, limit, offset
     )
 
 
@@ -2897,12 +2934,14 @@ async def kg_edges_filter(
 async def kg_path(
     project: str = "", from_node: str = "", to_node: str = "", max_hops: int = 5, scope: str = ""
 ) -> str:
-    """⚠️ SCAFFOLDING — jeevy-side endpoint not live yet, will 502 until
-    griffin-0's endpoint lands (task-f4220ba84f33).
+    """⚠️ jeevy-side endpoint not live yet, will 502 until it lands
+    (task-f4220ba84f33) — contract is confirmed, not guessed.
 
     Pathfinding between two opaque node ids, capped at max_hops (≤5) —
     "how are these two entities connected?", answered as an actual route
-    instead of manually walking kg_node edges hop by hop.
+    instead of manually walking kg_node edges hop by hop. Always
+    succeeds (200) — a "not reachable" result is a legitimate graph-shape
+    finding, not an error.
 
     Args:
         project: attached project with a registered KG adapter. Omit when
@@ -2913,6 +2952,34 @@ async def kg_path(
         scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
     """
     return await _monitor_tools.kg_path(project, from_node, to_node, max_hops, scope)
+
+
+@mcp.tool()
+@logged_tool("kg_export")
+async def kg_export(
+    project: str = "", scope: str = "", node_type: str = "", since: str = "", limit: int = 500
+) -> str:
+    """⚠️ jeevy-side endpoint not live yet, will 502 until it lands
+    (task-f4220ba84f33) — the pagination-ownership design question IS
+    resolved (griffin-0 confirmed): the daemon loops jeevy's cursor-
+    paginated export across pages server-side and returns one assembled
+    payload — you never see or manage a cursor.
+
+    Full node/edge dump for bulk export/analysis. For interactive
+    browsing prefer `kg_graph` (cheap overview + sample) or `kg_subgraph`
+    (one node's neighborhood) instead — this pulls everything matching
+    the filters, up to a hard daemon-side cap.
+
+    Args:
+        project: attached project with a registered KG adapter. Omit when
+            exactly one is registered — it auto-resolves.
+        scope: adapter-specific scope (e.g. jeevy's "shop:<id>").
+        node_type: narrow the export to one node type.
+        since: ISO timestamp — scopes to first-appearance ≥ ts.
+        limit: per-page size the daemon requests from the adapter while
+            looping (default 500) — not a cap on the total returned.
+    """
+    return await _monitor_tools.kg_export(project, scope, node_type, since, limit)
 
 
 # ---------------------------------------------------------------------------

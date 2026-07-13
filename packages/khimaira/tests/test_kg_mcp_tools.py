@@ -480,33 +480,31 @@ def test_since_forwarded_into_request_path():
 
 
 # ---------------------------------------------------------------------------
-# SCAFFOLDING (2026-07-13, task-f4220ba84f33) — kg_subgraph/kg_anomalies/
-# kg_edges_filter/kg_path. Their daemon-side jeevy endpoints don't exist yet;
-# these tests verify only the khimaira-side plumbing (request path built
-# correctly, response shell parsed/formatted, error/empty passthrough) against
-# an ASSUMED response shape — NOT a confirmed adapter contract. Once
-# griffin-0's real endpoints land, re-verify these against a live response
-# before trusting them (per the codebase's own audit-grade-evidence rule).
+# CONTRACT-CONFIRMED (2026-07-13, task-f4220ba84f33) — kg_subgraph/
+# kg_anomalies/kg_edges_filter/kg_path (real shapes) + kg_duplicates/
+# kg_export (new). Endpoints aren't live yet (jeevy lands them in parallel)
+# — these tests verify only the khimaira-side plumbing against the SETTLED
+# contract from griffin-0 (supersedes the pre-6bed449 assumed-shape tests).
 # ---------------------------------------------------------------------------
 
 
 def test_kg_subgraph_happy():
     payload = {
         "data": {
+            "root": "n1",
             "nodes": [
-                {"id": "n1", "type": "job", "label": "JOB-1"},
-                {"id": "n2", "type": "task", "label": "Cut steel"},
+                {"id": "n1", "type": "job", "depth": 0, "facts": [{"label": "status", "value": "open"}]},
+                {"id": "n2", "type": "task", "depth": 1, "facts": []},
             ],
-            "edges": [{"from": "n2", "to": "n1", "type": "belongs-to", "weight": 1.0}],
-            "center": "n1",
-            "hops": 2,
+            "edges": [{"from": "n2", "to": "n1", "link_type": "belongs_to", "match_method": "exact", "confidence": 1.0, "link_source": "projector", "status": "active"}],
         }
     }
     with patch.object(mt, "_get", return_value=payload):
         out = _run(mt.kg_subgraph("jeevy", "n1", hops=2, scope="shop:10"))
     assert "n1" in out
     assert "2 nodes, 1 edges" in out
-    assert "belongs-to" in out
+    assert "belongs_to" in out
+    assert "status=" in out  # facts rendered
 
 
 def test_kg_subgraph_requires_node_id():
@@ -526,7 +524,7 @@ def test_kg_subgraph_error_passthrough():
     assert "HTTP 502" in out
 
 
-def test_kg_subgraph_request_path_forwards_hops_and_scope():
+def test_kg_subgraph_request_path_forwards_direction_and_link_types():
     captured = {}
 
     def fake_get(path, **kw):
@@ -534,50 +532,119 @@ def test_kg_subgraph_request_path_forwards_hops_and_scope():
         return {"data": {"nodes": [], "edges": []}}
 
     with patch.object(mt, "_get", side_effect=fake_get):
-        _run(mt.kg_subgraph("jeevy", "n1", hops=3, scope="shop:10"))
-    assert "/node/n1/subgraph?hops=3&scope=shop%3A10" in captured["path"]
+        _run(mt.kg_subgraph("jeevy", "n1", hops=3, scope="shop:10", direction="out", link_types="belongs_to,assigned_to"))
+    path = captured["path"]
+    assert "/node/n1/subgraph?hops=3" in path
+    assert "direction=out" in path
+    assert "link_types=belongs_to%2Cassigned_to" in path
+    assert "scope=shop%3A10" in path
+
+
+def test_kg_anomalies_requires_kind():
+    out = _run(mt.kg_anomalies("jeevy"))
+    assert "❌" in out
+    assert "kind" in out
+
+
+def test_kg_anomalies_rejects_invalid_kind():
+    out = _run(mt.kg_anomalies("jeevy", kind="bogus"))
+    assert "❌" in out
 
 
 def test_kg_anomalies_happy():
-    payload = {
-        "data": {
-            "orphans": [{"id": "n2", "type": "user", "label": "Ghost"}],
-            "danglingEdges": [{"id": "e1", "type": "rel", "from": "a", "to": "missing"}],
-            "schemaViolations": [],
-        }
-    }
+    payload = {"data": {"kind": "orphans", "rows": [{"id": "n2", "type": "user", "label": "Ghost"}], "total": 1, "truncated": False}}
     with patch.object(mt, "_get", return_value=payload):
-        out = _run(mt.kg_anomalies("jeevy", "shop:10"))
-    assert "Orphans (1" in out
-    assert "Dangling edges (1" in out
+        out = _run(mt.kg_anomalies("jeevy", kind="orphans", scope="shop:10"))
+    assert "1 orphans" in out
     assert "n2" in out and "Ghost" in out
 
 
-def test_kg_anomalies_clean_graph():
-    payload = {"data": {"orphans": [], "danglingEdges": [], "schemaViolations": []}}
+def test_kg_anomalies_dangling_row_shape():
+    """Dangling-edge rows are edge-shaped (id/type/from/to), not node-shaped
+    — the generic row renderer must branch correctly."""
+    payload = {"data": {"kind": "dangling", "rows": [{"id": "e1", "type": "rel", "from": "a", "to": "missing"}], "total": 1}}
     with patch.object(mt, "_get", return_value=payload):
-        out = _run(mt.kg_anomalies("jeevy", "shop:10"))
-    assert "no anomalies" in out.lower()
+        out = _run(mt.kg_anomalies("jeevy", kind="dangling"))
+    assert "`a`" in out and "`missing`" in out
+
+
+def test_kg_anomalies_clean():
+    payload = {"data": {"kind": "orphans", "rows": [], "total": 0}}
+    with patch.object(mt, "_get", return_value=payload):
+        out = _run(mt.kg_anomalies("jeevy", kind="orphans"))
+    assert "no orphans" in out.lower()
 
 
 def test_kg_anomalies_error_passthrough():
     with patch.object(mt, "_get", return_value="khimaira-monitor → HTTP 502: adapter unreachable"):
-        out = _run(mt.kg_anomalies("jeevy"))
+        out = _run(mt.kg_anomalies("jeevy", kind="orphans"))
     assert "HTTP 502" in out
 
 
 def test_kg_anomalies_surfaces_truncation():
-    payload = {
-        "data": {
-            "orphans": [{"id": "n1", "type": "user", "label": "X"}],
-            "danglingEdges": [],
-            "schemaViolations": [],
-            "truncated": True,
-        }
-    }
+    payload = {"data": {"kind": "orphans", "rows": [{"id": "n1", "type": "user", "label": "X"}], "total": 47, "truncated": True}}
     with patch.object(mt, "_get", return_value=payload):
-        out = _run(mt.kg_anomalies("jeevy"))
+        out = _run(mt.kg_anomalies("jeevy", kind="orphans"))
     assert "truncated" in out.lower()
+    assert "47" in out
+
+
+def test_kg_anomalies_request_path_forwards_kind_and_node_type():
+    captured = {}
+
+    def fake_get(path, **kw):
+        captured["path"] = path
+        return {"data": {"rows": [], "total": 0}}
+
+    with patch.object(mt, "_get", side_effect=fake_get):
+        _run(mt.kg_anomalies("jeevy", kind="schema_violations", scope="shop:10", node_type="bom_line"))
+    path = captured["path"]
+    assert "kind=schema_violations" in path
+    assert "node_type=bom_line" in path
+    assert "scope=shop%3A10" in path
+
+
+def test_kg_duplicates_happy():
+    payload = {"data": {"rows": [{"ids": ["n1", "n2"], "canonical_key": "user:alice", "node_type": "user"}], "total": 1}}
+    with patch.object(mt, "_get", return_value=payload):
+        out = _run(mt.kg_duplicates("jeevy", scope="shop:10"))
+    assert "1 likely-duplicate" in out
+    assert "n1" in out and "n2" in out
+    assert "user:alice" in out
+
+
+def test_kg_duplicates_similar_labels_fallback():
+    payload = {"data": {"rows": [{"ids": ["n3", "n4"], "similar_labels": ["Bob", "Bobby"], "node_type": "user"}], "total": 1}}
+    with patch.object(mt, "_get", return_value=payload):
+        out = _run(mt.kg_duplicates("jeevy"))
+    assert "Bob" in out and "Bobby" in out
+
+
+def test_kg_duplicates_none_found():
+    with patch.object(mt, "_get", return_value={"data": {"rows": [], "total": 0}}):
+        out = _run(mt.kg_duplicates("jeevy"))
+    assert "no likely duplicates" in out.lower()
+
+
+def test_kg_duplicates_error_passthrough():
+    with patch.object(mt, "_get", return_value="khimaira-monitor → HTTP 502: adapter unreachable"):
+        out = _run(mt.kg_duplicates("jeevy"))
+    assert "HTTP 502" in out
+
+
+def test_kg_duplicates_request_path_forwards_threshold():
+    captured = {}
+
+    def fake_get(path, **kw):
+        captured["path"] = path
+        return {"data": {"rows": [], "total": 0}}
+
+    with patch.object(mt, "_get", side_effect=fake_get):
+        _run(mt.kg_duplicates("jeevy", scope="shop:10", node_type="user", threshold=0.85))
+    path = captured["path"]
+    assert "node_type=user" in path
+    assert "threshold=0.85" in path
+    assert "scope=shop%3A10" in path
 
 
 def test_kg_edges_filter_happy():
@@ -600,7 +667,7 @@ def test_kg_edges_filter_error_passthrough():
     assert "HTTP 502" in out
 
 
-def test_kg_edges_filter_request_path_forwards_predicates():
+def test_kg_edges_filter_request_path_uses_renamed_predicates():
     captured = {}
 
     def fake_get(path, **kw):
@@ -614,54 +681,40 @@ def test_kg_edges_filter_request_path_forwards_predicates():
                 "shop:10",
                 link_type="assigned",
                 match_method="fuzzy",
-                weight_min=0.1,
-                weight_max=0.9,
+                min_weight=0.1,
+                max_weight=0.9,
                 status="active",
-                source="extractor",
+                link_source="extractor",
             )
         )
     path = captured["path"]
-    assert "link_type=assigned" in path
-    assert "match_method=fuzzy" in path
-    assert "weight_min=0.1" in path
-    assert "weight_max=0.9" in path
-    assert "status=active" in path
-    assert "source=extractor" in path
-    assert "scope=shop%3A10" in path
+    assert "min_weight=0.1" in path
+    assert "max_weight=0.9" in path
+    assert "link_source=extractor" in path
+    assert "limit=50" in path and "offset=0" in path  # defaults always sent (real pagination)
 
 
-def test_kg_edges_filter_truncation_message():
+def test_kg_edges_filter_pagination_hint_uses_offset_not_limit():
     payload = {"data": {"edges": [{"id": "e1", "type": "rel", "from": "a", "to": "b"}], "total": 5}}
     with patch.object(mt, "_get", return_value=payload):
-        out = _run(mt.kg_edges_filter("jeevy", limit=1))
-    assert "4 more" in out
+        out = _run(mt.kg_edges_filter("jeevy", offset=0))
+    assert "offset=1" in out  # next-page hint, not "raise limit" (old scaffolding wording)
 
 
-def test_kg_path_happy_found():
-    payload = {
-        "data": {
-            "found": True,
-            "hops": 2,
-            "path": [
-                {"id": "n1", "type": "job", "label": "Job A"},
-                {"type": "assigned_to", "from": "n1", "to": "n2"},
-                {"id": "n2", "type": "user", "label": "Priya"},
-            ],
-        }
-    }
+def test_kg_path_happy_reachable():
+    payload = {"data": {"path": ["n1", "n2", "n3"], "hops": 2, "reachable": True}}
     with patch.object(mt, "_get", return_value=payload):
-        out = _run(mt.kg_path("jeevy", "n1", "n2"))
+        out = _run(mt.kg_path("jeevy", "n1", "n3"))
     assert "path found" in out.lower()
-    assert "n1" in out and "n2" in out
-    assert "assigned_to" in out
+    assert "n1" in out and "n2" in out and "n3" in out
+    assert "2 hop" in out
 
 
-def test_kg_path_not_found():
-    payload = {"data": {"found": False, "reason": "no route within 5 hops"}}
+def test_kg_path_not_reachable():
+    payload = {"data": {"path": None, "hops": None, "reachable": False}}
     with patch.object(mt, "_get", return_value=payload):
         out = _run(mt.kg_path("jeevy", "n1", "n99"))
-    assert "no path found" in out.lower()
-    assert "no route within 5 hops" in out
+    assert "not reachable" in out.lower()
 
 
 def test_kg_path_requires_both_nodes():
@@ -688,7 +741,7 @@ def test_kg_path_request_path_forwards_endpoints():
 
     def fake_get(path, **kw):
         captured["path"] = path
-        return {"data": {"found": False}}
+        return {"data": {"reachable": False}}
 
     with patch.object(mt, "_get", side_effect=fake_get):
         _run(mt.kg_path("jeevy", "n1", "n2", max_hops=3, scope="shop:10"))
@@ -697,3 +750,62 @@ def test_kg_path_request_path_forwards_endpoints():
     assert "to=n2" in path
     assert "max_hops=3" in path
     assert "scope=shop%3A10" in path
+
+
+def test_kg_export_happy():
+    payload = {"data": {"nodes": [{"id": "n1"}, {"id": "n2"}], "edges": [{"id": "e1"}], "truncated": False, "nextCursor": None}}
+    with patch.object(mt, "_get", return_value=payload):
+        out = _run(mt.kg_export("jeevy", scope="shop:10"))
+    assert "2 nodes, 1 edges" in out
+    assert "truncated" not in out.lower()
+
+
+def test_kg_export_empty():
+    with patch.object(mt, "_get", return_value={"data": {"nodes": [], "edges": []}}):
+        out = _run(mt.kg_export("jeevy"))
+    assert "empty" in out.lower()
+
+
+def test_kg_export_error_passthrough():
+    with patch.object(mt, "_get", return_value="khimaira-monitor → HTTP 502: adapter unreachable"):
+        out = _run(mt.kg_export("jeevy"))
+    assert "HTTP 502" in out
+
+
+def test_kg_export_surfaces_truncation():
+    payload = {"data": {"nodes": [{"id": "n1"}], "edges": [], "truncated": True, "nextCursor": "c99"}}
+    with patch.object(mt, "_get", return_value=payload):
+        out = _run(mt.kg_export("jeevy"))
+    assert "truncated" in out.lower()
+    assert "c99" in out
+
+
+def test_kg_export_uses_long_timeout():
+    """The daemon loops pages server-side before responding — the MCP
+    client call needs real headroom, not the 30s default the other kg_*
+    tools use (mirrors notebook_ask's own override)."""
+    captured = {}
+
+    def fake_get(path, **kw):
+        captured["timeout"] = kw.get("timeout")
+        return {"data": {"nodes": [], "edges": []}}
+
+    with patch.object(mt, "_get", side_effect=fake_get):
+        _run(mt.kg_export("jeevy"))
+    assert captured["timeout"] == 120.0
+
+
+def test_kg_export_request_path_forwards_node_type_and_since():
+    captured = {}
+
+    def fake_get(path, **kw):
+        captured["path"] = path
+        return {"data": {"nodes": [], "edges": []}}
+
+    with patch.object(mt, "_get", side_effect=fake_get):
+        _run(mt.kg_export("jeevy", scope="shop:10", node_type="bom_line", since="2026-01-01"))
+    path = captured["path"]
+    assert "node_type=bom_line" in path
+    assert "since=2026-01-01" in path
+    assert "scope=shop%3A10" in path
+    assert "limit=500" in path

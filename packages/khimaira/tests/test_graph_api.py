@@ -646,24 +646,23 @@ def test_contract_gate_env_strict_default(graph_mod, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# SCAFFOLDING routes (2026-07-13, task-f4220ba84f33) — the jeevy-side
-# endpoints these proxy to don't exist yet; these tests verify only the
-# khimaira-side plumbing (URL derivation, param forwarding, shared 404/502
-# handling via the same _adapter_or_404/_proxy_get helpers every other route
-# uses) — NOT a real adapter contract, which is unconfirmed.
+# CONTRACT-CONFIRMED routes (2026-07-13, task-f4220ba84f33) — griffin-0's
+# real jeevy paths/shapes for 5 tools + kg_duplicates (new). Endpoints
+# aren't live yet (still proxy to a fake adapter here, same as every other
+# route test) but the params/shape asserted below are the settled contract,
+# not a guess — supersedes the pre-6bed449 scaffolding-assumption tests.
 # ---------------------------------------------------------------------------
 
 _SUBGRAPH_CONTRACT = {
     "data": {
-        "nodes": [{"id": "n1", "type": "task", "label": "Cut sheet"}],
-        "edges": [],
-        "center": "n1",
-        "hops": 2,
+        "root": "n1",
+        "nodes": [{"id": "n1", "type": "task", "depth": 0, "facts": [{"label": "status", "value": "open"}]}],
+        "edges": [{"from": "n2", "to": "n1", "link_type": "belongs_to", "match_method": "exact", "confidence": 1.0, "link_source": "projector", "status": "active"}],
     }
 }
 
 
-def test_graph_subgraph_proxies_to_subgraph_subpath(graph_mod, monkeypatch):
+def test_graph_subgraph_proxies_and_forwards_direction_and_link_types(graph_mod, monkeypatch):
     monkeypatch.setattr(
         graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
     )
@@ -673,12 +672,32 @@ def test_graph_subgraph_proxies_to_subgraph_subpath(graph_mod, monkeypatch):
         _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_SUBGRAPH_CONTRACT)),
     )
     r = _client(graph_mod).get(
-        "/api/graph/jeevy_portal/node/n1/subgraph", params={"scope": "shop:10", "hops": 3}
+        "/api/graph/jeevy_portal/node/n1/subgraph",
+        params={"scope": "shop:10", "hops": 3, "direction": "out", "link_types": "belongs_to,assigned_to"},
     )
     assert r.status_code == 200
     assert r.json() == _SUBGRAPH_CONTRACT
     assert _FakeClient.last_url == "http://x/internal/kg/node/n1/subgraph"
-    assert _FakeClient.last_params == {"hops": 3, "scope": "shop:10"}
+    assert _FakeClient.last_params == {
+        "hops": 3,
+        "direction": "out",
+        "link_types": "belongs_to,assigned_to",
+        "scope": "shop:10",
+    }
+
+
+def test_graph_subgraph_omits_direction_and_link_types_when_unset(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_SUBGRAPH_CONTRACT)),
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/node/n1/subgraph")
+    assert r.status_code == 200
+    assert _FakeClient.last_params == {"hops": 2}
 
 
 def test_graph_subgraph_404_no_adapter(graph_mod, monkeypatch):
@@ -687,43 +706,103 @@ def test_graph_subgraph_404_no_adapter(graph_mod, monkeypatch):
     assert r.status_code == 404
 
 
-_ANOMALIES_CONTRACT = {
-    "data": {
-        "orphans": [{"id": "n2", "type": "user", "label": "Ghost"}],
-        "danglingEdges": [],
-        "schemaViolations": [],
-    }
-}
+_ANOMALIES_ORPHANS = {"data": {"kind": "orphans", "rows": [{"id": "n2", "type": "user", "label": "Ghost"}], "total": 1, "truncated": False}}
 
 
-def test_graph_anomalies_proxies_to_anomalies_subpath(graph_mod, monkeypatch):
+def test_graph_anomalies_requires_kind(graph_mod, monkeypatch):
+    """`kind` is a REQUIRED daemon-side input check (422), not forwarded
+    to the adapter unset — this is the one-kind-per-call contract."""
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/anomalies")
+    assert r.status_code == 422
+
+
+def test_graph_anomalies_rejects_invalid_kind(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/anomalies", params={"kind": "bogus"})
+    assert r.status_code == 422
+    assert "bogus" in r.json()["detail"]
+
+
+def test_graph_anomalies_proxies_one_kind_per_call(graph_mod, monkeypatch):
     monkeypatch.setattr(
         graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
     )
     monkeypatch.setattr(
         graph_mod.httpx,
         "AsyncClient",
-        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_ANOMALIES_CONTRACT)),
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_ANOMALIES_ORPHANS)),
     )
     r = _client(graph_mod).get(
-        "/api/graph/jeevy_portal/anomalies", params={"scope": "shop:10", "since": "2026-01-01"}
+        "/api/graph/jeevy_portal/anomalies",
+        params={"kind": "orphans", "scope": "shop:10", "node_type": "user"},
     )
     assert r.status_code == 200
-    assert r.json() == _ANOMALIES_CONTRACT
+    assert r.json() == _ANOMALIES_ORPHANS
     assert _FakeClient.last_url == "http://x/internal/kg/anomalies"
-    assert _FakeClient.last_params == {"scope": "shop:10", "since": "2026-01-01"}
+    assert _FakeClient.last_params == {"kind": "orphans", "node_type": "user", "scope": "shop:10"}
 
 
 def test_graph_anomalies_404_no_adapter(graph_mod, monkeypatch):
     monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
-    r = _client(graph_mod).get("/api/graph/jeevy_portal/anomalies")
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/anomalies", params={"kind": "orphans"})
     assert r.status_code == 404
 
 
-_EDGES_FILTER_CONTRACT = {"data": {"edges": [{"id": "e1", "type": "assigned"}], "total": 1}}
+_DUPLICATES_CONTRACT = {
+    "data": {"rows": [{"ids": ["n1", "n2"], "canonical_key": "user:alice", "node_type": "user"}], "total": 1}
+}
 
 
-def test_graph_edges_filter_proxies_and_forwards_predicates(graph_mod, monkeypatch):
+def test_graph_duplicates_proxies_and_forwards_params(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_DUPLICATES_CONTRACT)),
+    )
+    r = _client(graph_mod).get(
+        "/api/graph/jeevy_portal/duplicates",
+        params={"scope": "shop:10", "node_type": "user", "threshold": 0.8},
+    )
+    assert r.status_code == 200
+    assert r.json() == _DUPLICATES_CONTRACT
+    assert _FakeClient.last_url == "http://x/internal/kg/duplicates"
+    assert _FakeClient.last_params == {"node_type": "user", "threshold": 0.8, "scope": "shop:10"}
+
+
+def test_graph_duplicates_omits_unset_params(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx,
+        "AsyncClient",
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_DUPLICATES_CONTRACT)),
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/duplicates")
+    assert r.status_code == 200
+    assert _FakeClient.last_params == {}
+
+
+def test_graph_duplicates_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/duplicates")
+    assert r.status_code == 404
+
+
+_EDGES_FILTER_CONTRACT = {"data": {"edges": [{"id": "e1", "type": "assigned"}], "total": 1, "truncated": False}}
+
+
+def test_graph_edges_filter_proxies_and_forwards_renamed_predicates(graph_mod, monkeypatch):
+    """min_weight/max_weight (not weight_min/weight_max) + link_source +
+    real limit/offset pagination — the confirmed-contract param names."""
     monkeypatch.setattr(
         graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
     )
@@ -738,29 +817,33 @@ def test_graph_edges_filter_proxies_and_forwards_predicates(graph_mod, monkeypat
             "scope": "shop:10",
             "link_type": "assigned_to",
             "match_method": "fuzzy",
-            "weight_min": 0.1,
-            "weight_max": 0.5,
+            "min_weight": 0.1,
+            "max_weight": 0.5,
             "status": "active",
-            "source": "extractor",
+            "link_source": "extractor",
+            "limit": 25,
+            "offset": 50,
         },
     )
     assert r.status_code == 200
     assert r.json() == _EDGES_FILTER_CONTRACT
     assert _FakeClient.last_url == "http://x/internal/kg/edges"
     assert _FakeClient.last_params == {
+        "limit": 25,
+        "offset": 50,
         "link_type": "assigned_to",
         "match_method": "fuzzy",
-        "weight_min": 0.1,
-        "weight_max": 0.5,
+        "min_weight": 0.1,
+        "max_weight": 0.5,
         "status": "active",
-        "source": "extractor",
+        "link_source": "extractor",
         "scope": "shop:10",
     }
 
 
-def test_graph_edges_filter_omits_unset_predicates(graph_mod, monkeypatch):
-    """Only predicates the caller actually passed reach the adapter — no
-    None/empty-string noise in the forwarded params."""
+def test_graph_edges_filter_defaults_limit_and_offset(graph_mod, monkeypatch):
+    """limit/offset are ALWAYS sent (real pagination, not an optional
+    display cap) — default limit=50, offset=0."""
     monkeypatch.setattr(
         graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
     )
@@ -771,7 +854,7 @@ def test_graph_edges_filter_omits_unset_predicates(graph_mod, monkeypatch):
     )
     r = _client(graph_mod).get("/api/graph/jeevy_portal/edges")
     assert r.status_code == 200
-    assert _FakeClient.last_params == {}
+    assert _FakeClient.last_params == {"limit": 50, "offset": 0}
 
 
 def test_graph_edges_filter_404_no_adapter(graph_mod, monkeypatch):
@@ -780,18 +863,8 @@ def test_graph_edges_filter_404_no_adapter(graph_mod, monkeypatch):
     assert r.status_code == 404
 
 
-_PATH_FOUND = {
-    "data": {
-        "found": True,
-        "hops": 2,
-        "path": [
-            {"id": "n1", "type": "job", "label": "Job A"},
-            {"type": "assigned_to", "from": "n1", "to": "n2"},
-            {"id": "n2", "type": "user", "label": "Priya"},
-        ],
-    }
-}
-_PATH_NOT_FOUND = {"data": {"found": False, "reason": "no route within 5 hops"}}
+_PATH_REACHABLE = {"data": {"path": ["n1", "n2"], "hops": 1, "reachable": True}}
+_PATH_UNREACHABLE = {"data": {"path": None, "hops": None, "reachable": False}}
 
 
 def test_graph_path_proxies_and_forwards_endpoints(graph_mod, monkeypatch):
@@ -801,32 +874,34 @@ def test_graph_path_proxies_and_forwards_endpoints(graph_mod, monkeypatch):
     monkeypatch.setattr(
         graph_mod.httpx,
         "AsyncClient",
-        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_PATH_FOUND)),
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_PATH_REACHABLE)),
     )
     r = _client(graph_mod).get(
         "/api/graph/jeevy_portal/path",
         params={"from_node": "n1", "to_node": "n2", "max_hops": 3, "scope": "shop:10"},
     )
     assert r.status_code == 200
-    assert r.json() == _PATH_FOUND
+    assert r.json() == _PATH_REACHABLE
     assert _FakeClient.last_url == "http://x/internal/kg/path"
     assert _FakeClient.last_params == {"from": "n1", "to": "n2", "max_hops": 3, "scope": "shop:10"}
 
 
-def test_graph_path_not_found_passthrough(graph_mod, monkeypatch):
+def test_graph_path_unreachable_is_still_200(graph_mod, monkeypatch):
+    """reachable:false is a legitimate finding, not an error — always 200,
+    never 404/500 for a no-path result."""
     monkeypatch.setattr(
         graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
     )
     monkeypatch.setattr(
         graph_mod.httpx,
         "AsyncClient",
-        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_PATH_NOT_FOUND)),
+        _client_for(graph_mod, resp=_FakeResp(status_code=200, json_data=_PATH_UNREACHABLE)),
     )
     r = _client(graph_mod).get(
         "/api/graph/jeevy_portal/path", params={"from_node": "n1", "to_node": "n99"}
     )
     assert r.status_code == 200
-    assert r.json()["data"]["found"] is False
+    assert r.json()["data"]["reachable"] is False
 
 
 def test_graph_path_404_no_adapter(graph_mod, monkeypatch):
@@ -835,6 +910,137 @@ def test_graph_path_404_no_adapter(graph_mod, monkeypatch):
         "/api/graph/jeevy_portal/path", params={"from_node": "n1", "to_node": "n2"}
     )
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# kg_export — server-side pagination loop (griffin-0-confirmed design)
+# ---------------------------------------------------------------------------
+
+
+class _SequencedFakeClient:
+    """Async-context-manager stand-in returning a DIFFERENT response per
+    call — needed for kg_export, which calls the adapter multiple times."""
+
+    calls: list[dict] = []
+
+    def __init__(self, *, responses):
+        self._responses = list(responses)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    async def get(self, url, params=None, headers=None):
+        type(self).calls.append({"url": url, "params": params, "headers": headers})
+        idx = len(type(self).calls) - 1
+        return self._responses[min(idx, len(self._responses) - 1)]
+
+
+def _sequenced_client_for(responses):
+    _SequencedFakeClient.calls = []
+
+    def _factory(*_a, **_k):
+        return _SequencedFakeClient(responses=responses)
+
+    return _factory
+
+
+def test_graph_export_single_page_no_more(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    page = _FakeResp(
+        status_code=200,
+        json_data={"nodes": [{"id": "n1"}], "edges": [{"id": "e1"}], "next_cursor": None, "has_more": False},
+    )
+    monkeypatch.setattr(graph_mod.httpx, "AsyncClient", _sequenced_client_for([page]))
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/export", params={"scope": "shop:10"})
+    assert r.status_code == 200
+    body = r.json()["data"]
+    assert body["nodes"] == [{"id": "n1"}]
+    assert body["edges"] == [{"id": "e1"}]
+    assert body["truncated"] is False
+    assert body["nextCursor"] is None
+    assert len(_SequencedFakeClient.calls) == 1
+
+
+def test_graph_export_loops_across_pages_and_assembles(graph_mod, monkeypatch):
+    """The daemon loops server-side — 3 pages in, ONE assembled payload out."""
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    pages = [
+        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n1"}], "edges": [], "next_cursor": "c1", "has_more": True}),
+        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n2"}], "edges": [], "next_cursor": "c2", "has_more": True}),
+        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n3"}], "edges": [], "next_cursor": None, "has_more": False}),
+    ]
+    monkeypatch.setattr(graph_mod.httpx, "AsyncClient", _sequenced_client_for(pages))
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/export")
+    assert r.status_code == 200
+    body = r.json()["data"]
+    assert [n["id"] for n in body["nodes"]] == ["n1", "n2", "n3"]
+    assert body["truncated"] is False
+    assert len(_SequencedFakeClient.calls) == 3
+    # cursor forwarded correctly across the loop
+    assert _SequencedFakeClient.calls[1]["params"].get("cursor") == "c1"
+    assert _SequencedFakeClient.calls[2]["params"].get("cursor") == "c2"
+
+
+def test_graph_export_truncates_at_item_cap(graph_mod, monkeypatch):
+    """A page that pushes the running total past _EXPORT_MAX_ITEMS stops
+    the loop early with truncated=True, even though has_more was still true."""
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(graph_mod, "_EXPORT_MAX_ITEMS", 2)
+    pages = [
+        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n1"}, {"id": "n2"}], "edges": [], "next_cursor": "c1", "has_more": True}),
+        _FakeResp(status_code=200, json_data={"nodes": [{"id": "n3"}], "edges": [], "next_cursor": "c2", "has_more": True}),
+    ]
+    monkeypatch.setattr(graph_mod.httpx, "AsyncClient", _sequenced_client_for(pages))
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/export")
+    assert r.status_code == 200
+    body = r.json()["data"]
+    assert body["truncated"] is True
+    assert len(_SequencedFakeClient.calls) == 1  # stopped after the FIRST page hit the cap
+
+
+def test_graph_export_truncates_at_page_cap(graph_mod, monkeypatch):
+    """has_more=true forever → stops at _EXPORT_MAX_PAGES, truncated=True
+    (never loops forever on the daemon's dime)."""
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(graph_mod, "_EXPORT_MAX_PAGES", 3)
+    page = _FakeResp(
+        status_code=200,
+        json_data={"nodes": [{"id": "n"}], "edges": [], "next_cursor": "cN", "has_more": True},
+    )
+    monkeypatch.setattr(graph_mod.httpx, "AsyncClient", _sequenced_client_for([page]))
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/export")
+    assert r.status_code == 200
+    body = r.json()["data"]
+    assert body["truncated"] is True
+    assert len(_SequencedFakeClient.calls) == 3  # exactly the page cap, not infinite
+
+
+def test_graph_export_404_no_adapter(graph_mod, monkeypatch):
+    monkeypatch.setattr(graph_mod, "get_kg_adapter", lambda _p: None)
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/export")
+    assert r.status_code == 404
+
+
+def test_graph_export_502_first_page_unreachable(graph_mod, monkeypatch):
+    monkeypatch.setattr(
+        graph_mod, "get_kg_adapter", lambda _p: {"url": "http://x/internal/kg/graph"}
+    )
+    monkeypatch.setattr(
+        graph_mod.httpx, "AsyncClient", _client_for(graph_mod, raise_exc=httpx.ConnectError("boom"))
+    )
+    r = _client(graph_mod).get("/api/graph/jeevy_portal/export")
+    assert r.status_code == 502
 
 
 def test_runtime_field_constants_match_kgtypes_source(graph_mod):

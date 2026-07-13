@@ -46,6 +46,16 @@ log = logging.getLogger(__name__)
 # short connect so a down adapter fails fast → 502.
 _ADAPTER_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
 
+# kg_export (2026-07-13, task-f4220ba84f33) — griffin-0-confirmed design: the
+# daemon loops jeevy's cursor-paginated export endpoint server-side and
+# returns ONE assembled payload; the MCP tool never sees a cursor. These caps
+# bound that loop so a huge/misbehaving graph can't hang the daemon or blow up
+# the response — `truncated=True` (+ the last-seen cursor) is surfaced rather
+# than looping forever or silently dropping data past the cap.
+_EXPORT_MAX_PAGES = 50
+_EXPORT_MAX_ITEMS = 20_000  # nodes + edges combined
+_ANOMALY_KINDS = frozenset({"orphans", "dangling", "schema_violations"})
+
 
 def _resolve_token(token_env: str) -> str | None:
     """Resolve the bearer token from the daemon's environment.
@@ -407,67 +417,100 @@ def build_router():
         return await _proxy_get(project, adapter, _sub_url(adapter["url"], "scopes"), "")
 
     # -------------------------------------------------------------------
-    # SCAFFOLDING (2026-07-13, task-f4220ba84f33, griffin-0 handoff) — the
-    # jeevy-side sibling endpoints these 4 proxy to DON'T EXIST YET. Every
-    # `_sub_url(...)` call below is my best-guess sub-path, marked TODO, and
-    # every response shape assumed in the corresponding monitor_tools.py
-    # kg_* function is UNCONFIRMED — do not treat either as a settled
-    # contract. Wire the real path/shape in once griffin-0 answers (see the
-    # chat-102d8b5fd82f task-f4220ba84f33 thread for the open-question list
-    # per tool). kg_export is deliberately NOT scaffolded here — its
-    # pagination-ownership question (proxy loops server-side vs. tool
-    # exposes a cursor) is unresolved; building either half now risks an
-    # expensive-to-unwind wrong assumption.
+    # CONTRACT CONFIRMED (2026-07-13, task-f4220ba84f33) — griffin-0's real
+    # jeevy endpoint paths + response shapes for these 5, plus a 6th
+    # (kg_duplicates) added fresh to the suite. Endpoints aren't LIVE yet
+    # (jeevy lands them in parallel) — every route below will 502 until
+    # then, but the path/param/shape contract itself is settled, not a
+    # guess. Supersedes the scaffolding assumptions from commit 6bed449.
     # -------------------------------------------------------------------
 
     @router.get("/graph/{project}/node/{node_id}/subgraph")
     async def get_graph_subgraph(
-        project: str, node_id: str, hops: int = 2, scope: str = "", since: str = ""
+        project: str,
+        node_id: str,
+        hops: int = 2,
+        scope: str = "",
+        direction: str = "",
+        link_types: str = "",
     ) -> dict[str, Any]:
         """Ego-subgraph proxy: `node_id` + its `hops`-hop neighborhood,
-        provenance-enriched (edges carry the same `meta` shape as
-        `/edge/{id}`). The opaque node_id passes through verbatim.
+        direction- and link-type-filterable, provenance-enriched (each
+        edge carries match_method/confidence/link_source/status — richer
+        than the generic GraphEdge contract). The opaque node_id passes
+        through verbatim. Endpoint not live yet (griffin-0 lands it in
+        parallel) — will 502 until then.
 
-        TODO(griffin-0): confirm the real jeevy sub-path — guessed as a
-        sibling of `node/{id}` (mirrors the existing `node/{id}/source`
-        convention) rather than a top-level `subgraph/{id}`; either is
-        plausible. ASSUMED response shape (UNCONFIRMED):
-        `{"data": {"nodes": [...GraphNode], "edges": [...GraphEdge],
-        "center": node_id, "hops": N}}` — same generic contract as
-        `/graph/{project}` (kgTypes.ts GraphNode/GraphEdge), just pre-
-        filtered to one node's neighborhood instead of the whole graph.
-        `hops` IS forwarded as `?hops=N` below — TODO(griffin-0): confirm
-        the adapter actually honors it (vs. a fixed server-side default)
-        before treating it as load-bearing."""
+        Real jeevy path: `GET /internal/kg/node/{id}/subgraph?scope=&
+        hops=&direction=&link_types=`. Response: `{"data": {"root",
+        "nodes": [{id,type,depth,facts}], "edges": [{from,to,link_type,
+        match_method,confidence,link_source,status}]}}`.
+        """
         adapter = _adapter_or_404(project)
+        extra: dict[str, Any] = {"hops": hops}
+        if direction:
+            extra["direction"] = direction
+        if link_types:
+            extra["link_types"] = link_types
         return await _proxy_get(
             project,
             adapter,
             _sub_url(adapter["url"], f"node/{node_id}/subgraph"),
             scope,
-            since,
-            extra_params={"hops": hops},
+            extra_params=extra,
         )
 
     @router.get("/graph/{project}/anomalies")
     async def get_graph_anomalies(
-        project: str, scope: str = "", since: str = ""
+        project: str, kind: str, scope: str = "", node_type: str = ""
     ) -> dict[str, Any]:
-        """Itemized anomaly rows — the ROW-level sibling of `/health`'s
-        aggregate counts (orphan/dangling/schema-violation COUNTS there;
-        the actual offending nodes/edges here, so an agent can act on
-        them without a follow-up kg_search per suspect).
+        """Itemized anomaly rows for ONE `kind` per call (`orphans` |
+        `dangling` | `schema_violations`) — the row-level sibling of
+        `/health`'s aggregate counts, so an agent can act on the actual
+        offending nodes/edges instead of just seeing a number. Endpoint
+        not live yet (griffin-0 lands it in parallel) — will 502 until
+        then.
 
-        TODO(griffin-0): confirm the real jeevy sub-path (guessed
-        `anomalies`, a plural-noun sibling of `edges-audit`) and whether
-        it needs its own cap/truncation params (edges-audit's suspect
-        list is capped server-side — this probably needs the same).
-        ASSUMED response shape (UNCONFIRMED): `{"data": {"orphans":
-        [{id,type,label}...], "danglingEdges": [{id,from,to,type}...],
-        "schemaViolations": [{...}], "truncated": bool}}` — mirrors
-        health's three categories, itemized instead of counted."""
+        Real jeevy path: `GET /internal/kg/anomalies?scope=&kind=&
+        node_type=`. Response: `{"data": {"kind", "rows": [...], "total",
+        "truncated"}}`. 422 (not the adapter's fault — a daemon-side input
+        check) when `kind` isn't one of the three valid values.
+        """
+        if kind not in _ANOMALY_KINDS:
+            raise fastapi.HTTPException(
+                422, f"kind must be one of {sorted(_ANOMALY_KINDS)}, got {kind!r}"
+            )
         adapter = _adapter_or_404(project)
-        return await _proxy_get(project, adapter, _sub_url(adapter["url"], "anomalies"), scope, since)
+        extra: dict[str, Any] = {"kind": kind}
+        if node_type:
+            extra["node_type"] = node_type
+        return await _proxy_get(
+            project, adapter, _sub_url(adapter["url"], "anomalies"), scope, extra_params=extra
+        )
+
+    @router.get("/graph/{project}/duplicates")
+    async def get_graph_duplicates(
+        project: str, scope: str = "", node_type: str = "", threshold: float | None = None
+    ) -> dict[str, Any]:
+        """Likely-duplicate node clusters (e.g. two `user` nodes that are
+        probably the same person under different labels) — a 6th tool
+        added fresh to this suite (not in the original task-f4220ba84f33
+        scope; griffin-0 confirmed it alongside the other 5). Endpoint
+        not live yet — will 502 until jeevy ships it.
+
+        Real jeevy path: `GET /internal/kg/duplicates?scope=&node_type=&
+        threshold=`. Response: `{"data": {"rows": [{ids:[...],
+        canonical_key/similar_labels, node_type}], "total"}}`.
+        """
+        adapter = _adapter_or_404(project)
+        extra: dict[str, Any] = {}
+        if node_type:
+            extra["node_type"] = node_type
+        if threshold is not None:
+            extra["threshold"] = threshold
+        return await _proxy_get(
+            project, adapter, _sub_url(adapter["url"], "duplicates"), scope, extra_params=extra
+        )
 
     @router.get("/graph/{project}/edges")
     async def get_graph_edges_filter(
@@ -475,36 +518,38 @@ def build_router():
         scope: str = "",
         link_type: str = "",
         match_method: str = "",
-        weight_min: float | None = None,
-        weight_max: float | None = None,
+        min_weight: float | None = None,
+        max_weight: float | None = None,
         status: str = "",
-        source: str = "",
+        link_source: str = "",
+        limit: int = 50,
+        offset: int = 0,
     ) -> dict[str, Any]:
-        """Predicate-filtered edge list — the itemized sibling of
-        `/edges-audit`'s aggregate histograms, filterable on any single
-        predicate or a combination.
+        """Predicate-filtered, REAL-paginated edge list (`limit`/`offset`
+        forwarded to the adapter — it returns one page, the daemon does
+        not fetch-then-slice) — the itemized sibling of `/edges-audit`'s
+        aggregate histograms. Endpoint not live yet — will 502 until
+        jeevy ships it.
 
-        TODO(griffin-0): confirm the real jeevy sub-path (guessed `edges`,
-        a plural-noun sibling of `edge/{id}`) and which of these predicates
-        the adapter actually supports server-side vs. which the daemon
-        would need to filter client-side after an unfiltered fetch (an
-        important cost question on a ~5k-edge graph). ASSUMED response
-        shape (UNCONFIRMED): `{"data": {"edges": [...GraphEdge-with-meta],
-        "total": N, "truncated": bool}}`."""
+        Real jeevy path: `GET /internal/kg/edges?scope=&link_type&
+        match_method&min_weight&max_weight&status&link_source&limit&
+        offset`. Response: `{"data": {"edges": [...], "total",
+        "truncated"}}`.
+        """
         adapter = _adapter_or_404(project)
-        extra: dict[str, Any] = {}
+        extra: dict[str, Any] = {"limit": limit, "offset": offset}
         if link_type:
             extra["link_type"] = link_type
         if match_method:
             extra["match_method"] = match_method
-        if weight_min is not None:
-            extra["weight_min"] = weight_min
-        if weight_max is not None:
-            extra["weight_max"] = weight_max
+        if min_weight is not None:
+            extra["min_weight"] = min_weight
+        if max_weight is not None:
+            extra["max_weight"] = max_weight
         if status:
             extra["status"] = status
-        if source:
-            extra["source"] = source
+        if link_source:
+            extra["link_source"] = link_source
         return await _proxy_get(
             project, adapter, _sub_url(adapter["url"], "edges"), scope, extra_params=extra
         )
@@ -514,25 +559,92 @@ def build_router():
         project: str, from_node: str, to_node: str, max_hops: int = 5, scope: str = ""
     ) -> dict[str, Any]:
         """Pathfinding proxy between two opaque node ids, capped at
-        `max_hops` (≤5 per spec — the adapter should refuse/cap higher,
-        not the daemon, since it owns the traversal).
+        `max_hops` (≤5 — the adapter enforces the cap, not the daemon,
+        since it owns the traversal). Endpoint not live yet — will 502
+        until jeevy ships it. Note the response is ALWAYS 200 —
+        `reachable:false` on no path within `max_hops`, never 404/500 for
+        that case (that's a legitimate graph-shape finding, not an error).
 
-        TODO(griffin-0): confirm the real jeevy sub-path (guessed `path`)
-        and the query param names for the two endpoints (`from`/`to` used
-        here as placeholders — `from` is a Python keyword-adjacent name,
-        renamed `from_node`/`to_node` on this side; confirm what the
-        adapter expects on the wire). ASSUMED response shape
-        (UNCONFIRMED): `{"data": {"found": bool, "path": [node, edge,
-        node, ...] alternating, "hops": N}}` on success, or `{"data":
-        {"found": false, "reason": "..."}}` (mirrors node/source's
-        graceful-empty convention) when no path exists within max_hops."""
+        Real jeevy path: `GET /internal/kg/path?scope=&from=&to=&
+        max_hops=` (from_node/to_node here map to the wire params
+        from/to — confirmed correct). Response: `{"data": {"path":
+        [ids] or null, "hops" or null, "reachable": bool}}`.
+        """
         adapter = _adapter_or_404(project)
-        # `from`/`to`/`max_hops` are the wire param names used here as
-        # placeholders — TODO(griffin-0): confirm the adapter expects these
-        # exact keys before treating this as load-bearing.
         extra = {"from": from_node, "to": to_node, "max_hops": max_hops}
         return await _proxy_get(
             project, adapter, _sub_url(adapter["url"], "path"), scope, extra_params=extra
         )
+
+    @router.get("/graph/{project}/export")
+    async def get_graph_export(
+        project: str,
+        scope: str = "",
+        node_type: str = "",
+        since: str = "",
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """Cursor-paginated full node/edge dump — LOOPED SERVER-SIDE
+        (griffin-0-confirmed design, 2026-07-13): the daemon calls
+        jeevy's export endpoint repeatedly, accumulating pages, and
+        returns ONE assembled payload. The MCP tool (`kg_export`) stays a
+        single call — no cursor exposed to the calling agent. Endpoint
+        not live yet — will 502 (on the FIRST page fetch) until jeevy
+        ships it.
+
+        Hard-capped at `_EXPORT_MAX_PAGES` pages / `_EXPORT_MAX_ITEMS`
+        combined nodes+edges: `truncated=True` (+ `nextCursor` if the
+        adapter still has more) is surfaced rather than looping forever
+        on the daemon's dime or silently dropping data past the cap.
+
+        Real jeevy path (per page): `GET /internal/kg/export?scope=&
+        cursor=&limit=&node_type=&since=`. Per-page response:
+        `{"nodes": [...], "edges": [...], "next_cursor", "has_more"}`
+        (NOT wrapped in a `data` envelope per griffin-0's shape for this
+        one — unwrapped defensively below, mirroring `_kg_unwrap`'s own
+        "no data key → treat the whole dict as body" fallback).
+        """
+        adapter = _adapter_or_404(project)
+        all_nodes: list[Any] = []
+        all_edges: list[Any] = []
+        cursor = ""
+        truncated = False
+        next_cursor: Any = None
+        export_url = _sub_url(adapter["url"], "export")
+
+        for _page in range(_EXPORT_MAX_PAGES):
+            extra: dict[str, Any] = {"limit": limit}
+            if node_type:
+                extra["node_type"] = node_type
+            if cursor:
+                extra["cursor"] = cursor
+            payload = await _proxy_get(project, adapter, export_url, scope, since, extra_params=extra)
+            body = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+            if not isinstance(body, dict):
+                return payload  # unexpected shape — let the tool's own unwrap report it
+
+            all_nodes.extend(body.get("nodes") or [])
+            all_edges.extend(body.get("edges") or [])
+            has_more = bool(body.get("has_more"))
+            next_cursor = body.get("next_cursor")
+
+            if len(all_nodes) + len(all_edges) >= _EXPORT_MAX_ITEMS:
+                truncated = True
+                break
+            if not has_more:
+                next_cursor = None
+                break
+            cursor = next_cursor
+        else:
+            truncated = True  # exhausted _EXPORT_MAX_PAGES without has_more=false
+
+        return {
+            "data": {
+                "nodes": all_nodes,
+                "edges": all_edges,
+                "truncated": truncated,
+                "nextCursor": next_cursor if truncated else None,
+            }
+        }
 
     return router
