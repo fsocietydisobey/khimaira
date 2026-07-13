@@ -2834,3 +2834,89 @@ def test_session_has_in_progress_assigned_task(chats_api_client):
     )
     # done → False (no longer an active assignment)
     assert chats_mod.session_has_in_progress_assigned_task("bob") is False
+
+
+# ---------------------------------------------------------------------------
+# Freeze-class invariant (2026-07-13) — live production incident: py-spy
+# caught MainThread (the event loop) stuck synchronously inside
+# _get_session_obligations, called directly (no asyncio.to_thread) from
+# _guard4_check_once's 60s-interval watcher, once per session in
+# sessions_mod.list_sessions() (128 sessions observed live) — every tick
+# re-globbing and re-parsing every chat-*.jsonl file for every session, on
+# the event loop. Same bug class as the kitty-subprocess freeze (ca89f97),
+# an entirely different code path the earlier audit never covered. Fixed by
+# wrapping every call site in asyncio.to_thread. This test proves the CLASS
+# (event loop stays live during the call), not just a return-value check —
+# every other Guard-4 test above mocks obligations away entirely and
+# wouldn't have caught a missing to_thread wrap.
+# ---------------------------------------------------------------------------
+
+
+async def _assert_guard4_check_once_does_not_block_loop(api_mod, sessions_mod) -> None:
+    import asyncio
+    import threading
+
+    release = threading.Event()
+    entered = threading.Event()
+    real_obligations = api_mod._get_session_obligations
+
+    def _blocking_obligations(session_id):
+        entered.set()
+        if not release.wait(timeout=5.0):
+            raise AssertionError("test never released the blocking obligations call")
+        return real_obligations(session_id)
+
+    api_mod._get_session_obligations = _blocking_obligations
+    try:
+        task = asyncio.create_task(api_mod._guard4_check_once())
+
+        for _ in range(500):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set(), "_guard4_check_once never reached _get_session_obligations"
+
+        # PROOF: the background thread is still parked inside the blocking
+        # call (release not yet set), yet the event loop keeps running.
+        ticked = False
+        for _ in range(5):
+            await asyncio.sleep(0)
+            ticked = True
+        assert ticked
+        assert not task.done(), (
+            "_guard4_check_once completed while _get_session_obligations "
+            "should still be blocked — this means the call ran "
+            "SYNCHRONOUSLY on the event loop instead of being offloaded, "
+            "i.e. the freeze-class bug is back"
+        )
+
+        release.set()
+        await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        api_mod._get_session_obligations = real_obligations
+        release.set()
+
+
+def test_guard4_check_once_offloads_obligations_without_blocking_loop(guard4_env, monkeypatch):
+    import asyncio
+    import uuid
+
+    chats_mod, sessions_mod, api_mod = guard4_env
+
+    assignee_sid = str(uuid.uuid4())
+    _setup_guard4_scenario(chats_mod, sessions_mod, assignee_sid)
+
+    real_list = sessions_mod.list_sessions
+
+    def _mock_list(use_cache=True, **kw):
+        rows = real_list(use_cache=False)
+        for r in rows:
+            if r.get("session_id") == assignee_sid:
+                r["last_active_age_s"] = 300.0
+        return rows
+
+    monkeypatch.setattr(sessions_mod, "list_sessions", _mock_list)
+    monkeypatch.setattr(api_mod, "_is_process_alive_for_session", lambda sid: True)
+    api_mod._GUARD4_STALLED.clear()
+
+    asyncio.run(_assert_guard4_check_once_does_not_block_loop(api_mod, sessions_mod))

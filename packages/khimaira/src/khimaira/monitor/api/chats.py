@@ -768,7 +768,15 @@ def _get_session_obligations(session_id: str) -> list[dict]:
     session's current role (role-class obligations). A review-task is OPEN until
     get_gate_verdicts(gate_for) shows that verdict_role's verdict is present.
     Fail-open: errors scanning a chat are silently skipped.
-    """
+
+    Sync + potentially expensive (full JSONL glob + parse per chat) — every
+    caller MUST wrap this in asyncio.to_thread. Live-caught via py-spy
+    (2026-07-13): _guard4_check_once calls this once per session on every
+    60s tick with NO offload, blocking the event loop directly — the
+    dominant confirmed cause of a recurring multi-second daemon-wide
+    slowdown, same bug class as the kitty-subprocess freeze (ca89f97) but
+    an entirely different code path that audit never covered. See
+    _guard4_check_once/_handle_throttle_escalation for the fixed call sites."""
     obligations: list[dict] = []
     now = time.time()  # for the direct-verdict recency gate
     # Guard-5: resolve the session's current role for role-class obligation matching.
@@ -1243,7 +1251,7 @@ async def _handle_throttle_escalation(session_id: str, payload: dict) -> dict:
     _THROTTLE_STATE[session_id] = {"last_ts": now, "count": count}
 
     name = _session_display_name(session_id)
-    obligations = _get_session_obligations(session_id)
+    obligations = await asyncio.to_thread(_get_session_obligations, session_id)
 
     ra = payload.get("retry_attempt")
     mr = payload.get("max_retries")
@@ -1315,7 +1323,7 @@ async def _handle_throttle_escalation(session_id: str, payload: dict) -> dict:
         f"({retry_str}; {detail}) and stopped — no active task (informational). "
         f"(alert #{count})"
     )
-    chat_ids = _chats_for_session(session_id)
+    chat_ids = await asyncio.to_thread(_chats_for_session, session_id)
     for chat_id in chat_ids:
         try:
             await _post_msg(chat_id, body)
@@ -1367,7 +1375,8 @@ async def _guard4_check_once() -> None:
             sid, tid = sid_key
             # Re-scan obligations for this session and check if this task is still active.
             active_for_session = {
-                (sid, o["task_id"]) for o in _get_session_obligations(sid)
+                (sid, o["task_id"])
+                for o in await asyncio.to_thread(_get_session_obligations, sid)
             }
             current_obligation_keys |= active_for_session
         cleared = [
@@ -1395,7 +1404,7 @@ async def _guard4_check_once() -> None:
         if last_age_s < _GUARD4_MIN_SILENCE_S:
             continue  # recently active — skip
 
-        obligations = _get_session_obligations(session_id)
+        obligations = await asyncio.to_thread(_get_session_obligations, session_id)
         if not obligations:
             continue  # no obligations — silent demote is fine
 
