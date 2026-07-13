@@ -325,6 +325,17 @@ served by separate vLLM instances on the Spark. Re-bake from current source
 with `~/dev/ai-lab/mnemosyne/scripts/refresh_oracle.sh` (safe-swap: the live
 model is only replaced if the new bake trains + validates).
 
+**Canonical infra doc (KEEP CURRENT):** `~/dev/ai-lab/mnemosyne/README.md` is the
+always-maintained overview of the whole Spark/oracle stack — hardware + SSH access,
+the port/service/container map (proxy `:18100` → oracles `:18000`/`:18001`, distiller
+`:8766`, Qdrant `:6343`), the `deep`/`incremental` bake modes, the distiller's
+Haiku-default rationale, and the load-bearing gotchas (FP8 `--enforce-eager`,
+input-format contract, rep-penalty, root-owned model dirs). **When you change an oracle
+port, service, container, model, or training flow, update that README in the same
+change.** Deep dives live in `ai-lab/mnemosyne/docs/{SERVING,TRAINING}.md` +
+`docs/FOLLOWUP-*.md` (esp. `FOLLOWUP-oracle-as-distiller.md` — why the distiller default
+stays Haiku).
+
 ## Pointers
 
 | What | Where |
