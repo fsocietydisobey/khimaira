@@ -4571,3 +4571,146 @@ def test_gate_complete_does_not_auto_advance_multi_agent_task(isolated_chats):
     c.record_gate_verdict(chat_id, "verifier-u", tid, "ship")
 
     assert _status_of(c, chat_id, tid) == c.TASK_IN_PROGRESS  # stays — multi-agent
+
+
+def test_gate_hold_does_not_auto_advance_solo_assignee_to_done(isolated_chats):
+    """2026-07-14 live incident (griffin-0, jeevy roster): a BLOCKED gate must
+    NEVER auto-advance the task's status to done — a hold is not a completed
+    gate, it's a rejected one. The old implementation computed "gate complete"
+    from verdict PRESENCE (any ship OR hold counted the same as "acted"), so a
+    hold auto-advanced the task exactly like a ship would; only the recorded
+    TASK_VERDICT stayed correctly `hold`, while the status field lied. This
+    proves the fixed behavior: a critic=changes + verifier=hold pair on a
+    solo-assignee in_progress task must leave the task in_progress, not done."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _gate_room(c, sessions_mod)
+    task = c.create_task(chat_id, "master-u", "do thing", assignee_session_id="agent-u")
+    tid = task["id"]
+    c.update_task_status(chat_id, tid, "agent-u", c.TASK_IN_PROGRESS)
+
+    c.record_gate_verdict(chat_id, "critic-u", tid, "changes")
+    c.record_gate_verdict(chat_id, "verifier-u", tid, "hold")  # BLOCK, not ship
+
+    assert _status_of(c, chat_id, tid) == c.TASK_IN_PROGRESS  # NOT auto-advanced to done
+
+    # And the verdict record itself is exactly what was posted — hold, verbatim.
+    room = c.load_room(chat_id)
+    verdicts = [m for m in room["messages"] if m.get("kind") == c.TASK_VERDICT and m.get("task_id") == tid]
+    assert {v["verdict"] for v in verdicts} == {"changes", "hold"}
+
+
+def test_gate_ship_after_hold_still_auto_advances_once_actually_approved(isolated_chats):
+    """A hold followed by a genuine ship (the gatekeeper changed their mind, or
+    a second independent gatekeeper shipped) DOES eventually auto-advance —
+    the fix must not make a previously-held task permanently stuck, only
+    prevent the HOLD ITSELF from being mistaken for approval."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _gate_room(c, sessions_mod)
+    task = c.create_task(chat_id, "master-u", "do thing", assignee_session_id="agent-u")
+    tid = task["id"]
+    c.update_task_status(chat_id, tid, "agent-u", c.TASK_IN_PROGRESS)
+
+    c.record_gate_verdict(chat_id, "critic-u", tid, "changes")
+    c.record_gate_verdict(chat_id, "verifier-u", tid, "hold")
+    assert _status_of(c, chat_id, tid) == c.TASK_IN_PROGRESS
+
+    # Same reviewer changes their mind — latest verdict per session wins.
+    c.record_gate_verdict(chat_id, "critic-u", tid, "approve")
+    c.record_gate_verdict(chat_id, "verifier-u", tid, "ship")
+    assert _status_of(c, chat_id, tid) == c.TASK_DONE  # now genuinely approved
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-14 fix (griffin-0 live incident, jeevy roster, bug #2): Guard-4's
+# silence timer (sessions.list_sessions()'s last_active_age_s) only scanned
+# mtimes of files already inside a session's own state dir (decisions.jsonl,
+# files_touched.jsonl, status.json) — chat activity never touched any of
+# those, so a session actively posting verdicts read as impossibly stale.
+# Every chat mutation now touches a `chat_activity.marker` file inside the
+# acting session's state dir (see chats._touch_chat_activity, called from
+# the _append chokepoint every mutation already funnels through), which
+# list_sessions()'s existing mtime-max scan picks up automatically.
+# ---------------------------------------------------------------------------
+
+
+def test_chat_verdict_bumps_session_liveness_marker(isolated_chats):
+    """Recording a gate verdict must touch the acting session's own state
+    dir so sessions.list_sessions() sees it as recently active — this is
+    the exact signal Guard-4 reads to decide "silent too long"."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _gate_room(c, sessions_mod)
+    task = c.create_task(chat_id, "master-u", "do thing", assignee_session_id="agent-u")
+    tid = task["id"]
+    c.update_task_status(chat_id, tid, "agent-u", c.TASK_IN_PROGRESS)
+
+    sd = sessions_mod._session_dir_read("verifier-u")
+    marker = sd / "chat_activity.marker"
+    assert not marker.exists()
+
+    c.record_gate_verdict(chat_id, "verifier-u", tid, "hold")
+
+    assert marker.exists(), "gate verdict must bump the acting session's liveness marker"
+
+
+def test_chat_verdict_liveness_reflected_in_list_sessions(isolated_chats, monkeypatch):
+    """The marker must actually move the needle sessions.list_sessions()
+    reports — the exact field (last_active_age_s) Guard-4's silence check
+    reads. A session with a stale status.json but a fresh chat verdict must
+    NOT read as stale."""
+    import time
+
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _gate_room(c, sessions_mod)
+    task = c.create_task(chat_id, "master-u", "do thing", assignee_session_id="agent-u")
+    tid = task["id"]
+    c.update_task_status(chat_id, tid, "agent-u", c.TASK_IN_PROGRESS)
+
+    # Simulate a session whose OWN state files are old (past what Guard-4's
+    # min-silence gate would ignore) but that is actively posting in chat.
+    sd = sessions_mod._session_dir_read("verifier-u")
+    old = time.time() - 100_000  # ~27h — matches the live-incident magnitude
+    import os
+
+    for p in sd.iterdir():
+        if p.is_file():
+            os.utime(p, (old, old))
+
+    c.record_gate_verdict(chat_id, "verifier-u", tid, "hold")
+
+    rows = sessions_mod.list_sessions(use_cache=False)
+    row = next(r for r in rows if r["session_id"] == "verifier-u")
+    assert row["last_active_age_s"] is not None
+    assert row["last_active_age_s"] < 60, (
+        "a session with a fresh chat verdict must not report ~27h silence "
+        f"(got {row['last_active_age_s']:.0f}s)"
+    )
+
+
+def test_chat_activity_never_creates_phantom_session_dir(isolated_chats):
+    """The liveness touch is READ-ONLY on directory existence — a chat
+    mutation authored by an id with no khimaira session dir (e.g. a stale
+    or external id) must never fabricate a phantom entry in
+    sessions.list_sessions()'s output."""
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    chat_id = _gate_room(c, sessions_mod)
+    # master-u sends a plain chat message; the room already has 5 real
+    # sessions (master/agent/critic/verifier/agent2) via _gate_room.
+    c.send_message(chat_id, "master-u", "hello")
+
+    before = {r["session_id"] for r in sessions_mod.list_sessions(use_cache=False)}
+    assert "does-not-exist-u" not in before
+
+    rows = sessions_mod.list_sessions(use_cache=False)
+    assert {r["session_id"] for r in rows} == before, (
+        "chat activity must never create a new session directory"
+    )

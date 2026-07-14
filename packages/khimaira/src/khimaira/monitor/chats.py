@@ -383,9 +383,49 @@ def _new_event_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _touch_chat_activity(session_id: str | None) -> None:
+    """Bump the acting session's liveness mtime for a chat mutation.
+
+    2026-07-14 fix (griffin-0 live incident, jeevy roster, bug #2): Guard-4's
+    silence timer (`sessions.list_sessions()`'s `last_active_age_s`) is
+    computed from `max(mtime)` over files already inside the session's OWN
+    state directory (decisions.jsonl, files_touched.jsonl, status.json) —
+    chat messages/verdicts/task-updates never touch any of those files, so a
+    session actively participating in chat but quiet on those 3 signals reads
+    as impossibly stale (~29h observed live, a stuck-looking gatekeeper that
+    was actually mid-review). Sibling gap to the already-shipped mid-turn
+    liveness fix (which patches STATUS classification, not this raw silence
+    timer).
+
+    Rather than teach list_sessions() a second, chat-directory-scanning code
+    path (that would turn its cached, cheap per-session mtime scan into an
+    O(sessions × chat files) scan on every 2s-cache refresh), touch a small
+    marker file INSIDE the session's existing state dir on every chat
+    mutation it authors — list_sessions()'s existing `sd.iterdir()`
+    mtime-max scan (sessions.py) picks it up automatically for free, no
+    changes needed there.
+
+    Read-only dir lookup (`_session_dir_read`) on purpose: never CREATE a
+    session directory for a chat participant that doesn't already have one
+    (e.g. a system/daemon sender, or an id not tracked as a khimaira
+    session) — that would fabricate a phantom entry in list_sessions()'s
+    output. Silent no-op if the session has no directory yet.
+    """
+    if not session_id or session_id in (SYSTEM_SENDER_ID, _DAEMON_SENDER_ID):
+        return
+    try:
+        sd = sessions_mod._session_dir_read(session_id)
+        if sd is None:
+            return
+        (sd / "chat_activity.marker").touch()
+    except OSError:
+        pass
+
+
 def _append(chat_id: str, record: dict[str, Any]) -> None:
     _ensure_dir()
     sessions_mod._append_jsonl(_chat_path(chat_id), record)
+    _touch_chat_activity(record.get("sender_id") or record.get("by_session_id"))
     _broadcast(chat_id, record)
 
 
@@ -1810,6 +1850,9 @@ async def _dispatch_wake_worker_async(
         log.warning("chats: wake worker raised for %s", target_name, exc_info=True)
 
 
+_last_gate_wake_fingerprint: dict[tuple[str, str], tuple] = {}
+
+
 def _maybe_wake_master_on_gate_complete(
     chat_id: str, task_id: str, room: dict[str, Any]
 ) -> None:
@@ -1819,8 +1862,25 @@ def _maybe_wake_master_on_gate_complete(
     Closes the dead-SSE commit-miss (muther GAP #1, 2026-06-11): the master's SSE
     subscriber doesn't survive compaction, so it can miss the verdict-completion
     event and strand a fully-approved task uncommitted. The daemon now drives the
-    master on completion instead of relying on it to see the event live. Reuses
-    the (now duplicate-safe) wake; conservative guards live in the worker.
+    master on completion instead of relying on it to see the event live.
+
+    2026-07-14 fix (griffin-0 live incident, jeevy roster, bug #1): a gatekeeper
+    session got stuck and re-submitted the IDENTICAL hold verdict 5+ times; each
+    one re-triggered this wake. The docstring here used to claim the wake was
+    "duplicate-safe" via `_dispatch_wake_worker`'s own cooldown
+    (`_DISPATCH_WAKE_COOLDOWN_S`, 30s default) — that's a TIME-based cooldown,
+    real but insufficient for THIS failure mode: a session re-emitting the same
+    verdict every 1-3 minutes (a normal turn cadence) sails past a 30s window
+    every single time. The actual harm isn't the cooldown's duration, it's that
+    a repeated IDENTICAL verdict carries no new decision to act on — so this now
+    also dedupes on DECISION STATE: a fingerprint of the gate's vote set
+    (committable + who voted what) is compared against the last one this
+    function actually woke for on this task. An unchanged fingerprint means
+    nothing new happened — skip. Any real change (a new distinct gatekeeper
+    votes, an existing one flips their vote, e.g. a genuine hold→ship after
+    reconsideration) produces a different fingerprint and re-arms the wake.
+    In-memory, no TTL, matching `_last_dispatch_wake`'s own convention just
+    above — daemon-lifetime growth is bounded by distinct tasks ever gated.
     """
     tally = _gate_tally(room)
     entry = tally.get(task_id)
@@ -1838,6 +1898,23 @@ def _maybe_wake_master_on_gate_complete(
     # gate isn't complete yet (N not reached, only some reviewers voted).
     if not committable and not (has_hold and entry.get("status") == TASK_DONE):
         return  # gate not yet at a decision
+
+    # Dedupe on the OUTCOME, not the raw vote set: (committable, has_hold) is
+    # exactly the pair that decides which message gets sent below, so it's
+    # the right granularity — a vote that changes SUPPORTING detail (e.g. the
+    # critic's reasoning) without changing the outcome (still blocked, or
+    # still not-yet-committable) genuinely carries nothing new for the master
+    # to act on, and re-waking for it would just be a milder version of the
+    # exact bug this fix closes.
+    fingerprint = (committable, has_hold)
+    fp_key = (chat_id, task_id)
+    if _last_gate_wake_fingerprint.get(fp_key) == fingerprint:
+        log.info(
+            "chats: gate-complete wake SKIPPED for %s (task %s) — identical outcome "
+            "already woke the master, no new decision since",
+            chat_id, task_id,
+        )
+        return  # same outcome, already notified — a repeat verdict carries nothing new
 
     member_roles = (room.get("meta") or {}).get("member_roles") or {}
     master_id = next((sid for sid, r in member_roles.items() if r == ROLE_MASTER), None)
@@ -1870,6 +1947,13 @@ def _maybe_wake_master_on_gate_complete(
             "chat_my_chats, then dispatch rework per the gatekeeper verdict. Don't "
             "wait for an event."
         )
+
+    # Record the fingerprint only NOW that a notification is actually about to
+    # fire — not earlier — so a failed master_id/master_name resolution above
+    # (which returns without notifying anyone) never falsely marks this
+    # decision as "already woken," which would wrongly suppress a LATER retry
+    # once the resolution issue is fixed.
+    _last_gate_wake_fingerprint[fp_key] = fingerprint
 
     import threading
 
@@ -1947,12 +2031,21 @@ def _effective_gate_n(entry: dict[str, Any]) -> int:
     return 2 if (entry.get("high_stakes") or entry.get("escalated")) else 1
 
 
-def _is_committable(entry: dict[str, Any]) -> bool:
-    """True if a done task's commit gate is satisfied: lean N-distinct-gatekeeper
-    ships (no outstanding gatekeeper hold), OR the legacy critic=approve +
-    verifier=ship dual (pre-cutover compat)."""
-    if entry.get("status") != TASK_DONE:
-        return False
+def _gate_approved(entry: dict[str, Any]) -> bool:
+    """True if the entry's VOTES constitute approval: lean N-distinct-gatekeeper
+    ships with no outstanding gatekeeper hold, OR the legacy critic=approve +
+    verifier=ship dual (pre-cutover compat). Status-agnostic by design — every
+    caller applies its own status precondition on top (_is_committable requires
+    TASK_DONE; _maybe_auto_advance_gate_complete requires PENDING/IN_PROGRESS,
+    since it's deciding whether to ADVANCE a task INTO done, not verifying one
+    already there).
+
+    2026-07-14 extraction: this predicate used to be inlined only in
+    _is_committable. _maybe_auto_advance_gate_complete had its OWN parallel
+    copy that computed "gate reached" from verdict PRESENCE (any ship OR hold
+    counted as "acted") instead of approval — a hold set the same flag a ship
+    would, so a BLOCKED gate still auto-advanced the task's status to `done`.
+    Single chokepoint now; a hold anywhere in gk_latest can never satisfy this."""
     gk = entry.get("gk_latest") or {}
     ships = {s for s, v in gk.items() if v == "ship"}
     holds = {s for s, v in gk.items() if v == "hold"}
@@ -1960,6 +2053,14 @@ def _is_committable(entry: dict[str, Any]) -> bool:
         return True
     # Legacy dual-positive (pre-cutover in-flight tasks).
     return entry.get("crit") == "approve" and entry.get("ver") == "ship"
+
+
+def _is_committable(entry: dict[str, Any]) -> bool:
+    """True if a done task's commit gate is satisfied — see _gate_approved for
+    the vote logic; this adds the TASK_DONE status precondition."""
+    if entry.get("status") != TASK_DONE:
+        return False
+    return _gate_approved(entry)
 
 
 def committable_gate_tasks(chat_id: str) -> list[str]:
@@ -2090,67 +2191,53 @@ def _maybe_nudge_missing_verdict(
             log.debug("chats: verdict-nudge post_notice failed", exc_info=True)
 
 
-def _maybe_auto_advance_gate_complete(chat_id: str, task_id: str) -> bool:
-    """Auto-advance a SOLO-assignee task to `done` when its gate just completed.
+def _maybe_auto_advance_gate_complete(chat_id: str, task_id: str, room: dict[str, Any]) -> bool:
+    """Auto-advance a SOLO-assignee task to `done` when its gate just APPROVED.
 
-    ISSUE 3 hybrid (muther 2026-06-18): when both gate verdicts (critic approve/changes
-    + verifier ship/hold — PRESENCE, both reviewers acted) are recorded on a task that
-    is still pending/in_progress AND has a single assignee (no multi-agent required_agents
-    set), the assignee-driven done-transition often never fires, leaving the status stuck
-    at in_progress forever — false AWAITING-ACK + false owing-idle wake target. The gate
-    completing IS sufficient evidence the agent's work is finished, so the system advances
-    it to `done` on the agent's behalf. Master still commits via the normal done → approved
-    path (the human/master gate is preserved). Multi-agent gated tasks are EXCLUDED — they
-    keep the explicit per-agent ack.
+    ISSUE 3 hybrid (muther 2026-06-18): when the gate is satisfied on a task that
+    is still pending/in_progress AND has a single assignee (no multi-agent
+    required_agents set), the assignee-driven done-transition often never fires,
+    leaving the status stuck at in_progress forever — false AWAITING-ACK + false
+    owing-idle wake target. The gate PASSING is sufficient evidence the agent's
+    work is finished, so the system advances it to `done` on the agent's behalf.
+    Master still commits via the normal done → approved path (the human/master
+    gate is preserved). Multi-agent gated tasks are EXCLUDED — they keep the
+    explicit per-agent ack.
 
-    Returns True if it advanced the status, else False. Idempotent: a task already past
-    in_progress is left untouched.
+    2026-07-14 fix (griffin-0 live incident, jeevy roster): this used to compute
+    "gate complete" from verdict PRESENCE — a gatekeeper `hold` set the same flag
+    a `ship` would, so a BLOCKED gate still auto-advanced the task's status to
+    `done` (the TASK_VERDICT record itself stayed correctly `hold`; only the
+    status field lied). Now routes through `_gate_approved` — the same chokepoint
+    `_is_committable` uses — so a hold can never satisfy this, and through
+    `_round_aware_gate_entry` (not the non-round-aware `_gate_tally`) so a
+    reopened task's stale prior-round verdicts can't count either.
+
+    `room` must be freshly loaded (post-append) by the caller — see
+    `record_gate_verdict`, which reloads before calling this, exactly like its
+    sibling `_maybe_wake_master_on_gate_complete`.
+
+    Returns True if it advanced the status, else False. Idempotent: a task already
+    past in_progress is left untouched.
     """
-    status: str | None = None
-    assignee_id: str | None = None
-    required_agents: list[str] = []
-    high_stakes = False
-    escalated = False
-    crit_present = False
-    ver_present = False
-    member_roles: dict[str, str] = {}
-    gk_authors: set[str] = set()  # distinct ship/hold authors (role-filtered below)
-    for line in _read(chat_id):
-        k = line.get("kind")
-        if k == META and line.get("member_roles"):
-            member_roles = line.get("member_roles") or member_roles  # latest META wins
-        elif k == TASK and line.get("id") == task_id:
-            status = line.get("status")
-            assignee_id = line.get("assignee_id")
-            required_agents = list(line.get("required_agents") or [])
-            high_stakes = bool(line.get("high_stakes"))
-        elif k == TASK_UPDATE and line.get("task_id") == task_id:
-            status = line.get("status")
-        elif k == TASK_VERDICT and line.get("task_id") == task_id:
-            v = line.get("verdict", "")
-            sid = line.get("by_session_id")
-            if v in ("approve", "changes"):
-                crit_present = True
-            elif v in ("ship", "hold"):
-                ver_present = True
-            if sid and v in ("ship", "hold"):
-                gk_authors.add(sid)
-            if line.get("escalate"):
-                escalated = True
+    task_record = next(
+        (m for m in room.get("messages", []) if m.get("kind") == TASK and m.get("id") == task_id),
+        None,
+    )
+    if task_record is None:
+        return False  # no such task in this room
 
-    # Lean gate-quorum: N DISTINCT gatekeeper-role ship/hold authors (they acted),
-    # N=2 high-stakes else 1; OR the legacy critic+verifier both-present dual.
-    gk_distinct = {s for s in gk_authors if member_roles.get(s) == ROLE_GATEKEEPER}
-    n = 2 if (high_stakes or escalated) else 1
-    gate_reached = (len(gk_distinct) >= n) or (crit_present and ver_present)
-
-    if status not in (TASK_PENDING, TASK_IN_PROGRESS):
+    entry = _round_aware_gate_entry(room, task_id)
+    if entry["status"] not in (TASK_PENDING, TASK_IN_PROGRESS):
         return False  # already terminal / past in_progress — nothing to advance
-    if not gate_reached:
-        return False  # gate not complete yet
+    if not _gate_approved(entry):
+        return False  # gate not complete, or blocked by an outstanding hold
+
+    assignee_id = task_record.get("assignee_id")
     if not assignee_id:
         return False  # unassigned task — no solo owner to advance on behalf of
     # SOLO check: no multi-agent gate (required_agents empty or just the assignee).
+    required_agents = list(task_record.get("required_agents") or [])
     if required_agents and set(required_agents) - {assignee_id}:
         return False  # multi-agent gated task — keep the explicit per-agent ack
 
@@ -2164,17 +2251,18 @@ def _maybe_auto_advance_gate_complete(chat_id: str, task_id: str) -> bool:
         "by_session_id": assignee_id,
         "by_name": "khimaira-daemon (gate-auto)",
         "note": (
-            "auto-advanced → done: gate complete (critic + verifier verdicts recorded) "
-            "on a solo-assignee task whose done-transition never fired (ISSUE 3 hybrid)."
+            "auto-advanced → done: gate APPROVED (quorum reached, no outstanding "
+            "hold) on a solo-assignee task whose done-transition never fired "
+            "(ISSUE 3 hybrid)."
         ),
         "private": False,
         "to": None,
     }
     _append(chat_id, record)
     log.info(
-        "chats: task %s AUTO-ADVANCED %s → done (gate complete, solo-assignee) in %s",
+        "chats: task %s AUTO-ADVANCED %s → done (gate approved, solo-assignee) in %s",
         task_id,
-        status,
+        entry["status"],
         chat_id,
     )
     return True
@@ -2257,13 +2345,14 @@ def record_gate_verdict(
     }
     _append(chat_id, record)
     # Hybrid lifecycle auto-advance (ISSUE 3 / muther 2026-06-18): if this verdict
-    # completes the gate (critic + verifier both recorded) on a SOLO-assignee task
-    # still stuck at pending/in_progress, advance its status to `done` so it stops
-    # reading in_progress forever (the agent did the work + passed the gate but the
-    # assignee-driven done-transition never fired). Solo-only per the ruling; master
-    # then commits via the normal done → approved path. Fail-open.
+    # APPROVES the gate on a SOLO-assignee task still stuck at pending/in_progress,
+    # advance its status to `done` so it stops reading in_progress forever (the
+    # agent did the work + passed the gate but the assignee-driven done-transition
+    # never fired). Solo-only per the ruling; master then commits via the normal
+    # done → approved path. Fail-open. Reload the room — the verdict was just
+    # appended, mirroring _maybe_wake_master_on_gate_complete's own reload below.
     try:
-        _maybe_auto_advance_gate_complete(chat_id, task_id)
+        _maybe_auto_advance_gate_complete(chat_id, task_id, load_room(chat_id))
     except Exception as exc:
         log.warning("chats: gate-complete auto-advance failed for %s: %s", task_id, exc)
     log.info(
