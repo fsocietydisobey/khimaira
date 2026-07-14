@@ -2030,6 +2030,24 @@ async def test_invoke_claude_agentic_nonzero_exit_raises(pipeline, monkeypatch):
         await pipeline._invoke_claude_agentic("q", "i")
 
 
+async def test_invoke_claude_agentic_nonzero_exit_includes_stdout(pipeline, monkeypatch):
+    """2026-07-14 live incident: a real production failure logged as
+    'claude -p exited 1:' with NOTHING after the colon, twice, on two
+    different notes — stderr was genuinely empty both times because the
+    CLI's actual failure reason (an auth/rate-limit/budget JSON error
+    event) landed on stdout instead. The old exception only ever read
+    stderr, so the real cause was invisible in the logs. This proves
+    stdout is captured too, not just stderr, so a future occurrence is
+    actually diagnosable."""
+    _queue_responses(
+        pipeline,
+        monkeypatch,
+        [_FakeProc(b'{"type":"result","subtype":"error_max_budget_usd"}', stderr=b"", returncode=1)],
+    )
+    with pytest.raises(RuntimeError, match="error_max_budget_usd"):
+        await pipeline._invoke_claude_agentic("q", "i")
+
+
 async def test_invoke_claude_agentic_missing_result_raises(pipeline, monkeypatch):
     stdout = _stream_stdout({"type": "system", "subtype": "init"})
     _queue_responses(pipeline, monkeypatch, [_FakeProc(stdout)])

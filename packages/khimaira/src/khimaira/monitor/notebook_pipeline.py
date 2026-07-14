@@ -484,8 +484,17 @@ async def _invoke_claude(content: str, instruction: str, *, target_repo: str | N
     finally:
         _cleanup_config_dir(cfg_dir)
     if proc.returncode != 0:
+        # Capture BOTH streams (2026-07-14, live incident): a stderr-only
+        # message read as "claude -p exited 1:" with nothing after the colon
+        # twice in production — the CLI's actual failure reason had landed on
+        # stdout instead (its own JSON-stream error events, e.g. auth/rate-
+        # limit/budget errors, are written there, not stderr). Truncated
+        # rather than the full stdout to keep the exception readable — the
+        # goal is "what failed", not a full transcript.
         raise RuntimeError(
-            f"claude -p exited {proc.returncode}: {stderr.decode('utf-8', 'ignore')[:500]}"
+            f"claude -p exited {proc.returncode}: "
+            f"stderr={stderr.decode('utf-8', 'ignore')[:500]!r} "
+            f"stdout={stdout.decode('utf-8', 'ignore')[:500]!r}"
         )
 
     envelope = json.loads(stdout.decode("utf-8"))
@@ -597,8 +606,12 @@ async def _invoke_claude_agentic(
     finally:
         _cleanup_config_dir(cfg_dir)
     if proc.returncode != 0:
+        # Same stdout-capture fix as _invoke_claude (2026-07-14) — the CLI's
+        # actual failure reason can land on stdout, not stderr.
         raise RuntimeError(
-            f"claude -p (agentic) exited {proc.returncode}: {stderr.decode('utf-8', 'ignore')[:500]}"
+            f"claude -p (agentic) exited {proc.returncode}: "
+            f"stderr={stderr.decode('utf-8', 'ignore')[:500]!r} "
+            f"stdout={stdout.decode('utf-8', 'ignore')[:500]!r}"
         )
 
     web_grounded = False
