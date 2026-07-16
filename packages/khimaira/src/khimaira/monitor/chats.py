@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
@@ -1738,6 +1739,42 @@ _DISPATCH_WAKE_IDLE_MIN_S = float(os.environ.get("KHIMAIRA_DISPATCH_WAKE_IDLE_S"
 _DISPATCH_WAKE_COOLDOWN_S = float(os.environ.get("KHIMAIRA_DISPATCH_WAKE_COOLDOWN_S", "30"))
 _last_dispatch_wake: dict[str, float] = {}
 
+# Stagger between dispatch-wake injections (2026-07-16, burst-429 chokepoint fix).
+# `_DISPATCH_STAGGER_S` was originally added (commit f8318ef) only for
+# assign_batch's BEGIN step (see its use further down this file) to prevent a
+# burst of simultaneous first-API-calls tripping Anthropic's server-side 429.
+# That covered the BEGIN loop only — every OTHER path that ends in a real wake
+# injection (a targeted send_message, a create_task assignment, the gate-complete
+# master wake) funnels through `_dispatch_wake_worker_async` below with no
+# coordination against concurrent wakes for other targets, reproducing the exact
+# burst it was built to prevent. Reused here (not a second constant/env var) as
+# the shared gate for the ACTUAL dispatch action across every call site —
+# `_reserve_dispatch_slot` below is the chokepoint: it lives at the one place
+# all wake dispatches converge, so no current OR future caller that loops
+# send_message/create_task over multiple targets can reintroduce the burst.
+_DISPATCH_STAGGER_S: float = float(os.environ.get("KHIMAIRA_DISPATCH_STAGGER_S", "2.5"))
+_dispatch_gate_lock = threading.Lock()
+_next_dispatch_slot: float = 0.0  # monotonic time; next free stagger slot
+
+
+def _reserve_dispatch_slot() -> float:
+    """Thread-safe: claim the next stagger-spaced slot for a real wake dispatch
+    and return the monotonic time to (if in the future) sleep until.
+
+    Slot reservation, not a blocking sleep-while-locked: each caller holds the
+    lock only long enough to claim its slot (`now` if no other dispatch is
+    pending, else `_DISPATCH_STAGGER_S` after the previously claimed slot),
+    then releases the lock and sleeps independently. A lone wake with nothing
+    else in flight always gets `slot <= now` — zero added delay. Only a burst
+    of 2+ concurrent dispatches gets spaced apart.
+    """
+    global _next_dispatch_slot
+    with _dispatch_gate_lock:
+        now = time.monotonic()
+        slot = max(now, _next_dispatch_slot)
+        _next_dispatch_slot = slot + _DISPATCH_STAGGER_S
+        return slot
+
 
 _DEFAULT_DISPATCH_WAKE_MSG = (
     "⏰ dispatch from master — call chat_my_chats(session_id=<yours>) to "
@@ -1838,6 +1875,22 @@ async def _dispatch_wake_worker_async(
         if screen is not None and rr._is_busy(screen):
             log.info("chats: wake skipped — window busy %s", target_name)
             return
+
+        # Burst-429 chokepoint (2026-07-16): every idle/busy/cooldown decision
+        # above is unchanged — this only staggers the ACTUAL dispatch (the
+        # terminal inject-and-submit action, which is a real Anthropic API call
+        # once the target agent turns on it) against any OTHER concurrent wake
+        # dispatch anywhere in the process. See `_reserve_dispatch_slot`.
+        if _DISPATCH_STAGGER_S > 0:
+            slot = _reserve_dispatch_slot()
+            delay = slot - time.monotonic()
+            if delay > 0:
+                log.info(
+                    "chats: wake staggered %.2fs (burst-429 gate) for %s",
+                    delay, target_name,
+                )
+                await asyncio.sleep(delay)
+
         if await rr._inject_text_and_submit(wid, message or _DEFAULT_DISPATCH_WAKE_MSG, target_name):
             _last_dispatch_wake[ck] = now
             log.info(
@@ -4244,10 +4297,11 @@ def roster_progress(chat_id: str, requester_session_id: str) -> list[dict[str, A
     return results
 
 
-# Stagger between BEGIN signals when multiple agents are dispatched simultaneously.
-# Prevents burst API calls all hitting Anthropic in the same second (server-side 429).
-# KHIMAIRA_DISPATCH_STAGGER_S env var overrides; 0 disables. Staggers FIRST call only.
-_DISPATCH_STAGGER_S: float = float(os.environ.get("KHIMAIRA_DISPATCH_STAGGER_S", "2.5"))
+# `_DISPATCH_STAGGER_S` (stagger between BEGIN signals when multiple agents are
+# dispatched simultaneously, KHIMAIRA_DISPATCH_STAGGER_S env var, 0 disables) is
+# now defined near the other dispatch-wake constants above — see that
+# definition's comment for why it's shared with `_reserve_dispatch_slot`, the
+# burst-429 gate every wake-dispatch call site funnels through.
 
 
 async def assign_batch(
