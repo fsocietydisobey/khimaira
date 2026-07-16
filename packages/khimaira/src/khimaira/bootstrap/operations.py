@@ -17,17 +17,17 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from datetime import UTC
 from pathlib import Path
 from typing import Any, Literal
 
-
-from khimaira.log import get_logger
 from khimaira.bootstrap.schema import (
     DotfilesSpec,
     McpServerSpec,
     RepoSpec,
     SymlinkEntry,
 )
+from khimaira.log import get_logger
 
 log = get_logger("bootstrap.ops")
 
@@ -57,9 +57,7 @@ class OpResult:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
-def _run(
-    cmd: list[str] | str, *, cwd: Path | None = None
-) -> subprocess.CompletedProcess:
+def _run(cmd: list[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess:
     """Subprocess wrapper that captures output + raises with stderr on failure.
 
     Uses shell=True for str commands (the install/MCP commands users
@@ -494,8 +492,7 @@ def reconcile_mcp_drift(profile_names: set[str]) -> list[OpResult]:
                     target=name,
                     status="failed",
                     detail=(
-                        f"claude mcp remove failed: "
-                        f"{(proc.stderr or proc.stdout).strip()[:200]}"
+                        f"claude mcp remove failed: {(proc.stderr or proc.stdout).strip()[:200]}"
                     ),
                 )
             )
@@ -558,12 +555,12 @@ def log_sync_event(action: str, target: str, payload: dict[str, Any] | None = No
     this machine" queries.
     """
     import json
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     try:
         _SYNC_META_FILE.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "machine": _machine_id(),
             "action": action,
             "target": target,
@@ -659,9 +656,7 @@ def _write_install_hashes(hashes: dict[str, str]) -> None:
     try:
         _INSTALL_HASHES_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _INSTALL_HASHES_FILE.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(hashes, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        tmp.write_text(json.dumps(hashes, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         tmp.replace(_INSTALL_HASHES_FILE)
     except Exception as exc:  # noqa: BLE001
         log.warning("bootstrap: failed writing %s: %s", _INSTALL_HASHES_FILE, exc)
@@ -732,10 +727,7 @@ def maybe_reinstall_repo(spec: RepoSpec) -> OpResult:
             op="repo-install",
             target=spec.name,
             status="failed",
-            detail=(
-                "install command failed: "
-                f"{(proc.stderr or proc.stdout).strip()[:300]}"
-            ),
+            detail=(f"install command failed: {(proc.stderr or proc.stdout).strip()[:300]}"),
         )
     hashes[spec.name] = current_hash
     _write_install_hashes(hashes)
@@ -845,9 +837,7 @@ def check_monitor_freshness(workspace_root: Path | None) -> OpResult:
         )
 
     # Latest khimaira commit timestamp (committer date, ISO8601 strict)
-    proc = _run(
-        ["git", "-C", str(workspace_root), "log", "-1", "--format=%ct", "HEAD"]
-    )
+    proc = _run(["git", "-C", str(workspace_root), "log", "-1", "--format=%ct", "HEAD"])
     if proc.returncode != 0:
         return OpResult(
             op="monitor-fresh",
@@ -912,10 +902,7 @@ def restart_monitor() -> OpResult:
             op="monitor-restart",
             target="khimaira-monitor",
             status="failed",
-            detail=(
-                f"systemctl restart failed: "
-                f"{(proc.stderr or proc.stdout).strip()[:200]}"
-            ),
+            detail=(f"systemctl restart failed: {(proc.stderr or proc.stdout).strip()[:200]}"),
         )
     return OpResult(
         op="monitor-restart",
@@ -960,8 +947,8 @@ def _capture_stdout(fn, *args, **kwargs) -> tuple[int, str]:
 
 
 def install_claude_hooks(*, scripts_dir: str | None = None) -> OpResult:
-    """(Re-)write ~/.claude/settings.json with khimaira's SessionStart /
-    UserPromptSubmit / PostToolUse hooks via direct in-process call.
+    """(Re-)write ~/.claude/settings.json with khimaira's lifecycle hooks
+    and internal-roster PreToolUse governance via direct in-process call.
 
     Idempotent. Hooks are imported as `khimaira.hooks.<name>` modules
     via `python -m`, so the command works for both source checkout and
@@ -976,10 +963,8 @@ def install_claude_hooks(*, scripts_dir: str | None = None) -> OpResult:
     import argparse
 
     try:
-        from khimaira.cli.install_hooks import (
-            SETTINGS_PATH,
-            run as run_install_hooks,
-        )
+        from khimaira.cli.install_hooks import SETTINGS_PATH
+        from khimaira.cli.install_hooks import run as run_install_hooks
     except ImportError as e:
         return OpResult(
             op="claude-hooks",
@@ -1008,6 +993,66 @@ def install_claude_hooks(*, scripts_dir: str | None = None) -> OpResult:
         target="settings.json",
         status=status,
         detail=out.split("\n")[-1] if out else "hooks command completed",
+    )
+
+
+def install_codex_mcp_config(khimaira_root: Path, *, config_path: Path | None = None) -> OpResult:
+    """Merge Codex MCP config without disturbing unrelated TOML content."""
+    from khimaira.bootstrap.codex_config import (
+        CodexConfigError,
+        default_codex_config_path,
+        merge_codex_mcp_config,
+    )
+
+    target = config_path or default_codex_config_path()
+    try:
+        outcome = merge_codex_mcp_config(khimaira_root, path=target)
+    except (CodexConfigError, OSError) as exc:
+        return OpResult(
+            op="codex-mcp-config",
+            target=str(target),
+            status="failed",
+            detail=str(exc),
+        )
+    return OpResult(
+        op="codex-mcp-config",
+        target=str(target),
+        status=outcome.status,
+        detail=(
+            "khimaira MCP entries already match"
+            if outcome.status == "unchanged"
+            else "merged khimaira and khimaira-chat MCP entries"
+        ),
+    )
+
+
+def install_codex_hooks(*, hooks_path: Path | None = None) -> OpResult:
+    """Merge Codex lifecycle hooks without disturbing unrelated events."""
+    from khimaira.bootstrap.codex_config import (
+        CodexConfigError,
+        default_codex_hooks_path,
+        merge_codex_hooks,
+    )
+
+    target = hooks_path or default_codex_hooks_path()
+    try:
+        outcome = merge_codex_hooks(path=target)
+    except (CodexConfigError, OSError) as exc:
+        return OpResult(
+            op="codex-hooks",
+            target=str(target),
+            status="failed",
+            detail=str(exc),
+        )
+    return OpResult(
+        op="codex-hooks",
+        target=str(target),
+        status=outcome.status,
+        detail=(
+            "khimaira Codex hooks already match"
+            if outcome.status == "unchanged"
+            else "merged khimaira Codex lifecycle hooks"
+        ),
     )
 
 
@@ -1249,9 +1294,7 @@ def git_pull_repo(spec: RepoSpec) -> OpResult:
             detail="already up to date",
         )
 
-    proc = _run(
-        ["git", "-C", str(path), "rev-list", "--count", f"{prev_head}..{new_head}"]
-    )
+    proc = _run(["git", "-C", str(path), "rev-list", "--count", f"{prev_head}..{new_head}"])
     commits_pulled = 0
     if proc.returncode == 0:
         try:
@@ -1471,9 +1514,11 @@ def check_and_upgrade_khimaira(
                 meta={"current": __version__, "latest": latest, "tool": tool},
             )
         try:
-            reply = prompt_fn(
-                f"khimaira {__version__} → {latest} available. Upgrade now? [Y/n] "
-            ).strip().lower()
+            reply = (
+                prompt_fn(f"khimaira {__version__} → {latest} available. Upgrade now? [Y/n] ")
+                .strip()
+                .lower()
+            )
         except (EOFError, KeyboardInterrupt):
             reply = "n"
         if reply and reply not in ("y", "yes", ""):

@@ -1,6 +1,7 @@
 """`khimaira install-hooks` — wire khimaira's session hooks into Claude Code.
 
 Idempotent merge into ~/.claude/settings.json:
+  - PreToolUse hook → govern khimaira internal-roster subagents by role
   - PostToolUse hook on Edit|Write|MultiEdit|NotebookEdit → auto-log file touches
   - SessionStart hook → auto-read inbox notes from other sessions
   - UserPromptSubmit hook → periodic reminder to log decisions/questions
@@ -23,6 +24,7 @@ Removal: `khimaira install-hooks --uninstall` strips khimaira entries cleanly.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import shlex
@@ -37,9 +39,7 @@ log = get_logger("cli.install_hooks")
 
 
 SETTINGS_PATH = Path(
-    os.environ.get(
-        "CLAUDE_SETTINGS_PATH", str(Path.home() / ".claude" / "settings.json")
-    )
+    os.environ.get("CLAUDE_SETTINGS_PATH", str(Path.home() / ".claude" / "settings.json"))
 )
 
 # Legacy: the workspace-root scripts dir we used pre-khimaira.hooks-package.
@@ -88,10 +88,11 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         "install-hooks",
         help="Wire khimaira session hooks into Claude Code's settings.json.",
         description=(
-            "Adds three hooks to ~/.claude/settings.json: PostToolUse "
-            "(auto-log file touches), SessionStart (auto-read inbox), "
-            "UserPromptSubmit (periodic decision/question reminder). "
-            "Idempotent — safe to re-run."
+            "Adds khimaira hooks to ~/.claude/settings.json: PreToolUse "
+            "(internal-roster governance), PostToolUse (auto-log file "
+            "touches), SessionStart (auto-read inbox), UserPromptSubmit "
+            "(periodic decision/question reminder), and SubagentStop "
+            "(usage logging). Idempotent — safe to re-run."
         ),
     )
     p.add_argument(
@@ -172,6 +173,13 @@ def run(args: argparse.Namespace) -> int:
         print(json.dumps(new_settings, indent=2))
         return 0
 
+    if new_settings == settings:
+        print(
+            f"[khimaira install-hooks] no changes needed at {settings_path}",
+            flush=True,
+        )
+        return 0
+
     # Backup first
     if settings_path.is_file():
         backup = settings_path.with_suffix(f".json.bak.{int(_mtime(settings_path))}")
@@ -184,12 +192,16 @@ def run(args: argparse.Namespace) -> int:
     tmp.write_text(json.dumps(new_settings, indent=2) + "\n", encoding="utf-8")
     tmp.replace(settings_path)
 
-    print(
-        f"[khimaira install-hooks] {action} khimaira hooks at {settings_path}", flush=True
-    )
+    print(f"[khimaira install-hooks] {action} khimaira hooks at {settings_path}", flush=True)
     if not args.uninstall:
         print(
             "\nWhat's now active for new Claude Code sessions:",
+            flush=True,
+        )
+        print(
+            "  • PreToolUse → "
+            f"{_build_hook_command('claude_internal_roster_pretool')} "
+            "(governs khimaira internal-roster subagents by role)",
             flush=True,
         )
         print(
@@ -226,6 +238,7 @@ def run(args: argparse.Namespace) -> int:
 
 
 _KHIMAIRA_MARKER = "_khimaira_hook"
+_CLAUDE_INTERNAL_ROSTER_MARKER = "claude_internal_roster_pretool"
 
 
 def _add_khimaira_hooks(settings: dict) -> dict:
@@ -237,7 +250,10 @@ def _add_khimaira_hooks(settings: dict) -> dict:
     it's the one that has khimaira importable. See module-level
     _build_hook_command for details.
     """
-    out = dict(settings)
+    # Hook upserts mutate nested event lists in place. Copy deeply so callers
+    # can compare the returned settings with the original to detect a true
+    # no-op and so this helper has no surprising input mutation.
+    out = copy.deepcopy(settings)
     hooks = (
         out.setdefault("hooks", {})
         if isinstance(out.get("hooks"), dict) or "hooks" not in out
@@ -256,6 +272,7 @@ def _add_khimaira_hooks(settings: dict) -> dict:
     ss_cmd = _build_hook_command("session_start")
     ups_cmd = _build_hook_command("user_prompt_submit")
     sas_cmd = _build_hook_command("subagent_stop")
+    roster_cmd = _build_hook_command("claude_internal_roster_pretool")
 
     # Each hook event accepts a list of matchers. We append the khimaira entry
     # if not already present (matched by marker).
@@ -291,30 +308,88 @@ def _add_khimaira_hooks(settings: dict) -> dict:
             "hooks": [{"type": "command", "command": sas_cmd, _KHIMAIRA_MARKER: True}],
         },
     )
+    # Keep this as its own matcher entry, independent of the live Themis
+    # PreToolUse entry. Claude Code combines all matching PreToolUse hooks;
+    # neither hook should replace or absorb the other.
+    _upsert_hook(
+        hooks,
+        "PreToolUse",
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": roster_cmd,
+                    _KHIMAIRA_MARKER: _CLAUDE_INTERNAL_ROSTER_MARKER,
+                }
+            ],
+        },
+        legacy_command_fragments=("claude_internal_roster_pretool.py",),
+    )
 
     return out
 
 
-def _upsert_hook(hooks: dict, event: str, entry: dict) -> None:
+def _upsert_hook(
+    hooks: dict,
+    event: str,
+    entry: dict,
+    *,
+    legacy_command_fragments: tuple[str, ...] = (),
+) -> None:
     """Add `entry` to hooks[event] (creating the list if missing). If a
-    khimaira-marked entry already exists for this event, replace it in place."""
+    matching khimaira entry already exists for this event, replace it.
+
+    Marker *values* identify independent hooks that share an event. This is
+    load-bearing for PreToolUse: the internal-roster hook must replace only
+    itself, never the separate Themis hook. Exact command matching adopts an
+    entry that was installed manually without a marker. Optional legacy
+    fragments migrate older filesystem-path command forms.
+    """
     matchers = hooks.setdefault(event, [])
     if not isinstance(matchers, list):
         return  # malformed; skip silently to avoid clobbering
 
-    # Remove any prior khimaira entries
-    matchers[:] = [
-        m
-        for m in matchers
-        if not (
-            isinstance(m, dict)
-            and any(
-                isinstance(h, dict) and h.get(_KHIMAIRA_MARKER)
-                for h in m.get("hooks", [])
-            )
+    incoming_marker_values = _marker_values(entry)
+    incoming_commands = _hook_commands(entry)
+
+    def is_same_hook(matcher: object) -> bool:
+        if not isinstance(matcher, dict):
+            return False
+        if incoming_marker_values & _marker_values(matcher):
+            return True
+        commands = _hook_commands(matcher)
+        if incoming_commands & commands:
+            return True
+        return any(
+            fragment in command for fragment in legacy_command_fragments for command in commands
         )
-    ]
+
+    # Remove only prior instances of this khimaira hook. Other entries for
+    # the same event remain byte-for-byte unchanged and in their original
+    # order.
+    matchers[:] = [matcher for matcher in matchers if not is_same_hook(matcher)]
     matchers.append(entry)
+
+
+def _marker_values(matcher: dict) -> set[str | bool]:
+    """Return non-false marker values from a Claude hook matcher entry."""
+    return {
+        marker
+        for hook in matcher.get("hooks", [])
+        if isinstance(hook, dict)
+        if isinstance(marker := hook.get(_KHIMAIRA_MARKER), (str, bool))
+        if marker
+    }
+
+
+def _hook_commands(matcher: dict) -> set[str]:
+    """Return command strings from a Claude hook matcher entry."""
+    return {
+        command
+        for hook in matcher.get("hooks", [])
+        if isinstance(hook, dict)
+        if isinstance(command := hook.get("command"), str)
+    }
 
 
 def _strip_khimaira_hooks(settings: dict) -> dict:
@@ -333,10 +408,7 @@ def _strip_khimaira_hooks(settings: dict) -> dict:
             for m in matchers
             if not (
                 isinstance(m, dict)
-                and any(
-                    isinstance(h, dict) and h.get(_KHIMAIRA_MARKER)
-                    for h in m.get("hooks", [])
-                )
+                and any(isinstance(h, dict) and h.get(_KHIMAIRA_MARKER) for h in m.get("hooks", []))
             )
         ]
         if kept:

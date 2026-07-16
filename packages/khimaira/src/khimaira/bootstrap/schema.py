@@ -126,6 +126,8 @@ class Profile:
     # locations would write the wrong paths. install-hooks generates the
     # correct paths from THIS machine's khimaira location.
     install_claude_hooks: bool = False
+    # Declaratively merge khimaira MCP servers + lifecycle hooks into Codex.
+    install_codex_adapter: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """For diagnostics / JSON output. Mirrors the YAML schema."""
@@ -137,20 +139,16 @@ class Profile:
                 "repo": self.dotfiles.repo,
                 "path": self.dotfiles.path,
                 "branch": self.dotfiles.branch,
-                "symlinks": [
-                    {"src": s.src, "dest": s.dest} for s in self.dotfiles.symlinks
-                ],
+                "symlinks": [{"src": s.src, "dest": s.dest} for s in self.dotfiles.symlinks],
             }
         out["repos"] = [
-            {k: v for k, v in r.__dict__.items() if v not in (None, "")}
-            for r in self.repos
+            {k: v for k, v in r.__dict__.items() if v not in (None, "")} for r in self.repos
         ]
-        out["mcp_servers"] = [
-            {"name": m.name, "command": m.command} for m in self.mcp_servers
-        ]
+        out["mcp_servers"] = [{"name": m.name, "command": m.command} for m in self.mcp_servers]
         out["supervisor"] = {"auto_install": self.supervisor.auto_install}
         out["spa_build"] = self.spa_build
         out["install_claude_hooks"] = self.install_claude_hooks
+        out["install_codex_adapter"] = self.install_codex_adapter
         return out
 
 
@@ -178,12 +176,12 @@ def _parse_dict(raw: dict[str, Any]) -> Profile:
         "supervisor",
         "spa_build",
         "install_claude_hooks",
+        "install_codex_adapter",
     }
     unknown = set(raw.keys()) - known_top
     if unknown:
         raise ProfileError(
-            f"unknown top-level keys in profile: {sorted(unknown)}. "
-            f"Known: {sorted(known_top)}."
+            f"unknown top-level keys in profile: {sorted(unknown)}. Known: {sorted(known_top)}."
         )
 
     dotfiles: DotfilesSpec | None = None
@@ -197,9 +195,7 @@ def _parse_dict(raw: dict[str, Any]) -> Profile:
         for entry in df.get("symlinks") or []:
             if not isinstance(entry, dict) or "src" not in entry or "dest" not in entry:
                 raise ProfileError(f"each symlink needs src + dest; got {entry!r}")
-            symlinks.append(
-                SymlinkEntry(src=str(entry["src"]), dest=str(entry["dest"]))
-            )
+            symlinks.append(SymlinkEntry(src=str(entry["src"]), dest=str(entry["dest"])))
         dotfiles = DotfilesSpec(
             repo=str(df["repo"]),
             path=str(df.get("path") or "~/dotfiles"),
@@ -237,6 +233,10 @@ def _parse_dict(raw: dict[str, Any]) -> Profile:
         raise ProfileError("supervisor must be a mapping")
     supervisor = SupervisorSpec(auto_install=bool(sup_raw.get("auto_install", False)))
 
+    install_codex_adapter = raw.get("install_codex_adapter", False)
+    if not isinstance(install_codex_adapter, bool):
+        raise ProfileError("install_codex_adapter must be a boolean")
+
     return Profile(
         name=str(raw.get("name") or "anonymous"),
         description=str(raw.get("description") or ""),
@@ -246,6 +246,7 @@ def _parse_dict(raw: dict[str, Any]) -> Profile:
         supervisor=supervisor,
         spa_build=bool(raw.get("spa_build", False)),
         install_claude_hooks=bool(raw.get("install_claude_hooks", False)),
+        install_codex_adapter=install_codex_adapter,
     )
 
 

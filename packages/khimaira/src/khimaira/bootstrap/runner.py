@@ -27,11 +27,10 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from khimaira.log import get_logger
-from khimaira.bootstrap import checks
-from khimaira.bootstrap import install_mode
+from khimaira.bootstrap import checks, install_mode
 from khimaira.bootstrap import operations as ops
 from khimaira.bootstrap.schema import Profile
+from khimaira.log import get_logger
 
 log = get_logger("bootstrap.runner")
 
@@ -77,6 +76,52 @@ def _khimaira_repo_root() -> Path | None:
     return None
 
 
+def _codex_khimaira_root(profile: Profile) -> Path | None:
+    """Resolve the checkout Codex should use for khimaira's MCP server."""
+    for repo in profile.repos:
+        if repo.name == "khimaira":
+            return repo.resolved_path()
+    return _khimaira_repo_root()
+
+
+def _install_codex_adapter(report: RunReport, profile: Profile) -> None:
+    root = _codex_khimaira_root(profile)
+    if root is None or not root.is_dir():
+        report.results.append(
+            ops.OpResult(
+                op="codex-mcp-config",
+                target="~/.codex/config.toml",
+                status="failed",
+                detail=(
+                    "khimaira checkout is unavailable after bootstrap: add a repos "
+                    "entry named 'khimaira' or fix its clone/install failure"
+                ),
+            )
+        )
+    else:
+        report.results.append(ops.install_codex_mcp_config(root))
+    report.results.append(ops.install_codex_hooks())
+
+
+def _check_codex_adapter(report: RunReport, profile: Profile) -> None:
+    root = _codex_khimaira_root(profile)
+    if root is None:
+        report.results.append(
+            ops.OpResult(
+                op="codex-mcp-config",
+                target="~/.codex/config.toml",
+                status="failed",
+                detail=(
+                    "cannot resolve khimaira checkout: add a repos entry named "
+                    "'khimaira' to the profile"
+                ),
+            )
+        )
+    else:
+        report.results.append(checks.check_codex_mcp_config(root))
+    report.results.append(checks.check_codex_hooks())
+
+
 def run_bootstrap(profile: Profile, *, force: bool = False) -> RunReport:
     """First-run bootstrap. See module docstring for order."""
     report = RunReport()
@@ -114,6 +159,9 @@ def run_bootstrap(profile: Profile, *, force: bool = False) -> RunReport:
         # `python -m khimaira.hooks.<name>` commands that work for
         # source checkouts AND wheel installs identically.
         report.results.append(ops.install_claude_hooks())
+
+    if profile.install_codex_adapter:
+        _install_codex_adapter(report, profile)
 
     # --- 6. supervisor ---
     if profile.supervisor.auto_install:
@@ -173,9 +221,7 @@ def run_sync(
         # No dotfiles git-pull or sibling git-pull in this mode — those
         # ops assume a workspace checkout. Apply only the symmetric
         # parts of the pipeline.
-        report.results.append(
-            ops.check_and_upgrade_khimaira(auto_upgrade=auto_upgrade)
-        )
+        report.results.append(ops.check_and_upgrade_khimaira(auto_upgrade=auto_upgrade))
 
         # Apply symlinks IFF the user has a dotfiles repo declared — for
         # community-profile users without dotfiles, this is a no-op.
@@ -183,14 +229,10 @@ def run_sync(
             r = ops.sync_dotfiles(profile.dotfiles)
             report.results.append(r)
             if r.status != "failed":
-                dotfiles_root = Path(
-                    os.path.expanduser(profile.dotfiles.path)
-                ).resolve()
+                dotfiles_root = Path(os.path.expanduser(profile.dotfiles.path)).resolve()
                 if dotfiles_root.is_dir():
                     for entry in profile.dotfiles.symlinks:
-                        report.results.append(
-                            ops.apply_symlink(entry, dotfiles_root)
-                        )
+                        report.results.append(ops.apply_symlink(entry, dotfiles_root))
 
         # Re-register MCP servers + reconcile drift — works the same in
         # either mode (operates on Claude Code's settings, not the repo).
@@ -205,6 +247,9 @@ def run_sync(
         # upgraded).
         if profile.install_claude_hooks:
             report.results.append(ops.install_claude_hooks())
+
+        if profile.install_codex_adapter:
+            _install_codex_adapter(report, profile)
 
         # Audit-log this run for future cross-machine comparisons.
         ops.log_sync_event(
@@ -244,9 +289,7 @@ def run_sync(
     # Installed-wheel runs skip — there's no workspace to re-sync.
     workspace_root = _khimaira_repo_root()
     if workspace_root is not None:
-        report.results.append(
-            ops.maybe_run_uv_sync(workspace_root, any_deps_changed)
-        )
+        report.results.append(ops.maybe_run_uv_sync(workspace_root, any_deps_changed))
 
     # --- 3b. sibling install re-run (v2.3) — for each repo, re-run
     #          its `install:` command IFF the command changed in the
@@ -278,6 +321,9 @@ def run_sync(
     if profile.install_claude_hooks:
         report.results.append(ops.install_claude_hooks())
 
+    if profile.install_codex_adapter:
+        _install_codex_adapter(report, profile)
+
     # --- 6b. monitor freshness check (v2.2) — surface stale-daemon
     #          warning; with auto_restart=True, run systemctl restart. ---
     freshness = ops.check_monitor_freshness(workspace_root)
@@ -295,11 +341,7 @@ def run_sync(
     # Append a "sync-run" event to ~/.local/state/khimaira/sync_meta.jsonl.
     # Per-machine local; no cross-machine sync of the meta file itself.
     # Lets future syncs answer "when did I last sync this machine?".
-    repos_pulled = sum(
-        1
-        for r in report.results
-        if r.op == "repo-pull" and r.status == "updated"
-    )
+    repos_pulled = sum(1 for r in report.results if r.op == "repo-pull" and r.status == "updated")
     commits_total = sum(
         r.meta.get("commits_pulled", 0)
         for r in report.results
@@ -379,6 +421,9 @@ def check_bootstrap(profile: Profile) -> RunReport:
     # --- 4. Claude Code hooks ---
     if profile.install_claude_hooks:
         report.results.append(checks.check_claude_hooks())
+
+    if profile.install_codex_adapter:
+        _check_codex_adapter(report, profile)
 
     # --- 5. supervisor ---
     if profile.supervisor.auto_install:
@@ -465,6 +510,8 @@ def check_sync(profile: Profile) -> RunReport:
             report.results.append(checks.check_mcp(mcp))
         if profile.install_claude_hooks:
             report.results.append(checks.check_claude_hooks())
+        if profile.install_codex_adapter:
+            _check_codex_adapter(report, profile)
         return report
 
     # --- Editable mode preview (existing path) ---
@@ -518,6 +565,9 @@ def check_sync(profile: Profile) -> RunReport:
     if profile.install_claude_hooks:
         report.results.append(checks.check_claude_hooks())
 
+    if profile.install_codex_adapter:
+        _check_codex_adapter(report, profile)
+
     # --- 7. unpushed-commits report (reusing the apply-mode op — it's
     #        already read-only / informational) ---
     for repo_spec in profile.repos:
@@ -568,8 +618,6 @@ def summarize_sync(report: RunReport) -> str:
     if deps_refreshed:
         parts.append("workspace deps refreshed")
     if unpushed_total:
-        parts.append(
-            f"{unpushed_total} unpushed commit(s) on {repos_with_unpushed} repo(s)"
-        )
+        parts.append(f"{unpushed_total} unpushed commit(s) on {repos_with_unpushed} repo(s)")
 
     return " · ".join(parts) if parts else "no changes"

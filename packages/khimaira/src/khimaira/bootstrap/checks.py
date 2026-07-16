@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from importlib import resources
 from pathlib import Path
 
 from khimaira.bootstrap.operations import OpResult, _claude_mcp_list
@@ -157,11 +156,10 @@ def check_claude_hooks() -> OpResult:
     """Are khimaira's hooks present in settings.json and using the
     current `python -m khimaira.hooks.<name>` command form?
 
-    A "yes" requires all three hook events (PostToolUse, SessionStart,
-    UserPromptSubmit) to have a khimaira-marked entry whose command
-    starts with `<some-python> -m khimaira.hooks.`. Legacy command
-    forms (filesystem paths to scripts/hooks/*.py) report `would-update`
-    so the user re-runs install-hooks.
+    A "yes" requires every installed hook event, including internal-roster
+    PreToolUse governance, to have its expected khimaira-marked module
+    command. Legacy command forms (filesystem paths to scripts/hooks/*.py)
+    report `would-update` so the user re-runs install-hooks.
     """
     try:
         from khimaira.cli.install_hooks import _KHIMAIRA_MARKER, SETTINGS_PATH
@@ -193,10 +191,16 @@ def check_claude_hooks() -> OpResult:
         )
 
     hooks = settings.get("hooks", {}) if isinstance(settings, dict) else {}
-    required = ("PostToolUse", "SessionStart", "UserPromptSubmit")
+    required = {
+        "PreToolUse": "claude_internal_roster_pretool",
+        "PostToolUse": "post_tool_use",
+        "SessionStart": "session_start",
+        "UserPromptSubmit": "user_prompt_submit",
+        "SubagentStop": "subagent_stop",
+    }
     missing: list[str] = []
     legacy: list[str] = []
-    for event in required:
+    for event, module_basename in required.items():
         entries = hooks.get(event) or []
         if not isinstance(entries, list):
             missing.append(event)
@@ -213,7 +217,8 @@ def check_claude_hooks() -> OpResult:
             missing.append(event)
             continue
         # Look for at least one command using the current form.
-        if not any("-m khimaira.hooks." in c for c in khimaira_cmds):
+        expected_module = f"-m khimaira.hooks.{module_basename}"
+        if not any(expected_module in command for command in khimaira_cmds):
             legacy.append(event)
 
     if missing:
@@ -237,7 +242,67 @@ def check_claude_hooks() -> OpResult:
         op="claude-hooks",
         target=str(settings_path),
         status="unchanged",
-        detail="all 3 events use the current `python -m khimaira.hooks.` form",
+        detail="all 5 events use their current `python -m khimaira.hooks.` form",
+    )
+
+
+def check_codex_mcp_config(khimaira_root: Path, *, config_path: Path | None = None) -> OpResult:
+    """Read-only check for the two managed Codex MCP server tables."""
+    from khimaira.bootstrap.codex_config import (
+        CodexConfigError,
+        default_codex_config_path,
+        merge_codex_mcp_config,
+    )
+
+    target = config_path or default_codex_config_path()
+    try:
+        outcome = merge_codex_mcp_config(khimaira_root, path=target, apply=False)
+    except (CodexConfigError, OSError) as exc:
+        return OpResult(
+            op="codex-mcp-config",
+            target=str(target),
+            status="failed",
+            detail=str(exc),
+        )
+    return OpResult(
+        op="codex-mcp-config",
+        target=str(target),
+        status=outcome.status,
+        detail=(
+            "khimaira MCP entries match"
+            if outcome.status == "unchanged"
+            else "would merge khimaira and khimaira-chat MCP entries"
+        ),
+    )
+
+
+def check_codex_hooks(*, hooks_path: Path | None = None) -> OpResult:
+    """Read-only check for the four managed Codex lifecycle hooks."""
+    from khimaira.bootstrap.codex_config import (
+        CodexConfigError,
+        default_codex_hooks_path,
+        merge_codex_hooks,
+    )
+
+    target = hooks_path or default_codex_hooks_path()
+    try:
+        outcome = merge_codex_hooks(path=target, apply=False)
+    except (CodexConfigError, OSError) as exc:
+        return OpResult(
+            op="codex-hooks",
+            target=str(target),
+            status="failed",
+            detail=str(exc),
+        )
+    return OpResult(
+        op="codex-hooks",
+        target=str(target),
+        status=outcome.status,
+        detail=(
+            "khimaira Codex hooks match"
+            if outcome.status == "unchanged"
+            else "would merge khimaira Codex lifecycle hooks"
+        ),
     )
 
 
@@ -346,7 +411,7 @@ def check_spa(khimaira_root: Path) -> OpResult:
 # ---------------------------------------------------------------------------
 
 
-def check_git_pull_repo(spec: "RepoSpec") -> OpResult:
+def check_git_pull_repo(spec: RepoSpec) -> OpResult:
     """`khimaira sync --check` preview: what WOULD git_pull_repo do?
 
     Runs `git fetch` (network op — keeps origin/main fresh) then
@@ -413,9 +478,7 @@ def check_git_pull_repo(spec: "RepoSpec") -> OpResult:
         )
 
     # Would ff-only succeed? Use merge-base to detect divergence.
-    base_p = _run(
-        ["git", "-C", str(path), "merge-base", current_head, fetch_head]
-    )
+    base_p = _run(["git", "-C", str(path), "merge-base", current_head, fetch_head])
     base = (base_p.stdout or "").strip()
     if base_p.returncode != 0 or not base:
         return OpResult(
@@ -438,9 +501,7 @@ def check_git_pull_repo(spec: "RepoSpec") -> OpResult:
         )
 
     # ff-only would succeed. Count commits + detect dep changes.
-    count_p = _run(
-        ["git", "-C", str(path), "rev-list", "--count", f"{current_head}..{fetch_head}"]
-    )
+    count_p = _run(["git", "-C", str(path), "rev-list", "--count", f"{current_head}..{fetch_head}"])
     commits_pulled = 0
     if count_p.returncode == 0:
         try:
