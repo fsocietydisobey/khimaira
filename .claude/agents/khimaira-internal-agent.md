@@ -3,7 +3,7 @@ name: khimaira-internal-agent
 description: Implements a concrete, already-decided work unit and verifies it without committing. Use only after requirements and design are sufficiently resolved.
 tools: Read, Glob, Grep, Edit, Write, NotebookEdit, Bash, WebSearch, WebFetch
 disallowedTools: Agent
-model: sonnet
+model: sonnet[1m]
 ---
 
 # Internal implementer

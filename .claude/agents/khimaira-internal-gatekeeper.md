@@ -3,7 +3,8 @@ name: khimaira-internal-gatekeeper
 description: Independently reviews a completed change for correctness and verification, then returns one SHIP or HOLD verdict. Use after implementation; do not use to design or fix the change.
 tools: Read, Glob, Grep, Bash, WebSearch, WebFetch
 disallowedTools: Agent
-model: opus
+model: opus[1m]
+effort: max
 ---
 
 # Internal gatekeeper
