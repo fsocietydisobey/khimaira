@@ -472,7 +472,7 @@ export const monitorApi = createApi({
     }),
     createTab: build.mutation<
       NotebookTab,
-      { title?: string; kind?: NotebookTabKind; parent_id?: string | null }
+      { repo: string; title?: string; kind?: NotebookTabKind; parent_id?: string | null }
     >({
       query: (body) => ({ url: "/tabs", method: "POST", body }),
       invalidatesTags: [{ type: "Tabs", id: "LIST" }],
@@ -483,11 +483,19 @@ export const monitorApi = createApi({
     // 422 (cycle / cross-kind-nesting / sibling-name collision) surfaces as
     // `err.data.detail` on the rejected `.unwrap()` promise — callers must
     // catch and show it, RTK Query won't do that for you.
+    // North-star (2026-07-16): `repo` is now REQUIRED and travels as a query
+    // param (not a body field) — the backend's UpdateTabReq has no repo
+    // field, and it must exactly match the target tab's stored repo (mismatch
+    // -> 404).
     updateTab: build.mutation<
       NotebookTab,
-      { id: string; title?: string; kind?: NotebookTabKind; parent_id?: string | null }
+      { id: string; repo: string; title?: string; kind?: NotebookTabKind; parent_id?: string | null }
     >({
-      query: ({ id, ...body }) => ({ url: `/tabs/${encodeURIComponent(id)}`, method: "PATCH", body }),
+      query: ({ id, repo, ...body }) => ({
+        url: `/tabs/${encodeURIComponent(id)}?repo=${encodeURIComponent(repo)}`,
+        method: "PATCH",
+        body,
+      }),
       invalidatesTags: (_r, _e, { id }) => [
         { type: "Tabs", id },
         { type: "Tabs", id: "LIST" },
@@ -495,9 +503,13 @@ export const monitorApi = createApi({
       ],
     }),
     // Re-files child tabs + direct member notes server-side (never loses a
-    // guide) — invalidate both Tabs and Notes lists, not just Tabs.
-    deleteTab: build.mutation<{ id: string; deleted: boolean }, string>({
-      query: (id) => ({ url: `/tabs/${encodeURIComponent(id)}`, method: "DELETE" }),
+    // guide) — invalidate both Tabs and Notes lists, not just Tabs. `repo`
+    // is a required query param (same exact-match contract as updateTab).
+    deleteTab: build.mutation<{ id: string; deleted: boolean }, { id: string; repo: string }>({
+      query: ({ id, repo }) => ({
+        url: `/tabs/${encodeURIComponent(id)}?repo=${encodeURIComponent(repo)}`,
+        method: "DELETE",
+      }),
       invalidatesTags: [{ type: "Tabs", id: "LIST" }, { type: "Notes", id: "LIST" }],
     }),
 

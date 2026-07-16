@@ -74,6 +74,7 @@ import { Library } from "@/components/notebook/LibraryView";
 import { MarkdownView } from "@/components/notebook/MarkdownView";
 import { TicketsView } from "@/components/notebook/TicketsView";
 import {
+  GENERAL_REPO,
   isStudyGuidePipeline,
   type Note,
   type NotebookTab,
@@ -91,10 +92,6 @@ import { cn } from "@/lib/utils";
 
 const ALL_TABS = "__all__";
 const CHAT_WIDTH = 380;
-/** Mirrors notes.GENERAL_REPO — a repo value meaning "no codebase", for
- *  cross-cutting notes. Always in scope alongside whichever project the
- *  left list / ask are currently scoped to. */
-const GENERAL_REPO = "general";
 /** Well-known tab_id for the Personal/Behavior folder — a distinct left-list
  *  section, independent of the regular tab filter / repo scope. The
  *  pipeline reads notes in this tab as behavioral context for every LLM
@@ -530,7 +527,7 @@ export function Notebook() {
 
   const handleCreateTab = async () => {
     const title = newTabTitle.trim();
-    const created = await createTab({ title }).unwrap();
+    const created = await createTab({ title, repo: projectName }).unwrap();
     setNewTabTitle("");
     setCreatingTab(false);
     setSelectedTab(created.id);
@@ -645,6 +642,7 @@ export function Notebook() {
           isLoading={filesNotesLoading}
           rail={rail}
           onRailChange={setRail}
+          newTabRepo={projectName}
           selected={selected}
           onToggleSelect={(id) =>
             setSelected((prev) => {
@@ -956,6 +954,7 @@ function NotesFileManager({
   isLoading,
   rail,
   onRailChange,
+  newTabRepo,
   selected,
   onToggleSelect,
   onClearSelect,
@@ -975,6 +974,7 @@ function NotesFileManager({
   isLoading: boolean;
   rail: Rail;
   onRailChange: (r: Rail) => void;
+  newTabRepo: string;
   selected: Set<string>;
   onToggleSelect: (id: string) => void;
   onClearSelect: () => void;
@@ -1051,6 +1051,7 @@ function NotesFileManager({
           rail={rail}
           onRailChange={onRailChange}
           onDropRecords={onMoveToTab}
+          newTabRepo={newTabRepo}
         />
       </div>
 

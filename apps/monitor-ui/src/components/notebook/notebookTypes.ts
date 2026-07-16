@@ -140,6 +140,11 @@ export interface Note {
  *  tab records — treat as "folder". */
 export type NotebookTabKind = "folder" | "collection";
 
+/** Mirrors notes.GENERAL_REPO — a repo value meaning "no codebase to
+ *  validate against", for cross-cutting notes/tabs. Always in scope
+ *  alongside whichever project the left list / ask are currently scoped to. */
+export const GENERAL_REPO = "general";
+
 export interface NotebookTab {
   id: string;
   title: string;
@@ -149,6 +154,11 @@ export interface NotebookTab {
   /** File-manager (2026-07-04): adjacency-list nesting — null is root level.
    *  Pre-migration tabs read as null via the backend's setdefault. */
   parent_id: string | null;
+  /** North-star (2026-07-16): which codebase this tab is scoped to — mirrors
+   *  `Note.repo`. Required on every /tabs mutation now (create/update/delete
+   *  all validate against it); null only on pre-migration records the
+   *  backend hasn't backfilled (`_with_note_ids` setdefaults to null). */
+  repo: string | null;
   /** Note ids grouped by tab_id — derived at read time, not stored redundantly. */
   note_ids: string[];
 }

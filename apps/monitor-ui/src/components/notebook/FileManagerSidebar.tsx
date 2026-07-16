@@ -129,6 +129,7 @@ export function FileManagerSidebar({
   rail,
   onRailChange,
   onDropRecords,
+  newTabRepo,
   compact = false,
 }: {
   tabKind: NotebookTabKind;
@@ -136,6 +137,11 @@ export function FileManagerSidebar({
   rail: Rail;
   onRailChange: (r: Rail) => void;
   onDropRecords: (ids: string[], tabId: string) => void;
+  /** North-star (2026-07-16): which repo to stamp on a brand-new TOP-LEVEL
+   *  tab (no parent) — the backend now requires `repo` on every /tabs
+   *  mutation. Anything targeting an EXISTING tab derives its repo from
+   *  `tabsById` instead (must match the stored value exactly). */
+  newTabRepo: string;
   /** Narrower rendering for the notes-side sidebar (embedded in a ~240px
    *  panel alongside other controls) vs the guide Library's full-width rail. */
   compact?: boolean;
@@ -150,8 +156,10 @@ export function FileManagerSidebar({
 
   const handleCreateChild = async (parentId: string | null) => {
     setActionError(null);
+    // child tab's repo MUST equal the parent's (backend get_tab match); top-level uses newTabRepo
+    const repo = parentId ? (tabsById.get(parentId)?.repo ?? newTabRepo) : newTabRepo;
     try {
-      await createTab({ title: `New ${tabKind}`, kind: tabKind, parent_id: parentId }).unwrap();
+      await createTab({ title: `New ${tabKind}`, kind: tabKind, parent_id: parentId, repo }).unwrap();
     } catch (err) {
       setActionError(errDetail(err, `couldn't create the ${tabKind}.`));
     }
@@ -159,8 +167,9 @@ export function FileManagerSidebar({
 
   const handleRenameTab = async (id: string, title: string) => {
     setActionError(null);
+    const repo = tabsById.get(id)?.repo ?? newTabRepo;
     try {
-      await updateTab({ id, title }).unwrap();
+      await updateTab({ id, title, repo }).unwrap();
     } catch (err) {
       setActionError(errDetail(err, "couldn't rename — a sibling may already use that name."));
     }
@@ -168,8 +177,9 @@ export function FileManagerSidebar({
 
   const handleDeleteTab = async (id: string) => {
     setActionError(null);
+    const repo = tabsById.get(id)?.repo ?? newTabRepo;
     try {
-      await deleteTab(id).unwrap();
+      await deleteTab({ id, repo }).unwrap();
       if (rail.kind === "tab" && rail.tabId === id) {
         onRailChange({ kind: "tab", tabId: tabsById.get(id)?.parent_id ?? null });
       }

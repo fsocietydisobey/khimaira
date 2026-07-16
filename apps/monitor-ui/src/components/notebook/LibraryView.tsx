@@ -49,6 +49,7 @@ import {
   usePersistedBoolean,
 } from "@/components/notebook/Notebook";
 import {
+  GENERAL_REPO,
   isStudyGuidePipeline,
   type Note,
   type NotebookTab,
@@ -248,6 +249,7 @@ function FileManager({
           rail={rail}
           onRailChange={setRail}
           onDropRecords={(ids, tabId) => void moveGuidesToTab(ids, tabId)}
+          newTabRepo={GENERAL_REPO}
         />
       </div>
 
