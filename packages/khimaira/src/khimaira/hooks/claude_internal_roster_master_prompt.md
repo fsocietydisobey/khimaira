@@ -1,5 +1,20 @@
 # Claude Code internal roster: master prompting note
 
+## Recommended budget
+
+| Role | Model | Effort |
+| --- | --- | --- |
+| master (the untyped top-level session — no `.claude/agents/*.md` file, set via slash commands) | latest Opus, 1M context | high |
+| `khimaira-internal-consultant` | Sonnet 5, 1M context | max |
+| `khimaira-internal-gatekeeper` | Sonnet 5, 1M context | high |
+| `khimaira-internal-agent` | Sonnet 5, 1M context | (unset — inherits default) |
+
+Consultant/gatekeeper/agent are pinned in each `.claude/agents/khimaira-internal-*.md`
+file's own frontmatter (`model:`/`effort:`) — they apply automatically whenever the master
+spawns that type, no manual step needed. The master session itself has no such file (it's
+the plain top-level session, not a spawned subagent), so its budget has to be set directly
+in that session: type `/model opus[1m]` then `/effort high`.
+
 The master remains the only orchestrator. Delegate through Claude Code's current native
 `Agent` tool (called `Task` in older discussions), using one of these exact custom types:
 

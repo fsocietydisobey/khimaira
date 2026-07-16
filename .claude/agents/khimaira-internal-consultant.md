@@ -3,7 +3,7 @@ name: khimaira-internal-consultant
 description: Resolves ambiguity and synthesizes architecture or implementation design before coding. Use for fuzzy requirements, consequential trade-offs, or bug-class enumeration; do not use for implementation or final review.
 tools: Read, Glob, Grep, Bash, WebSearch, WebFetch
 disallowedTools: Agent
-model: opus[1m]
+model: sonnet[1m]
 effort: max
 ---
 
