@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -20,11 +21,12 @@ def notes_store(isolated_state, monkeypatch):
 
 
 def test_add_and_get_note_round_trip(notes_store):
-    note = notes_store.add_note("some raw pasted text", tab_id="proj-a", title="My note")
+    tab = notes_store.add_tab(title="proj-a")
+    note = notes_store.add_note("some raw pasted text", tab_id=tab["id"], title="My note")
     fetched = notes_store.get_note(note["id"])
     assert fetched["raw_text"] == "some raw pasted text"
     assert fetched["title"] == "My note"
-    assert fetched["tab_id"] == "proj-a"
+    assert fetched["tab_id"] == tab["id"]
     assert fetched["status"] == "draft"
     assert fetched["pipeline"] is None
     assert fetched["training"]["promoted"] is False
@@ -230,8 +232,9 @@ def test_update_note_rejects_invalid_priority(notes_store):
 
 
 def test_list_notes_priority_filter(notes_store):
-    notes_store.add_note("a", tab_id="t1")
-    urgent = notes_store.add_note("b", tab_id="t1")
+    tab = notes_store.add_tab(title="t1")
+    notes_store.add_note("a", tab_id=tab["id"])
+    urgent = notes_store.add_note("b", tab_id=tab["id"])
     notes_store.update_note(urgent["id"], priority="urgent")
 
     urgent_only = notes_store.list_notes(priority="urgent")
@@ -278,8 +281,9 @@ def test_update_note_rejects_invalid_test_status(notes_store):
 
 
 def test_list_notes_test_status_filter(notes_store):
-    notes_store.add_note("a", tab_id="t1")
-    tested = notes_store.add_note("b", tab_id="t1")
+    tab = notes_store.add_tab(title="t1")
+    notes_store.add_note("a", tab_id=tab["id"])
+    tested = notes_store.add_note("b", tab_id=tab["id"])
     notes_store.update_note(tested["id"], test_status="tested")
 
     tested_only = notes_store.list_notes(test_status="tested")
@@ -443,7 +447,8 @@ def test_list_notes_includes_raw_text_and_pipeline(notes_store):
     """Listing must carry full render data (raw_text/pipeline/training) —
     the frontend renders note cards straight from the list response,
     no per-note get_note() round trip."""
-    note = notes_store.add_note("full text here", tab_id="t1")
+    tab = notes_store.add_tab(title="t1")
+    note = notes_store.add_note("full text here", tab_id=tab["id"])
     notes_store.set_pipeline(
         note["id"],
         {
@@ -455,17 +460,19 @@ def test_list_notes_includes_raw_text_and_pipeline(notes_store):
             "entities": [],
         },
     )
-    listed = notes_store.list_notes(tab_id="t1")
+    listed = notes_store.list_notes(tab_id=tab["id"])
     assert listed[0]["raw_text"] == "full text here"
     assert listed[0]["pipeline"]["summary"] == "s"
     assert listed[0]["training"]["promoted"] is False
 
 
 def test_list_notes_filters_by_tab_and_sorts_recent_first(notes_store):
-    a = notes_store.add_note("a", tab_id="tab1")
-    notes_store.add_note("b", tab_id="tab2")
+    tab1 = notes_store.add_tab(title="tab1")
+    tab2 = notes_store.add_tab(title="tab2")
+    a = notes_store.add_note("a", tab_id=tab1["id"])
+    notes_store.add_note("b", tab_id=tab2["id"])
     notes_store.update_note(a["id"], title="a-updated")
-    listed = notes_store.list_notes(tab_id="tab1")
+    listed = notes_store.list_notes(tab_id=tab1["id"])
     assert [n["id"] for n in listed] == [a["id"]]
     all_notes = notes_store.list_notes()
     assert len(all_notes) == 2
@@ -541,13 +548,15 @@ def test_update_note_same_repo_keeps_validation_state(notes_store):
 
 
 def test_update_note_round_trip(notes_store):
-    note = notes_store.add_note("raw", tab_id="t1")
-    updated = notes_store.update_note(note["id"], title="new title", tab_id="t2")
+    tab1 = notes_store.add_tab(title="t1")
+    tab2 = notes_store.add_tab(title="t2")
+    note = notes_store.add_note("raw", tab_id=tab1["id"])
+    updated = notes_store.update_note(note["id"], title="new title", tab_id=tab2["id"])
     assert updated["title"] == "new title"
-    assert updated["tab_id"] == "t2"
+    assert updated["tab_id"] == tab2["id"]
     refetched = notes_store.get_note(note["id"])
     assert refetched["title"] == "new title"
-    assert refetched["tab_id"] == "t2"
+    assert refetched["tab_id"] == tab2["id"]
 
 
 def test_update_note_raw_text_change_snapshots_prior_version(notes_store):
@@ -697,7 +706,8 @@ def test_promote_note_round_trip(notes_store):
 
 
 def test_delete_note_round_trip(notes_store):
-    note = notes_store.add_note("raw", tab_id="t1")
+    tab = notes_store.add_tab(title="t1")
+    note = notes_store.add_note("raw", tab_id=tab["id"])
     result = notes_store.delete_note(note["id"])
     assert result == {"id": note["id"], "deleted": True}
     with pytest.raises(ValueError, match="No note with id"):
@@ -791,9 +801,10 @@ def test_derive_lifecycle_resolved_once_resolution_lands(notes_store):
 
 
 def test_list_notes_includes_resolution_fields_and_lifecycle(notes_store):
-    note = notes_store.add_note("raw", tab_id="t1")
+    tab = notes_store.add_tab(title="t1")
+    note = notes_store.add_note("raw", tab_id=tab["id"])
     notes_store.add_resolution(note["id"], "fixed it", resolved_by="agent-1")
-    listed = notes_store.list_notes(tab_id="t1")
+    listed = notes_store.list_notes(tab_id=tab["id"])
     assert listed[0]["resolution"] == "fixed it"
     assert listed[0]["resolved_by"] == "agent-1"
     assert listed[0]["resolved_at"] is not None
@@ -834,9 +845,10 @@ def test_list_tabs_empty_store_returns_empty_list(notes_store):
 
 def test_tab_note_ids_derived_from_live_notes(notes_store):
     tab = notes_store.add_tab(title="grouped")
+    other_tab = notes_store.add_tab(title="other")
     n1 = notes_store.add_note("a", tab_id=tab["id"])
     n2 = notes_store.add_note("b", tab_id=tab["id"])
-    notes_store.add_note("c", tab_id="other-tab")
+    notes_store.add_note("c", tab_id=other_tab["id"])
     fetched = notes_store.get_tab(tab["id"])
     assert set(fetched["note_ids"]) == {n1["id"], n2["id"]}
     notes_store.delete_note(n1["id"])
@@ -936,16 +948,19 @@ def test_derive_lifecycle_study_guide_ignores_resolution_fields(notes_store):
 
 
 def test_mark_organized_stamps_without_refiling_when_tab_id_omitted(notes_store):
-    guide = notes_store.add_study_guide("body", tab_id="original-tab")
+    original = notes_store.add_tab(title="original", kind="collection")
+    guide = notes_store.add_study_guide("body", tab_id=original["id"])
     updated = notes_store.mark_organized(guide["id"])
-    assert updated["tab_id"] == "original-tab"
+    assert updated["tab_id"] == original["id"]
     assert updated["organized_at"] is not None
 
 
 def test_mark_organized_refiles_when_tab_id_given(notes_store):
-    guide = notes_store.add_study_guide("body", tab_id="original-tab")
-    updated = notes_store.mark_organized(guide["id"], tab_id="new-tab")
-    assert updated["tab_id"] == "new-tab"
+    original = notes_store.add_tab(title="original", kind="collection")
+    destination = notes_store.add_tab(title="new", kind="collection")
+    guide = notes_store.add_study_guide("body", tab_id=original["id"])
+    updated = notes_store.mark_organized(guide["id"], tab_id=destination["id"])
+    assert updated["tab_id"] == destination["id"]
 
 
 def test_find_by_source_path_finds_existing(notes_store):
@@ -1561,7 +1576,7 @@ def test_update_ticket_linear_pulled_rejects_synced_field(notes_store):
 def test_update_ticket_linear_pulled_still_allows_tab_id(notes_store):
     """Filing (tab_id) is always a local concern, even on a mirrored ticket."""
     ticket = notes_store.add_ticket("Mirrored", origin="linear-pulled", linear_ref="LIN-3")
-    tab = notes_store.add_tab(title="My tickets")
+    tab = notes_store.add_tab(title="My tickets", repo=notes_store.GENERAL_REPO)
     updated = notes_store.update_ticket(ticket["id"], tab_id=tab["id"])
     assert updated["tab_id"] == tab["id"]
 
@@ -1634,14 +1649,18 @@ def test_upsert_ticket_from_linear_is_idempotent_no_duplicates(notes_store):
     assert first_created is True
 
     updated_mapped = {"linear_ref": "LIN-11", "title": "Renamed upstream", "state": "In Progress"}
-    second, second_created = notes_store.upsert_ticket_from_linear(updated_mapped, project="Langgraph")
+    second, second_created = notes_store.upsert_ticket_from_linear(
+        updated_mapped, project="Langgraph"
+    )
     assert second_created is False
     assert second["id"] == first["id"]
     assert second["title"] == "Renamed upstream"
     assert second["state"] == "In Progress"
 
     all_tickets = notes_store.list_tickets(project="Langgraph")
-    assert len(all_tickets) == 1, "resync must never create a duplicate ticket for the same linear_ref"
+    assert len(all_tickets) == 1, (
+        "resync must never create a duplicate ticket for the same linear_ref"
+    )
 
 
 def test_upsert_ticket_from_linear_partial_map_leaves_other_fields_untouched(notes_store):
@@ -1664,7 +1683,7 @@ def test_upsert_ticket_from_linear_never_touches_local_annotations(notes_store):
     record, _ = notes_store.upsert_ticket_from_linear(mapped, project="Langgraph")
     notes_store.add_ticket_comment(record["id"], "local note")
     notes_store.add_resolution(record["id"], "worked around it")
-    tab = notes_store.add_tab(title="Filed")
+    tab = notes_store.add_tab(title="Filed", repo=notes_store.GENERAL_REPO)
     notes_store.update_ticket(record["id"], tab_id=tab["id"])
 
     resynced, created = notes_store.upsert_ticket_from_linear(mapped, project="Langgraph")
@@ -1694,3 +1713,237 @@ def test_index_stub_ticket_fields_harmless_on_notes(notes_store):
     assert stub["state"] is None
     assert stub["labels"] == []
     assert stub["comments_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Repository-scoped tabs + legacy migration
+# ---------------------------------------------------------------------------
+
+
+def test_tabs_are_repo_scoped_with_intentional_general_visibility(notes_store):
+    tab_a = notes_store.add_tab("A", repo="repo-a")
+    tab_b = notes_store.add_tab("B", repo="repo-b")
+    general = notes_store.add_tab("General", repo=notes_store.GENERAL_REPO)
+    assert {tab["id"] for tab in notes_store.list_tabs(repo="repo-a")} == {
+        tab_a["id"],
+        general["id"],
+    }
+    assert tab_b["id"] not in {tab["id"] for tab in notes_store.list_tabs(repo="repo-a")}
+    with pytest.raises(ValueError, match="No tab"):
+        notes_store.get_tab(general["id"], repo="repo-a")
+    assert notes_store.get_tab(general["id"], repo=notes_store.GENERAL_REPO)["id"] == general["id"]
+
+
+def test_sibling_uniqueness_is_scoped_by_repo(notes_store):
+    notes_store.add_tab("Root", repo="repo-a")
+    notes_store.add_tab("Root", repo="repo-b")
+    with pytest.raises(notes_store.TabValidationError, match="already exists"):
+        notes_store.add_tab("root", repo="repo-a")
+
+
+def test_cross_repo_tab_access_parent_and_mutation_are_not_found(notes_store):
+    tab_b = notes_store.add_tab("B", repo="repo-b")
+    original = dict(notes_store.get_tab(tab_b["id"], repo="repo-b"))
+    for action in (
+        lambda: notes_store.get_tab(tab_b["id"], repo="repo-a"),
+        lambda: notes_store.update_tab(tab_b["id"], repo="repo-a", title="changed"),
+        lambda: notes_store.delete_tab(tab_b["id"], repo="repo-a"),
+        lambda: notes_store.add_tab("child", parent_id=tab_b["id"], repo="repo-a"),
+    ):
+        with pytest.raises(ValueError, match="No tab"):
+            action()
+    assert notes_store.get_tab(tab_b["id"], repo="repo-b") == original
+
+
+def test_delete_and_note_ids_walk_exact_repo_only(notes_store):
+    tab_a = notes_store.add_tab("A", repo="repo-a")
+    tab_b = notes_store.add_tab("B", repo="repo-b")
+    note_a = notes_store.add_note("a", tab_id=tab_a["id"], repo="repo-a")
+    note_b = notes_store.add_note("b", tab_id=tab_b["id"], repo="repo-b")
+    assert notes_store.get_tab(tab_a["id"], repo="repo-a")["note_ids"] == [note_a["id"]]
+    notes_store.delete_tab(tab_a["id"], repo="repo-a")
+    assert notes_store.get_note(note_a["id"])["tab_id"] == notes_store._DEFAULT_TAB_ID
+    assert notes_store.get_note(note_b["id"])["tab_id"] == tab_b["id"]
+    assert notes_store.get_tab(tab_b["id"], repo="repo-b")["note_ids"] == [note_b["id"]]
+
+
+def test_note_assignment_and_repo_change_require_exact_destination(notes_store):
+    tab_a = notes_store.add_tab("A", repo="repo-a")
+    tab_b = notes_store.add_tab("B", repo="repo-b")
+    with pytest.raises(ValueError, match="No tab"):
+        notes_store.add_note("wrong", tab_id=tab_b["id"], repo="repo-a")
+    note = notes_store.add_note("a", tab_id=tab_a["id"], repo="repo-a")
+    with pytest.raises(notes_store.TabValidationError, match="destination tab_id"):
+        notes_store.update_note(note["id"], repo="repo-b")
+    with pytest.raises(ValueError, match="No tab"):
+        notes_store.update_note(note["id"], repo="repo-b", tab_id=tab_a["id"])
+    moved = notes_store.update_note(note["id"], repo="repo-b", tab_id=tab_b["id"])
+    assert (moved["repo"], moved["tab_id"]) == ("repo-b", tab_b["id"])
+
+
+def test_kind_change_rejects_existing_incompatible_children(notes_store):
+    parent = notes_store.add_tab("parent", kind="folder", repo="repo-a")
+    notes_store.add_tab("child", kind="folder", parent_id=parent["id"], repo="repo-a")
+    with pytest.raises(notes_store.TabValidationError, match="direct children"):
+        notes_store.update_tab(parent["id"], repo="repo-a", kind="collection")
+
+
+def _seed_legacy_tab(notes_store, tab_id, title, parent_id=None, **metadata):
+    notes_store._ensure_dirs()
+    now = notes_store._now_iso()
+    record = {
+        "id": tab_id,
+        "title": title,
+        "kind": "folder",
+        "parent_id": parent_id,
+        "created_at": now,
+        "updated_at": now,
+        "deleted": False,
+        **metadata,
+    }
+    notes_store._append_tab_record(record)
+    return record
+
+
+def _seed_legacy_tab_note(notes_store, tab_id, repo, text):
+    note = notes_store.add_note(text, repo=repo)
+    note["tab_id"] = tab_id
+    notes_store._write_note_atomic(note["id"], note)
+    notes_store._append_index_stub(note)
+    # add_note initializes the store before writing. Restore the seeded tab
+    # rows to their pre-migration shape so the explicit migration run below
+    # sees the intended legacy fixture rather than that eager quarantine.
+    for tab in notes_store._fold_tabs().values():
+        legacy = dict(tab)
+        legacy.pop("repo", None)
+        notes_store._append_tab_record(legacy)
+    return note
+
+
+def _rerun_tab_repo_migration(notes_store):
+    notes_store._tab_repo_migration_path().unlink(missing_ok=True)
+    notes_store._MIGRATED_BASE_DIRS.clear()
+    notes_store.initialize_tab_repo_migration()
+
+
+def test_tab_repo_migration_single_repo_stamps_whole_tree(notes_store):
+    root = _seed_legacy_tab(notes_store, "legacy-root", "root", custom="kept")
+    child = _seed_legacy_tab(notes_store, "legacy-child", "child", root["id"])
+    note = _seed_legacy_tab_note(notes_store, child["id"], "repo-a", "a")
+    _rerun_tab_repo_migration(notes_store)
+    assert notes_store.get_tab(root["id"], repo="repo-a")["custom"] == "kept"
+    assert notes_store.get_tab(child["id"], repo="repo-a")["parent_id"] == root["id"]
+    assert notes_store.get_note(note["id"])["tab_id"] == child["id"]
+
+
+def test_tab_repo_migration_mixed_repos_clones_component_and_remaps_notes(notes_store):
+    root = _seed_legacy_tab(notes_store, "mixed-root", "root")
+    child = _seed_legacy_tab(notes_store, "mixed-child", "child", root["id"])
+    note_a = _seed_legacy_tab_note(notes_store, root["id"], "repo-a", "a")
+    note_b = _seed_legacy_tab_note(notes_store, child["id"], "repo-b", "b")
+    _rerun_tab_repo_migration(notes_store)
+    a_tabs = {tab["title"]: tab for tab in notes_store.list_tabs(repo="repo-a")}
+    b_tabs = {tab["title"]: tab for tab in notes_store.list_tabs(repo="repo-b")}
+    assert a_tabs["root"]["id"] == root["id"]
+    assert b_tabs["root"]["id"] != root["id"]
+    assert b_tabs["child"]["parent_id"] == b_tabs["root"]["id"]
+    assert notes_store.get_note(note_a["id"])["tab_id"] == a_tabs["root"]["id"]
+    assert notes_store.get_note(note_b["id"])["tab_id"] == b_tabs["child"]["id"]
+
+
+def test_tab_repo_migration_zero_note_component_is_quarantined(notes_store):
+    legacy = _seed_legacy_tab(notes_store, "empty-legacy", "empty")
+    _rerun_tab_repo_migration(notes_store)
+    unscoped = {tab["id"]: tab for tab in notes_store.list_tabs()}
+    assert unscoped[legacy["id"]]["repo"] is None
+    assert legacy["id"] not in {tab["id"] for tab in notes_store.list_tabs(repo="repo-a")}
+    with pytest.raises(ValueError, match="No tab"):
+        notes_store.get_tab(legacy["id"], repo="repo-a")
+
+
+def test_tab_repo_migration_general_replay_and_compaction_preserve_metadata(notes_store):
+    root = _seed_legacy_tab(notes_store, "general-root", "root", marker="preserved")
+    general_note = _seed_legacy_tab_note(notes_store, root["id"], notes_store.GENERAL_REPO, "g")
+    repo_note = _seed_legacy_tab_note(notes_store, root["id"], "repo-z", "z")
+    _rerun_tab_repo_migration(notes_store)
+    first_tabs = notes_store._tabs_path().read_text(encoding="utf-8")
+    first_index = notes_store._index_path().read_text(encoding="utf-8")
+    general_tab = notes_store.get_tab(root["id"], repo=notes_store.GENERAL_REPO)
+    repo_tab = next(tab for tab in notes_store.list_tabs(repo="repo-z") if tab["repo"] == "repo-z")
+    assert general_tab["marker"] == "preserved"
+    assert notes_store.get_note(general_note["id"])["tab_id"] == general_tab["id"]
+    assert notes_store.get_note(repo_note["id"])["tab_id"] == repo_tab["id"]
+    notes_store._MIGRATED_BASE_DIRS.clear()
+    notes_store.initialize_tab_repo_migration()
+    assert notes_store._tabs_path().read_text(encoding="utf-8") == first_tabs
+    assert notes_store._index_path().read_text(encoding="utf-8") == first_index
+    with notes_store._TABS_LOCK:
+        notes_store._compact_tabs_locked()
+    assert notes_store.get_tab(root["id"], repo=notes_store.GENERAL_REPO)["marker"] == "preserved"
+
+
+def test_tab_repo_migration_resumes_a_partially_applied_durable_plan(notes_store):
+    root = _seed_legacy_tab(notes_store, "resume-root", "root")
+    note = _seed_legacy_tab_note(notes_store, root["id"], "repo-a", "a")
+    notes_store._tab_repo_migration_path().unlink(missing_ok=True)
+    notes_store._MIGRATED_BASE_DIRS.clear()
+    plan = notes_store._build_tab_repo_migration_plan()
+    notes_store._atomic_write_json(notes_store._tab_repo_migration_path(), plan)
+    # Simulate a crash after the first append but before note moves / marker completion.
+    notes_store._append_tab_record(plan["tabs"][0])
+
+    notes_store.initialize_tab_repo_migration()
+
+    assert notes_store.get_tab(root["id"], repo="repo-a")["id"] == root["id"]
+    assert notes_store.get_note(note["id"])["tab_id"] == root["id"]
+    marker = __import__("json").loads(
+        notes_store._tab_repo_migration_path().read_text(encoding="utf-8")
+    )
+    assert marker["status"] == "complete"
+
+
+def test_add_tab_from_worker_thread_after_main_thread_migration(notes_store):
+    notes_store.initialize_tab_repo_migration()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        tab = executor.submit(notes_store.add_tab, "threaded", repo="repo-a").result(timeout=2)
+    assert notes_store.get_tab(tab["id"], repo="repo-a")["title"] == "threaded"
+
+
+def test_tab_repo_migration_replay_repairs_index_after_note_file_only_crash(notes_store):
+    root = _seed_legacy_tab(notes_store, "file-only-root", "root")
+    _seed_legacy_tab_note(notes_store, root["id"], "repo-a", "a")
+    note_b = _seed_legacy_tab_note(notes_store, root["id"], "repo-b", "b")
+    notes_store._tab_repo_migration_path().unlink(missing_ok=True)
+    notes_store._MIGRATED_BASE_DIRS.clear()
+    plan = notes_store._build_tab_repo_migration_plan()
+    target_tab_id = plan["note_tabs"][note_b["id"]]
+    assert target_tab_id != root["id"]
+    notes_store._atomic_write_json(notes_store._tab_repo_migration_path(), plan)
+
+    # Exact crash boundary: the note file reached its clone, but the process
+    # died before appending the corresponding index projection.
+    file_record = notes_store._read_note_file(note_b["id"])
+    file_record["tab_id"] = target_tab_id
+    notes_store._write_note_atomic(note_b["id"], file_record)
+    assert notes_store._fold_index()[note_b["id"]]["tab_id"] == root["id"]
+
+    notes_store.initialize_tab_repo_migration()
+
+    assert notes_store.get_note(note_b["id"])["tab_id"] == target_tab_id
+    assert notes_store._fold_index()[note_b["id"]]["tab_id"] == target_tab_id
+    marker = __import__("json").loads(
+        notes_store._tab_repo_migration_path().read_text(encoding="utf-8")
+    )
+    assert marker["status"] == "complete"
+    stable_bytes = (
+        notes_store._tabs_path().read_bytes(),
+        notes_store._index_path().read_bytes(),
+        notes_store._tab_repo_migration_path().read_bytes(),
+    )
+    notes_store._MIGRATED_BASE_DIRS.clear()
+    notes_store.initialize_tab_repo_migration()
+    assert (
+        notes_store._tabs_path().read_bytes(),
+        notes_store._index_path().read_bytes(),
+        notes_store._tab_repo_migration_path().read_bytes(),
+    ) == stable_bytes

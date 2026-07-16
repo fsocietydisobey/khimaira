@@ -99,6 +99,7 @@ def import_dir(root: str | Path, *, repo: str = "", dry_run: bool = True) -> dic
     always [] when dry_run=True.
     """
     root_path = Path(root).expanduser().resolve()
+    normalized_repo = repo or notes.GENERAL_REPO
     manifest: list[dict[str, Any]] = []
     imported: list[str] = []
 
@@ -148,12 +149,12 @@ def import_dir(root: str | Path, *, repo: str = "", dry_run: bool = True) -> dic
         )
 
         if not dry_run:
-            tab = notebook_organizer.get_or_create_collection(collection)
+            tab = notebook_organizer.get_or_create_collection(collection, repo=normalized_repo)
             record = notes.add_study_guide(
                 text,
                 tab_id=tab["id"],
                 title=title,
-                repo=repo or notes.GENERAL_REPO,
+                repo=normalized_repo,
                 source_path=source_path,
             )
             # FILE-MANAGER (2026-07-04): only ever fires on a BRAND-NEW note

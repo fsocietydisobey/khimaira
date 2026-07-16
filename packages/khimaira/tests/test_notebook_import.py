@@ -140,9 +140,31 @@ def test_import_dir_real_import_creates_notes(importer, notes_store, tmp_path):
     assert all(g["source_path"] for g in guides)
 
     onboarding_guides = [
-        g for g in guides if notes_store.get_tab(g["tab_id"])["title"] == "Onboarding"
+        g
+        for g in guides
+        if notes_store.get_tab(g["tab_id"], repo="jeevy_portal")["title"] == "Onboarding"
     ]
     assert len(onboarding_guides) == 2
+
+
+def test_import_dir_isolates_same_collection_name_by_repo(importer, notes_store, tmp_path):
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    (root_a / "onboarding").mkdir(parents=True)
+    (root_b / "onboarding").mkdir(parents=True)
+    (root_a / "onboarding" / "guide.md").write_text("# A\n")
+    (root_b / "onboarding" / "guide.md").write_text("# B\n")
+
+    result_a = importer.import_dir(root_a, repo="repo-a", dry_run=False)
+    result_b = importer.import_dir(root_b, repo="repo-b", dry_run=False)
+
+    guide_a = notes_store.get_note(result_a["imported"][0])
+    guide_b = notes_store.get_note(result_b["imported"][0])
+    assert guide_a["tab_id"] != guide_b["tab_id"]
+    tab_a = notes_store.get_tab(guide_a["tab_id"], repo="repo-a")
+    tab_b = notes_store.get_tab(guide_b["tab_id"], repo="repo-b")
+    assert (tab_a["title"], tab_a["repo"]) == ("Onboarding", "repo-a")
+    assert (tab_b["title"], tab_b["repo"]) == ("Onboarding", "repo-b")
 
 
 def test_import_dir_is_idempotent_on_rerun(importer, notes_store, tmp_path):

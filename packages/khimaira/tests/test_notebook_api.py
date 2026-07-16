@@ -33,11 +33,12 @@ def notebook_client(isolated_state, monkeypatch):
 
 
 def test_create_note_returns_draft(notebook_client):
-    r = notebook_client.post("/api/notes", json={"raw_text": "hello world", "tab_id": "t1"})
+    tab = notebook_client.post("/api/tabs", json={"title": "Drafts", "repo": "khimaira"}).json()
+    r = notebook_client.post("/api/notes", json={"raw_text": "hello world", "tab_id": tab["id"]})
     assert r.status_code == 200
     body = r.json()
     assert body["raw_text"] == "hello world"
-    assert body["tab_id"] == "t1"
+    assert body["tab_id"] == tab["id"]
     assert body["status"] == "draft"
     assert body["pipeline"] is None
 
@@ -92,6 +93,7 @@ def test_create_note_study_guide_collection_resolves_to_tab(notebook_client):
     tabs = notebook_client.get("/api/tabs").json()["tabs"]
     onboarding = next(t for t in tabs if t["title"] == "Onboarding")
     assert onboarding["kind"] == "collection"
+    assert onboarding["repo"] == "khimaira"
     assert body["tab_id"] == onboarding["id"]
 
 
@@ -120,6 +122,35 @@ def test_create_note_study_guide_collection_reuses_existing(notebook_client):
     assert len(collections) == 1
 
 
+def test_create_note_study_guide_collection_is_repo_scoped(notebook_client):
+    first = notebook_client.post(
+        "/api/notes",
+        json={
+            "raw_text": "# A",
+            "kind": "study_guide",
+            "collection": "Architecture",
+            "repo": "repo-a",
+        },
+    ).json()
+    second = notebook_client.post(
+        "/api/notes",
+        json={
+            "raw_text": "# B",
+            "kind": "study_guide",
+            "collection": "Architecture",
+            "repo": "repo-b",
+        },
+    ).json()
+
+    assert first["tab_id"] != second["tab_id"]
+    assert first["repo"] == "repo-a"
+    assert second["repo"] == "repo-b"
+    tabs_a = notebook_client.get("/api/tabs", params={"repo": "repo-a"}).json()["tabs"]
+    tabs_b = notebook_client.get("/api/tabs", params={"repo": "repo-b"}).json()["tabs"]
+    assert {tab["id"] for tab in tabs_a} == {first["tab_id"]}
+    assert {tab["id"] for tab in tabs_b} == {second["tab_id"]}
+
+
 def test_list_notes_kind_filter_route(notebook_client):
     notebook_client.post("/api/notes", json={"raw_text": "a note"})
     notebook_client.post(
@@ -141,13 +172,15 @@ def test_list_notes_empty_store(notebook_client):
 
 
 def test_list_notes_filters_by_tab(notebook_client):
-    notebook_client.post("/api/notes", json={"raw_text": "a", "tab_id": "t1"})
-    notebook_client.post("/api/notes", json={"raw_text": "b", "tab_id": "t2"})
-    r = notebook_client.get("/api/notes", params={"tab_id": "t1"})
+    tab_1 = notebook_client.post("/api/tabs", json={"title": "One", "repo": "khimaira"}).json()
+    tab_2 = notebook_client.post("/api/tabs", json={"title": "Two", "repo": "khimaira"}).json()
+    notebook_client.post("/api/notes", json={"raw_text": "a", "tab_id": tab_1["id"]})
+    notebook_client.post("/api/notes", json={"raw_text": "b", "tab_id": tab_2["id"]})
+    r = notebook_client.get("/api/notes", params={"tab_id": tab_1["id"]})
     assert r.status_code == 200
     notes = r.json()["notes"]
     assert len(notes) == 1
-    assert notes[0]["tab_id"] == "t1"
+    assert notes[0]["tab_id"] == tab_1["id"]
 
 
 def test_list_notes_repo_filter_includes_general(notebook_client):
@@ -322,7 +355,7 @@ def test_promote_note_unknown_id_returns_404(notebook_client):
 
 
 def test_tabs_crud_happy_path(notebook_client):
-    r = notebook_client.post("/api/tabs", json={"title": "My Tab"})
+    r = notebook_client.post("/api/tabs", json={"title": "My Tab", "repo": "khimaira"})
     assert r.status_code == 200
     tab = r.json()
     assert tab["title"] == "My Tab"
@@ -332,13 +365,15 @@ def test_tabs_crud_happy_path(notebook_client):
     assert r.status_code == 200
     assert len(r.json()["tabs"]) == 1
 
-    r = notebook_client.patch(f"/api/tabs/{tab['id']}", json={"title": "renamed"})
+    r = notebook_client.patch(
+        f"/api/tabs/{tab['id']}", params={"repo": "khimaira"}, json={"title": "renamed"}
+    )
     assert r.status_code == 200
     assert r.json()["title"] == "renamed"
 
 
 def test_tabs_group_notes_by_tab_id(notebook_client):
-    tab = notebook_client.post("/api/tabs", json={"title": "grouped"}).json()
+    tab = notebook_client.post("/api/tabs", json={"title": "grouped", "repo": "khimaira"}).json()
     note = notebook_client.post("/api/notes", json={"raw_text": "a", "tab_id": tab["id"]}).json()
     r = notebook_client.get("/api/tabs")
     tabs = r.json()["tabs"]
@@ -346,8 +381,51 @@ def test_tabs_group_notes_by_tab_id(notebook_client):
     assert matched["note_ids"] == [note["id"]]
 
 
+def test_list_tabs_repo_isolation(notebook_client):
+    tab_a = notebook_client.post("/api/tabs", json={"title": "A only", "repo": "repo-a"}).json()
+
+    tabs_b = notebook_client.get("/api/tabs", params={"repo": "repo-b"}).json()["tabs"]
+
+    assert tab_a["id"] not in {tab["id"] for tab in tabs_b}
+
+
+def test_list_tabs_scoped_includes_general_and_unscoped_lists_all(notebook_client):
+    tab_a = notebook_client.post("/api/tabs", json={"title": "A only", "repo": "repo-a"}).json()
+    tab_b = notebook_client.post("/api/tabs", json={"title": "B only", "repo": "repo-b"}).json()
+    general = notebook_client.post("/api/tabs", json={"title": "Shared", "repo": "general"}).json()
+
+    scoped_ids = {
+        tab["id"]
+        for tab in notebook_client.get("/api/tabs", params={"repo": "repo-a"}).json()["tabs"]
+    }
+    all_ids = {tab["id"] for tab in notebook_client.get("/api/tabs").json()["tabs"]}
+
+    assert scoped_ids == {tab_a["id"], general["id"]}
+    assert all_ids == {tab_a["id"], tab_b["id"], general["id"]}
+
+
+def test_wrong_scope_patch_and_delete_are_not_found_and_non_destructive(notebook_client):
+    tab = notebook_client.post("/api/tabs", json={"title": "A only", "repo": "repo-a"}).json()
+
+    patch = notebook_client.patch(
+        f"/api/tabs/{tab['id']}", params={"repo": "repo-b"}, json={"title": "stolen"}
+    )
+    delete = notebook_client.delete(f"/api/tabs/{tab['id']}", params={"repo": "repo-b"})
+
+    assert patch.status_code == 404
+    assert delete.status_code == 404
+    tabs_a = notebook_client.get("/api/tabs", params={"repo": "repo-a"}).json()["tabs"]
+    assert [(item["id"], item["title"]) for item in tabs_a] == [(tab["id"], "A only")]
+
+
+def test_create_tab_requires_repo(notebook_client):
+    assert notebook_client.post("/api/tabs", json={"title": "missing scope"}).status_code == 422
+
+
 def test_patch_tab_unknown_id_returns_404(notebook_client):
-    r = notebook_client.patch("/api/tabs/no-such-tab", json={"title": "x"})
+    r = notebook_client.patch(
+        "/api/tabs/no-such-tab", params={"repo": "khimaira"}, json={"title": "x"}
+    )
     assert r.status_code == 404
 
 
@@ -357,60 +435,112 @@ def test_patch_tab_unknown_id_returns_404(notebook_client):
 
 
 def test_create_tab_with_kind_and_parent_id(notebook_client):
-    root = notebook_client.post("/api/tabs", json={"title": "Root", "kind": "collection"}).json()
+    root = notebook_client.post(
+        "/api/tabs", json={"title": "Root", "kind": "collection", "repo": "khimaira"}
+    ).json()
     child = notebook_client.post(
-        "/api/tabs", json={"title": "Child", "kind": "collection", "parent_id": root["id"]}
+        "/api/tabs",
+        json={
+            "title": "Child",
+            "kind": "collection",
+            "parent_id": root["id"],
+            "repo": "khimaira",
+        },
     )
     assert child.status_code == 200
     assert child.json()["parent_id"] == root["id"]
 
 
 def test_create_tab_dangling_parent_returns_404(notebook_client):
-    r = notebook_client.post("/api/tabs", json={"title": "x", "parent_id": "no-such-tab"})
+    r = notebook_client.post(
+        "/api/tabs", json={"title": "x", "parent_id": "no-such-tab", "repo": "khimaira"}
+    )
     assert r.status_code == 404
 
 
 def test_create_tab_cross_kind_parent_returns_422(notebook_client):
-    collection = notebook_client.post("/api/tabs", json={"title": "C", "kind": "collection"}).json()
+    collection = notebook_client.post(
+        "/api/tabs", json={"title": "C", "kind": "collection", "repo": "khimaira"}
+    ).json()
     r = notebook_client.post(
-        "/api/tabs", json={"title": "F", "kind": "folder", "parent_id": collection["id"]}
+        "/api/tabs",
+        json={
+            "title": "F",
+            "kind": "folder",
+            "parent_id": collection["id"],
+            "repo": "khimaira",
+        },
     )
     assert r.status_code == 422
 
 
 def test_create_tab_sibling_collision_returns_422(notebook_client):
-    parent = notebook_client.post("/api/tabs", json={"title": "P", "kind": "collection"}).json()
+    parent = notebook_client.post(
+        "/api/tabs", json={"title": "P", "kind": "collection", "repo": "khimaira"}
+    ).json()
     notebook_client.post(
-        "/api/tabs", json={"title": "API", "kind": "collection", "parent_id": parent["id"]}
+        "/api/tabs",
+        json={
+            "title": "API",
+            "kind": "collection",
+            "parent_id": parent["id"],
+            "repo": "khimaira",
+        },
     )
     r = notebook_client.post(
-        "/api/tabs", json={"title": "api", "kind": "collection", "parent_id": parent["id"]}
+        "/api/tabs",
+        json={
+            "title": "api",
+            "kind": "collection",
+            "parent_id": parent["id"],
+            "repo": "khimaira",
+        },
     )
     assert r.status_code == 422
 
 
 def test_patch_tab_reparent(notebook_client):
-    root = notebook_client.post("/api/tabs", json={"title": "Root", "kind": "collection"}).json()
-    child = notebook_client.post("/api/tabs", json={"title": "Child", "kind": "collection"}).json()
-    r = notebook_client.patch(f"/api/tabs/{child['id']}", json={"parent_id": root["id"]})
+    root = notebook_client.post(
+        "/api/tabs", json={"title": "Root", "kind": "collection", "repo": "khimaira"}
+    ).json()
+    child = notebook_client.post(
+        "/api/tabs", json={"title": "Child", "kind": "collection", "repo": "khimaira"}
+    ).json()
+    r = notebook_client.patch(
+        f"/api/tabs/{child['id']}",
+        params={"repo": "khimaira"},
+        json={"parent_id": root["id"]},
+    )
     assert r.status_code == 200
     assert r.json()["parent_id"] == root["id"]
 
 
 def test_patch_tab_reparent_cycle_returns_422(notebook_client):
-    a = notebook_client.post("/api/tabs", json={"title": "A", "kind": "collection"}).json()
-    b = notebook_client.post(
-        "/api/tabs", json={"title": "B", "kind": "collection", "parent_id": a["id"]}
+    a = notebook_client.post(
+        "/api/tabs", json={"title": "A", "kind": "collection", "repo": "khimaira"}
     ).json()
-    r = notebook_client.patch(f"/api/tabs/{a['id']}", json={"parent_id": b["id"]})
+    b = notebook_client.post(
+        "/api/tabs",
+        json={
+            "title": "B",
+            "kind": "collection",
+            "parent_id": a["id"],
+            "repo": "khimaira",
+        },
+    ).json()
+    r = notebook_client.patch(
+        f"/api/tabs/{a['id']}",
+        params={"repo": "khimaira"},
+        json={"parent_id": b["id"]},
+    )
     assert r.status_code == 422
 
 
 def test_delete_tab_route_happy_path(notebook_client):
-    parent = notebook_client.post("/api/tabs", json={"title": "Parent"}).json()
+    parent = notebook_client.post("/api/tabs", json={"title": "Parent", "repo": "khimaira"}).json()
     note = notebook_client.post("/api/notes", json={"raw_text": "a", "tab_id": parent["id"]}).json()
 
-    r = notebook_client.delete(f"/api/tabs/{parent['id']}")
+    r = notebook_client.delete(f"/api/tabs/{parent['id']}", params={"repo": "khimaira"})
     assert r.status_code == 200
     assert r.json() == {"id": parent["id"], "deleted": True}
 
@@ -423,7 +553,7 @@ def test_delete_tab_route_happy_path(notebook_client):
 
 
 def test_delete_tab_route_unknown_id_returns_404(notebook_client):
-    r = notebook_client.delete("/api/tabs/no-such-tab")
+    r = notebook_client.delete("/api/tabs/no-such-tab", params={"repo": "khimaira"})
     assert r.status_code == 404
 
 
@@ -851,7 +981,9 @@ def test_add_resolution_on_ticket_does_not_schedule_training_promote(notebook_cl
     monkeypatch.setattr(notebook_api.notebook_training, "schedule_promote", scheduled.append)
 
     ticket = notebook_client.post("/api/tickets", json={"title": "Fix the reaper race"}).json()
-    r = notebook_client.post(f"/api/notes/{ticket['id']}/resolution", json={"resolution": "fixed in PR #123"})
+    r = notebook_client.post(
+        f"/api/notes/{ticket['id']}/resolution", json={"resolution": "fixed in PR #123"}
+    )
     assert r.status_code == 200
     assert r.json()["resolution"] == "fixed in PR #123"
     assert scheduled == [], "a resolved ticket must never enter the training-promotion path"
@@ -1406,10 +1538,14 @@ def test_create_note_idempotency_key_dedupes(notebook_client):
     second = notebook_client.post("/api/notes", json={"raw_text": "hello", "idempotency_key": key})
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json()["id"] == second.json()["id"], "same idempotency_key must return the same note, not a duplicate"
+    assert first.json()["id"] == second.json()["id"], (
+        "same idempotency_key must return the same note, not a duplicate"
+    )
 
     all_notes = notebook_client.get("/api/notes").json()["notes"]
-    assert len(all_notes) == 1, "a retried create with the same key must never produce a second record"
+    assert len(all_notes) == 1, (
+        "a retried create with the same key must never produce a second record"
+    )
 
 
 def test_create_note_without_idempotency_key_is_unchanged(notebook_client):
@@ -1424,7 +1560,9 @@ def test_create_note_without_idempotency_key_is_unchanged(notebook_client):
     assert len(all_notes) == 2
 
 
-def test_create_note_idempotency_key_does_not_double_schedule_pipeline(notebook_client, monkeypatch):
+def test_create_note_idempotency_key_does_not_double_schedule_pipeline(
+    notebook_client, monkeypatch
+):
     """The cache-hit path must skip trigger_pipeline/schedule_upsert too —
     not just avoid a duplicate record — since those call asyncio.create_task
     and re-firing them on every retry would waste an LLM structuring pass
@@ -1451,7 +1589,9 @@ def test_create_study_guide_idempotency_key_dedupes(notebook_client):
     assert len(guides) == 1
 
 
-def test_add_resolution_idempotency_key_dedupes_and_skips_second_promote(notebook_client, monkeypatch):
+def test_add_resolution_idempotency_key_dedupes_and_skips_second_promote(
+    notebook_client, monkeypatch
+):
     from khimaira.monitor.api import notebook as notebook_api
 
     scheduled: list[dict] = []
@@ -1479,7 +1619,9 @@ def test_create_ticket_idempotency_key_dedupes(notebook_client):
     assert first.json()["id"] == second.json()["id"]
 
     tickets = notebook_client.get("/api/tickets").json()["tickets"]
-    assert len(tickets) == 1, "a retried ticket create with the same key must never produce a duplicate"
+    assert len(tickets) == 1, (
+        "a retried ticket create with the same key must never produce a duplicate"
+    )
 
 
 def test_different_idempotency_keys_create_separate_records(notebook_client):

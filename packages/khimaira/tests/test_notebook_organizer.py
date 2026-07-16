@@ -75,9 +75,10 @@ def test_derive_collection_handles_path_outside_root(organizer):
 
 
 def test_get_or_create_collection_delegates_to_notes(organizer, notes_store):
-    tab = organizer.get_or_create_collection("My Collection")
+    tab = organizer.get_or_create_collection("My Collection", repo="repo-a")
     assert tab["kind"] == "collection"
-    again = organizer.get_or_create_collection("my collection")
+    assert tab["repo"] == "repo-a"
+    again = organizer.get_or_create_collection("my collection", repo="repo-a")
     assert again["id"] == tab["id"]
 
 
@@ -110,6 +111,20 @@ def test_assign_deterministic_reuses_existing_collection(organizer, notes_store)
     assert len(collections) == 1
 
 
+def test_assign_deterministic_isolates_same_collection_name_by_note_repo(organizer, notes_store):
+    root = Path("/shared-docs")
+    path = root / "onboarding" / "guide.md"
+    guide_a = notes_store.add_study_guide("a", repo="repo-a")
+    guide_b = notes_store.add_study_guide("b", repo="repo-b")
+
+    updated_a = organizer.assign_deterministic(guide_a["id"], path, root)
+    updated_b = organizer.assign_deterministic(guide_b["id"], path, root)
+
+    assert updated_a["tab_id"] != updated_b["tab_id"]
+    assert notes_store.get_tab(updated_a["tab_id"], repo="repo-a")["repo"] == "repo-a"
+    assert notes_store.get_tab(updated_b["tab_id"], repo="repo-b")["repo"] == "repo-b"
+
+
 # ---------------------------------------------------------------------------
 # Grimoire Phase 2 — the LLM organize pass. `_invoke_claude`'s subprocess
 # layer is mocked out (via notebook_pipeline.transform_note) — these tests
@@ -125,16 +140,16 @@ def organizer_llm(organizer, monkeypatch):
     yield organizer, pipeline_mod
 
 
-def _guide_with_abstract(notes_store, title, abstract, tags=None, tab_id=""):
-    guide = notes_store.add_study_guide(f"# {title}\n\nbody", title=title, tab_id=tab_id)
+def _guide_with_abstract(notes_store, title, abstract, tags=None, tab_id="", repo="khimaira"):
+    guide = notes_store.add_study_guide(f"# {title}\n\nbody", title=title, tab_id=tab_id, repo=repo)
     notes_store.set_study_guide_pipeline(
         guide["id"], {"abstract": abstract, "toc": [], "tags": tags or [], "entities": []}
     )
     return notes_store.get_note(guide["id"])
 
 
-def _note_with_summary(notes_store, title, summary, tags=None, tab_id=""):
-    note = notes_store.add_note(title, title=title, tab_id=tab_id)
+def _note_with_summary(notes_store, title, summary, tags=None, tab_id="", repo="khimaira"):
+    note = notes_store.add_note(title, title=title, tab_id=tab_id, repo=repo)
     notes_store.set_pipeline(
         note["id"],
         {
@@ -451,6 +466,39 @@ async def test_organize_library_handles_mixed_notes_and_guides_in_one_call(
     guide_tab = notes_store.get_tab(notes_store.get_note(guide["id"])["tab_id"])
     assert note_tab["kind"] == "folder"
     assert guide_tab["kind"] == "collection"
+
+
+async def test_organize_library_keeps_destinations_isolated_per_repo_in_one_call(
+    organizer_llm, notes_store, monkeypatch
+):
+    organizer, pipeline_mod = organizer_llm
+    guide_a = _guide_with_abstract(notes_store, "Guide A", "repo a architecture", repo="repo-a")
+    guide_b = _guide_with_abstract(notes_store, "Guide B", "repo b architecture", repo="repo-b")
+    calls: list[str] = []
+
+    async def fake_transform_note(content, *, instruction, schema):
+        calls.append(content)
+        return {
+            "placements": [
+                {"note_id": guide_a["id"], "collection": "Architecture"},
+                {"note_id": guide_b["id"], "collection": "Architecture"},
+            ]
+        }
+
+    monkeypatch.setattr(pipeline_mod, "transform_note", fake_transform_note)
+    result = await organizer.organize_library()
+
+    assert len(calls) == 1
+    assert "Repo 'repo-a' existing guide collections" in calls[0]
+    assert "Repo 'repo-b' existing guide collections" in calls[0]
+    assert set(result["reassigned"]) == {guide_a["id"], guide_b["id"]}
+    updated_a = notes_store.get_note(guide_a["id"])
+    updated_b = notes_store.get_note(guide_b["id"])
+    assert updated_a["tab_id"] != updated_b["tab_id"]
+    tab_a = notes_store.get_tab(updated_a["tab_id"], repo="repo-a")
+    tab_b = notes_store.get_tab(updated_b["tab_id"], repo="repo-b")
+    assert (tab_a["title"], tab_a["repo"]) == ("Architecture", "repo-a")
+    assert (tab_b["title"], tab_b["repo"]) == ("Architecture", "repo-b")
 
 
 async def test_organize_library_note_and_guide_can_reuse_same_name_in_different_namespaces(

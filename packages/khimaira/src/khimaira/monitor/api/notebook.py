@@ -77,7 +77,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -286,6 +287,7 @@ class BulkUpsertTicketsReq(BaseModel):
 
 
 class CreateTabReq(BaseModel):
+    repo: str
     title: str = ""
     kind: str = ""
     parent_id: str | None = None
@@ -304,6 +306,7 @@ def trigger_pipeline(note_id: str) -> None:
 
 def build_router():
     fastapi = require("fastapi")
+    notes.initialize_tab_repo_migration()
     router = fastapi.APIRouter()
 
     @router.post("/notes")
@@ -329,8 +332,11 @@ def build_router():
             # a tab_id up front. Takes precedence over a raw tab_id if both
             # are somehow given.
             tab_id = req.tab_id
+            repo = req.repo or notes._DEFAULT_REPO
             if req.collection:
-                collection = await asyncio.to_thread(notes.get_or_create_collection, req.collection)
+                collection = await asyncio.to_thread(
+                    notes.get_or_create_collection, req.collection, repo=repo
+                )
                 tab_id = collection["id"]
             record, was_fresh = await asyncio.to_thread(
                 _idempotent_op,
@@ -339,7 +345,7 @@ def build_router():
                     req.raw_text,
                     tab_id=tab_id,
                     title=req.title,
-                    repo=req.repo,
+                    repo=repo,
                     source_path=req.source_path,
                     sensitive=req.sensitive,
                 ),
@@ -366,7 +372,9 @@ def build_router():
                 # (notebook_pipeline._personal_context) — no structuring, no
                 # embed (notebook_retrieval.upsert_note already refuses to
                 # embed them too; this just avoids the wasted structuring call).
-                record = await asyncio.to_thread(notes.update_note, record["id"], status="processed")
+                record = await asyncio.to_thread(
+                    notes.update_note, record["id"], status="processed"
+                )
             else:
                 trigger_pipeline(record["id"])
                 notebook_retrieval.schedule_upsert(record)
@@ -420,7 +428,9 @@ def build_router():
         Review the manifest before ever calling with dry_run=False; a real
         import creates a note per file (idempotent via source_path — safe
         to re-run) and schedules each one's structuring pipeline async."""
-        return await asyncio.to_thread(notebook_import.import_dir, req.root, repo=req.repo, dry_run=req.dry_run)
+        return await asyncio.to_thread(
+            notebook_import.import_dir, req.root, repo=req.repo, dry_run=req.dry_run
+        )
 
     @router.get("/notes/search")
     async def search_notes(
@@ -656,8 +666,8 @@ def build_router():
             raise fastapi.HTTPException(404, str(e)) from e
 
     @router.get("/tabs")
-    async def list_tabs() -> dict:
-        return {"tabs": await asyncio.to_thread(notes.list_tabs)}
+    async def list_tabs(repo: str | None = None) -> dict:
+        return {"tabs": await asyncio.to_thread(notes.list_tabs, repo=repo)}
 
     @router.post("/tabs")
     async def create_tab(req: CreateTabReq) -> dict:
@@ -668,7 +678,11 @@ def build_router():
         parent_id (plain ValueError, mirrors get_tab)."""
         try:
             return await asyncio.to_thread(
-                notes.add_tab, title=req.title, kind=req.kind, parent_id=req.parent_id
+                notes.add_tab,
+                title=req.title,
+                kind=req.kind,
+                parent_id=req.parent_id,
+                repo=req.repo,
             )
         except notes.TabValidationError as e:
             raise fastapi.HTTPException(422, str(e)) from e
@@ -676,26 +690,26 @@ def build_router():
             raise fastapi.HTTPException(404, str(e)) from e
 
     @router.patch("/tabs/{tab_id}")
-    async def update_tab(tab_id: str, req: UpdateTabReq) -> dict:
+    async def update_tab(tab_id: str, req: UpdateTabReq, repo: str) -> dict:
         """FILE-MANAGER (2026-07-04): `parent_id` reparents — enforces
         no-cycle/homogeneous-kind/sibling-uniqueness (422,
         notes.TabValidationError) and parent-exists (404, plain
         ValueError, mirrors get_tab)."""
         fields = req.model_dump(exclude_unset=True)
         try:
-            return await asyncio.to_thread(notes.update_tab, tab_id, **fields)
+            return await asyncio.to_thread(notes.update_tab, tab_id, repo=repo, **fields)
         except notes.TabValidationError as e:
             raise fastapi.HTTPException(422, str(e)) from e
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 
     @router.delete("/tabs/{tab_id}")
-    async def delete_tab_route(tab_id: str) -> dict:
+    async def delete_tab_route(tab_id: str, repo: str) -> dict:
         """FILE-MANAGER (2026-07-04): re-files child tabs (to this tab's own
         parent) AND direct member notes (to this tab's parent, or the
         default tab at root) — "never lose a guide." See notes.delete_tab."""
         try:
-            return await asyncio.to_thread(notes.delete_tab, tab_id)
+            return await asyncio.to_thread(notes.delete_tab, tab_id, repo=repo)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 
@@ -775,7 +789,9 @@ def build_router():
         for issue in req.tickets:
             try:
                 _, was_created = await asyncio.to_thread(
-                    notes.upsert_ticket_from_linear, issue.model_dump(exclude_unset=True), project=req.project
+                    notes.upsert_ticket_from_linear,
+                    issue.model_dump(exclude_unset=True),
+                    project=req.project,
                 )
             except ValueError as e:
                 raise fastapi.HTTPException(422, str(e)) from e
@@ -812,7 +828,9 @@ def build_router():
     @router.post("/tickets/{ticket_id}/comments")
     async def add_ticket_comment_route(ticket_id: str, req: AddTicketCommentReq) -> dict:
         try:
-            return await asyncio.to_thread(notes.add_ticket_comment, ticket_id, req.text, req.author)
+            return await asyncio.to_thread(
+                notes.add_ticket_comment, ticket_id, req.text, req.author
+            )
         except ValueError as e:
             msg = str(e)
             status = 404 if "is not a ticket" in msg or "No note with id" in msg else 422

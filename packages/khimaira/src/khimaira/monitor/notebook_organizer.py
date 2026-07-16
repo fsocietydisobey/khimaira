@@ -63,18 +63,18 @@ def derive_collection(path: Path, root: Path) -> str:
     return parts[-1].replace("-", " ").replace("_", " ").title()
 
 
-def get_or_create_collection(title: str) -> dict[str, Any]:
+def get_or_create_collection(title: str, *, repo: str) -> dict[str, Any]:
     """Thin re-export of notes.get_or_create_collection — callers that
     reach for "the organizer" as the conceptual owner of collection
     creation can import it from here instead of reaching into notes.py
     directly."""
-    return notes.get_or_create_collection(title)
+    return notes.get_or_create_collection(title, repo=repo)
 
 
-def get_or_create_folder(title: str) -> dict[str, Any]:
+def get_or_create_folder(title: str, *, repo: str) -> dict[str, Any]:
     """Thin re-export of notes.get_or_create_folder — the note-side sibling
     of get_or_create_collection above."""
-    return notes.get_or_create_folder(title)
+    return notes.get_or_create_folder(title, repo=repo)
 
 
 def assign_deterministic(note_id: str, path: Path, root: Path) -> dict[str, Any]:
@@ -86,7 +86,8 @@ def assign_deterministic(note_id: str, path: Path, root: Path) -> dict[str, Any]
     cost. The later LLM organize_library() pass handles what this can't:
     already-collected-but-wrong, ambiguous naming, content-based re-filing."""
     collection = derive_collection(path, root)
-    tab = get_or_create_collection(collection)
+    record = notes.get_note(note_id)
+    tab = get_or_create_collection(collection, repo=record["repo"])
     return notes.mark_organized(note_id, tab_id=tab["id"])
 
 
@@ -147,7 +148,8 @@ def _format_item_for_prompt(record: dict[str, Any], current_title: str) -> str:
     tags = pipeline.get("tags") or []
     kind_label = "guide" if record.get("kind") == "study_guide" else "note"
     return (
-        f"- note_id={record['id']} kind={kind_label} title={record.get('title', '?')!r} "
+        f"- note_id={record['id']} repo={record['repo']!r} kind={kind_label} "
+        f"title={record.get('title', '?')!r} "
         f"blurb={_content_blurb(record)!r} tags={tags!r} current_location={current_title!r}"
     )
 
@@ -204,17 +206,33 @@ async def organize_library(note_ids: list[str] | None = None) -> dict[str, Any]:
         return {"considered": 0, "reassigned": [], "new_collections": []}
 
     tabs = await asyncio.to_thread(notes.list_tabs)
-    tabs_by_id = {t["id"]: t for t in tabs}
-    existing_collections = sorted({t["title"] for t in tabs if t.get("kind") == "collection"})
-    existing_folders = sorted({t["title"] for t in tabs if t.get("kind") == "folder"})
-
-    lines = [
-        f"Existing guide collections: {existing_collections or '(none yet)'}",
-        f"Existing note folders: {existing_folders or '(none yet)'}",
-        "",
-    ]
+    target_repos = sorted({record["repo"] for record in targets})
+    tabs_by_repo = {
+        repo: {tab["id"]: tab for tab in tabs if tab.get("repo") == repo} for repo in target_repos
+    }
+    existing_names_by_repo_kind: dict[str, dict[str, list[str]]] = {}
+    lines: list[str] = []
+    for repo in target_repos:
+        repo_tabs = tabs_by_repo[repo].values()
+        existing_collections = sorted(
+            {tab["title"] for tab in repo_tabs if tab.get("kind") == "collection"}
+        )
+        existing_folders = sorted(
+            {tab["title"] for tab in repo_tabs if tab.get("kind") == "folder"}
+        )
+        existing_names_by_repo_kind[repo] = {
+            "study_guide": existing_collections,
+            "note": existing_folders,
+        }
+        lines.extend(
+            [
+                f"Repo {repo!r} existing guide collections: {existing_collections or '(none yet)'}",
+                f"Repo {repo!r} existing note folders: {existing_folders or '(none yet)'}",
+                "",
+            ]
+        )
     for record in targets:
-        current_title = tabs_by_id.get(record["tab_id"], {}).get("title", "?")
+        current_title = tabs_by_repo[record["repo"]].get(record["tab_id"], {}).get("title", "?")
         lines.append(_format_item_for_prompt(record, current_title))
     content = "\n".join(lines)
 
@@ -229,9 +247,9 @@ async def organize_library(note_ids: list[str] | None = None) -> dict[str, Any]:
         return {"considered": len(targets), "reassigned": [], "new_collections": []}
 
     valid_by_id = {n["id"]: n for n in targets}
-    existing_lower_by_kind = {
-        "study_guide": {c.lower() for c in existing_collections},
-        "note": {f.lower() for f in existing_folders},
+    existing_lower_by_repo_kind = {
+        repo: {kind: {name.lower() for name in names} for kind, names in names_by_kind.items()}
+        for repo, names_by_kind in existing_names_by_repo_kind.items()
     }
     reassigned: list[str] = []
     new_collections: list[str] = []
@@ -244,14 +262,16 @@ async def organize_library(note_ids: list[str] | None = None) -> dict[str, Any]:
 
         is_guide = record["kind"] == "study_guide"
         tab = await asyncio.to_thread(
-            get_or_create_collection if is_guide else get_or_create_folder, location
+            get_or_create_collection if is_guide else get_or_create_folder,
+            location,
+            repo=record["repo"],
         )
         if tab["id"] == record["tab_id"]:
             await asyncio.to_thread(notes.mark_organized, note_id)  # still correctly placed
             continue
         await asyncio.to_thread(notes.mark_organized, note_id, tab_id=tab["id"])
         reassigned.append(note_id)
-        if location.lower() not in existing_lower_by_kind[record["kind"]]:
+        if location.lower() not in existing_lower_by_repo_kind[record["repo"]][record["kind"]]:
             new_collections.append(location)
 
     return {

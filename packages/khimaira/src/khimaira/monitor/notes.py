@@ -19,6 +19,7 @@ are derived by grouping live notes on tab_id, not stored redundantly.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
@@ -129,6 +130,10 @@ _VALID_TICKET_SYNC_STATES = frozenset({"local-only", "synced", "drifted"})
 _VALID_TAB_KINDS = frozenset({"folder", "collection"})
 _DEFAULT_TAB_KIND = "folder"
 
+_TAB_REPO_MIGRATION_VERSION = 1
+_TAB_REPO_MIGRATION_NAMESPACE = uuid.UUID("9f6b05cc-5a62-4c74-9d65-b12ec4bfb577")
+_MIGRATED_BASE_DIRS: set[Path] = set()
+
 
 class TabValidationError(ValueError):
     """FILE-MANAGER (2026-07-04): a tab create/reparent request that's
@@ -179,6 +184,14 @@ def _index_path() -> Path:
 
 def _tabs_path() -> Path:
     return _base_dir() / "tabs.jsonl"
+
+
+def _tab_repo_migration_path() -> Path:
+    return _base_dir() / "tab_repo_migration_v1.json"
+
+
+def _tab_repo_migration_lock_path() -> Path:
+    return _base_dir() / "tab_repo_migration_v1.lock"
 
 
 def _note_path(note_id: str) -> Path:
@@ -315,8 +328,8 @@ def _index_stub(record: dict[str, Any], *, deleted: bool = False) -> dict[str, A
     }
 
 
-_INDEX_LOCK = threading.Lock()
-_TABS_LOCK = threading.Lock()
+_INDEX_LOCK = threading.RLock()
+_TABS_LOCK = threading.RLock()
 
 # Compact once the raw line count exceeds the folded (deduped) count by this
 # many stale entries. Small/lightly-churned libraries never cross this and
@@ -346,7 +359,9 @@ def _atomic_replace_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     Unique-per-call tmp name (pid + thread + random) — a fixed name races
     under concurrent writers (see sessions._atomic_write_json's docstring
     for the confirmed failure mode this pattern closes)."""
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
+    )
     with tmp.open("w", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(rec, separators=(",", ":")) + "\n")
@@ -444,6 +459,202 @@ def _fold_tabs() -> dict[str, dict[str, Any]]:
     return {tid: rec for tid, rec in folded.items() if not rec.get("deleted")}
 
 
+def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
+    )
+    tmp.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _migration_clone_id(tab_id: str, repo: str, occupied: set[str]) -> str:
+    attempt = 0
+    while True:
+        salt = f"{tab_id}:{repo}:{attempt}"
+        candidate = uuid.uuid5(_TAB_REPO_MIGRATION_NAMESPACE, salt).hex[:12]
+        if candidate not in occupied:
+            occupied.add(candidate)
+            return candidate
+        attempt += 1
+
+
+def _build_tab_repo_migration_plan() -> dict[str, Any]:
+    tabs = _fold_tabs()
+    live_notes: dict[str, dict[str, Any]] = {}
+    for note_id in _fold_index():
+        record = _read_note_file(note_id)
+        if record is not None:
+            live_notes[note_id] = record
+
+    adjacency: dict[str, set[str]] = {tab_id: set() for tab_id in tabs}
+    for tab_id, tab in tabs.items():
+        parent_id = tab.get("parent_id")
+        if parent_id in tabs:
+            adjacency[tab_id].add(parent_id)
+            adjacency[parent_id].add(tab_id)
+
+    components: list[set[str]] = []
+    unseen = set(tabs)
+    while unseen:
+        root = min(unseen)
+        component: set[str] = set()
+        pending = [root]
+        while pending:
+            current = pending.pop()
+            if current in component:
+                continue
+            component.add(current)
+            unseen.discard(current)
+            pending.extend(adjacency[current] - component)
+        components.append(component)
+
+    target_tabs: list[dict[str, Any]] = []
+    note_tabs: dict[str, str] = {}
+    occupied = set(tabs)
+    for component in components:
+        if all("repo" in tabs[tab_id] for tab_id in component):
+            continue
+        member_notes = {
+            note_id: note for note_id, note in live_notes.items() if note.get("tab_id") in component
+        }
+        unresolved_note = any(
+            not isinstance(note.get("repo"), str) or not note.get("repo")
+            for note in member_notes.values()
+        )
+        repos = sorted(
+            {
+                note["repo"]
+                for note in member_notes.values()
+                if isinstance(note.get("repo"), str) and note.get("repo")
+            }
+        )
+        if unresolved_note or not repos:
+            for tab_id in sorted(component):
+                migrated = dict(tabs[tab_id])
+                migrated["repo"] = None
+                target_tabs.append(migrated)
+            continue
+
+        repo_maps: dict[str, dict[str, str]] = {}
+        for index, repo in enumerate(repos):
+            if index == 0:
+                repo_maps[repo] = {tab_id: tab_id for tab_id in component}
+            else:
+                repo_maps[repo] = {
+                    tab_id: _migration_clone_id(tab_id, repo, occupied)
+                    for tab_id in sorted(component)
+                }
+        for repo in repos:
+            mapping = repo_maps[repo]
+            for tab_id in sorted(component):
+                migrated = dict(tabs[tab_id])
+                migrated["id"] = mapping[tab_id]
+                parent_id = migrated.get("parent_id")
+                if parent_id in component:
+                    migrated["parent_id"] = mapping[parent_id]
+                migrated["repo"] = repo
+                target_tabs.append(migrated)
+        for note_id, note in member_notes.items():
+            note_repo = note.get("repo")
+            note_tabs[note_id] = repo_maps[note_repo][note["tab_id"]]
+
+    return {
+        "version": _TAB_REPO_MIGRATION_VERSION,
+        "status": "planned",
+        "tabs": target_tabs,
+        "note_tabs": note_tabs,
+    }
+
+
+def _apply_tab_repo_migration_plan(plan: dict[str, Any]) -> None:
+    current_tabs = _fold_tabs()
+    for record in plan.get("tabs", []):
+        if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+            continue
+        if current_tabs.get(record["id"]) == record:
+            continue
+        _append_jsonl(_tabs_path(), record)
+        current_tabs[record["id"]] = record
+
+    current_index = _fold_index()
+    for note_id, tab_id in (plan.get("note_tabs") or {}).items():
+        if not isinstance(note_id, str) or not isinstance(tab_id, str):
+            continue
+        record = _read_note_file(note_id)
+        if record is None:
+            continue
+        if record.get("tab_id") != tab_id:
+            record["tab_id"] = tab_id
+            _write_note_atomic(note_id, record)
+        desired_stub = _index_stub(record)
+        if current_index.get(note_id) != desired_stub:
+            _append_jsonl(_index_path(), desired_stub)
+            current_index[note_id] = desired_stub
+
+
+def initialize_tab_repo_migration() -> None:
+    """Migrate legacy repo-less tab trees once, with a durable replay plan."""
+    base_dir = _base_dir()
+    if base_dir in _MIGRATED_BASE_DIRS:
+        return
+    _ensure_dirs()
+    with _tab_repo_migration_lock_path().open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        with _TABS_LOCK, _INDEX_LOCK:
+            marker: dict[str, Any] | None = None
+            try:
+                loaded = json.loads(_tab_repo_migration_path().read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    marker = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+            if (
+                marker is not None
+                and marker.get("version") == _TAB_REPO_MIGRATION_VERSION
+                and marker.get("status") == "complete"
+            ):
+                _MIGRATED_BASE_DIRS.add(base_dir)
+                return
+            plan = (
+                marker
+                if marker is not None
+                and marker.get("version") == _TAB_REPO_MIGRATION_VERSION
+                and marker.get("status") == "planned"
+                else _build_tab_repo_migration_plan()
+            )
+            _atomic_write_json(_tab_repo_migration_path(), plan)
+            _apply_tab_repo_migration_plan(plan)
+            complete = dict(plan)
+            complete["status"] = "complete"
+            _atomic_write_json(_tab_repo_migration_path(), complete)
+    _MIGRATED_BASE_DIRS.add(base_dir)
+
+
+def _tab_not_found(tab_id: str) -> ValueError:
+    return ValueError(f"No tab with id={tab_id!r}. Use list_tabs() to see available tabs.")
+
+
+def _get_tab_record_exact(tab_id: str, repo: str) -> dict[str, Any]:
+    record = _fold_tabs().get(tab_id)
+    if record is None or record.get("repo") != repo:
+        raise _tab_not_found(tab_id)
+    return record
+
+
+def _assert_tab_assignment(tab_id: str, repo: str) -> None:
+    if tab_id in (_DEFAULT_TAB_ID, PERSONAL_TAB_ID):
+        return
+    _get_tab_record_exact(tab_id, repo)
+
+
+def _exact_note_stubs_for_tab(tab_id: str, repo: str) -> list[dict[str, Any]]:
+    return [
+        stub
+        for stub in _fold_index().values()
+        if stub.get("tab_id") == tab_id and stub.get("repo") == repo
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Public API — notes
 # ---------------------------------------------------------------------------
@@ -480,6 +691,10 @@ def add_note(
     training/cross-note-context egress reads llm_view(record) instead of
     raw_text, so the note's real secret values never reach a model call.
     """
+    initialize_tab_repo_migration()
+    repo = repo or _DEFAULT_REPO
+    tab_id = tab_id or _DEFAULT_TAB_ID
+    _assert_tab_assignment(tab_id, repo)
     note_id = _new_id()
     now = _now_iso()
     llm_text, redactions = _compute_llm_fields(raw_text, sensitive)
@@ -495,7 +710,7 @@ def add_note(
         "created_at": now,
         "updated_at": now,
         "title": title or _derive_title(title_source),
-        "tab_id": tab_id or _DEFAULT_TAB_ID,
+        "tab_id": tab_id,
         "raw_text": raw_text,
         "status": "draft",
         "pipeline": None,
@@ -507,7 +722,7 @@ def add_note(
             "distilled_pairs": 0,
         },
         "links": [],
-        "repo": repo or _DEFAULT_REPO,
+        "repo": repo,
         "history": [],
         "last_validated_at": None,
         "validated_git_sha": None,
@@ -562,6 +777,10 @@ def add_study_guide(
 
     `sensitive`: see add_note's docstring — same redacted-twin contract.
     """
+    initialize_tab_repo_migration()
+    repo = repo or _DEFAULT_REPO
+    tab_id = tab_id or _DEFAULT_TAB_ID
+    _assert_tab_assignment(tab_id, repo)
     note_id = _new_id()
     now = _now_iso()
     llm_text, redactions = _compute_llm_fields(raw_text, sensitive)
@@ -577,7 +796,7 @@ def add_study_guide(
         "created_at": now,
         "updated_at": now,
         "title": title or _derive_title(title_source),
-        "tab_id": tab_id or _DEFAULT_TAB_ID,
+        "tab_id": tab_id,
         "raw_text": raw_text,
         "status": "draft",
         "pipeline": None,
@@ -589,7 +808,7 @@ def add_study_guide(
             "distilled_pairs": 0,
         },
         "links": [],
-        "repo": repo or _DEFAULT_REPO,
+        "repo": repo,
         "history": [],
         "last_validated_at": None,
         "validated_git_sha": None,
@@ -621,6 +840,7 @@ def add_study_guide(
 
 
 def get_note(note_id: str) -> dict[str, Any]:
+    initialize_tab_repo_migration()
     record = _read_note_file(note_id)
     if record is None:
         raise ValueError(f"No note with id={note_id!r}. Use list_notes() to see available notes.")
@@ -672,6 +892,7 @@ def list_notes(
     `test_status`, when given, scopes to that testing-workflow status
     ("untested"|"needs_testing"|"in_review"|"tested"). `test_status=None`
     returns all."""
+    initialize_tab_repo_migration()
     stubs = list(_fold_index().values())
     if tab_id is not None:
         stubs = [s for s in stubs if s["tab_id"] == tab_id]
@@ -731,6 +952,27 @@ def update_note(note_id: str, **fields: Any) -> dict[str, Any]:
             f"Invalid test_status {fields['test_status']!r}; "
             f"must be one of {sorted(_VALID_TEST_STATUSES)}."
         )
+    old_repo = record.get("repo", _DEFAULT_REPO)
+    new_repo = fields.get("repo", old_repo)
+    if not isinstance(new_repo, str) or not new_repo:
+        raise ValueError("repo must be a non-empty string.")
+    old_tab_id = record.get("tab_id", _DEFAULT_TAB_ID)
+    if (
+        new_repo != old_repo
+        and "tab_id" not in fields
+        and old_tab_id
+        not in (
+            _DEFAULT_TAB_ID,
+            PERSONAL_TAB_ID,
+        )
+    ):
+        raise TabValidationError(
+            "Changing repo for a note in a named tab requires a destination "
+            "tab_id in the new repo in the same update."
+        )
+    destination_tab_id = fields.get("tab_id", old_tab_id)
+    if "tab_id" in fields or new_repo != old_repo:
+        _assert_tab_assignment(destination_tab_id, new_repo)
     if "repo" in fields and fields["repo"] != record.get("repo"):
         record["validated_git_sha"] = None
         record["last_validated_at"] = None
@@ -828,6 +1070,7 @@ def mark_organized(note_id: str, tab_id: str | None = None) -> dict[str, Any]:
     record = get_note(note_id)
     now = _now_iso()
     if tab_id is not None and not record.get("pinned_placement"):
+        _assert_tab_assignment(tab_id, record.get("repo", _DEFAULT_REPO))
         record["tab_id"] = tab_id
     record["organized_at"] = now
     record["updated_at"] = now
@@ -1089,9 +1332,12 @@ def add_ticket(
         )
     if origin == "linear-pulled" and not linear_ref:
         raise ValueError(
-            "linear-pulled tickets require linear_ref (the Linear issue id "
-            "— the sync join key)."
+            "linear-pulled tickets require linear_ref (the Linear issue id — the sync join key)."
         )
+
+    initialize_tab_repo_migration()
+    tab_id = tab_id or _DEFAULT_TAB_ID
+    _assert_tab_assignment(tab_id, GENERAL_REPO)
 
     ticket_id = _new_id()
     now = _now_iso()
@@ -1100,7 +1346,7 @@ def add_ticket(
         "created_at": now,
         "updated_at": now,
         "title": title or "Untitled ticket",
-        "tab_id": tab_id or _DEFAULT_TAB_ID,
+        "tab_id": tab_id,
         "raw_text": description,
         "status": "draft",
         "pipeline": None,
@@ -1146,7 +1392,11 @@ def add_ticket(
     _write_note_atomic(ticket_id, record)
     _append_index_stub(record)
     log.info(
-        "notes: added ticket %s (%s) origin=%s project=%s", ticket_id, record["title"], origin, project
+        "notes: added ticket %s (%s) origin=%s project=%s",
+        ticket_id,
+        record["title"],
+        origin,
+        project,
     )
     return record
 
@@ -1181,7 +1431,9 @@ def list_tickets(
 
 def _ticket_assignee_matches(stub: dict[str, Any], needle: str) -> bool:
     assignee = stub.get("assignee") or {}
-    return (assignee.get("id") or "").lower() == needle or (assignee.get("name") or "").lower() == needle
+    return (assignee.get("id") or "").lower() == needle or (
+        assignee.get("name") or ""
+    ).lower() == needle
 
 
 # Synced fields: authoritative from Linear once a ticket is `linear-pulled`
@@ -1241,11 +1493,16 @@ def update_ticket(ticket_id: str, **fields: Any) -> dict[str, Any]:
             f"Invalid ticket state {fields['state']!r}; "
             f"must be one of {sorted(_VALID_TICKET_STATES)}."
         )
-    if "linear_priority" in fields and fields["linear_priority"] not in _VALID_TICKET_LINEAR_PRIORITIES:
+    if (
+        "linear_priority" in fields
+        and fields["linear_priority"] not in _VALID_TICKET_LINEAR_PRIORITIES
+    ):
         raise ValueError(
             f"Invalid ticket linear_priority {fields['linear_priority']!r}; "
             f"must be one of {sorted(_VALID_TICKET_LINEAR_PRIORITIES)}."
         )
+    if "tab_id" in fields:
+        _assert_tab_assignment(fields["tab_id"], GENERAL_REPO)
     record.update(fields)
     record["updated_at"] = _now_iso()
     _write_note_atomic(ticket_id, record)
@@ -1283,7 +1540,9 @@ def find_ticket_by_linear_ref(linear_ref: str) -> dict[str, Any] | None:
     return None
 
 
-def upsert_ticket_from_linear(mapped: dict[str, Any], *, project: str) -> tuple[dict[str, Any], bool]:
+def upsert_ticket_from_linear(
+    mapped: dict[str, Any], *, project: str
+) -> tuple[dict[str, Any], bool]:
     """Idempotent create-or-update of one `linear-pulled` ticket, keyed on
     `mapped["linear_ref"]`. Pure deterministic write — this is the
     disposal half of the perceive/dispose split: the CALLER (an agent,
@@ -1353,7 +1612,12 @@ def upsert_ticket_from_linear(mapped: dict[str, Any], *, project: str) -> tuple[
 
 
 def _assert_sibling_unique(
-    title: str, kind: str, parent_id: str | None, *, exclude_tab_id: str | None = None
+    title: str,
+    kind: str,
+    parent_id: str | None,
+    *,
+    repo: str,
+    exclude_tab_id: str | None = None,
 ) -> None:
     """FILE-MANAGER (2026-07-04): `(kind, parent_id, title_norm)` must be
     unique among live tabs — the invariant that replaces the old GLOBAL
@@ -1362,11 +1626,12 @@ def _assert_sibling_unique(
     latter is what silently let the organizer misfile before nesting
     existed to make the ambiguity possible)."""
     title_norm = title.strip().lower()
-    for tab in list_tabs():
+    for tab in _fold_tabs().values():
         if tab["id"] == exclude_tab_id:
             continue
         if (
-            tab.get("kind") == kind
+            tab.get("repo") == repo
+            and tab.get("kind") == kind
             and tab.get("parent_id") == parent_id
             and tab["title"].strip().lower() == title_norm
         ):
@@ -1397,7 +1662,13 @@ def _tab_ancestor_ids(tab_id: str, tabs_by_id: dict[str, dict[str, Any]]) -> lis
     return ancestors
 
 
-def add_tab(title: str = "", *, kind: str = "", parent_id: str | None = None) -> dict[str, Any]:
+def add_tab(
+    title: str = "",
+    *,
+    kind: str = "",
+    parent_id: str | None = None,
+    repo: str = _DEFAULT_REPO,
+) -> dict[str, Any]:
     """`kind`: "folder" (default, regular note groups) or "collection"
     (study-guide groups, shown in the Library view) — so the two don't
     intermix in the filter bar.
@@ -1409,19 +1680,22 @@ def add_tab(title: str = "", *, kind: str = "", parent_id: str | None = None) ->
     and collections never nest into each other), and sibling-uniqueness
     among `(kind, parent_id, title_norm)`.
     """
+    initialize_tab_repo_migration()
     _ensure_dirs()
+    if not isinstance(repo, str) or not repo:
+        raise ValueError("repo must be a non-empty string.")
     if kind and kind not in _VALID_TAB_KINDS:
         raise ValueError(f"Invalid tab kind {kind!r}; must be one of {sorted(_VALID_TAB_KINDS)}.")
     kind = kind or _DEFAULT_TAB_KIND
     if parent_id is not None:
-        parent = get_tab(parent_id)  # raises plain ValueError if missing
+        parent = get_tab(parent_id, repo=repo)  # raises plain ValueError if missing
         if parent.get("kind") != kind:
             raise TabValidationError(
                 f"Cannot create a {kind!r} tab under a {parent.get('kind')!r} parent "
                 "(folders and collections don't nest into each other)."
             )
     title = title or f"Tab {_new_id()[:6]}"
-    _assert_sibling_unique(title, kind, parent_id)
+    _assert_sibling_unique(title, kind, parent_id, repo=repo)
     tab_id = _new_id()
     now = _now_iso()
     record = {
@@ -1429,6 +1703,7 @@ def add_tab(title: str = "", *, kind: str = "", parent_id: str | None = None) ->
         "title": title,
         "kind": kind,
         "parent_id": parent_id,
+        "repo": repo,
         "created_at": now,
         "updated_at": now,
         "deleted": False,
@@ -1437,15 +1712,13 @@ def add_tab(title: str = "", *, kind: str = "", parent_id: str | None = None) ->
     return _with_note_ids(record)
 
 
-def get_tab(tab_id: str) -> dict[str, Any]:
-    folded = _fold_tabs()
-    record = folded.get(tab_id)
-    if record is None:
-        raise ValueError(f"No tab with id={tab_id!r}. Use list_tabs() to see available tabs.")
+def get_tab(tab_id: str, *, repo: str = _DEFAULT_REPO) -> dict[str, Any]:
+    initialize_tab_repo_migration()
+    record = _get_tab_record_exact(tab_id, repo)
     return _with_note_ids(record)
 
 
-def update_tab(tab_id: str, **fields: Any) -> dict[str, Any]:
+def update_tab(tab_id: str, *, repo: str = _DEFAULT_REPO, **fields: Any) -> dict[str, Any]:
     """Edit title/kind/parent_id. Reparenting (`parent_id` in fields)
     enforces ALL FOUR tab invariants (FILE-MANAGER, 2026-07-04):
 
@@ -1461,7 +1734,7 @@ def update_tab(tab_id: str, **fields: Any) -> dict[str, Any]:
     Raises TabValidationError (a ValueError subclass) for 1-3; a plain
     ValueError for an unknown tab_id/parent_id (mirrors get_tab)."""
     _ensure_dirs()
-    existing = get_tab(tab_id)
+    existing = get_tab(tab_id, repo=repo)
     existing.pop("note_ids", None)
     unknown = set(fields) - {"title", "kind", "parent_id"}
     if unknown:
@@ -1478,10 +1751,10 @@ def update_tab(tab_id: str, **fields: Any) -> dict[str, Any]:
     new_parent_id = fields["parent_id"] if "parent_id" in fields else existing.get("parent_id")
     new_title = fields.get("title", existing["title"])
 
-    if "parent_id" in fields and new_parent_id is not None:
+    tabs_by_id = {tab["id"]: tab for tab in _fold_tabs().values() if tab.get("repo") == repo}
+    if new_parent_id is not None and ({"parent_id", "kind"} & set(fields)):
         if new_parent_id == tab_id:
             raise TabValidationError(f"Tab {tab_id!r} cannot be its own parent.")
-        tabs_by_id = {t["id"]: t for t in list_tabs()}
         parent = tabs_by_id.get(new_parent_id)
         if parent is None:
             raise ValueError(
@@ -1492,14 +1765,32 @@ def update_tab(tab_id: str, **fields: Any) -> dict[str, Any]:
                 f"Cannot reparent a {new_kind!r} tab under a {parent['kind']!r} tab "
                 "(folders and collections don't nest into each other)."
             )
-        if tab_id in _tab_ancestor_ids(new_parent_id, tabs_by_id):
+        if "parent_id" in fields and tab_id in _tab_ancestor_ids(new_parent_id, tabs_by_id):
             raise TabValidationError(
                 f"Reparenting {tab_id!r} under {new_parent_id!r} would create a cycle "
                 "(the proposed parent is a descendant of this tab)."
             )
 
+    if "kind" in fields and fields["kind"] != existing.get("kind"):
+        incompatible_children = [
+            child["id"]
+            for child in tabs_by_id.values()
+            if child.get("parent_id") == tab_id and child.get("kind") != new_kind
+        ]
+        if incompatible_children:
+            raise TabValidationError(
+                f"Cannot change tab {tab_id!r} to kind {new_kind!r}; existing "
+                f"direct children would violate homogeneous nesting: {incompatible_children}."
+            )
+
     if {"title", "parent_id", "kind"} & set(fields):
-        _assert_sibling_unique(new_title, new_kind, new_parent_id, exclude_tab_id=tab_id)
+        _assert_sibling_unique(
+            new_title,
+            new_kind,
+            new_parent_id,
+            repo=repo,
+            exclude_tab_id=tab_id,
+        )
 
     existing.update(fields)
     existing["updated_at"] = _now_iso()
@@ -1508,7 +1799,7 @@ def update_tab(tab_id: str, **fields: Any) -> dict[str, Any]:
     return _with_note_ids(existing)
 
 
-def delete_tab(tab_id: str) -> dict[str, Any]:
+def delete_tab(tab_id: str, *, repo: str = _DEFAULT_REPO) -> dict[str, Any]:
     """Delete a tab (FILE-MANAGER, 2026-07-04 — greenfield, no prior
     implementation). "Never lose a guide" requires re-filing TWO things,
     not just one — the easy thing a naive implementation omits is the
@@ -1537,18 +1828,20 @@ def delete_tab(tab_id: str) -> dict[str, Any]:
        reclaim it on the next sweep; the user can always re-pin).
 
     Raises ValueError if tab_id doesn't exist (mirrors get_tab)."""
-    existing = get_tab(tab_id)
+    existing = get_tab(tab_id, repo=repo)
     fallback_parent_id = existing.get("parent_id")  # None -> root
     fallback_note_tab_id = fallback_parent_id or _DEFAULT_TAB_ID
 
-    for child in list_tabs():
+    for child in _fold_tabs().values():
+        if child.get("repo") != repo:
+            continue
         if child.get("parent_id") == tab_id:
             child["parent_id"] = fallback_parent_id
             child["updated_at"] = _now_iso()
             child["deleted"] = False
             _append_tab_record(child)
 
-    for note_stub in list_notes(tab_id=tab_id):
+    for note_stub in _exact_note_stubs_for_tab(tab_id, repo):
         update_note(note_stub["id"], tab_id=fallback_note_tab_id, pinned_placement=False)
 
     now = _now_iso()
@@ -1562,8 +1855,12 @@ def delete_tab(tab_id: str) -> dict[str, Any]:
     return {"id": tab_id, "deleted": True}
 
 
-def list_tabs() -> list[dict[str, Any]]:
-    tabs = [_with_note_ids(rec) for rec in _fold_tabs().values()]
+def list_tabs(repo: str | None = None) -> list[dict[str, Any]]:
+    initialize_tab_repo_migration()
+    records = list(_fold_tabs().values())
+    if repo is not None:
+        records = [rec for rec in records if rec.get("repo") in {repo, GENERAL_REPO}]
+    tabs = [_with_note_ids(rec) for rec in records]
     tabs.sort(key=lambda t: t["created_at"])
     return tabs
 
@@ -1572,12 +1869,15 @@ def _with_note_ids(tab_record: dict[str, Any]) -> dict[str, Any]:
     out = dict(tab_record)
     out.setdefault("kind", _DEFAULT_TAB_KIND)
     out.setdefault("parent_id", None)  # pre-FILE-MANAGER tabs read as root
-    out["note_ids"] = [n["id"] for n in list_notes(tab_id=tab_record["id"])]
+    out.setdefault("repo", None)
+    out["note_ids"] = [
+        note["id"] for note in _exact_note_stubs_for_tab(tab_record["id"], out["repo"])
+    ]
     return out
 
 
 def _get_or_create_tab_by_kind(
-    title: str, kind: str, parent_id: str | None = None
+    title: str, kind: str, parent_id: str | None = None, *, repo: str
 ) -> dict[str, Any]:
     """Find an existing tab of the given `kind` + `parent_id` matching
     `title` (case-insensitive), or create one. The deterministic-first
@@ -1595,26 +1895,33 @@ def _get_or_create_tab_by_kind(
     the organizer's auto-create until a tree-aware v2 pass (documented safe
     limitation, not a silent misfile)."""
     title_norm = title.strip().lower()
-    for tab in list_tabs():
+    for tab in _fold_tabs().values():
         if (
-            tab.get("kind") == kind
+            tab.get("repo") == repo
+            and tab.get("kind") == kind
             and tab.get("parent_id") == parent_id
             and tab["title"].strip().lower() == title_norm
         ):
             return tab
-    return add_tab(title=title, kind=kind, parent_id=parent_id)
+    return add_tab(title=title, kind=kind, parent_id=parent_id, repo=repo)
 
 
-def get_or_create_collection(title: str, parent_id: str | None = None) -> dict[str, Any]:
+def get_or_create_collection(
+    title: str, parent_id: str | None = None, *, repo: str = _DEFAULT_REPO
+) -> dict[str, Any]:
     """Get-or-create a `kind="collection"` tab — study guides' organize
     destination. `parent_id=None` (root) is what the organizer always
     passes — nesting is human-authored, see _get_or_create_tab_by_kind."""
-    return _get_or_create_tab_by_kind(title, "collection", parent_id)
+    initialize_tab_repo_migration()
+    return _get_or_create_tab_by_kind(title, "collection", parent_id, repo=repo)
 
 
-def get_or_create_folder(title: str, parent_id: str | None = None) -> dict[str, Any]:
+def get_or_create_folder(
+    title: str, parent_id: str | None = None, *, repo: str = _DEFAULT_REPO
+) -> dict[str, Any]:
     """Get-or-create a `kind="folder"` tab — regular notes' organize
     destination (the sibling to get_or_create_collection, added when the
     organizer was extended to notes — kept in its own namespace so notes
     and guides never intermix in the tab filter bar)."""
-    return _get_or_create_tab_by_kind(title, "folder", parent_id)
+    initialize_tab_repo_migration()
+    return _get_or_create_tab_by_kind(title, "folder", parent_id, repo=repo)
