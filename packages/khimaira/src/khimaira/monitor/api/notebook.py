@@ -333,39 +333,45 @@ def build_router():
             # are somehow given.
             tab_id = req.tab_id
             repo = req.repo or notes._DEFAULT_REPO
-            if req.collection:
-                collection = await asyncio.to_thread(
-                    notes.get_or_create_collection, req.collection, repo=repo
+            try:
+                if req.collection:
+                    collection = await asyncio.to_thread(
+                        notes.get_or_create_collection, req.collection, repo=repo
+                    )
+                    tab_id = collection["id"]
+                record, was_fresh = await asyncio.to_thread(
+                    _idempotent_op,
+                    req.idempotency_key,
+                    lambda: notes.add_study_guide(
+                        req.raw_text,
+                        tab_id=tab_id,
+                        title=req.title,
+                        repo=repo,
+                        source_path=req.source_path,
+                        sensitive=req.sensitive,
+                    ),
                 )
-                tab_id = collection["id"]
-            record, was_fresh = await asyncio.to_thread(
-                _idempotent_op,
-                req.idempotency_key,
-                lambda: notes.add_study_guide(
-                    req.raw_text,
-                    tab_id=tab_id,
-                    title=req.title,
-                    repo=repo,
-                    source_path=req.source_path,
-                    sensitive=req.sensitive,
-                ),
-            )
+            except ValueError as e:
+                raise fastapi.HTTPException(404, str(e)) from e
             if was_fresh:
                 trigger_pipeline(record["id"])
                 notebook_retrieval.schedule_upsert(record)
             return record
 
-        record, was_fresh = await asyncio.to_thread(
-            _idempotent_op,
-            req.idempotency_key,
-            lambda: notes.add_note(
-                req.raw_text,
-                tab_id=req.tab_id,
-                title=req.title,
-                repo=req.repo,
-                sensitive=req.sensitive,
-            ),
-        )
+        try:
+            record, was_fresh = await asyncio.to_thread(
+                _idempotent_op,
+                req.idempotency_key,
+                lambda: notes.add_note(
+                    req.raw_text,
+                    tab_id=req.tab_id,
+                    title=req.title,
+                    repo=req.repo,
+                    sensitive=req.sensitive,
+                ),
+            )
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
         if was_fresh:
             if record["tab_id"] == notes.PERSONAL_TAB_ID:
                 # Personal/Behavior folder notes are read as raw_text directly

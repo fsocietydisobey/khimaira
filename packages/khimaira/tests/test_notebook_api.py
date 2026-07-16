@@ -55,6 +55,24 @@ def test_create_note_in_personal_folder_skips_structuring(notebook_client):
     assert body["pipeline"] is None
 
 
+def test_create_note_unknown_tab_returns_404_not_500(notebook_client):
+    """Regression: create_note had no exception handling at all around
+    _assert_tab_assignment's ValueError, so an unknown tab_id crashed with
+    an uncaught 500 instead of a proper 404."""
+    r = notebook_client.post("/api/notes", json={"raw_text": "hello", "tab_id": "kg"})
+    assert r.status_code == 404
+    assert "No tab with id" in r.json()["detail"]
+
+
+def test_create_study_guide_unknown_tab_returns_404_not_500(notebook_client):
+    r = notebook_client.post(
+        "/api/notes",
+        json={"raw_text": "hello", "kind": "study_guide", "tab_id": "kg"},
+    )
+    assert r.status_code == 404
+    assert "No tab with id" in r.json()["detail"]
+
+
 def test_create_note_defaults_kind_to_note(notebook_client):
     r = notebook_client.post("/api/notes", json={"raw_text": "hello"})
     assert r.json()["kind"] == "note"
