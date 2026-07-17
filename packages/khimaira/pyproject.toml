@@ -52,7 +52,7 @@ dependencies = [
     # `uv sync --all-packages`) silently uninstalled it, disabling Themis role
     # enforcement daemon-wide for every active session. Declaring it here
     # closes that gap for good, matching how khimaira-chat was integrated.
-    "khimaira-themis",
+    "khimaira-themis[server]",
 ]
 
 [tool.uv.sources]

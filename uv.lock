@@ -1083,7 +1083,7 @@ dependencies = [
     { name = "fastembed" },
     { name = "fastmcp" },
     { name = "httpx" },
-    { name = "khimaira-themis" },
+    { name = "khimaira-themis", extra = ["server"] },
     { name = "khimaira-transport" },
     { name = "khimaira-types" },
     { name = "langchain-core" },
@@ -1123,7 +1123,7 @@ requires-dist = [
     { name = "khimaira-seance", marker = "extra == 'all'", editable = "packages/seance" },
     { name = "khimaira-sibyl", marker = "extra == 'all'", editable = "packages/sibyl" },
     { name = "khimaira-specter", marker = "extra == 'all'", editable = "packages/specter" },
-    { name = "khimaira-themis", editable = "packages/themis" },
+    { name = "khimaira-themis", extras = ["server"], editable = "packages/themis" },
     { name = "khimaira-transport", editable = "shared/transport" },
     { name = "khimaira-types", editable = "shared/types" },
     { name = "langchain-core", specifier = ">=0.3" },
@@ -1264,17 +1264,20 @@ name = "khimaira-themis"
 version = "0.1.0"
 source = { editable = "packages/themis" }
 dependencies = [
-    { name = "fastapi" },
-    { name = "mcp", extra = ["cli"] },
     { name = "pyyaml" },
+]
+
+[package.optional-dependencies]
+server = [
+    { name = "mcp", extra = ["cli"] },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "fastapi", specifier = ">=0.111" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.0" },
+    { name = "mcp", extras = ["cli"], marker = "extra == 'server'", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
+provides-extras = ["server"]
 
 [[package]]
 name = "khimaira-transport"

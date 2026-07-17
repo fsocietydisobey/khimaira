@@ -8,10 +8,11 @@ license = { text = "MIT" }
 authors = [{ name = "fsocietydisobey" }]
 keywords = ["khimaira", "enforcement", "role-boundaries", "pretooluse", "mcp"]
 dependencies = [
-    "mcp[cli]>=1.0",
     "pyyaml>=6.0",
-    "fastapi>=0.111",
 ]
+
+[project.optional-dependencies]
+server = ["mcp[cli]>=1.0"]
 
 [project.scripts]
 themis = "themis.cli:main"
@@ -22,3 +23,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/themis"]
+artifacts = [
+    "src/themis/rules/*.yaml",
+    "src/themis/assets/**/*.md",
+]
