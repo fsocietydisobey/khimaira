@@ -28,9 +28,29 @@ same way; `@main` tracks the branch tip and is not reproducible.
 
 The command copies these package assets into `~/.claude/agents/`:
 
-- `khimaira-internal-consultant.md`
-- `khimaira-internal-gatekeeper.md`
-- `khimaira-internal-agent.md`
+- `khimaira-internal-consultant.md` — `model: sonnet[1m]`, `effort: max`
+- `khimaira-internal-gatekeeper.md` — `model: sonnet[1m]`, `effort: high`
+- `khimaira-internal-agent.md` — `model: sonnet[1m]` (effort unset — inherits default)
+
+Each subagent's model/effort is pinned in that file's own frontmatter, so it
+applies automatically the moment the master spawns that type via the `Agent`
+tool's `subagent_type` field — no manual step. The **master** session itself
+has no such file (it is the plain top-level session, not a spawned
+subagent), so set its budget directly in that session:
+`/model opus[1m]` then `/effort high`.
+
+Recommended delegation flow for the master session:
+
+| Need | `subagent_type` | What the master supplies |
+| --- | --- | --- |
+| Resolve ambiguity or design | `khimaira-internal-consultant` | The decision to make, constraints/files, known evidence, required output. Does not implement. |
+| Implement a decided unit | `khimaira-internal-agent` | A bounded task, acceptance criteria, file/scope ownership. Spawn one instance per independent work unit. |
+| Review a completed change | `khimaira-internal-gatekeeper` | The intended contract, exact diff/scope, tests already run. Returns SHIP or HOLD; only the master decides whether to commit. |
+
+If `.claude/agents/` did not exist when the current Claude Code session
+started, restart that session — Anthropic documents that the file watcher
+does not discover a newly created agents directory in an already-running
+session.
 
 It also merges one independent entry into
 `~/.claude/settings.json`:
