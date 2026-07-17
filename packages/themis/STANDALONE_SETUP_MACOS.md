@@ -13,13 +13,18 @@ environment:
 THEMIS_VENV="$HOME/.local/share/khimaira-themis"
 python3.12 -m venv "$THEMIS_VENV"
 "$THEMIS_VENV/bin/python" -m pip install \
-  "git+https://github.com/fsocietydisobey/khimaira.git@main#subdirectory=packages/themis"
+  "git+https://github.com/fsocietydisobey/khimaira.git@f71525e#subdirectory=packages/themis"
 "$THEMIS_VENV/bin/themis" install-internal-roster
 ```
 
 The Git direct reference is intentional: this guide does not assume that
-`khimaira-themis` has been published to a package index. Pin `@main` to a tag or
-commit when reproducibility requires an immutable revision.
+`khimaira-themis` has been published to a package index. `@f71525e` pins the
+commit this guide was verified against (`feat(themis): standalone,
+dotfiles-free macOS package for the internal-roster hooks`) — this exact
+command was proven end-to-end from a scratch venv against the real, pushed
+`fsocietydisobey/khimaira` GitHub repository, not just asserted. Move the pin
+forward to a newer commit or tag once a later revision has been verified the
+same way; `@main` tracks the branch tip and is not reproducible.
 
 The command copies these package assets into `~/.claude/agents/`:
 
