@@ -2638,6 +2638,66 @@ def session_has_in_progress_assigned_task(session_id: str) -> bool:
         return False
 
 
+def _find_active_task_chat_resolved(
+    session_id: str,
+) -> tuple[dict[str, Any], str] | None:
+    """Return the session's most-recent active task and its chat ID.
+
+    Active means assigned to the session with status ``in_progress`` or ``done``.
+    Individual unreadable rooms are skipped, matching the historical gate-verdict
+    lookup behavior. Other lookup failures propagate so callers can apply their
+    own fail-open or fail-closed policy.
+    """
+    chat_dir = _chat_dir()
+    if not chat_dir.exists():
+        return None
+
+    best_task: dict[str, Any] | None = None
+    best_chat_id: str | None = None
+    best_ts = ""
+
+    for path in chat_dir.glob("chat-*.jsonl"):
+        try:
+            room = load_room(path.stem)
+        except Exception:
+            continue
+        member = room["members"].get(session_id)
+        if not member or member["state"] != ACCEPTED:
+            continue
+        task_latest: dict[str, dict[str, Any]] = {}
+        for msg in room.get("messages", []):
+            kind = msg.get("kind")
+            if kind == TASK and msg.get("assignee_id") == session_id:
+                task_id = msg.get("id")
+                if task_id:
+                    task_latest[task_id] = {**msg, "status": TASK_PENDING}
+            elif kind == TASK_UPDATE:
+                task_id = msg.get("task_id")
+                if task_id and task_id in task_latest:
+                    new_status = msg.get("new_status") or msg.get("status")
+                    if new_status:
+                        task_latest[task_id]["status"] = new_status
+                    task_latest[task_id]["last_ts"] = msg.get("ts", "")
+
+        for task in task_latest.values():
+            if task.get("status") not in (TASK_IN_PROGRESS, TASK_DONE):
+                continue
+            task_ts = task.get("last_ts") or task.get("ts", "")
+            if task_ts > best_ts:
+                best_ts = task_ts
+                best_task = task
+                best_chat_id = path.stem
+
+    if best_task is None or best_chat_id is None:
+        return None
+    return best_task, best_chat_id
+
+
+def find_active_task_chat(session_id: str) -> tuple[dict[str, Any], str] | None:
+    """Resolve ``session_id`` and return its most-recent active task/chat."""
+    return _find_active_task_chat_resolved(_resolve_or_uuid(session_id))
+
+
 def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
     """Return the gate-verdict state for the session's current active task.
 
@@ -2660,50 +2720,10 @@ def get_gate_verdicts(session_id: str) -> dict[str, Any] | str:
         return None
 
     try:
-        chat_dir = _chat_dir()
-        if not chat_dir.exists():
-            return None
-
-        # Step 1: find active task (most-recently-updated in_progress or done)
-        best_task: dict[str, Any] | None = None
-        best_chat_id: str | None = None
-        best_ts: str = ""
-
-        for path in chat_dir.glob("chat-*.jsonl"):
-            try:
-                room = load_room(path.stem)
-            except Exception:
-                continue
-            member = room["members"].get(session_id)
-            if not member or member["state"] != ACCEPTED:
-                continue
-            # Fold task states from messages
-            task_latest: dict[str, dict[str, Any]] = {}
-            for msg in room.get("messages", []):
-                kind = msg.get("kind")
-                if kind == TASK and msg.get("assignee_id") == session_id:
-                    tid = msg.get("id")
-                    if tid:
-                        task_latest[tid] = {**msg, "status": TASK_PENDING}
-                elif kind == TASK_UPDATE:
-                    tid = msg.get("task_id")
-                    if tid and tid in task_latest:
-                        new_status = msg.get("new_status") or msg.get("status")
-                        if new_status:
-                            task_latest[tid]["status"] = new_status
-                        task_latest[tid]["last_ts"] = msg.get("ts", "")
-
-            for tid, task in task_latest.items():
-                if task.get("status") not in (TASK_IN_PROGRESS, TASK_DONE):
-                    continue
-                ts = task.get("last_ts") or task.get("ts", "")
-                if ts > best_ts:
-                    best_ts = ts
-                    best_task = task
-                    best_chat_id = path.stem
-
-        if best_task is None:
+        active_task = _find_active_task_chat_resolved(session_id)
+        if active_task is None:
             return None  # no active task → ad-hoc commit allowed
+        best_task, best_chat_id = active_task
 
         # Step 2: scan for verdict events — only from the CURRENT done round.
         # Guard-5 Part A: changes_requested invalidates prior-round verdicts.

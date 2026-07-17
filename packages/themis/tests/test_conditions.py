@@ -8,6 +8,7 @@ import pytest
 
 from themis.conditions import (
     chat_my_chats_not_called_this_turn,
+    commit_without_manual_test_signal,
     done_report_missing_branch_declaration,
     evaluate_condition,
     idle_agents_exist,
@@ -437,3 +438,23 @@ class TestDoneReportMissingBranchDeclaration:
             "tool_input": {"new_status": "done", "note": ""},
         }
         assert done_report_missing_branch_declaration(payload) is False
+
+
+class TestCommitWithoutManualTestSignal:
+    def test_key_absent_returns_false(self):
+        assert commit_without_manual_test_signal({}) is False
+
+    def test_error_returns_true(self):
+        assert commit_without_manual_test_signal(
+            {"manual_test_signal_present": "error"}
+        ) is True
+
+    def test_true_returns_false(self):
+        assert commit_without_manual_test_signal(
+            {"manual_test_signal_present": True}
+        ) is False
+
+    def test_false_returns_true(self):
+        assert commit_without_manual_test_signal(
+            {"manual_test_signal_present": False}
+        ) is True

@@ -13,6 +13,8 @@ packages/themis package to be installed.
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
 import importlib
 import json
 from pathlib import Path
@@ -1248,6 +1250,234 @@ def test_p0_heartbeat_and_turn_start_enriched_from_disk(
     payload = call_kwargs.get("conditions_payload") or {}
     assert payload.get("subscriber_last_heartbeat") == "2026-01-01T00:00:00+00:00"
     assert payload.get("turn_start_ts") == "2026-01-01T01:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# Master manual-test signal enrichment
+# ---------------------------------------------------------------------------
+
+
+def _setup_manual_test_signal_scenario(
+    isolated_chats,
+    sessions_mod,
+    *,
+    caller_role: str = "master",
+) -> tuple[str, str, str]:
+    master_id = "22222222-1111-4000-8000-000000000001"
+    caller_id = (
+        master_id
+        if caller_role == "master"
+        else "33333333-1111-4000-8000-000000000002"
+    )
+    _make_session(sessions_mod, master_id)
+    members = [] if caller_id == master_id else [caller_id]
+    if caller_id != master_id:
+        _make_session(sessions_mod, caller_id)
+
+    isolated_chats.create_room(
+        master_id,
+        members,
+        title="manual-test-signal",
+        member_roles={master_id: "master", caller_id: caller_role},
+    )
+    chat_id = list(isolated_chats._chat_dir().glob("chat-*.jsonl"))[0].stem
+    if caller_id != master_id:
+        isolated_chats.accept(chat_id, caller_id)
+    task = isolated_chats.create_task(
+        chat_id,
+        master_id,
+        "exercise manual-test signal",
+        assignee_session_id=caller_id,
+    )
+    isolated_chats.update_task_status(
+        chat_id,
+        task["id"],
+        caller_id,
+        isolated_chats.TASK_IN_PROGRESS,
+    )
+    return caller_id, chat_id, task["id"]
+
+
+def _capture_themis_conditions(
+    themis_client,
+    *,
+    session_id: str,
+    tool_name: str,
+    tool_input: dict,
+) -> dict:
+    from khimaira.monitor.api import themis as themis_api
+
+    mock_result = MagicMock(ok=True, violation=None)
+    mock_engine = MagicMock()
+    mock_engine.evaluate.return_value = mock_result
+
+    check_endpoint = next(
+        route.endpoint
+        for route in themis_client.app.routes
+        if route.path == "/api/themis/check"
+    )
+
+    with patch.dict("sys.modules", {"themis.engine": mock_engine}):
+        response = asyncio.run(
+            check_endpoint(
+                themis_api.CheckReq(
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                )
+            )
+        )
+
+    assert response["ok"] is True
+    _call_args, call_kwargs = mock_engine.evaluate.call_args
+    return call_kwargs["conditions_payload"]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["MANUAL-TEST-PASSED task-abc123", "COMMIT-OVERRIDE: Joseph"],
+)
+def test_manual_test_signal_triggered_marker_in_window_is_true(
+    isolated_chats,
+    sessions_mod,
+    themis_client,
+    marker: str,
+) -> None:
+    caller_id, chat_id, _task_id = _setup_manual_test_signal_scenario(
+        isolated_chats, sessions_mod
+    )
+    isolated_chats.send_message(chat_id, caller_id, marker)
+
+    payload = _capture_themis_conditions(
+        themis_client,
+        session_id=caller_id,
+        tool_name="Bash",
+        tool_input={"command": "git add packages/khimaira"},
+    )
+
+    assert payload["manual_test_signal_present"] is True
+
+
+def test_manual_test_signal_in_window_beyond_last_50_messages_is_true(
+    isolated_chats, sessions_mod, themis_client
+) -> None:
+    caller_id, chat_id, _task_id = _setup_manual_test_signal_scenario(
+        isolated_chats, sessions_mod
+    )
+    isolated_chats.send_message(
+        chat_id, caller_id, "MANUAL-TEST-PASSED task-busy-room"
+    )
+    for index in range(55):
+        isolated_chats.send_message(chat_id, caller_id, f"follow-up {index}")
+
+    payload = _capture_themis_conditions(
+        themis_client,
+        session_id=caller_id,
+        tool_name="Bash",
+        tool_input={"command": "git commit -m verified"},
+    )
+
+    assert payload["manual_test_signal_present"] is True
+
+
+def test_manual_test_signal_triggered_without_marker_is_false(
+    isolated_chats, sessions_mod, themis_client
+) -> None:
+    caller_id, chat_id, _task_id = _setup_manual_test_signal_scenario(
+        isolated_chats, sessions_mod
+    )
+    isolated_chats.send_message(chat_id, caller_id, "tests are probably fine")
+
+    payload = _capture_themis_conditions(
+        themis_client,
+        session_id=caller_id,
+        tool_name="Bash",
+        tool_input={"command": "git commit -m verified"},
+    )
+
+    assert payload["manual_test_signal_present"] is False
+
+
+def test_manual_test_signal_marker_outside_window_is_false(
+    isolated_chats,
+    sessions_mod,
+    themis_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller_id, chat_id, _task_id = _setup_manual_test_signal_scenario(
+        isolated_chats, sessions_mod
+    )
+    old_timestamp = (dt.datetime.now(dt.UTC) - dt.timedelta(hours=25)).isoformat()
+    monkeypatch.setattr(isolated_chats, "_now_iso", lambda: old_timestamp)
+    isolated_chats.send_message(
+        chat_id, caller_id, "MANUAL-TEST-PASSED task-too-old"
+    )
+
+    payload = _capture_themis_conditions(
+        themis_client,
+        session_id=caller_id,
+        tool_name="Bash",
+        tool_input={"command": "git add ."},
+    )
+
+    assert payload["manual_test_signal_present"] is False
+
+
+@pytest.mark.parametrize(
+    ("caller_role", "tool_name", "command"),
+    [
+        ("master", "Read", "git commit -m ignored"),
+        ("agent", "Bash", "git add ."),
+    ],
+)
+def test_manual_test_signal_non_trigger_tool_or_role_leaves_key_absent(
+    isolated_chats,
+    sessions_mod,
+    themis_client,
+    caller_role: str,
+    tool_name: str,
+    command: str,
+) -> None:
+    caller_id, chat_id, task_id = _setup_manual_test_signal_scenario(
+        isolated_chats, sessions_mod, caller_role=caller_role
+    )
+    isolated_chats.send_message(
+        chat_id, caller_id, f"MANUAL-TEST-PASSED {task_id}"
+    )
+
+    payload = _capture_themis_conditions(
+        themis_client,
+        session_id=caller_id,
+        tool_name=tool_name,
+        tool_input={"command": command},
+    )
+
+    assert "manual_test_signal_present" not in payload
+
+
+def test_manual_test_signal_lookup_error_sets_error(
+    isolated_chats,
+    sessions_mod,
+    themis_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller_id, _chat_id, _task_id = _setup_manual_test_signal_scenario(
+        isolated_chats, sessions_mod
+    )
+    monkeypatch.setattr(
+        isolated_chats,
+        "find_active_task_chat",
+        MagicMock(side_effect=OSError("unreadable chat")),
+    )
+
+    payload = _capture_themis_conditions(
+        themis_client,
+        session_id=caller_id,
+        tool_name="Bash",
+        tool_input={"command": "git commit -m verified"},
+    )
+
+    assert payload["manual_test_signal_present"] == "error"
 
 
 def test_p0_in_master_1_fires_via_conditions_payload(

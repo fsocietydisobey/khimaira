@@ -22,9 +22,11 @@ list and append a warning line to ~/.claude/hooks/themis_authviolations.log.
 
 from __future__ import annotations
 
+import datetime as dt
 import importlib
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -48,6 +50,10 @@ _AUTH_VIOLATIONS_LOG = Path.home() / ".claude" / "hooks" / "themis_authviolation
 _OVERRIDES_PATH = (
     Path.home() / ".local" / "state" / "khimaira" / "themis_overrides.jsonl"
 )
+
+_MANUAL_TEST_SIGNAL_WINDOW_HOURS = 24
+_MANUAL_TEST_PASSED_PATTERN = re.compile(r"MANUAL-TEST-PASSED\s+task-\S+")
+_COMMIT_OVERRIDE_PATTERN = re.compile(r"COMMIT-OVERRIDE:\s*Joseph")
 
 # Roles that may read any session's violations (D12)
 _ROLES_ALLOWED_CROSS_SESSION_READ: frozenset[str] = frozenset(
@@ -852,6 +858,49 @@ def build_router():
                 )
             except Exception:
                 pass  # fail-open: missing key → condition returns False (no warn)
+
+        # Lazy enrichment: manual_test_signal_present. Master git staging/commit
+        # must carry a recent audit signal from the chat containing master's active
+        # task. The lookup is shared with get_gate_verdicts so task selection cannot
+        # drift between the two enforcement paths.
+        _command = (req.tool_input or {}).get("command", "")
+        _needs_manual_test_signal = (
+            role == "master"
+            and req.tool_name == "Bash"
+            and bool(re.search(r"git\s+(commit|add)", _command))
+        )
+        if _needs_manual_test_signal:
+            try:
+                _active_task = chats.find_active_task_chat(req.session_id)
+                _manual_test_signal_present = False
+                if _active_task is not None:
+                    _, _active_chat_id = _active_task
+                    _active_room = chats.load_room(_active_chat_id)
+                    _now = dt.datetime.now(dt.UTC)
+                    _cutoff = _now - dt.timedelta(
+                        hours=_MANUAL_TEST_SIGNAL_WINDOW_HOURS
+                    )
+                    for _message in reversed(_active_room.get("messages", [])):
+                        _body = _message.get("body") or ""
+                        _timestamp = _message.get("ts")
+                        _has_marker = _MANUAL_TEST_PASSED_PATTERN.search(
+                            _body
+                        ) or _COMMIT_OVERRIDE_PATTERN.search(_body)
+                        if not _timestamp or not _has_marker:
+                            continue
+                        _message_time = dt.datetime.fromisoformat(
+                            _timestamp.replace("Z", "+00:00")
+                        )
+                        if _message_time.tzinfo is None:
+                            _message_time = _message_time.replace(tzinfo=dt.UTC)
+                        if _cutoff <= _message_time <= _now:
+                            _manual_test_signal_present = True
+                            break
+                conditions_payload["manual_test_signal_present"] = (
+                    _manual_test_signal_present
+                )
+            except Exception:
+                conditions_payload["manual_test_signal_present"] = "error"
 
         # Lazy enrichment: gate_verdicts (B3 Slice B)
         # Only computed for (a) Bash+git-commit and (b) chat_task_update→approved.

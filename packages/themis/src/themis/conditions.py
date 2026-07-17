@@ -607,3 +607,33 @@ def agent_edit_without_assigned_task(payload: dict[str, Any]) -> bool:
 
 
 _REGISTRY["agent_edit_without_assigned_task"] = agent_edit_without_assigned_task
+
+
+_MANUAL_TEST_SIGNAL_SENTINEL = object()
+
+
+def commit_without_manual_test_signal(payload: dict[str, Any]) -> bool:
+    """True when commit enrichment confirms no manual-test signal is present.
+
+    This mechanism originated in jeevy_portal, but is deliberately
+    cross-project-general: any app-scoped rule may use it when its hook
+    enrichment supplies ``manual_test_signal_present``.
+
+    Exact fail-open/fail-closed semantics:
+      - key absent → enrichment did not run → False
+      - ``"error"`` → enrichment failed → True
+      - ``True`` → a manual-test signal is present → False
+      - ``False`` → no manual-test signal is present → True
+    """
+    signal = payload.get(
+        "manual_test_signal_present",
+        _MANUAL_TEST_SIGNAL_SENTINEL,
+    )
+    if signal is _MANUAL_TEST_SIGNAL_SENTINEL:
+        return False
+    if signal == "error":
+        return True
+    return signal is False
+
+
+_REGISTRY["commit_without_manual_test_signal"] = commit_without_manual_test_signal
