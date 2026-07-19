@@ -373,6 +373,21 @@ def test_promote_note_unknown_id_returns_404(notebook_client):
     assert r.status_code == 404
 
 
+def test_unpromote_note_happy_path(notebook_client):
+    created = notebook_client.post("/api/notes", json={"raw_text": "hi"}).json()
+    notebook_client.post(f"/api/notes/{created['id']}/promote")
+    r = notebook_client.post(f"/api/notes/{created['id']}/unpromote")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["training"]["promoted"] is False
+    assert body["status"] == "processed"
+
+
+def test_unpromote_note_unknown_id_returns_404(notebook_client):
+    r = notebook_client.post("/api/notes/no-such-id/unpromote")
+    assert r.status_code == 404
+
+
 def test_tabs_crud_happy_path(notebook_client):
     r = notebook_client.post("/api/tabs", json={"title": "My Tab", "repo": "khimaira"})
     assert r.status_code == 200

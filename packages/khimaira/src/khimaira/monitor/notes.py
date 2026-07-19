@@ -1185,6 +1185,30 @@ def promote_note(note_id: str) -> dict[str, Any]:
     record["updated_at"] = now
     _write_note_atomic(note_id, record)
     _append_index_stub(record)
+    log.info("notes: %s promoted for training", note_id)
+    return record
+
+
+def unpromote_note(note_id: str) -> dict[str, Any]:
+    """Reverse `promote_note` — the archive/undo counterpart.
+
+    Restores status to "processed" (the state promote_note started from —
+    every note reaches promoted only via the structuring pipeline finishing
+    first) and clears training.promoted/promoted_at. The resolution itself
+    (if any) is untouched: unpromoting only undoes the curated-training
+    flag, not the roster's resolution write-back. A note with a resolution
+    that gets unpromoted falls back to lifecycle="resolved" (derive_lifecycle),
+    leaving the normal (non-archived) view — restoring visibility, not
+    deleting anything.
+    """
+    record = get_note(note_id)
+    record["training"]["promoted"] = False
+    record["training"]["promoted_at"] = None
+    record["status"] = "processed"
+    record["updated_at"] = _now_iso()
+    _write_note_atomic(note_id, record)
+    _append_index_stub(record)
+    log.info("notes: %s unpromoted (restored from archive)", note_id)
     return record
 
 

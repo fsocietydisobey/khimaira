@@ -52,6 +52,7 @@ import {
   useListProjectsQuery,
   useListTabsQuery,
   usePromoteNoteMutation,
+  useUnpromoteNoteMutation,
   useRevalidateNoteMutation,
   useUpdateNoteMutation,
 } from "@/api";
@@ -419,6 +420,7 @@ export function Notebook() {
   const [createNote, { isLoading: creatingNote }] = useCreateNoteMutation();
   const [createTab] = useCreateTabMutation();
   const [promoteNote] = usePromoteNoteMutation();
+  const [unpromoteNote] = useUnpromoteNoteMutation();
   const [deleteNote] = useDeleteNoteMutation();
   const [updateNote] = useUpdateNoteMutation();
   const [revalidateNote, { isLoading: revalidating }] =
@@ -685,6 +687,7 @@ export function Notebook() {
           onMoveToTab={(ids, tabId) => void moveNotesToTab(ids, tabId)}
           onOpenNote={handleSelectNote}
           onPromote={(id) => promoteNote(id)}
+          onUnpromote={(id) => unpromoteNote(id)}
           onDelete={(id) => deleteNote(id)}
           repoOptions={repoOptions}
           onChangeRepo={handleChangeRepo}
@@ -710,6 +713,9 @@ export function Notebook() {
             view={centerView}
             onPromote={
               selectedNote ? () => promoteNote(selectedNote.id) : undefined
+            }
+            onUnpromote={
+              selectedNote ? () => unpromoteNote(selectedNote.id) : undefined
             }
             onDelete={
               selectedNote
@@ -990,6 +996,7 @@ function NotesFileManager({
   onMoveToTab,
   onOpenNote,
   onPromote,
+  onUnpromote,
   onDelete,
   repoOptions,
   onChangeRepo,
@@ -1010,6 +1017,7 @@ function NotesFileManager({
   onMoveToTab: (ids: string[], tabId: string) => void;
   onOpenNote: (id: string) => void;
   onPromote: (id: string) => void;
+  onUnpromote: (id: string) => void;
   onDelete: (id: string) => void;
   repoOptions: string[];
   onChangeRepo: (noteId: string, repo: string) => void;
@@ -1223,6 +1231,7 @@ function NotesFileManager({
                   note={n}
                   onOpen={() => onOpenNote(n.id)}
                   onPromote={() => onPromote(n.id)}
+                  onUnpromote={() => onUnpromote(n.id)}
                   onDelete={() => onDelete(n.id)}
                   repoOptions={repoOptions}
                   onChangeRepo={(repo) => onChangeRepo(n.id, repo)}
@@ -1645,6 +1654,7 @@ function NoteCard({
   note,
   onOpen,
   onPromote,
+  onUnpromote,
   onDelete,
   repoOptions,
   onChangeRepo,
@@ -1657,6 +1667,7 @@ function NoteCard({
   note: Note;
   onOpen: () => void;
   onPromote: () => void;
+  onUnpromote: () => void;
   onDelete: () => void;
   repoOptions: string[];
   onChangeRepo: (repo: string) => void;
@@ -1834,15 +1845,22 @@ function NoteCard({
             size="sm"
             variant="ghost"
             className="h-6 px-2 text-[10px]"
-            title="Mark as good for training — feeds the mnemosyne distiller"
+            title="Mark as good for training — feeds the mnemosyne distiller. If this note is already resolved, this also archives it (hides it from the default list) — use restore to undo."
             onClick={onPromote}
           >
             promote
           </Button>
         ) : (
-          <span className="px-2 text-[10px] text-muted-foreground/60">
-            promoted for training
-          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-[10px] text-muted-foreground/60"
+            title="Undo promote — restores this note to the default (non-archived) list"
+            onClick={onUnpromote}
+          >
+            promoted for training — restore
+          </Button>
         )}
         <Button
           type="button"
@@ -1863,6 +1881,7 @@ function NoteCard({
 function CenterReaderPanel({
   view,
   onPromote,
+  onUnpromote,
   onDelete,
   onRevalidate,
   revalidating,
@@ -1874,6 +1893,7 @@ function CenterReaderPanel({
 }: {
   view: CenterView;
   onPromote?: () => void;
+  onUnpromote?: () => void;
   onDelete?: () => void;
   onRevalidate?: () => void;
   revalidating: boolean;
@@ -1901,6 +1921,7 @@ function CenterReaderPanel({
       section={section}
       onSectionChange={setSection}
       onPromote={onPromote}
+      onUnpromote={onUnpromote}
       onDelete={onDelete}
       onRevalidate={onRevalidate}
       revalidating={revalidating}
@@ -1923,6 +1944,7 @@ function NoteStructuredReader({
   section,
   onSectionChange,
   onPromote,
+  onUnpromote,
   onDelete,
   onRevalidate,
   revalidating,
@@ -1936,6 +1958,7 @@ function NoteStructuredReader({
   section: "summary" | "technical" | "plain";
   onSectionChange: (s: "summary" | "technical" | "plain") => void;
   onPromote?: () => void;
+  onUnpromote?: () => void;
   onDelete?: () => void;
   onRevalidate?: () => void;
   revalidating: boolean;
@@ -2175,15 +2198,22 @@ function NoteStructuredReader({
             size="sm"
             variant="ghost"
             className="h-6 px-2 text-[10px]"
-            title="Mark as good for training — feeds the mnemosyne distiller"
+            title="Mark as good for training — feeds the mnemosyne distiller. If this note is already resolved, this also archives it (hides it from the default list) — use restore to undo."
             onClick={onPromote}
           >
             promote
           </Button>
         ) : (
-          <span className="px-2 text-[10px] text-muted-foreground/60">
-            promoted for training
-          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-[10px] text-muted-foreground/60"
+            title="Undo promote — restores this note to the default (non-archived) list"
+            onClick={onUnpromote}
+          >
+            promoted for training — restore
+          </Button>
         )}
         <Button
           type="button"

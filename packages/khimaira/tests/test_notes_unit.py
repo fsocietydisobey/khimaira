@@ -203,6 +203,32 @@ def test_promote_note_still_works_for_non_sensitive_notes(notes_store):
     assert promoted["training"]["promoted"] is True
 
 
+def test_unpromote_note_reverses_promote(notes_store):
+    note = notes_store.add_note("ordinary note")
+    notes_store.promote_note(note["id"])
+    restored = notes_store.unpromote_note(note["id"])
+    assert restored["training"]["promoted"] is False
+    assert restored["training"]["promoted_at"] is None
+    assert restored["status"] == "processed"
+
+
+def test_unpromote_note_restores_archived_to_resolved_lifecycle(notes_store):
+    note = notes_store.add_note("problem text")
+    notes_store.add_resolution(note["id"], "fixed it")
+    notes_store.promote_note(note["id"])
+    assert notes_store.derive_lifecycle(notes_store.get_note(note["id"])) == "archived"
+    notes_store.unpromote_note(note["id"])
+    assert notes_store.derive_lifecycle(notes_store.get_note(note["id"])) == "resolved"
+
+
+def test_unpromote_note_preserves_resolution(notes_store):
+    note = notes_store.add_note("problem text")
+    notes_store.add_resolution(note["id"], "fixed it")
+    notes_store.promote_note(note["id"])
+    restored = notes_store.unpromote_note(note["id"])
+    assert restored["resolution"] == "fixed it"
+
+
 # ---------------------------------------------------------------------------
 # Priority flags (2026-07-04)
 # ---------------------------------------------------------------------------

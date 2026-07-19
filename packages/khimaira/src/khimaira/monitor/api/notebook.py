@@ -24,6 +24,7 @@ Endpoints:
                                    "move" = tab_id + pinned_placement=true together
   DELETE /notes/{id}            — delete a note
   POST   /notes/{id}/promote    — curated promotion (training.promoted=True)
+  POST   /notes/{id}/unpromote  — undo promote (the archive/restore counterpart)
   POST   /notes/{id}/resolution — v2: attach a resolution (roster-loop write-back);
                                    schedules a fire-and-forget mnemosyne distill
   POST   /notes/{id}/revalidate — Phase 2a north-star: re-ground vs current code
@@ -554,6 +555,15 @@ def build_router():
     async def promote_note(note_id: str) -> dict:
         try:
             return await asyncio.to_thread(notes.promote_note, note_id)
+        except ValueError as e:
+            raise fastapi.HTTPException(404, str(e)) from e
+
+    @router.post("/notes/{note_id}/unpromote")
+    async def unpromote_note(note_id: str) -> dict:
+        """Undo promote_note — the archive/restore counterpart. See
+        notes.unpromote_note for the exact reversal semantics."""
+        try:
+            return await asyncio.to_thread(notes.unpromote_note, note_id)
         except ValueError as e:
             raise fastapi.HTTPException(404, str(e)) from e
 
