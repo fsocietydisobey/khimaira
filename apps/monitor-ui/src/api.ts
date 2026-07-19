@@ -468,6 +468,25 @@ export const monitorApi = createApi({
         { type: "Tabs", id: "LIST" },
       ],
     }),
+    // Phase 2b semantic search (packages/khimaira/.../monitor/api/notebook.py
+    // `search_notes`, packages/khimaira/.../monitor/notebook_retrieval.py) —
+    // Qdrant-backed, matches by meaning over embedded notes AND study guides.
+    // Thin response (id + relevance score only, best-first) — callers resolve
+    // note_id → title/kind/summary against the already-loaded listNotes cache,
+    // falling back to getNote for cache misses. `[]` on no hits / RAG disabled
+    // / qdrant down (fail-open on the backend) — never errors.
+    searchNotes: build.query<
+      { hits: { note_id: string; score: number }[] },
+      { q: string; topK?: number; repo?: string }
+    >({
+      query: ({ q, topK, repo }) => {
+        const params = new URLSearchParams();
+        params.set("q", q);
+        if (topK !== undefined) params.set("top_k", String(topK));
+        if (repo) params.set("repo", repo);
+        return `/notes/search?${params.toString()}`;
+      },
+    }),
     listTabs: build.query<{ tabs: NotebookTab[] }, { repo?: string } | void>({
       query: (arg) => {
         const params = new URLSearchParams();
@@ -636,6 +655,7 @@ export const {
   useClearChatMutation,
   useCompactChatMutation,
   useDeleteNoteMutation,
+  useLazySearchNotesQuery,
   useListTabsQuery,
   useCreateTabMutation,
   useUpdateTabMutation,

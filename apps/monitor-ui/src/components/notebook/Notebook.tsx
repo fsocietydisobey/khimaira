@@ -34,9 +34,11 @@ import {
   Grid3x3,
   LayoutGrid,
   List,
+  Loader2,
   Plus,
   RefreshCw,
   Search,
+  Sparkles,
   Star,
   Ticket as TicketIcon,
   Trash2,
@@ -48,6 +50,7 @@ import {
   useCreateTabMutation,
   useDeleteNoteMutation,
   useGetNoteQuery,
+  useLazySearchNotesQuery,
   useListNotesQuery,
   useListProjectsQuery,
   useListTabsQuery,
@@ -327,6 +330,203 @@ function ViewModeToggle({
         </button>
       ))}
     </div>
+  );
+}
+
+/** Semantic ("find by meaning") search — a distinct capability alongside the
+ *  plain-text substring filter in Files mode (NotesFileManager's `search`
+ *  state above), not a replacement. Hits the Phase 2b `/notes/search`
+ *  endpoint (Qdrant-backed) via a lazy query, fired on Enter or ~400ms after
+ *  the user stops typing. The endpoint returns only `{note_id, score}` —
+ *  results are resolved against the caller's already-loaded notes cache
+ *  (`cachedNotes`, e.g. `mentionableNotes` in the parent) to avoid N
+ *  individual fetches for a corpus that's usually already in the RTK cache;
+ *  `SearchResultRow` falls back to `getNote` only for cache misses. */
+function AiSearchButton({
+  repoScope,
+  cachedNotes,
+  onSelectNote,
+}: {
+  repoScope?: string;
+  cachedNotes: Note[];
+  onSelectNote: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [triggerSearch, { data, isFetching, isUninitialized }] =
+    useLazySearchNotesQuery();
+
+  // Debounce ~400ms — this is a real network call (embed + qdrant query),
+  // not a client-side filter; don't fire on every keystroke.
+  useEffect(() => {
+    if (!open) return;
+    const trimmed = query.trim();
+    if (!trimmed) return;
+    const timer = setTimeout(() => {
+      void triggerSearch({ q: trimmed, repo: repoScope });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [open, query, repoScope, triggerSearch]);
+
+  // Close on outside click — same convention as the mention dropdown's
+  // Escape handling in ChatPanel, extended to a click-away since this panel
+  // (unlike the mention list) isn't anchored inside an always-visible input.
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [open]);
+
+  const cachedById = useMemo(() => {
+    const map = new Map<string, Note>();
+    for (const n of cachedNotes) map.set(n.id, n);
+    return map;
+  }, [cachedNotes]);
+
+  const hits = data?.hits ?? [];
+
+  return (
+    <div ref={containerRef} className="relative">
+      <button
+        type="button"
+        aria-pressed={open}
+        title="Find a note or guide by meaning"
+        onClick={() => setOpen((v) => !v)}
+        className={cn(
+          "flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors",
+          open
+            ? "border-violet-500/50 bg-violet-500/10 text-violet-300"
+            : "border-border bg-card/40 text-muted-foreground hover:text-foreground",
+        )}
+      >
+        <Sparkles className="h-3.5 w-3.5" />
+        AI search
+      </button>
+      {open ? (
+        <div className="absolute right-0 top-full z-30 mt-1 w-96 rounded-md border border-border bg-card shadow-lg">
+          <div className="border-b border-border p-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <input
+                autoFocus
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    const trimmed = query.trim();
+                    if (trimmed) void triggerSearch({ q: trimmed, repo: repoScope });
+                  } else if (e.key === "Escape") {
+                    setOpen(false);
+                  }
+                }}
+                placeholder="describe what you're looking for…"
+                className="w-full rounded-md border border-border bg-background/60 py-1.5 pl-7 pr-2 text-xs outline-none focus:border-ring"
+              />
+            </div>
+          </div>
+          <div className="max-h-80 overflow-y-auto">
+            {isFetching ? (
+              <div className="flex items-center gap-2 px-3 py-4 text-[11px] text-muted-foreground">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                searching…
+              </div>
+            ) : isUninitialized || !query.trim() ? (
+              <div className="px-3 py-4 text-[11px] text-muted-foreground">
+                matches by meaning, not exact words — e.g. "notes about
+                centralized KG networking".
+              </div>
+            ) : hits.length === 0 ? (
+              <div className="px-3 py-4 text-[11px] text-muted-foreground">
+                no matches for "{query.trim()}".
+              </div>
+            ) : (
+              hits.map((hit) => (
+                <SearchResultRow
+                  key={hit.note_id}
+                  hit={hit}
+                  cached={cachedById.get(hit.note_id)}
+                  onSelect={() => {
+                    onSelectNote(hit.note_id);
+                    setOpen(false);
+                  }}
+                />
+              ))
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SearchResultRow({
+  hit,
+  cached,
+  onSelect,
+}: {
+  hit: { note_id: string; score: number };
+  cached: Note | undefined;
+  onSelect: () => void;
+}) {
+  // Fallback fetch only for hits the caller's cache didn't already have —
+  // skipToken skips the request entirely once `cached` resolves.
+  const { data: fetched, isLoading } = useGetNoteQuery(
+    cached ? skipToken : hit.note_id,
+  );
+  const note = cached ?? fetched;
+
+  if (!note) {
+    return (
+      <div className="border-b border-border/50 px-3 py-2 text-[11px] text-muted-foreground last:border-b-0">
+        {isLoading ? "loading…" : "note unavailable"}
+      </div>
+    );
+  }
+
+  const isGuide = note.kind === "study_guide";
+  const snippet =
+    note.pipeline && isStudyGuidePipeline(note.pipeline)
+      ? note.pipeline.abstract
+      : note.pipeline && !isStudyGuidePipeline(note.pipeline)
+        ? note.pipeline.summary
+        : "";
+  const preview = snippet.trim() || note.raw_text.slice(0, 160).trim();
+
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className="flex w-full flex-col gap-0.5 border-b border-border/50 px-3 py-2 text-left last:border-b-0 hover:bg-accent/40"
+    >
+      <div className="flex items-center gap-1.5">
+        <Badge variant="outline" className="shrink-0 gap-0.5 text-[9px]">
+          {isGuide ? <BookMarked className="h-2.5 w-2.5" /> : null}
+          {isGuide ? "guide" : "note"}
+        </Badge>
+        <span className="min-w-0 flex-1 truncate text-xs font-medium">
+          {note.title}
+        </span>
+        <span
+          className="shrink-0 text-[9px] text-muted-foreground"
+          title="relevance"
+        >
+          {Math.round(hit.score * 100)}%
+        </span>
+      </div>
+      {preview ? (
+        <p className="line-clamp-2 text-[10px] text-muted-foreground">
+          {preview}
+        </p>
+      ) : null}
+      <span className="text-[9px] text-muted-foreground/70">{note.repo}</span>
+    </button>
   );
 }
 
@@ -635,6 +835,11 @@ export function Notebook() {
             <NotebookSectionToggle section={section} onChange={setSection} />
             {section === "notes" ? (
               <>
+                <AiSearchButton
+                  repoScope={repoScope}
+                  cachedNotes={mentionableNotes}
+                  onSelectNote={handleSelectNote}
+                />
                 <button
                   type="button"
                   aria-pressed={archivedOnly}
