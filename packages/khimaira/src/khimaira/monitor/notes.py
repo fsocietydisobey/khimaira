@@ -1664,13 +1664,30 @@ def _assert_sibling_unique(
     title-uniqueness assumption once tabs nest (two "API" collections under
     DIFFERENT parents are fine; two under the SAME parent are not — the
     latter is what silently let the organizer misfile before nesting
-    existed to make the ambiguity possible)."""
+    existed to make the ambiguity possible).
+
+    Repo collision check also treats GENERAL_REPO as universal (2026-07-19):
+    list_tabs already shows `repo OR GENERAL_REPO` together in every
+    project's sidebar, so a project-scoped tab and a general-bucket tab
+    sharing a title visually collide even though their `repo` fields
+    differ. Two DIFFERENT specific repos (e.g. khimaira vs jeevy_portal)
+    never collide — they never render in the same sidebar.
+
+    Note: this only guards the add_tab/update_tab creation path. It does
+    NOT run during the one-time tab-repo migration (_apply_tab_repo_migration_plan
+    writes tab records directly) — that migration is what originally produced
+    same-repo duplicate tabs sharing a title, since two independently-created,
+    then-unscoped tabs could carry the same title and land in the same repo
+    once assigned. That's a one-time historical data-quality issue (fixed by
+    a retroactive merge), not a live gap this check needs to also cover."""
     title_norm = title.strip().lower()
     for tab in _fold_tabs().values():
         if tab["id"] == exclude_tab_id:
             continue
+        tab_repo = tab.get("repo")
+        repo_collides = tab_repo == repo or GENERAL_REPO in (tab_repo, repo)
         if (
-            tab.get("repo") == repo
+            repo_collides
             and tab.get("kind") == kind
             and tab.get("parent_id") == parent_id
             and tab["title"].strip().lower() == title_norm

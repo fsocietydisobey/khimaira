@@ -1821,6 +1821,24 @@ def test_sibling_uniqueness_is_scoped_by_repo(notes_store):
         notes_store.add_tab("root", repo="repo-a")
 
 
+def test_sibling_uniqueness_treats_general_repo_as_universal(notes_store):
+    notes_store.add_tab("Testing", repo=notes_store.GENERAL_REPO)
+    with pytest.raises(notes_store.TabValidationError, match="already exists"):
+        notes_store.add_tab("testing", repo="repo-a")
+
+
+def test_sibling_uniqueness_general_repo_blocked_by_any_existing_project_tab(notes_store):
+    notes_store.add_tab("Testing", repo="repo-a")
+    with pytest.raises(notes_store.TabValidationError, match="already exists"):
+        notes_store.add_tab("testing", repo=notes_store.GENERAL_REPO)
+
+
+def test_sibling_uniqueness_two_specific_repos_do_not_collide(notes_store):
+    notes_store.add_tab("Testing", repo="repo-a")
+    created = notes_store.add_tab("Testing", repo="repo-b")
+    assert created["title"] == "Testing"
+
+
 def test_cross_repo_tab_access_parent_and_mutation_are_not_found(notes_store):
     tab_b = notes_store.add_tab("B", repo="repo-b")
     original = dict(notes_store.get_tab(tab_b["id"], repo="repo-b"))
