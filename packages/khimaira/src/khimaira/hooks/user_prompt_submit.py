@@ -960,6 +960,17 @@ def _poll_missed_chat_events(session_id: str) -> str:
     message older than 10 minutes (staleness cap). Updates watermarks after each
     successful fetch.
 
+    Also excludes `role_directive` system messages (meta.event_type ==
+    "role_directive"): they carry Claude-Code-specific slash-command guidance
+    (`/model`, `/effort`) that is meaningless — and confusing — to a non-Claude
+    consumer (this function is shared verbatim by codex_user_prompt_submit.py).
+    Role assignment itself is durable state (chat.meta.member_roles), so a
+    session that missed the live directive still learns its role correctly on
+    its next tool call; nothing is lost by dropping it from this replay
+    surface. This is a defense-in-depth backstop — the emitting side
+    (chats._emit_role_directive) also marks the record `private=True` so
+    history()/this endpoint already excludes it for non-target members.
+
     Returns a formatted block, or "" when nothing new.
     Silently returns "" on daemon-down or any error.
     Opt-out: KHIMAIRA_CHAT_POLL_BANNER=0.
@@ -1028,6 +1039,7 @@ def _poll_missed_chat_events(session_id: str) -> str:
             m for m in messages
             if m.get("kind") == "msg"
             and m.get("sender_id") != session_id
+            and (m.get("meta") or {}).get("event_type") != "role_directive"
             and (watermark is not None or (m.get("ts") or "") >= cutoff_iso)
         ]
         if new_msgs:

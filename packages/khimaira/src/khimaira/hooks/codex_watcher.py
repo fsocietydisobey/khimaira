@@ -175,6 +175,19 @@ def _poll_once(watermarks: dict[str, str]) -> None:
         for m in messages:
             if m.get("kind") != "msg":
                 continue
+            # role_directive carries Claude-Code-specific slash-command guidance
+            # (/model, /effort) that is meaningless to a Codex session. Role
+            # assignment is durable state (chat.meta.member_roles), so a
+            # session that misses this injection still learns its role
+            # correctly on its next tool call — nothing is lost by skipping
+            # it. Backstops chats._emit_role_directive's private=True (which
+            # already hides this from bystander members via history()'s
+            # filter) for the remaining case where a Codex session IS the
+            # directive's legitimate `to`-target (e.g. codex-master itself
+            # granted a role) and would otherwise see the raw Claude text
+            # injected verbatim into its terminal.
+            if (m.get("meta") or {}).get("event_type") == "role_directive":
+                continue
             sender = m.get("sender_id")
             targets = m.get("to") or [x for x in members if x != sender]
             for target in targets:

@@ -3267,6 +3267,66 @@ def test_subscribe_backfill_skips_role_directives(isolated_chats):
             break
 
 
+def test_role_directive_is_private_to_target(isolated_chats):
+    """Class-closure regression: role_directive records must be marked
+    private=True so non-target members can't see Claude-Code-specific
+    slash-command guidance via history() replay (e.g. a Codex session
+    sharing the chat polling GET /api/chats/{id}/messages).
+
+    Bug: _emit_role_directive set `to=[target]` (scopes the live SSE push)
+    but not `private=True` (scopes history()/replay visibility), so
+    history() returned the directive to EVERY accepted member, not just
+    the target. See CLAUDE.md-adjacent chat-062cc92f32dd repro.
+    """
+    from khimaira.monitor import sessions as sessions_mod
+
+    c = isolated_chats
+    _make_session(sessions_mod, "alice-uuid", "alice")
+    _make_session(sessions_mod, "bob-uuid", "bob")
+    room = c.create_room(
+        "alice-uuid",
+        ["bob-uuid"],
+        title="t",
+        member_roles={"alice-uuid": c.ROLE_MASTER, "bob-uuid": c.ROLE_AGENT},
+    )
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob-uuid")
+
+    directives = _directives(c, chat_id)
+    assert len(directives) >= 1
+    assert all(
+        d.get("private") is True for d in directives
+    ), "role_directive records must be emitted with private=True"
+
+    # Bob sends a normal message so we can confirm the private filter is
+    # scoped to role_directive and doesn't over-filter ordinary chat.
+    c.send_message(chat_id, "bob-uuid", "hello from bob")
+
+    # Alice is the master AND the target of her own create_room directive —
+    # she must still see it (audit + self-target visibility).
+    alice_view = c.history(chat_id, "alice-uuid")
+    alice_bodies = [m.get("body") for m in alice_view]
+    assert any("Role updated" in (b or "") for b in alice_bodies)
+    assert any("hello from bob" in (b or "") for b in alice_bodies)
+
+    # Bob was granted "agent", not "master" — Bob's own role_directive (if
+    # any) targets Bob, so Bob sees his own. But Bob must NOT see Alice's
+    # master-targeted role_directive (an ordinary non-master member reading
+    # someone else's private directive is exactly the leak this closes).
+    bob_view = c.history(chat_id, "bob-uuid")
+    bob_directive_bodies = [
+        m.get("body")
+        for m in bob_view
+        if (m.get("meta") or {}).get("event_type") == "role_directive"
+    ]
+    assert all(
+        "master" not in (b or "").lower() for b in bob_directive_bodies
+    ), "bob (non-master, non-target) must not see alice's role_directive"
+    # Ordinary chat still passes through the private filter untouched.
+    bob_bodies = [m.get("body") for m in bob_view]
+    assert any("hello from bob" in (b or "") for b in bob_bodies)
+
+
 def test_gc_role_directives_drops_historical_dupes(isolated_chats):
     """gc_role_directives_in_chat keeps only the latest directive per target."""
     from khimaira.monitor import sessions as sessions_mod

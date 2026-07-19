@@ -104,6 +104,60 @@ def test_poll_missed_chat_events_formats_correctly(hook_module):
     assert "second message" in result
 
 
+def test_poll_missed_chat_events_excludes_role_directive(hook_module):
+    """Regression: role_directive system messages (Claude-Code-specific
+    /model + /effort slash-command guidance) must NOT surface in the
+    generic "missed chat events" replay — this function is shared
+    verbatim by codex_user_prompt_submit.py, so a Codex session polling
+    the same chat must not see Claude-only guidance. A normal `msg` from
+    another session must still surface (don't over-filter).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    ts1 = (now - timedelta(minutes=2)).isoformat()
+    ts2 = (now - timedelta(minutes=1)).isoformat()
+
+    chats_payload = {
+        "chats": [{"chat_id": CHAT_ID, "title": "test chat", "my_state": "accepted"}]
+    }
+    messages_payload = {
+        "messages": [
+            {
+                "kind": "msg",
+                "event_id": "evt-001",
+                "sender_id": "system",
+                "sender_name": "system",
+                "ts": ts1,
+                "body": "🎚️ Role updated: you are now master. Recommended budget: "
+                "/model opus[1m], /effort max.",
+                "to": ["bbbbbbbb-0000-0000-0000-000000000002"],
+                "private": True,
+                "meta": {"event_type": "role_directive", "role": "master"},
+            },
+            {
+                "kind": "msg",
+                "event_id": "evt-002",
+                "sender_id": "cccccccc-0000-0000-0000-000000000003",
+                "sender_name": "agent-3",
+                "ts": ts2,
+                "body": "a normal chat message",
+            },
+        ]
+    }
+
+    with patch(
+        "khimaira.hooks.user_prompt_submit.urllib.request.urlopen",
+        side_effect=_mock_urlopen([chats_payload, messages_payload]),
+    ):
+        result = hook_module._poll_missed_chat_events(SESSION_ID)
+
+    assert "/model opus[1m]" not in result
+    assert "Role updated" not in result
+    assert "a normal chat message" in result
+    assert "agent-3" in result
+
+
 # ---------------------------------------------------------------------------
 # Fix B (muther ISSUE 1/2, 2026-06-18) — catch-up staleness cap decoupled from
 # wake latency: an unseen-but-old dispatch must surface once a watermark proves

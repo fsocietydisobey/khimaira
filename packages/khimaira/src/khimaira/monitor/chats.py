@@ -450,6 +450,18 @@ def _emit_role_directive(
     pushes to the recipient — sibling agents see the role change via
     member_roles META, not via the slash-command guidance.
 
+    `private=True`: the directive's slash-command guidance is CLI-specific
+    (Claude Code `/model` + `/effort`) and meaningless to non-Claude
+    consumers (e.g. Codex sessions sharing this chat). `to` alone only
+    controls the live SSE push target — `history()` (and anything reading
+    it, e.g. GET /api/chats/{id}/messages, _poll_missed_chat_events) would
+    otherwise return this record to every accepted member on replay.
+    `private=True` scopes visibility in history() to sender/target/master,
+    matching this function's own "sibling agents see the role change via
+    member_roles META" claim above. `_broadcast` (the live-push path)
+    filters solely on `to`, not `private`, so this does not affect
+    real-time delivery to the intended recipient.
+
     **Silent-skip when role is not in ROLE_BUDGET** (currently just
     `critic`). The directive's purpose is slash-command guidance; for
     roles without a default, there's nothing to recommend, and the
@@ -480,6 +492,7 @@ def _emit_role_directive(
         "sender_name": SYSTEM_SENDER_ID,
         "body": body,
         "to": [target_session_id],
+        "private": True,
         "meta": {
             "event_type": "role_directive",
             "role": role,
