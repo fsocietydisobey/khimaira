@@ -211,12 +211,16 @@ def _new_id() -> str:
 
 
 def derive_lifecycle(record: dict[str, Any]) -> str:
-    """captured -> reviewed -> resolved, derived (not stored). A note is
-    "resolved" once a resolution has been attached (see `add_resolution`) —
-    that's the training-quality gate: a problem earns training status by
-    being worked to completion, not by being merely structured. "reviewed"
-    means the structuring pipeline ran (status processed/promoted) but no
-    resolution has landed yet; anything else (draft/failed) is "captured".
+    """captured -> reviewed -> resolved -> archived, derived (not stored).
+
+    A resolved note becomes "archived" only after curated promotion, so
+    `resolution` truthy plus `status="promoted"` takes precedence over the
+    ordinary resolved state. A note is otherwise "resolved" once a resolution
+    has been attached (see `add_resolution`) — that's the training-quality
+    gate: a problem earns training status by being worked to completion, not
+    by being merely structured. "reviewed" means the structuring pipeline ran
+    (status processed/promoted) but no resolution has landed yet; anything
+    else (draft/failed) is "captured".
 
     Study guides (kind="study_guide") get a DIFFERENT lifecycle — they're
     finished deliverables to house, not problems to resolve, so
@@ -232,6 +236,8 @@ def derive_lifecycle(record: dict[str, Any]) -> str:
     for schema uniformity with the generic _index_stub projection)."""
     if record.get("kind") == "study_guide":
         return "organized" if record.get("organized_at") else "housed"
+    if record.get("resolution") and record.get("status") == "promoted":
+        return "archived"
     if record.get("resolution"):
         return "resolved"
     if record.get("status") in ("processed", "promoted"):
@@ -865,6 +871,7 @@ def list_notes(
     priority: str | None = None,
     starred: bool | None = None,
     test_status: str | None = None,
+    archived: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Newest-created first. Sorted by created_at (not updated_at) so a
     revalidate/heal pass — which only bumps updated_at — doesn't reshuffle
@@ -891,9 +898,16 @@ def list_notes(
 
     `test_status`, when given, scopes to that testing-workflow status
     ("untested"|"needs_testing"|"in_review"|"tested"). `test_status=None`
-    returns all."""
+    returns all.
+
+    `archived`, when given, scopes by the derived lifecycle: `True` returns
+    only lifecycle="archived" notes; `False` excludes them; `None` returns
+    both archived and active records."""
     initialize_tab_repo_migration()
-    stubs = list(_fold_index().values())
+    # Lifecycle is a projection, not persisted source-of-truth. Re-derive it
+    # from every folded stub so records written by an older release immediately
+    # gain new lifecycle states without a disk rewrite or migration.
+    stubs = [{**stub, "lifecycle": derive_lifecycle(stub)} for stub in _fold_index().values()]
     if tab_id is not None:
         stubs = [s for s in stubs if s["tab_id"] == tab_id]
     if repo is not None:
@@ -906,6 +920,8 @@ def list_notes(
         stubs = [s for s in stubs if s.get("starred", False) == starred]
     if test_status is not None:
         stubs = [s for s in stubs if s.get("test_status", _DEFAULT_TEST_STATUS) == test_status]
+    if archived is not None:
+        stubs = [s for s in stubs if (s.get("lifecycle") == "archived") == archived]
     stubs.sort(key=lambda s: s["created_at"], reverse=True)
     return stubs
 

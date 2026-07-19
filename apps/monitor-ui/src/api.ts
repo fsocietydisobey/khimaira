@@ -299,6 +299,8 @@ export const monitorApi = createApi({
           starred?: boolean;
           /** Human testing-workflow status (notes only). */
           testStatus?: NoteTestStatus;
+          /** Derived lifecycle archive filter. False explicitly excludes archived. */
+          archived?: boolean;
         }
       | void
     >({
@@ -311,6 +313,8 @@ export const monitorApi = createApi({
         if (arg?.sort) params.set("sort", arg.sort);
         if (arg?.starred) params.set("starred", "true");
         if (arg?.testStatus) params.set("test_status", arg.testStatus);
+        if (arg?.archived !== undefined)
+          params.set("archived", String(arg.archived));
         const qs = params.toString();
         return qs ? `/notes?${qs}` : "/notes";
       },
@@ -460,8 +464,13 @@ export const monitorApi = createApi({
         { type: "Tabs", id: "LIST" },
       ],
     }),
-    listTabs: build.query<{ tabs: NotebookTab[] }, void>({
-      query: () => "/tabs",
+    listTabs: build.query<{ tabs: NotebookTab[] }, { repo?: string } | void>({
+      query: (arg) => {
+        const params = new URLSearchParams();
+        if (arg?.repo) params.set("repo", arg.repo);
+        const qs = params.toString();
+        return qs ? `/tabs?${qs}` : "/tabs";
+      },
       providesTags: (result) =>
         result
           ? [

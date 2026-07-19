@@ -9,6 +9,11 @@
 
 export type NoteStatus = "draft" | "processed" | "promoted" | "failed";
 
+/** Read-only workflow projection derived by the backend. Regular notes use
+ * captured/reviewed/resolved/archived; study guides use housed/organized. */
+export type NoteLifecycle =
+  "captured" | "reviewed" | "resolved" | "archived" | "housed" | "organized";
+
 /** User-set importance, independent of `NoteStatus` (lifecycle). Mirrors the
  *  backend's `_VALID_PRIORITIES`; default "normal". */
 export type NotePriority = "low" | "normal" | "high" | "urgent";
@@ -75,6 +80,7 @@ export interface Note {
   tab_id: string;
   raw_text: string;
   status: NoteStatus;
+  lifecycle: NoteLifecycle;
   /** Default "note" for every pre-grimoire record. Narrow on this before
    *  reading `pipeline` — it discriminates NotePipeline vs StudyGuidePipeline. */
   kind: NoteKind;
@@ -321,4 +327,3 @@ export interface ChatMessage {
   /** Notebook-wide only — repos where no code-grounding was available. */
   codeUnavailable?: string[];
 }
-

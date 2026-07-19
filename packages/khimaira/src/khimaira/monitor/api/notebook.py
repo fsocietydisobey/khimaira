@@ -3,8 +3,9 @@
 Endpoints:
   POST   /notes                 — create a draft note (or, kind="study_guide", a
                                    grimoire guide); kicks off the structuring pipeline
-  GET    /notes?tab_id=&repo=&kind=&priority=&starred= — list notes, optionally
-                                   filtered by tab/repo/kind/priority/starred
+  GET    /notes?tab_id=&repo=&kind=&priority=&starred=&archived= — list notes,
+                                   optionally filtered by tab/repo/kind/priority/
+                                   starred/archived lifecycle
   POST   /notes/import          — grimoire Phase 1c: bulk-import study guides from a
                                    directory (dry_run=True by default — manifest only)
   GET    /notes/search?q=       — Phase 2b: semantic search over embedded notes
@@ -394,6 +395,7 @@ def build_router():
         priority: str | None = None,
         starred: bool | None = None,
         test_status: str | None = None,
+        archived: bool | None = None,
         sort: str | None = None,
     ) -> dict:
         """`repo`, when given, scopes to that repo plus the "General" bucket
@@ -405,7 +407,9 @@ def build_router():
         `priority`, when given, scopes to one priority value. `starred`
         (FILE-MANAGER, 2026-07-04), when given, scopes to that starred
         state — the Starred rail. `test_status` (2026-07-07), when given,
-        scopes to one testing-workflow status value. `sort`
+        scopes to one testing-workflow status value. `archived`, when given,
+        selects (`true`) or excludes (`false`) lifecycle="archived" notes;
+        omitted returns both. `sort`
         (`"priority"` or `"-priority"`) orders the result by urgent > high >
         normal > low (or the reverse) — a presentation concern, so it's
         applied here rather than inside notes.list_notes."""
@@ -417,6 +421,7 @@ def build_router():
             priority=priority,
             starred=starred,
             test_status=test_status,
+            archived=archived,
         )
         if sort in ("priority", "-priority"):
             result = sorted(

@@ -72,7 +72,7 @@ export function Library() {
   // no repo scope here — unlike the regular note list, which follows the
   // project route it's mounted under.
   const { data: guidesData, isLoading } = useListNotesQuery(
-    { kind: "study_guide" },
+    { kind: "study_guide", archived: false },
     { pollingInterval: 5000 },
   );
   const { data: tabsData } = useListTabsQuery();

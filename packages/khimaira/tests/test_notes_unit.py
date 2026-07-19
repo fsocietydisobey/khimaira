@@ -800,6 +800,21 @@ def test_derive_lifecycle_resolved_once_resolution_lands(notes_store):
     assert notes_store.derive_lifecycle(resolved) == "resolved"
 
 
+def test_derive_lifecycle_archived_after_resolution_and_promotion(notes_store):
+    note = notes_store.add_note("raw")
+    resolved = notes_store.add_resolution(note["id"], "fixed it")
+    assert notes_store.derive_lifecycle(resolved) == "resolved"
+
+    promoted = notes_store.promote_note(note["id"])
+    assert notes_store.derive_lifecycle(promoted) == "archived"
+
+
+def test_derive_lifecycle_promoted_without_resolution_is_reviewed(notes_store):
+    note = notes_store.add_note("raw")
+    promoted = notes_store.promote_note(note["id"])
+    assert notes_store.derive_lifecycle(promoted) == "reviewed"
+
+
 def test_list_notes_includes_resolution_fields_and_lifecycle(notes_store):
     tab = notes_store.add_tab(title="t1")
     note = notes_store.add_note("raw", tab_id=tab["id"])
@@ -1332,6 +1347,45 @@ def test_list_notes_starred_filter(notes_store):
 
     unstarred_only = notes_store.list_notes(starred=False)
     assert starred_note["id"] not in [n["id"] for n in unstarred_only]
+
+
+def test_list_notes_archived_filter(notes_store):
+    active = notes_store.add_note("active")
+    resolved = notes_store.add_note("resolved")
+    notes_store.add_resolution(resolved["id"], "fixed")
+    archived = notes_store.add_note("archived")
+    notes_store.add_resolution(archived["id"], "fixed")
+    notes_store.promote_note(archived["id"])
+
+    archived_only = notes_store.list_notes(archived=True)
+    assert [note["id"] for note in archived_only] == [archived["id"]]
+
+    active_only = notes_store.list_notes(archived=False)
+    assert {note["id"] for note in active_only} == {active["id"], resolved["id"]}
+
+    all_notes = notes_store.list_notes(archived=None)
+    assert {note["id"] for note in all_notes} == {
+        active["id"],
+        resolved["id"],
+        archived["id"],
+    }
+
+
+def test_list_notes_archived_filter_rederives_stale_persisted_lifecycle(notes_store):
+    note = notes_store.add_note("legacy archived")
+    notes_store.add_resolution(note["id"], "fixed")
+    promoted = notes_store.promote_note(note["id"])
+
+    stale_stub = {
+        **notes_store._index_stub(promoted),
+        "lifecycle": "resolved",
+    }
+    notes_store._append_jsonl(notes_store._index_path(), stale_stub)
+    assert notes_store._fold_index()[note["id"]]["lifecycle"] == "resolved"
+
+    archived = notes_store.list_notes(archived=True)
+    assert [record["id"] for record in archived] == [note["id"]]
+    assert archived[0]["lifecycle"] == "archived"
 
 
 def test_update_note_pinned_placement_and_starred_round_trip(notes_store):

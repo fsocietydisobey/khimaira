@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 
 import pytest
@@ -594,6 +595,53 @@ def test_list_notes_starred_filter_route(notebook_client):
     assert r.status_code == 200
     ids = [n["id"] for n in r.json()["notes"]]
     assert ids == [starred["id"]]
+
+
+def test_list_notes_archived_filter_route(isolated_state, monkeypatch):
+    from khimaira.monitor import notebook_pipeline as pipeline_mod
+    from khimaira.monitor import notebook_training as training_mod
+    from khimaira.monitor import notes as notes_mod
+    from khimaira.monitor.api import notebook as notebook_api
+
+    importlib.reload(notes_mod)
+    importlib.reload(pipeline_mod)
+    importlib.reload(training_mod)
+    importlib.reload(notebook_api)
+    monkeypatch.setattr(
+        notebook_api.notebook_training,
+        "schedule_promote",
+        lambda record: None,
+    )
+
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(notebook_api.asyncio, "to_thread", run_inline)
+
+    active = notebook_api.notes.add_note("active")
+    archived = notebook_api.notes.add_note("archived")
+    notebook_api.notes.add_resolution(archived["id"], "fixed it")
+    notebook_api.notes.promote_note(archived["id"])
+
+    router = notebook_api.build_router()
+    list_endpoint = next(
+        route.endpoint
+        for route in router.routes
+        if route.path == "/notes" and "GET" in route.methods
+    )
+
+    async def query_notes(archived_param: bool | None) -> list[dict]:
+        response = await list_endpoint(archived=archived_param)
+        return response["notes"]
+
+    archived_only = asyncio.run(query_notes(True))
+    assert [note["id"] for note in archived_only] == [archived["id"]]
+
+    active_only = asyncio.run(query_notes(False))
+    assert [note["id"] for note in active_only] == [active["id"]]
+
+    unfiltered = asyncio.run(query_notes(None))
+    assert {note["id"] for note in unfiltered} == {active["id"], archived["id"]}
 
 
 def test_list_tabs_empty_store(notebook_client):

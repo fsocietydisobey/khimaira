@@ -24,6 +24,7 @@ import { skipToken } from "@reduxjs/toolkit/query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import {
+  Archive,
   BookMarked,
   BookOpen,
   CheckCircle2,
@@ -344,6 +345,7 @@ export function Notebook() {
   const [newTabTitle, setNewTabTitle] = useState("");
   const [priorityFilter, setPriorityFilter] = useState<NotePriority | "">("");
   const [testStatusFilter, setTestStatusFilter] = useState<NoteTestStatus | "">("");
+  const [archivedOnly, setArchivedOnly] = useState(false);
   const [showAddPersonalNote, setShowAddPersonalNote] = useState(false);
   const [personalDraft, setPersonalDraft] = useState("");
   const [centerView, setCenterView] = useState<CenterView>(null);
@@ -383,13 +385,14 @@ export function Notebook() {
   );
   const repoScope = allProjects ? undefined : projectName || undefined;
 
-  const { data: tabsData } = useListTabsQuery();
+  const { data: tabsData } = useListTabsQuery({ repo: repoScope });
   const { data: notesData, isLoading: notesLoading } = useListNotesQuery(
     {
       tabId: selectedTab === ALL_TABS ? undefined : selectedTab,
       repo: repoScope,
       priority: priorityFilter || undefined,
       testStatus: testStatusFilter || undefined,
+      archived: archivedOnly,
       sort: "-priority",
     },
     { pollingInterval: 3000 },
@@ -399,14 +402,17 @@ export function Notebook() {
   // must NOT be narrowed by Grid/Reader's selectedTab or priorityFilter.
   // skipToken when Files isn't the active mode — no wasted fetch.
   const { data: filesNotesData, isLoading: filesNotesLoading } =
-    useListNotesQuery(viewMode === "files" ? { repo: repoScope } : skipToken, {
-      pollingInterval: 5000,
-    });
+    useListNotesQuery(
+      viewMode === "files"
+        ? { repo: repoScope, archived: archivedOnly }
+        : skipToken,
+      { pollingInterval: 5000 },
+    );
   // Personal/Behavior folder — independent of the tab filter / repo scope
   // above; always the same notes regardless of what the regular list is
   // scoped to.
   const { data: personalNotesData } = useListNotesQuery(
-    { tabId: PERSONAL_TAB_ID },
+    { tabId: PERSONAL_TAB_ID, archived: false },
     { pollingInterval: 5000 },
   );
   const { data: projectsData } = useListProjectsQuery();
@@ -593,21 +599,23 @@ export function Notebook() {
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {notesListPanel}
       </div>
-      <PersonalFolderSection
-        notes={personalNotes}
-        selectedNoteId={
-          viewMode === "reader" && centerView?.kind === "note"
-            ? centerView.noteId
-            : null
-        }
-        onSelectNote={handleSelectNote}
-        showAddNote={showAddPersonalNote}
-        onToggleAddNote={() => setShowAddPersonalNote((v) => !v)}
-        draft={personalDraft}
-        onDraftChange={setPersonalDraft}
-        creatingNote={creatingNote}
-        onAddNote={handleAddPersonalNote}
-      />
+      {!archivedOnly ? (
+        <PersonalFolderSection
+          notes={personalNotes}
+          selectedNoteId={
+            viewMode === "reader" && centerView?.kind === "note"
+              ? centerView.noteId
+              : null
+          }
+          onSelectNote={handleSelectNote}
+          showAddNote={showAddPersonalNote}
+          onToggleAddNote={() => setShowAddPersonalNote((v) => !v)}
+          draft={personalDraft}
+          onDraftChange={setPersonalDraft}
+          creatingNote={creatingNote}
+          onAddNote={handleAddPersonalNote}
+        />
+      ) : null}
     </div>
   );
 
@@ -624,7 +632,28 @@ export function Notebook() {
           <div className="flex items-center gap-3">
             <NotebookSectionToggle section={section} onChange={setSection} />
             {section === "notes" ? (
-              <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+              <>
+                <button
+                  type="button"
+                  aria-pressed={archivedOnly}
+                  title="Show archived notes only"
+                  onClick={() => {
+                    setArchivedOnly((value) => !value);
+                    setCenterView(null);
+                    setSelected(new Set());
+                  }}
+                  className={cn(
+                    "flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors",
+                    archivedOnly
+                      ? "border-amber-500/50 bg-amber-500/10 text-amber-300"
+                      : "border-border bg-card/40 text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Archive className="h-3.5 w-3.5" />
+                  archived
+                </button>
+                <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+              </>
             ) : null}
             <ProjectNavTabs projectName={projectName} />
           </div>
