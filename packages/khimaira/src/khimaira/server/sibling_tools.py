@@ -23,12 +23,61 @@ module's import.
 
 from __future__ import annotations
 
+import functools
 import importlib
+import inspect
 import logging
+from collections.abc import Callable
+from typing import Any
 
 log = logging.getLogger(__name__)
 
 SIBLING_PACKAGES: tuple[str, ...] = ("seance", "specter", "scarlet", "sibyl", "themis")
+
+
+def _isolate_tool_base_exceptions(
+    fn: Callable[..., Any], *, qualified_name: str
+) -> Callable[..., Any]:
+    """Keep process-control exceptions from escaping a sibling tool call.
+
+    FastMCP already converts ordinary ``Exception`` subclasses into tool-call
+    errors, so those deliberately pass through unchanged. ``SystemExit``,
+    ``KeyboardInterrupt``, ``GeneratorExit``, and any future direct
+    ``BaseException`` subclass are process-control signals; a sibling tool must
+    not be able to use one to terminate the shared khimaira MCP process.
+
+    ``functools.wraps`` is load-bearing: FastMCP inspects the callable's
+    signature when building its input schema, and follows ``__wrapped__`` to
+    retain the sibling tool's real parameters instead of exposing
+    ``*args, **kwargs``.
+    """
+
+    def _normalize(exc: BaseException) -> RuntimeError:
+        return RuntimeError(f"sibling tool {qualified_name} raised {type(exc).__name__}: {exc}")
+
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def _async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await fn(*args, **kwargs)
+            except Exception:
+                raise
+            except BaseException as exc:
+                raise _normalize(exc) from exc
+
+        return _async_wrapper
+
+    @functools.wraps(fn)
+    def _sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            raise
+        except BaseException as exc:
+            raise _normalize(exc) from exc
+
+    return _sync_wrapper
 
 
 def register_sibling_tools(khimaira_mcp) -> int:
@@ -62,7 +111,7 @@ def register_sibling_tools(khimaira_mcp) -> int:
             new_name = f"{prefix}{tool.name}"
             try:
                 khimaira_mcp._tool_manager.add_tool(
-                    tool.fn,
+                    _isolate_tool_base_exceptions(tool.fn, qualified_name=f"{name}.{tool.name}"),
                     name=new_name,
                     description=tool.description or "",
                 )

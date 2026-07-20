@@ -10,17 +10,26 @@ Commands:
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from pathlib import Path
 
 import click
 
-from seance.config import load_config
+from seance.config import SeanceConfigError, load_config
 
 
-@click.group()
+class _SeanceGroup(click.Group):
+    """Keep process termination at the CLI boundary, not in library code."""
+
+    def invoke(self, ctx: click.Context):
+        try:
+            return super().invoke(ctx)
+        except SeanceConfigError as exc:
+            sys.exit(str(exc))
+
+
+@click.group(cls=_SeanceGroup)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging.")
 def main(verbose: bool) -> None:
     """Séance — semantic codebase search."""
@@ -46,8 +55,10 @@ def index(path: str, name: str | None) -> None:
     pipeline = IndexingPipeline(config)
     stats = pipeline.index_project(project_path, project_name)
 
-    click.echo(f"Indexed '{project_name}': {stats['file_count']} files, "
-               f"{stats['chunk_count']} chunks, {stats['embedded_count']} embedded")
+    click.echo(
+        f"Indexed '{project_name}': {stats['file_count']} files, "
+        f"{stats['chunk_count']} chunks, {stats['embedded_count']} embedded"
+    )
 
 
 @main.command()
@@ -64,8 +75,10 @@ def reindex(path: str, name: str | None) -> None:
     pipeline = IndexingPipeline(config)
     stats = pipeline.reindex_changed(project_path, project_name)
 
-    click.echo(f"Reindexed '{project_name}': {stats['changed_files']} changed files, "
-               f"{stats['chunk_count']} chunks, {stats['embedded_count']} embedded")
+    click.echo(
+        f"Reindexed '{project_name}': {stats['changed_files']} changed files, "
+        f"{stats['chunk_count']} chunks, {stats['embedded_count']} embedded"
+    )
 
 
 @main.command()
@@ -74,7 +87,9 @@ def reindex(path: str, name: str | None) -> None:
 @click.option("--top-k", "-k", default=10, help="Number of results.")
 @click.option("--language", "-l", default=None, help="Filter by language.")
 @click.option("--type", "-t", "chunk_type", default=None, help="Filter by chunk type.")
-def search(project: str, query: str, top_k: int, language: str | None, chunk_type: str | None) -> None:
+def search(
+    project: str, query: str, top_k: int, language: str | None, chunk_type: str | None
+) -> None:
     """Search an indexed codebase with a natural language query."""
     from seance.search.engine import SearchEngine
 
@@ -126,4 +141,5 @@ def list_projects() -> None:
 def serve() -> None:
     """Start the MCP server (stdio transport)."""
     from seance.server import mcp
+
     mcp.run()

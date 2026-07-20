@@ -9,7 +9,31 @@ Verifies that:
 
 from __future__ import annotations
 
+import inspect
+from types import SimpleNamespace
+
+import pytest
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+
+
+def _register_fake_sibling(monkeypatch, *functions):
+    import khimaira.server.sibling_tools as st
+
+    sibling_mcp = FastMCP("fake-sibling")
+    for function in functions:
+        sibling_mcp.tool()(function)
+
+    monkeypatch.setattr(st, "SIBLING_PACKAGES", ("fake",))
+    monkeypatch.setattr(
+        st.importlib,
+        "import_module",
+        lambda module_name: SimpleNamespace(mcp=sibling_mcp),
+    )
+
+    khimaira_mcp = FastMCP("test-khimaira")
+    assert st.register_sibling_tools(khimaira_mcp) == len(functions)
+    return khimaira_mcp
 
 
 def test_register_sibling_tools_attaches_all_three_packages():
@@ -83,3 +107,56 @@ def test_register_sibling_tools_idempotent_within_fresh_server():
     second = register_sibling_tools(fresh_mcp)
     assert first >= 40
     assert second == 0 or second == first  # duplicate-overwrite or skip
+
+
+@pytest.mark.asyncio
+async def test_system_exit_becomes_tool_error_and_server_remains_callable(monkeypatch):
+    def fatal(value: int) -> int:
+        raise SystemExit(f"bad configuration for {value}")
+
+    def echo(value: int, prefix: str = "ok") -> str:
+        return f"{prefix}:{value}"
+
+    khimaira_mcp = _register_fake_sibling(monkeypatch, fatal, echo)
+
+    fatal_tool = khimaira_mcp._tool_manager.get_tool("fake_fatal")
+    assert fatal_tool is not None
+    assert inspect.signature(fatal_tool.fn) == inspect.signature(fatal)
+    assert fatal_tool.parameters["required"] == ["value"]
+
+    with pytest.raises(ToolError, match="SystemExit") as exc_info:
+        await khimaira_mcp._tool_manager.call_tool("fake_fatal", {"value": 7})
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert isinstance(exc_info.value.__cause__.__cause__, SystemExit)
+    assert (
+        await khimaira_mcp._tool_manager.call_tool("fake_echo", {"value": 7, "prefix": "alive"})
+        == "alive:7"
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_base_exception_becomes_tool_error(monkeypatch):
+    async def fatal_async(value: str) -> str:
+        raise KeyboardInterrupt(value)
+
+    khimaira_mcp = _register_fake_sibling(monkeypatch, fatal_async)
+
+    with pytest.raises(ToolError, match="KeyboardInterrupt") as exc_info:
+        await khimaira_mcp._tool_manager.call_tool("fake_fatal_async", {"value": "stop"})
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert isinstance(exc_info.value.__cause__.__cause__, KeyboardInterrupt)
+
+
+@pytest.mark.asyncio
+async def test_normal_exception_propagates_unchanged_to_fastmcp(monkeypatch):
+    def broken(value: int) -> int:
+        raise ValueError(f"invalid {value}")
+
+    khimaira_mcp = _register_fake_sibling(monkeypatch, broken)
+
+    with pytest.raises(ToolError, match="invalid 3") as exc_info:
+        await khimaira_mcp._tool_manager.call_tool("fake_broken", {"value": 3})
+
+    assert isinstance(exc_info.value.__cause__, ValueError)

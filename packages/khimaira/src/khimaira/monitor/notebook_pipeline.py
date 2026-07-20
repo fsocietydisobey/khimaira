@@ -1215,12 +1215,11 @@ def _seance_code_search(
                check alone can't distinguish "not indexed" from "indexed but
                no match" — checked explicitly via VectorStore.list_projects()
                so callers know whether to trust an empty result or fall back.
-      errored: True only on an actual exception (import fail, embed API
-               error). NOTE: load_config() raises SystemExit (not Exception)
-               when GOOGLE_AI_API_KEY is unset — a BaseException, so it must
-               be caught explicitly alongside Exception (a real gap present
-               in oracle.py's own version of this function; flagged, not
-               fixed there — out of this task's scope).
+      errored: True only on an actual exception (import fail, configuration
+               error, embed API error). ``seance.config.load_config`` raises
+               the normal ``SeanceConfigError`` exception when
+               GOOGLE_AI_API_KEY is unset, so the shared MCP process cannot be
+               terminated by an in-process semantic-search failure.
     """
     try:
         from seance.config import load_config
@@ -1239,7 +1238,7 @@ def _seance_code_search(
         engine = SearchEngine(config)
         results = engine.search(project_name=repo, query=question, top_k=top_k)
         return [r.to_dict() for r in results], True, False
-    except (Exception, SystemExit) as exc:
+    except Exception as exc:
         log.warning("notebook_pipeline: seance code search failed for repo=%r: %s", repo, exc)
         return [], False, True
 

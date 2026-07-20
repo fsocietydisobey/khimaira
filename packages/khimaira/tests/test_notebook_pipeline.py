@@ -1132,16 +1132,16 @@ def test_seance_code_search_indexed_returns_results(pipeline, monkeypatch):
     assert chunks[0]["file_path"] == "foo.py"
 
 
-def test_seance_code_search_missing_api_key_systemexit_is_caught(pipeline, monkeypatch):
-    """Regression: seance.config.load_config() raises SystemExit (a
-    BaseException, not Exception) when GOOGLE_AI_API_KEY is unset — must be
-    caught explicitly, not propagate and break the whole ask."""
+def test_seance_code_search_missing_api_key_config_error_is_caught(pipeline, monkeypatch):
+    """A missing Séance API key degrades search without breaking the ask."""
     importlib.reload(pipeline)  # undo the fixture's _seance_code_search stub — see above
 
-    def _raise_system_exit():
-        raise SystemExit("GOOGLE_AI_API_KEY is not set.")
+    from seance.config import SeanceConfigError
 
-    monkeypatch.setattr("seance.config.load_config", _raise_system_exit)
+    def _raise_config_error():
+        raise SeanceConfigError("GOOGLE_AI_API_KEY is not set.")
+
+    monkeypatch.setattr("seance.config.load_config", _raise_config_error)
 
     chunks, indexed, errored = pipeline._seance_code_search("any-repo", "question")
     assert chunks == []
@@ -2042,7 +2042,11 @@ async def test_invoke_claude_agentic_nonzero_exit_includes_stdout(pipeline, monk
     _queue_responses(
         pipeline,
         monkeypatch,
-        [_FakeProc(b'{"type":"result","subtype":"error_max_budget_usd"}', stderr=b"", returncode=1)],
+        [
+            _FakeProc(
+                b'{"type":"result","subtype":"error_max_budget_usd"}', stderr=b"", returncode=1
+            )
+        ],
     )
     with pytest.raises(RuntimeError, match="error_max_budget_usd"):
         await pipeline._invoke_claude_agentic("q", "i")

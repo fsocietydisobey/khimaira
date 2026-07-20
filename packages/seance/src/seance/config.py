@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+class SeanceConfigError(Exception):
+    """Raised when Séance cannot load a valid runtime configuration."""
+
+
 @dataclass(frozen=True)
 class SeanceConfig:
     """Immutable configuration for Séance, loaded from environment variables."""
@@ -25,11 +29,11 @@ def load_config() -> SeanceConfig:
     """Load configuration from environment variables.
 
     Raises:
-        SystemExit: If required env vars are missing.
+        SeanceConfigError: If required environment variables are missing.
     """
     api_key = os.environ.get("GOOGLE_AI_API_KEY")
     if not api_key:
-        raise SystemExit(
+        raise SeanceConfigError(
             "GOOGLE_AI_API_KEY is not set. "
             "Export it or add it to your .env file. "
             "See .env.example for details."
@@ -37,9 +41,7 @@ def load_config() -> SeanceConfig:
 
     return SeanceConfig(
         google_api_key=api_key,
-        storage_dir=Path(
-            os.environ.get("SEANCE_STORAGE_DIR", str(Path.home() / ".seance"))
-        ),
+        storage_dir=Path(os.environ.get("SEANCE_STORAGE_DIR", str(Path.home() / ".seance"))),
         embedding_model=os.environ.get("SEANCE_EMBEDDING_MODEL", "gemini-embedding-001"),
         chunk_overlap=int(os.environ.get("SEANCE_CHUNK_OVERLAP", "2")),
     )
