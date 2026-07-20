@@ -50,6 +50,7 @@ import {
   useCreateTabMutation,
   useDeleteNoteMutation,
   useGetNoteQuery,
+  useGetRevalidationStatusQuery,
   useLazySearchNotesQuery,
   useListNotesQuery,
   useListProjectsQuery,
@@ -57,6 +58,7 @@ import {
   usePromoteNoteMutation,
   useUnpromoteNoteMutation,
   useRevalidateNoteMutation,
+  useRevalidateAllNotesMutation,
   useUpdateNoteMutation,
 } from "@/api";
 import {
@@ -551,6 +553,7 @@ export function Notebook() {
   const [personalDraft, setPersonalDraft] = useState("");
   const [centerView, setCenterView] = useState<CenterView>(null);
   const [originalRawMode, setOriginalRawMode] = useState(false);
+  const [revalidationError, setRevalidationError] = useState<string | null>(null);
 
   const [leftCollapsed, setLeftCollapsed] = usePersistedBoolean(
     "notebook-left-collapsed",
@@ -625,6 +628,20 @@ export function Notebook() {
   const [updateNote] = useUpdateNoteMutation();
   const [revalidateNote, { isLoading: revalidating }] =
     useRevalidateNoteMutation();
+  const [revalidateAllNotes, { isLoading: schedulingRevalidation }] =
+    useRevalidateAllNotesMutation();
+  const { data: revalidationStatus, refetch: refetchRevalidationStatus } =
+    useGetRevalidationStatusQuery(undefined, { pollingInterval: 5000 });
+  const lastSweep = revalidationStatus?.last_sweep;
+  const revalidationStatusText = revalidationError
+    ? revalidationError
+    : revalidationStatus?.in_progress
+      ? "revalidating notebook…"
+      : revalidationStatus?.job?.status === "error"
+        ? "last revalidation failed"
+        : lastSweep
+          ? `revalidated ${relativeTime(lastSweep.completed_at)} — ${lastSweep.summary.healed} updated, ${lastSweep.summary.confirmed} confirmed`
+          : "not yet revalidated";
 
   const tabs = tabsData?.tabs ?? [];
   // Folders are notes' tab namespace (guide collections live in the
@@ -700,6 +717,16 @@ export function Notebook() {
     updateNote({ id: noteId, test_status: testStatus });
   const handleToggleStarred = (noteId: string, starred: boolean) =>
     updateNote({ id: noteId, starred });
+
+  const handleRevalidateAll = async () => {
+    setRevalidationError(null);
+    try {
+      await revalidateAllNotes().unwrap();
+      await refetchRevalidationStatus();
+    } catch {
+      setRevalidationError("could not start revalidation");
+    }
+  };
 
   // Shared by the Reader-mode capture box (defaults to the flat selectedTab
   // filter) AND Files mode (defaults to whatever folder the rail is
@@ -835,6 +862,29 @@ export function Notebook() {
             <NotebookSectionToggle section={section} onChange={setSection} />
             {section === "notes" ? (
               <>
+                <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                  <span title={revalidationError ?? undefined}>
+                    {revalidationStatusText}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleRevalidateAll}
+                    disabled={
+                      schedulingRevalidation || revalidationStatus?.in_progress
+                    }
+                    title="Re-check active notes and study guides against current code"
+                    className="flex items-center gap-1 rounded-md border border-border bg-card/40 px-2 py-1 font-medium transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={cn(
+                        "h-3 w-3",
+                        (schedulingRevalidation ||
+                          revalidationStatus?.in_progress) && "animate-spin",
+                      )}
+                    />
+                    revalidate now
+                  </button>
+                </div>
                 <AiSearchButton
                   repoScope={repoScope}
                   cachedNotes={mentionableNotes}

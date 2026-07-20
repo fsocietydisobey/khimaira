@@ -80,6 +80,11 @@ def _queue_responses(pipeline, monkeypatch, responses: list[_FakeProc]):
     monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
 
 
+async def _inline_to_thread(func, /, *args, **kwargs):
+    """Sandbox-safe stand-in; production still offloads these disk calls."""
+    return func(*args, **kwargs)
+
+
 _VALID_PAYLOAD = {
     "title": "A test note title",
     "summary": "a summary",
@@ -460,6 +465,7 @@ _ANCHORED_PAYLOAD = {**_VALID_PAYLOAD, "entities": ["sessions.py"]}
 async def test_revalidate_note_staleness_gate_skips_when_unchanged(
     notes_store, pipeline, monkeypatch, git_repo
 ):
+    monkeypatch.setattr(pipeline.asyncio, "to_thread", _inline_to_thread)
     _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
     note = notes_store.add_note("raw", repo="testrepo")
     notes_store.set_pipeline(note["id"], _ANCHORED_PAYLOAD)
@@ -469,15 +475,23 @@ async def test_revalidate_note_staleness_gate_skips_when_unchanged(
     # No canned responses queued — an LLM call here would raise IndexError.
     _queue_responses(pipeline, monkeypatch, [])
 
-    result = await pipeline.revalidate_note(note["id"])
+    budget = pipeline._RevalidationSweepBudget(0)
+    token = pipeline._ACTIVE_REVALIDATION_SWEEP_BUDGET.set(budget)
+    try:
+        result = await pipeline.revalidate_note(note["id"])
+    finally:
+        pipeline._ACTIVE_REVALIDATION_SWEEP_BUDGET.reset(token)
     assert result["validated_git_sha"] == initial_sha
     assert result["history"] == []
     assert result["pipeline"] == _ANCHORED_PAYLOAD
+    assert budget.used == 0
 
 
 async def test_revalidate_note_heals_when_anchor_file_changed(
     notes_store, pipeline, monkeypatch, git_repo
 ):
+    monkeypatch.setattr(pipeline.asyncio, "to_thread", _inline_to_thread)
+    monkeypatch.setattr(pipeline.notebook_retrieval, "upsert_note", lambda record: None)
     _patch_repo_root(pipeline, monkeypatch, "testrepo", git_repo)
     note = notes_store.add_note("raw", repo="testrepo")
     notes_store.set_pipeline(note["id"], _ANCHORED_PAYLOAD)
@@ -492,13 +506,19 @@ async def test_revalidate_note_heals_when_anchor_file_changed(
     healed_payload = {**_ANCHORED_PAYLOAD, "summary": "updated summary", "unchanged": False}
     _queue_responses(pipeline, monkeypatch, [_FakeProc(_envelope(json.dumps(healed_payload)))])
 
-    result = await pipeline.revalidate_note(note["id"])
+    budget = pipeline._RevalidationSweepBudget(1)
+    token = pipeline._ACTIVE_REVALIDATION_SWEEP_BUDGET.set(budget)
+    try:
+        result = await pipeline.revalidate_note(note["id"])
+    finally:
+        pipeline._ACTIVE_REVALIDATION_SWEEP_BUDGET.reset(token)
     assert result["pipeline"]["summary"] == "updated summary"
     assert result["validated_git_sha"] == new_sha
     assert len(result["history"]) == 1
     assert result["history"][0]["pipeline"] == _ANCHORED_PAYLOAD
     assert result["history"][0]["validated_git_sha"] == initial_sha
     assert result["raw_text"] == "raw"
+    assert budget.used == 1
 
 
 async def test_revalidate_note_threads_own_repo_as_target_repo(
@@ -841,6 +861,230 @@ async def test_revalidate_note_study_guide_uses_higher_anchor_cap(
     await pipeline.revalidate_note(guide["id"])
 
     assert seen_caps == [pipeline._MAX_ANCHOR_FILES_GUIDE]
+
+
+# ---------------------------------------------------------------------------
+# Notebook-wide revalidation sweep
+# ---------------------------------------------------------------------------
+
+
+async def test_revalidate_all_notes_filters_ineligible_records(pipeline, monkeypatch):
+    records = [
+        {"id": "note-1", "title": "Note", "kind": "note", "repo": "khimaira"},
+        {
+            "id": "guide-1",
+            "title": "Guide",
+            "kind": "study_guide",
+            "repo": "jeevy_portal",
+        },
+        {"id": "ticket-1", "title": "Ticket", "kind": "ticket", "repo": "khimaira"},
+        {
+            "id": "general-1",
+            "title": "General",
+            "kind": "note",
+            "repo": pipeline.notes.GENERAL_REPO,
+        },
+        {
+            "id": "archived-1",
+            "title": "Archived",
+            "kind": "note",
+            "repo": "khimaira",
+            "resolution": "fixed",
+            "status": "promoted",
+        },
+        {
+            "id": "deleted-1",
+            "title": "Deleted",
+            "kind": "note",
+            "repo": "khimaira",
+            "deleted": True,
+        },
+    ]
+    monkeypatch.setattr(pipeline.notes, "list_notes", lambda: records)
+    monkeypatch.setattr(pipeline.asyncio, "to_thread", _inline_to_thread)
+
+    called = []
+
+    async def fake_revalidate(note_id):
+        called.append(note_id)
+        record = next(record for record in records if record["id"] == note_id)
+        return {**record, "last_validated_at": "after"}
+
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+
+    summary = await pipeline.revalidate_all_notes()
+
+    assert called == ["note-1", "guide-1"]
+    assert summary["confirmed"] == 2
+    assert summary["failed"] == 0
+
+
+async def test_revalidate_all_notes_caps_paid_calls_but_continues_free_checks(
+    pipeline, monkeypatch
+):
+    records = [
+        {
+            "id": "paid-heal",
+            "title": "Heal me",
+            "kind": "note",
+            "repo": "khimaira",
+            "pipeline": {"summary": "old"},
+            "last_validated_at": "before",
+        },
+        {
+            "id": "paid-deferred",
+            "title": "Try tomorrow",
+            "kind": "note",
+            "repo": "khimaira",
+            "pipeline": {"summary": "stale"},
+            "last_validated_at": "before",
+        },
+        {
+            "id": "free-confirm",
+            "title": "Still current",
+            "kind": "study_guide",
+            "repo": "khimaira",
+            "pipeline": {"abstract": "current"},
+            "last_validated_at": "before",
+        },
+    ]
+    monkeypatch.setattr(pipeline.notes, "list_notes", lambda: records)
+    monkeypatch.setattr(pipeline.asyncio, "to_thread", _inline_to_thread)
+
+    called = []
+
+    async def fake_revalidate(note_id):
+        called.append(note_id)
+        record = next(record for record in records if record["id"] == note_id)
+        if note_id.startswith("paid-"):
+            budget = pipeline._ACTIVE_REVALIDATION_SWEEP_BUDGET.get()
+            assert budget is not None
+            budget.claim()
+        if note_id == "paid-heal":
+            return {
+                **record,
+                "pipeline": {"summary": "healed"},
+                "last_validated_at": "after",
+            }
+        return {**record, "last_validated_at": "after"}
+
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+
+    summary = await pipeline.revalidate_all_notes(llm_call_cap=1)
+
+    assert called == ["paid-heal", "paid-deferred", "free-confirm"]
+    assert summary["llm_calls"] == 1
+    assert summary["healed"] == 1
+    assert summary["confirmed"] == 1
+    assert summary["skipped_capped"] == 1
+    assert summary["healed_notes"] == [{"note_id": "paid-heal", "title": "Heal me"}]
+    assert summary["deferred_notes"] == [{"note_id": "paid-deferred", "title": "Try tomorrow"}]
+
+
+async def test_revalidate_all_notes_isolates_failures_and_persists_summary(pipeline, monkeypatch):
+    records = [
+        {"id": "bad", "title": "Bad note", "kind": "note", "repo": "khimaira"},
+        {"id": "good", "title": "Good note", "kind": "note", "repo": "khimaira"},
+        {
+            "id": "missing-repo",
+            "title": "Missing repo",
+            "kind": "note",
+            "repo": "gone",
+        },
+    ]
+    monkeypatch.setattr(pipeline.notes, "list_notes", lambda: records)
+    monkeypatch.setattr(pipeline.asyncio, "to_thread", _inline_to_thread)
+
+    called = []
+
+    async def fake_revalidate(note_id):
+        called.append(note_id)
+        if note_id == "bad":
+            raise RuntimeError("one broken note")
+        record = next(record for record in records if record["id"] == note_id)
+        if note_id == "missing-repo":
+            return record
+        return {**record, "last_validated_at": "after"}
+
+    monkeypatch.setattr(pipeline, "revalidate_note", fake_revalidate)
+
+    summary = await pipeline.revalidate_all_notes()
+
+    assert called == ["bad", "good", "missing-repo"]
+    assert summary["confirmed"] == 1
+    assert summary["failed"] == 2
+    assert summary["failed_notes"] == [
+        {"note_id": "bad", "title": "Bad note"},
+        {"note_id": "missing-repo", "title": "Missing repo"},
+    ]
+    persisted = pipeline.read_last_revalidation_sweep()
+    assert persisted is not None
+    assert persisted["summary"] == summary
+    assert persisted["completed_at"]
+
+
+async def test_transform_note_claims_sweep_budget_at_paid_call_chokepoint(pipeline, monkeypatch):
+    async def fake_run_once(*args, **kwargs):
+        return pipeline.PipelineOutput.model_validate(_VALID_PAYLOAD)
+
+    monkeypatch.setattr(pipeline, "_run_once", fake_run_once)
+    budget = pipeline._RevalidationSweepBudget(1)
+    token = pipeline._ACTIVE_REVALIDATION_SWEEP_BUDGET.set(budget)
+    try:
+        assert await pipeline.transform_note("first") == _VALID_PAYLOAD
+        with pytest.raises(pipeline._RevalidationSweepCapReached):
+            await pipeline.transform_note("deferred")
+    finally:
+        pipeline._ACTIVE_REVALIDATION_SWEEP_BUDGET.reset(token)
+
+    assert budget.used == 1
+
+
+async def test_schedule_revalidation_sweep_coalesces_and_reports_completion(pipeline, monkeypatch):
+    summary = {
+        "healed": 1,
+        "confirmed": 2,
+        "skipped_capped": 0,
+        "failed": 0,
+    }
+
+    async def fake_sweep():
+        await asyncio.sleep(0)
+        return summary
+
+    monkeypatch.setattr(pipeline, "revalidate_all_notes", fake_sweep)
+
+    job_id = pipeline.schedule_revalidation_sweep()
+    assert pipeline.schedule_revalidation_sweep() == job_id
+    assert pipeline.get_revalidation_status()["in_progress"] is True
+
+    await asyncio.sleep(0.01)
+
+    status = pipeline.get_revalidation_status()
+    assert status["in_progress"] is False
+    assert status["job"] == {
+        "job_id": job_id,
+        "status": "done",
+        "kind": "revalidation_sweep",
+        "summary": summary,
+    }
+
+
+async def test_schedule_revalidation_sweep_reports_job_error(pipeline, monkeypatch):
+    async def failing_sweep():
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(pipeline, "revalidate_all_notes", failing_sweep)
+
+    job_id = pipeline.schedule_revalidation_sweep()
+    await asyncio.sleep(0.01)
+
+    assert pipeline.get_revalidation_status()["job"] == {
+        "job_id": job_id,
+        "status": "error",
+        "kind": "revalidation_sweep",
+        "error": "sweep exploded",
+    }
 
 
 # ---------------------------------------------------------------------------

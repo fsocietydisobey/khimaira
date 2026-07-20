@@ -21,6 +21,8 @@ import re
 import shutil
 import tempfile
 import uuid
+from contextvars import ContextVar
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -687,6 +689,12 @@ async def transform_note(
     every attempt failed — the caller marks the note status="failed" and
     keeps raw_text.
     """
+    sweep_budget = _ACTIVE_REVALIDATION_SWEEP_BUDGET.get()
+    if sweep_budget is not None:
+        # This is the actual paid-call chokepoint. Free anchor-unchanged
+        # revalidations never reach transform_note; the cap therefore cannot
+        # be bypassed by code/Git state changing after a separate preflight.
+        sweep_budget.claim()
     for attempt in range(1, _MAX_CLAUDE_ATTEMPTS + 1):
         try:
             output = await _run_once(
@@ -899,6 +907,34 @@ _MAX_ANCHOR_FILES = 5
 # Phase 2, master's spec: "raise anchor caps for guides").
 _MAX_ANCHOR_FILES_GUIDE = 15
 _MAX_ANCHOR_FILE_CHARS = 20_000  # per-file cap fed into the revalidation prompt
+# A nightly sweep must not turn a large, long-neglected notebook into an
+# unbounded burst of paid agentic calls. Anchor-unchanged notes remain free
+# and continue past this cap; only notes that need a real LLM check consume it.
+_REVALIDATION_LLM_CALL_CAP = 30
+_REVALIDATION_SWEEP_STATE_FILE = "last_revalidation_sweep.json"
+
+
+class _RevalidationSweepCapReached(Exception):
+    """Internal control flow: this note must wait for the next sweep."""
+
+
+class _RevalidationSweepBudget:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.used = 0
+
+    def claim(self) -> None:
+        if self.used >= self.limit:
+            raise _RevalidationSweepCapReached
+        self.used += 1
+
+
+# Context-local rather than module-global mutable state: manual revalidations
+# and unrelated structuring tasks can run concurrently without consuming a
+# sweep's budget. The sweep sets this only around its own revalidate_note call.
+_ACTIVE_REVALIDATION_SWEEP_BUDGET: ContextVar[_RevalidationSweepBudget | None] = ContextVar(
+    "active_revalidation_sweep_budget", default=None
+)
 
 _REVALIDATE_INSTRUCTION_TEMPLATE = (
     "You are checking whether a previously-structured note is still accurate against "
@@ -1172,6 +1208,114 @@ async def revalidate_note(note_id: str) -> dict[str, Any]:
         # so re-embedding would just waste an embed+upsert call.
         await asyncio.to_thread(notebook_retrieval.upsert_note, updated)
     return updated
+
+
+def _revalidation_sweep_state_path() -> Path:
+    """XDG-aware persisted status, alongside the notebook's other state."""
+    return notes._base_dir() / _REVALIDATION_SWEEP_STATE_FILE
+
+
+def read_last_revalidation_sweep() -> dict[str, Any] | None:
+    """Return the last completed sweep, or ``None`` when none is readable."""
+    path = _revalidation_sweep_state_path()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError, TypeError):
+        log.exception("notebook_pipeline: could not read revalidation sweep state at %s", path)
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _persist_revalidation_sweep(summary: dict[str, Any]) -> dict[str, Any]:
+    completed = {
+        "completed_at": datetime.now(UTC).isoformat(),
+        "summary": summary,
+    }
+    path = _revalidation_sweep_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    notes._atomic_write_json(path, completed)
+    return completed
+
+
+async def revalidate_all_notes(*, llm_call_cap: int = _REVALIDATION_LLM_CALL_CAP) -> dict[str, Any]:
+    """Revalidate every eligible code-grounded note without one failure aborting.
+
+    Tickets are work-tracking records rather than curated code-grounded
+    knowledge (the same reason resolution promotion excludes them). General
+    notes have no repo to inspect, archived notes are closed training data,
+    and deleted records are absent from ``list_notes``; all are skipped.
+
+    The cost cap applies only to notes whose anchor-file gate requires an LLM
+    call. Deferred notes remain unchanged and are named in the result so the
+    next sweep can retry them; free fast-path confirmations continue.
+    """
+    if llm_call_cap < 0:
+        raise ValueError("llm_call_cap must be non-negative")
+
+    summary: dict[str, Any] = {
+        "healed": 0,
+        "confirmed": 0,
+        "skipped_capped": 0,
+        "failed": 0,
+        "llm_calls": 0,
+        "llm_call_cap": llm_call_cap,
+        "healed_notes": [],
+        "failed_notes": [],
+        "deferred_notes": [],
+    }
+    cap_logged = False
+    candidates = [
+        record
+        for record in await asyncio.to_thread(notes.list_notes)
+        if record.get("kind") in ("note", "study_guide")
+        and record.get("repo") != notes.GENERAL_REPO
+        and notes.derive_lifecycle(record) != "archived"
+        and not record.get("deleted")
+    ]
+
+    budget = _RevalidationSweepBudget(llm_call_cap)
+    for record in candidates:
+        note_ref = {"note_id": record["id"], "title": record.get("title") or "Untitled"}
+        token = _ACTIVE_REVALIDATION_SWEEP_BUDGET.set(budget)
+        try:
+            updated = await revalidate_note(record["id"])
+            if updated.get("last_validated_at") == record.get("last_validated_at"):
+                # revalidate_note deliberately fails open on missing repos,
+                # invalid Git state, and LLM parse failures. For a sweep,
+                # all are failed validations, identifiable because no
+                # validation stamp advanced.
+                summary["failed"] += 1
+                summary["failed_notes"].append(note_ref)
+            elif updated.get("pipeline") != record.get("pipeline"):
+                summary["healed"] += 1
+                summary["healed_notes"].append(note_ref)
+            else:
+                summary["confirmed"] += 1
+        except _RevalidationSweepCapReached:
+            if not cap_logged:
+                log.warning(
+                    "notebook_pipeline: revalidation sweep reached its %d-call LLM cap; "
+                    "deferring remaining drifted notes while continuing free checks",
+                    llm_call_cap,
+                )
+                cap_logged = True
+            summary["skipped_capped"] += 1
+            summary["deferred_notes"].append(note_ref)
+        except Exception:
+            log.exception(
+                "notebook_pipeline: bulk revalidation crashed for note %s",
+                record["id"],
+            )
+            summary["failed"] += 1
+            summary["failed_notes"].append(note_ref)
+        finally:
+            _ACTIVE_REVALIDATION_SWEEP_BUDGET.reset(token)
+
+    summary["llm_calls"] = budget.used
+    await asyncio.to_thread(_persist_revalidation_sweep, summary)
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1683,6 +1827,7 @@ async def research_revise(
 
 _RESEARCH_JOBS: dict[str, dict[str, Any]] = {}
 _RESEARCH_JOB_TASKS: set[asyncio.Task] = set()
+_REVALIDATION_SWEEP_JOB_ID: str | None = None
 
 
 def _new_job_id() -> str:
@@ -1718,6 +1863,44 @@ def track_job_task(task: asyncio.Task) -> None:
     own docstring for the failure mode this guards against)."""
     _RESEARCH_JOB_TASKS.add(task)
     task.add_done_callback(_RESEARCH_JOB_TASKS.discard)
+
+
+async def _run_revalidation_sweep_job(job_id: str) -> None:
+    try:
+        summary = await revalidate_all_notes()
+        complete_job(job_id, kind="revalidation_sweep", summary=summary)
+    except Exception as exc:
+        log.exception("notebook_pipeline: revalidation sweep job %s crashed", job_id)
+        fail_job(job_id, kind="revalidation_sweep", error=str(exc))
+
+
+def schedule_revalidation_sweep() -> str:
+    """Schedule one background sweep, coalescing concurrent trigger requests."""
+    global _REVALIDATION_SWEEP_JOB_ID
+
+    if _REVALIDATION_SWEEP_JOB_ID is not None:
+        current = _RESEARCH_JOBS.get(_REVALIDATION_SWEEP_JOB_ID)
+        if current is not None and current.get("status") == "pending":
+            return _REVALIDATION_SWEEP_JOB_ID
+
+    job_id = create_job("revalidation_sweep")
+    _REVALIDATION_SWEEP_JOB_ID = job_id
+    track_job_task(asyncio.create_task(_run_revalidation_sweep_job(job_id)))
+    return job_id
+
+
+def get_revalidation_status() -> dict[str, Any]:
+    """Return process-local progress plus the last durable sweep result."""
+    job = None
+    if _REVALIDATION_SWEEP_JOB_ID is not None:
+        stored = _RESEARCH_JOBS.get(_REVALIDATION_SWEEP_JOB_ID)
+        if stored is not None:
+            job = {"job_id": _REVALIDATION_SWEEP_JOB_ID, **stored}
+    return {
+        "in_progress": bool(job and job.get("status") == "pending"),
+        "job": job,
+        "last_sweep": read_last_revalidation_sweep(),
+    }
 
 
 async def _run_research_answer_job(

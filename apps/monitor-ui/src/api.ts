@@ -8,6 +8,7 @@ import type {
   NotebookTabKind,
   NoteKind,
   NotePriority,
+  RevalidationStatus,
   NoteStatus,
   NoteTestStatus,
   Ticket,
@@ -400,6 +401,12 @@ export const monitorApi = createApi({
       query: (id) => ({ url: `/notes/${encodeURIComponent(id)}/revalidate`, method: "POST" }),
       invalidatesTags: (_r, _e, id) => [{ type: "Notes", id }, { type: "Notes", id: "LIST" }],
     }),
+    revalidateAllNotes: build.mutation<{ job_id: string; status: "pending" }, void>({
+      query: () => ({ url: "/notes/revalidate-all", method: "POST" }),
+    }),
+    getRevalidationStatus: build.query<RevalidationStatus, void>({
+      query: () => "/notes/revalidation-status",
+    }),
     // Grimoire (Phase 3 chat redesign + CHAT-UNIFY): one persistent per-
     // record chat (guide OR note — the guide-only 404 was lifted) + one
     // one-shot notebook-wide chat (nothing open). Both are async (job+poll)
@@ -648,6 +655,8 @@ export const {
   usePromoteNoteMutation,
   useUnpromoteNoteMutation,
   useRevalidateNoteMutation,
+  useRevalidateAllNotesMutation,
+  useGetRevalidationStatusQuery,
   useGetChatHistoryQuery,
   useSendChatMessageMutation,
   useSendNotebookChatMutation,

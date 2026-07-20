@@ -14,6 +14,42 @@ export type NoteStatus = "draft" | "processed" | "promoted" | "failed";
 export type NoteLifecycle =
   "captured" | "reviewed" | "resolved" | "archived" | "housed" | "organized";
 
+export interface RevalidationNoteRef {
+  note_id: string;
+  title: string;
+}
+
+export interface RevalidationSweepSummary {
+  healed: number;
+  confirmed: number;
+  skipped_capped: number;
+  failed: number;
+  llm_calls: number;
+  llm_call_cap: number;
+  healed_notes: RevalidationNoteRef[];
+  failed_notes: RevalidationNoteRef[];
+  deferred_notes: RevalidationNoteRef[];
+}
+
+export interface RevalidationSweepRecord {
+  completed_at: string;
+  summary: RevalidationSweepSummary;
+}
+
+export interface RevalidationSweepJob {
+  job_id: string;
+  status: "pending" | "done" | "error";
+  kind: "revalidation_sweep";
+  summary?: RevalidationSweepSummary;
+  error?: string;
+}
+
+export interface RevalidationStatus {
+  in_progress: boolean;
+  job: RevalidationSweepJob | null;
+  last_sweep: RevalidationSweepRecord | null;
+}
+
 /** User-set importance, independent of `NoteStatus` (lifecycle). Mirrors the
  *  backend's `_VALID_PRIORITIES`; default "normal". */
 export type NotePriority = "low" | "normal" | "high" | "urgent";

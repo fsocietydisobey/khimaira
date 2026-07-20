@@ -10,6 +10,8 @@ Endpoints:
                                    directory (dry_run=True by default — manifest only)
   GET    /notes/search?q=       — Phase 2b: semantic search over embedded notes
   POST   /notes/ask             — Phase 2c capstone: ask -> retrieve -> heal -> answer
+  POST   /notes/revalidate-all  — schedule a cost-capped background currency sweep
+  GET    /notes/revalidation-status — current sweep state + last persisted summary
   POST   /notes/research        — grimoire Phase 3 ANSWER: schedules a research-grounded
                                    Q&A job (code + web), read-only; returns {job_id}
   GET    /notes/research/{job_id} — poll an ANSWER or REVISE job's status/result
@@ -468,6 +470,22 @@ def build_router():
         return await notebook_pipeline.answer_question(
             req.question, repo=req.repo, mentioned_note_ids=req.note_ids, exclusive=req.exclusive
         )
+
+    @router.post("/notes/revalidate-all")
+    async def revalidate_all_notes() -> dict:
+        """Schedule the notebook-wide currency sweep and return immediately.
+
+        A sweep may make multiple paid LLM calls and can take minutes, so it
+        uses the existing background job store. Concurrent triggers coalesce
+        onto the already-pending sweep instead of starting duplicate work.
+        """
+        job_id = notebook_pipeline.schedule_revalidation_sweep()
+        return {"job_id": job_id, "status": "pending"}
+
+    @router.get("/notes/revalidation-status")
+    async def get_revalidation_status() -> dict:
+        """Return live job progress and the last durable sweep result."""
+        return await asyncio.to_thread(notebook_pipeline.get_revalidation_status)
 
     @router.post("/notes/research")
     async def research(req: ResearchReq) -> dict:

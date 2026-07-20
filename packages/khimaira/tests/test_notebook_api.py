@@ -8,6 +8,11 @@ import importlib
 import pytest
 
 
+async def _inline_to_thread(func, /, *args, **kwargs):
+    """Sandbox-safe stand-in; production still offloads these disk calls."""
+    return func(*args, **kwargs)
+
+
 @pytest.fixture
 def notebook_client(isolated_state, monkeypatch):
     from fastapi import FastAPI
@@ -696,6 +701,50 @@ def test_revalidate_note_happy_path(notebook_client, monkeypatch):
 def test_revalidate_note_unknown_id_returns_404(notebook_client):
     r = notebook_client.post("/api/notes/no-such-id/revalidate")
     assert r.status_code == 404
+
+
+async def test_revalidate_all_route_schedules_background_job(async_notebook_client, monkeypatch):
+    client, notebook_api = async_notebook_client
+    monkeypatch.setattr(
+        notebook_api.notebook_pipeline,
+        "schedule_revalidation_sweep",
+        lambda: "sweep-job-1",
+    )
+
+    r = await client.post("/api/notes/revalidate-all")
+
+    assert r.status_code == 200
+    assert r.json() == {"job_id": "sweep-job-1", "status": "pending"}
+
+
+async def test_revalidation_status_route_returns_live_and_persisted_state(
+    async_notebook_client, monkeypatch
+):
+    client, notebook_api = async_notebook_client
+    monkeypatch.setattr(notebook_api.asyncio, "to_thread", _inline_to_thread)
+    status = {
+        "in_progress": False,
+        "job": {
+            "job_id": "sweep-job-1",
+            "status": "done",
+            "kind": "revalidation_sweep",
+            "summary": {"healed": 3, "confirmed": 41},
+        },
+        "last_sweep": {
+            "completed_at": "2026-07-20T03:04:05+00:00",
+            "summary": {"healed": 3, "confirmed": 41},
+        },
+    }
+    monkeypatch.setattr(
+        notebook_api.notebook_pipeline,
+        "get_revalidation_status",
+        lambda: status,
+    )
+
+    r = await client.get("/api/notes/revalidation-status")
+
+    assert r.status_code == 200
+    assert r.json() == status
 
 
 # ---------------------------------------------------------------------------
