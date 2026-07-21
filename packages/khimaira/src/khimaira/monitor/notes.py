@@ -133,6 +133,8 @@ _DEFAULT_TAB_KIND = "folder"
 _TAB_REPO_MIGRATION_VERSION = 1
 _TAB_REPO_MIGRATION_NAMESPACE = uuid.UUID("9f6b05cc-5a62-4c74-9d65-b12ec4bfb577")
 _MIGRATED_BASE_DIRS: set[Path] = set()
+_TAB_KIND_MIGRATION_VERSION = 1
+_KIND_MIGRATED_BASE_DIRS: set[Path] = set()
 
 
 class TabValidationError(ValueError):
@@ -192,6 +194,14 @@ def _tab_repo_migration_path() -> Path:
 
 def _tab_repo_migration_lock_path() -> Path:
     return _base_dir() / "tab_repo_migration_v1.lock"
+
+
+def _tab_kind_migration_path() -> Path:
+    return _base_dir() / "tab_kind_migration_v1.json"
+
+
+def _tab_kind_migration_lock_path() -> Path:
+    return _base_dir() / "tab_kind_migration_v1.lock"
 
 
 def _note_path(note_id: str) -> Path:
@@ -445,10 +455,13 @@ def _fold_index() -> dict[str, dict[str, Any]]:
     return {nid: stub for nid, stub in folded.items() if not stub.get("deleted")}
 
 
-def _fold_tabs() -> dict[str, dict[str, Any]]:
-    """Fold tabs.jsonl to the latest record per tab id, dropping deleted
-    ones. Self-compacting sibling of _fold_index — same rationale, much
-    smaller file today, but the same append-only growth pattern applies."""
+def _fold_tabs_raw() -> dict[str, dict[str, Any]]:
+    """Fold tabs.jsonl without applying read-time schema defaults.
+
+    Production readers should use `_fold_tabs`. This raw variant exists for
+    one-time migrations that must distinguish a missing legacy field from a
+    persisted value.
+    """
     raw = _read_jsonl(_tabs_path())
     folded: dict[str, dict[str, Any]] = {}
     for line in raw:
@@ -465,12 +478,105 @@ def _fold_tabs() -> dict[str, dict[str, Any]]:
     return {tid: rec for tid, rec in folded.items() if not rec.get("deleted")}
 
 
+def _fold_tabs() -> dict[str, dict[str, Any]]:
+    """Fold live tabs and normalize defaults shared by every consumer.
+
+    `kind` did not exist before study-guide collections were introduced.
+    Those legacy records are ordinary note folders. Normalizing at this
+    chokepoint prevents raw `_fold_tabs` consumers from silently disagreeing
+    with `get_tab`/`list_tabs`, which have always exposed the same default.
+    The durable migration persists the default separately; this read-time
+    normalization keeps invariants correct even before or during migration.
+    """
+    normalized: dict[str, dict[str, Any]] = {}
+    for tab_id, record in _fold_tabs_raw().items():
+        tab = dict(record)
+        tab.setdefault("kind", _DEFAULT_TAB_KIND)
+        normalized[tab_id] = tab
+    return normalized
+
+
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     tmp = path.with_name(
         f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
     )
     tmp.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
     tmp.replace(path)
+
+
+def _build_tab_kind_migration_plan() -> dict[str, Any]:
+    """Plan persistence of the pre-collection tab-kind default.
+
+    Git history confirms tab collections and the `kind` field arrived in the
+    same commit. A live record with no `kind` therefore predates collections
+    and can only represent an ordinary folder.
+    """
+    return {
+        "version": _TAB_KIND_MIGRATION_VERSION,
+        "status": "planned",
+        "tab_ids": sorted(
+            tab_id for tab_id, record in _fold_tabs_raw().items() if "kind" not in record
+        ),
+    }
+
+
+def _apply_tab_kind_migration_plan(plan: dict[str, Any]) -> None:
+    """Backfill only still-missing kinds; never overwrite a current value."""
+    current_tabs = _fold_tabs_raw()
+    for tab_id in plan.get("tab_ids", []):
+        if not isinstance(tab_id, str):
+            continue
+        current = current_tabs.get(tab_id)
+        if current is None or "kind" in current:
+            continue
+        migrated = dict(current)
+        migrated["kind"] = _DEFAULT_TAB_KIND
+        _append_jsonl(_tabs_path(), migrated)
+        current_tabs[tab_id] = migrated
+
+
+def initialize_tab_kind_migration() -> None:
+    """Persist `kind="folder"` on every live pre-collection tab, once.
+
+    The durable planned/complete marker makes a crash replayable. The plan
+    stores ids rather than full records, and apply re-reads each latest row,
+    so metadata changes or an explicit kind written after planning are never
+    overwritten.
+    """
+    base_dir = _base_dir()
+    if base_dir in _KIND_MIGRATED_BASE_DIRS:
+        return
+    _ensure_dirs()
+    with _tab_kind_migration_lock_path().open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        with _TABS_LOCK:
+            marker: dict[str, Any] | None = None
+            try:
+                loaded = json.loads(_tab_kind_migration_path().read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    marker = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+            if (
+                marker is not None
+                and marker.get("version") == _TAB_KIND_MIGRATION_VERSION
+                and marker.get("status") == "complete"
+            ):
+                _KIND_MIGRATED_BASE_DIRS.add(base_dir)
+                return
+            plan = (
+                marker
+                if marker is not None
+                and marker.get("version") == _TAB_KIND_MIGRATION_VERSION
+                and marker.get("status") == "planned"
+                else _build_tab_kind_migration_plan()
+            )
+            _atomic_write_json(_tab_kind_migration_path(), plan)
+            _apply_tab_kind_migration_plan(plan)
+            complete = dict(plan)
+            complete["status"] = "complete"
+            _atomic_write_json(_tab_kind_migration_path(), complete)
+    _KIND_MIGRATED_BASE_DIRS.add(base_dir)
 
 
 def _migration_clone_id(tab_id: str, repo: str, occupied: set[str]) -> str:
@@ -600,6 +706,10 @@ def _apply_tab_repo_migration_plan(plan: dict[str, Any]) -> None:
 
 def initialize_tab_repo_migration() -> None:
     """Migrate legacy repo-less tab trees once, with a durable replay plan."""
+    # Kind predates repo-scoping and is the simpler schema backfill. Run it
+    # first so the repo migration and every public tab operation see one
+    # normalized/persisted tab shape.
+    initialize_tab_kind_migration()
     base_dir = _base_dir()
     if base_dir in _MIGRATED_BASE_DIRS:
         return

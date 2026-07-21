@@ -1903,6 +1903,23 @@ def _seed_legacy_tab(notes_store, tab_id, title, parent_id=None, **metadata):
     return record
 
 
+def _seed_kindless_tab(notes_store, tab_id, title, *, repo, parent_id=None, **metadata):
+    notes_store._ensure_dirs()
+    now = notes_store._now_iso()
+    record = {
+        "id": tab_id,
+        "title": title,
+        "parent_id": parent_id,
+        "repo": repo,
+        "created_at": now,
+        "updated_at": now,
+        "deleted": False,
+        **metadata,
+    }
+    notes_store._append_tab_record(record)
+    return record
+
+
 def _seed_legacy_tab_note(notes_store, tab_id, repo, text):
     note = notes_store.add_note(text, repo=repo)
     note["tab_id"] = tab_id
@@ -1922,6 +1939,100 @@ def _rerun_tab_repo_migration(notes_store):
     notes_store._tab_repo_migration_path().unlink(missing_ok=True)
     notes_store._MIGRATED_BASE_DIRS.clear()
     notes_store.initialize_tab_repo_migration()
+
+
+def _rerun_tab_kind_migration(notes_store):
+    notes_store._tab_kind_migration_path().unlink(missing_ok=True)
+    notes_store._KIND_MIGRATED_BASE_DIRS.clear()
+    notes_store.initialize_tab_kind_migration()
+
+
+def test_legacy_kindless_tab_blocks_duplicate_sibling(notes_store):
+    # Complete migrations first so this specifically proves the central
+    # read-time normalization, not the backfill that would also repair it.
+    notes_store.initialize_tab_repo_migration()
+    legacy = _seed_kindless_tab(
+        notes_store,
+        "legacy-research",
+        "research",
+        repo="jeevy_portal",
+    )
+
+    with pytest.raises(notes_store.TabValidationError, match="already exists"):
+        notes_store.add_tab("Research", repo="jeevy_portal")
+
+    assert notes_store._fold_tabs()[legacy["id"]]["kind"] == "folder"
+    assert "kind" not in notes_store._fold_tabs_raw()[legacy["id"]]
+
+
+def test_get_or_create_folder_reuses_legacy_kindless_tab(notes_store):
+    notes_store.initialize_tab_repo_migration()
+    legacy = _seed_kindless_tab(
+        notes_store,
+        "legacy-research",
+        "Research",
+        repo="jeevy_portal",
+    )
+
+    reused = notes_store.get_or_create_folder("research", repo="jeevy_portal")
+
+    assert reused["id"] == legacy["id"]
+    assert (
+        len(
+            [
+                tab
+                for tab in notes_store._fold_tabs().values()
+                if tab["repo"] == "jeevy_portal" and tab["title"].lower() == "research"
+            ]
+        )
+        == 1
+    )
+
+
+def test_tab_kind_migration_backfills_only_missing_and_is_idempotent(notes_store):
+    notes_store.initialize_tab_repo_migration()
+    missing = _seed_kindless_tab(
+        notes_store,
+        "missing-kind",
+        "Legacy folder",
+        repo="repo-a",
+        marker="preserved",
+    )
+    explicit_folder = _seed_legacy_tab(
+        notes_store,
+        "explicit-folder",
+        "Folder",
+        repo="repo-a",
+        marker="folder-kept",
+    )
+    explicit_collection = {
+        **_seed_legacy_tab(
+            notes_store,
+            "explicit-collection",
+            "Collection",
+            repo="repo-a",
+            marker="collection-kept",
+        ),
+        "kind": "collection",
+    }
+    notes_store._append_tab_record(explicit_collection)
+
+    _rerun_tab_kind_migration(notes_store)
+
+    raw = notes_store._fold_tabs_raw()
+    assert raw[missing["id"]]["kind"] == "folder"
+    assert raw[missing["id"]]["marker"] == "preserved"
+    assert raw[explicit_folder["id"]]["kind"] == "folder"
+    assert raw[explicit_folder["id"]]["marker"] == "folder-kept"
+    assert raw[explicit_collection["id"]]["kind"] == "collection"
+    assert raw[explicit_collection["id"]]["marker"] == "collection-kept"
+
+    stable_tabs = notes_store._tabs_path().read_bytes()
+    stable_marker = notes_store._tab_kind_migration_path().read_bytes()
+    notes_store._KIND_MIGRATED_BASE_DIRS.clear()
+    notes_store.initialize_tab_kind_migration()
+    assert notes_store._tabs_path().read_bytes() == stable_tabs
+    assert notes_store._tab_kind_migration_path().read_bytes() == stable_marker
 
 
 def test_tab_repo_migration_single_repo_stamps_whole_tree(notes_store):
