@@ -1,9 +1,10 @@
 """`/internal/memory-kg/*` — the memory knowledge-graph's own adapter endpoints.
 
 The monitor daemon serves these itself (no new service/process) and registers
-`http://127.0.0.1:<port>/internal/memory-kg/graph` as the virtual KG adapter
-for project label `khimaira-memory` (see monitor/memory_kg.register_adapter).
-The existing generic proxy (`GET /api/graph/khimaira-memory` in api/graph.py)
+`http://127.0.0.1:<port>/internal/memory-kg/graph` as the `khimaira` project's
+own KG adapter (see monitor/memory_kg.register_adapter — memory is a khimaira
+feature, so it rides the khimaira sidebar entry's kg tab).
+The existing generic proxy (`GET /api/graph/khimaira` in api/graph.py)
 then reaches these routes exactly like it reaches jeevy's adapter — same
 `{data: {nodes, edges}}` contract, same `_sub_url` sibling convention for
 node/<id>, schema, and health.

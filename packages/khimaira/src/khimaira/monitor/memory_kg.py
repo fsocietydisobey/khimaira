@@ -12,9 +12,12 @@ supersedes that" value without rewriting content).
 
 Serving: the monitor daemon mounts ``monitor/api/memory_kg.py`` at
 ``/internal/memory-kg/{graph,node/<id>,schema,health}`` and registers itself
-as a virtual KG adapter (label ``khimaira-memory``) so the existing generic
-proxy (``/api/graph/khimaira-memory``), graph viewer, and ``kg_*`` MCP tools
-work with zero UI/tool changes. Nodes are derived live from the memory files
+as the ``khimaira`` project's KG adapter — memory is a khimaira feature, not
+a separate project, so the sidebar's khimaira → kg tab is the entry point.
+The existing generic proxy (``/api/graph/khimaira``), graph viewer, and
+``kg_*`` MCP tools work with zero UI/tool changes; when the khimaira repo is
+attached (the normal case) the adapter annotates that real registry entry,
+falling back to a virtual placeholder otherwise. Nodes are derived live from the memory files
 on each request (they're tiny); only edges live in SQLite.
 
 Edge writes happen ONLY through :func:`link_entries` (the ``memory_link``
@@ -43,7 +46,7 @@ from khimaira.log import get_logger
 
 log = get_logger("monitor.memory_kg")
 
-ADAPTER_LABEL = "khimaira-memory"
+ADAPTER_LABEL = "khimaira"
 
 EDGE_TYPES = ("SUPERSEDES", "RELATES_TO", "CAUSED_BY")
 

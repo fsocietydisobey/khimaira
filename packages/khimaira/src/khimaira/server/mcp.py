@@ -295,7 +295,7 @@ async def memory_link(
 
     The knowledge-graph layer over MEMORY.md / MEMORY_ARCHIVE.md: entries stay
     untouched forever; relationships are explicit edges in a small SQLite
-    store, viewable via the generic graph tools (project ``khimaira-memory``).
+    store, viewable via the generic graph tools (project ``khimaira``).
 
     This is the ONLY way an edge is committed — there is no automatic edge
     inference. Suggest a link in conversation if unsure; call this tool only

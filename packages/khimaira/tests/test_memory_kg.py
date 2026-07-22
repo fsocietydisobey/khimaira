@@ -326,3 +326,20 @@ def test_virtual_entry_skipped_by_attach_supervisor(isolated_registry, monkeypat
 
     monkeypatch.setattr(attach_supervisor, "attach_project", _boom)
     asyncio.run(attach_supervisor.startup_reattach_pass())
+
+
+def test_set_virtual_kg_adapter_annotates_real_entry_when_label_exists(
+    isolated_registry, tmp_path
+):
+    """The production path since the label moved to "khimaira": when a REAL
+    attached entry matches the label, the adapter annotates it in place — no
+    virtual placeholder is created alongside it."""
+    reg = isolated_registry
+    reg.record_attach(tmp_path / "khimaira", tmp_path / "khimaira" / ".venv", label="khimaira")
+
+    reg.set_virtual_kg_adapter("khimaira", url="http://127.0.0.1:8740/internal/memory-kg/graph")
+
+    entries = [e for e in reg.list_attached() if e.get("label") == "khimaira"]
+    assert len(entries) == 1
+    assert entries[0].get("virtual") is not True
+    assert reg.get_kg_adapter("khimaira")["url"].endswith("/internal/memory-kg/graph")

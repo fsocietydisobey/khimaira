@@ -198,8 +198,8 @@ def build_app():
     app.include_router(graph_api.build_router(), prefix="/api")
     app.include_router(notebook_api.build_router(), prefix="/api")
     # memory-kg: the daemon serves its OWN KG-adapter endpoints (no separate
-    # process); /api/graph/khimaira-memory proxies back to these routes via
-    # the virtual adapter registered in serve().
+    # process); /api/graph/khimaira proxies back to these routes via the
+    # adapter registered on the khimaira project entry in serve().
     app.include_router(memory_kg_api.build_router(), prefix="/internal/memory-kg")
 
     # One-time backfill (Joseph, 2026-07-03): drop pre-fix spurious "heals"
