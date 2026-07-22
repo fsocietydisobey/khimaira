@@ -103,6 +103,30 @@ where a UUID was expected, etc.), the error/empty path should suggest
 the closest correct primitive by name. Saves the next layer of
 "why doesn't this work?" loop.
 
+## Internal roster (in-session subagents)
+
+Every session in this repo has a standing internal team — the
+`khimaira-internal-*` subagents in `.claude/agents/` — plus a deterministic
+pipeline over them (`/intern`). **Be aware of them and say so**: when a task
+arrives, state your routing suggestion the way a roster master would ("I'll
+have the consultant enumerate the bug class first", "this is fully specified —
+straight to the implementer"), then do it. Don't silently work solo on
+something a seat is built for, and don't silently delegate either — narrate
+the routing so the user can redirect.
+
+| Task shape | Route to |
+|---|---|
+| Fuzzy requirements, consequential trade-off, bug-class enumeration | `khimaira-internal-consultant` (recommends; you decide) |
+| Concrete, already-designed change to implement + verify | `khimaira-internal-agent` (never commits) |
+| Independent review of a completed change → SHIP/HOLD | `khimaira-internal-gatekeeper` (only if it didn't shape the design) |
+| Full design → build → verify pipeline in one shot | `/intern <task>` (Workflow; your invocation is the opt-in) |
+
+Do it yourself when the task is a one-liner, needs THIS conversation's
+context, or is a tightly-coupled edit sequence where coordination costs more
+than the work. The internal roster complements the cross-session roster below
+— internal seats are ephemeral and in-session; cross-session seats persist
+and are for long-horizon parallel work.
+
 ## Cross-session coordination
 
 ### Default to delegating when other sessions are available
