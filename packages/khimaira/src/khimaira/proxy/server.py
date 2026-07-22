@@ -107,6 +107,13 @@ _BACKUP_CREDS_PATH = os.path.expanduser(
 _primary_capped_until: float = 0.0  # epoch; while now < this, route to the backup
 _backup_tok_cache: dict[str, object] = {"token": None, "mtime": 0.0}
 _failover_events: int = 0  # observability
+# Requests whose bearer was actually swapped to the backup account (forced OR
+# cap-window). `events` only counts 429-triggered failover ENTRIES, so under
+# KHIMAIRA_PROXY_FORCE_BACKUP it stays 0 forever — this counter is the
+# per-request ground truth that the swap is really happening (2026-07-22:
+# an expired backup token made forced mode silently pass primary through;
+# nothing in /health distinguished that from working).
+_bearer_swaps: int = 0
 
 
 _BACKUP_TOKEN_EXPIRY_SKEW_S = 60.0  # treat as expired this long before the real expiresAt
@@ -660,6 +667,10 @@ async def _handle_proxy(request: Request, method: str, path: str) -> Response:
         swapped = _with_backup_auth(headers)
         if swapped is not None:
             headers = swapped
+            global _bearer_swaps
+            _bearer_swaps += 1
+            if _bearer_swaps == 1 or _bearer_swaps % 100 == 0:
+                logger.info("proxy: bearer swapped to backup (total swaps=%d)", _bearer_swaps)
 
     try:
         if is_stream:
@@ -705,6 +716,7 @@ async def health() -> dict:
             "active": _in_failover_window(),
             "capped_until": round(_primary_capped_until, 1),
             "events": _failover_events,
+            "bearer_swaps": _bearer_swaps,
             "backup_token_present": _backup_bearer() is not None,
         },
         **(ctrl.metrics() if ctrl else {}),
