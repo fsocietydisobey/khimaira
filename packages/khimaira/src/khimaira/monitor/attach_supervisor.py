@@ -41,6 +41,10 @@ async def startup_reattach_pass() -> None:
 
     log.info("attach_supervisor: startup pass over %d registered project(s)", len(entries))
     for entry in entries:
+        if entry.get("virtual"):
+            # Adapter-only placeholder (e.g. khimaira-memory) — nothing on disk
+            # to re-inject, and warning about it every boot would be noise.
+            continue
         project = Path(entry.get("project_path", ""))
         venv = Path(entry.get("venv_path", ""))
         if not project.is_dir() or not venv.is_dir():

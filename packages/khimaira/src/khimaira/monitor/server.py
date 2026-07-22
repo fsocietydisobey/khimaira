@@ -166,6 +166,7 @@ def build_app():
     from .api import graph as graph_api
     from .api import heartbeats as heartbeats_api
     from .api import mcp_calls as mcp_calls_api
+    from .api import memory_kg as memory_kg_api
     from .api import notebook as notebook_api
     from .api import oracle as oracle_api
     from .api import processes as processes_api
@@ -196,6 +197,10 @@ def build_app():
     app.include_router(oracle_api.build_router(), prefix="/api")
     app.include_router(graph_api.build_router(), prefix="/api")
     app.include_router(notebook_api.build_router(), prefix="/api")
+    # memory-kg: the daemon serves its OWN KG-adapter endpoints (no separate
+    # process); /api/graph/khimaira-memory proxies back to these routes via
+    # the virtual adapter registered in serve().
+    app.include_router(memory_kg_api.build_router(), prefix="/internal/memory-kg")
 
     # One-time backfill (Joseph, 2026-07-03): drop pre-fix spurious "heals"
     # from notebook history — see notes.backfill_drop_spurious_heals_all's
@@ -560,6 +565,28 @@ def build_app():
 
         _spawn(_loop())
 
+    # Claude native-memory maintenance — lifecycle hooks alone miss sessions
+    # that remain open continuously for days. This cheap periodic backstop uses
+    # the same fingerprint-gated prune+reindex operation as Stop and the CLI,
+    # but remains inert until KHIMAIRA_MEMORY_AUTO_REFRESH=1 is explicitly set.
+    @app.on_event("startup")
+    async def _start_claude_memory_refresh_loop() -> None:
+        if os.environ.get("KHIMAIRA_MEMORY_AUTO_REFRESH") != "1":
+            return
+        from khimaira import claude_memory_retrieval
+
+        interval = float(os.environ.get("KHIMAIRA_MEMORY_REFRESH_S", "10800"))
+        if interval <= 0:
+            return
+
+        async def _loop() -> None:
+            await asyncio.sleep(60)
+            while True:
+                claude_memory_retrieval.schedule_memory_refresh()
+                await asyncio.sleep(interval)
+
+        _spawn(_loop())
+
     # Self-watch — periodic invariant checks that the daemon's claims
     # match the underlying truth (DB → API consistency, observation
     # freshness, topology agreement). Failures land in the anomaly log
@@ -678,6 +705,12 @@ def serve(*, port: int = DEFAULT_PORT, host: str = DEFAULT_HOST) -> None:
 
     uvicorn = require("uvicorn")
     app = build_app()
+
+    # memory-kg virtual adapter — registered here (not build_app) because only
+    # serve() knows the real bound port. Idempotent; failure is non-fatal.
+    from . import memory_kg as _memory_kg
+
+    _memory_kg.register_adapter(port)
 
     # Belt and suspenders: clear any inherited env that uvicorn might use
     # to override the host (defense against accidental 0.0.0.0).

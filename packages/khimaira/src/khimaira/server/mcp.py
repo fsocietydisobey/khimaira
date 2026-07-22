@@ -232,6 +232,110 @@ async def mnemosyne_ask(question: str, project: str = "khimaira", max_tokens: in
 
 
 @mcp.tool()
+@logged_tool("memory_search")
+async def memory_search(
+    query: str,
+    project: str = "",
+    include_archived: bool = True,
+    top_k: int = 8,
+) -> str:
+    """Search Claude Code's native memory indexes across khimaira and jeevy.
+
+    This is deterministic retrieval over the live ``MEMORY.md`` indexes and
+    their archives, not mnemosyne and not an LLM answer. Use it when the native
+    boot-time memory excerpt may have omitted or archived a relevant topic.
+
+    Args:
+        query: Semantic search query.
+        project: Optional ``khimaira`` or ``jeevy`` corpus filter.
+        include_archived: Include archived index entries (default true).
+        top_k: Maximum matches, clamped to 1..50 (default 8).
+    """
+    from khimaira.claude_memory_retrieval import search_memory
+
+    result = await asyncio.to_thread(
+        search_memory,
+        query,
+        project=project,
+        include_archived=include_archived,
+        top_k=top_k,
+    )
+    if result.get("error"):
+        return f"⚠️ Claude memory search unavailable: {result['error']}"
+
+    hits = result.get("hits", [])
+    if not hits:
+        return "No Claude native-memory entries matched."
+
+    lines = [f"Claude native-memory matches ({len(hits)}):"]
+    for index, hit in enumerate(hits, start=1):
+        source = "LIVE" if hit.get("source_file") == "MEMORY.md" else "ARCHIVED"
+        score = float(hit.get("score", 0.0))
+        lines.extend(
+            [
+                f"{index}. {hit.get('title', 'Untitled')} "
+                f"[{source}] — {hit.get('project', 'unknown')} ({score:.4f})",
+                f"   {hit.get('body', '')}",
+                f"   Topic: `{hit.get('link', '')}`",
+            ]
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@logged_tool("memory_link")
+async def memory_link(
+    from_link: str,
+    to_link: str,
+    type: str,
+    project: str = "khimaira",
+    note: str = "",
+) -> str:
+    """Create one typed edge between two Claude native-memory entries.
+
+    The knowledge-graph layer over MEMORY.md / MEMORY_ARCHIVE.md: entries stay
+    untouched forever; relationships are explicit edges in a small SQLite
+    store, viewable via the generic graph tools (project ``khimaira-memory``).
+
+    This is the ONLY way an edge is committed — there is no automatic edge
+    inference. Suggest a link in conversation if unsure; call this tool only
+    when the relationship is decided (propose, don't dispose).
+
+    Args:
+        from_link: source entry's link target as it appears in the index
+            bullet, e.g. ``feedback_question_framing.md``.
+        to_link: target entry's link target.
+        type: ``SUPERSEDES`` | ``RELATES_TO`` | ``CAUSED_BY``. ``SUPERSEDES``
+            points from the newer entry to the one it supersedes.
+        project: which memory corpus both entries live in — ``khimaira``
+            (default) or ``jeevy``.
+        note: optional free-text rationale stored on the edge.
+
+    Returns:
+        Confirmation with the edge id, or a ⚠️ message naming exactly what
+        failed validation (unknown project/type/link, self-link).
+    """
+    from khimaira.monitor.memory_kg import link_entries
+
+    try:
+        result = await asyncio.to_thread(
+            link_entries, project, from_link, to_link, type, note
+        )
+    except ValueError as exc:
+        return f"⚠️ memory_link rejected: {exc}"
+
+    verb = "created" if result["created"] else "already existed (no-op)"
+    lines = [
+        f"🔗 memory edge {verb}: {result['from_link']} —[{result['type']}]→ "
+        f"{result['to_link']} ({result['project']})",
+        f"   id: {result['id']}",
+    ]
+    if result.get("note"):
+        lines.append(f"   note: {result['note']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 @logged_tool("list_tasks")
 async def list_tasks(hook_safe_only: bool = False) -> str:
     """List open tasks across every configured external task source.
@@ -2846,7 +2950,9 @@ async def kg_subgraph(
 
 @mcp.tool()
 @logged_tool("kg_anomalies")
-async def kg_anomalies(project: str = "", kind: str = "", scope: str = "", node_type: str = "") -> str:
+async def kg_anomalies(
+    project: str = "", kind: str = "", scope: str = "", node_type: str = ""
+) -> str:
     """⚠️ jeevy-side endpoint not live yet, will 502 until it lands
     (task-f4220ba84f33) — contract is confirmed, not guessed.
 
@@ -2925,7 +3031,16 @@ async def kg_edges_filter(
             the next page.
     """
     return await _monitor_tools.kg_edges_filter(
-        project, scope, link_type, match_method, min_weight, max_weight, status, link_source, limit, offset
+        project,
+        scope,
+        link_type,
+        match_method,
+        min_weight,
+        max_weight,
+        status,
+        link_source,
+        limit,
+        offset,
     )
 
 
@@ -3091,7 +3206,9 @@ async def notebook_add_resolution(
             the first attempt — a repeat returns the cached result instead
             of re-scheduling a redundant training distill. Omit otherwise.
     """
-    return await _notebook_tools.notebook_add_resolution(note_id, resolution, resolved_by, idempotency_key)
+    return await _notebook_tools.notebook_add_resolution(
+        note_id, resolution, resolved_by, idempotency_key
+    )
 
 
 @mcp.tool()
@@ -3256,7 +3373,9 @@ async def notebook_delete(note_id: str) -> str:
 
 @mcp.tool()
 @logged_tool("ticket_list")
-async def ticket_list(project: str = "", state: str = "", assignee: str = "", label: str = "") -> str:
+async def ticket_list(
+    project: str = "", state: str = "", assignee: str = "", label: str = ""
+) -> str:
     """List local tickets (the Linear mirror) — filter by project/state/
     assignee/label.
 
@@ -3308,12 +3427,16 @@ async def ticket_create(
             the retry — a repeat returns the SAME ticket instead of creating
             a duplicate. Omit for a normal one-shot call.
     """
-    return await _notebook_tools.ticket_create(title, description, state, project, labels, idempotency_key)
+    return await _notebook_tools.ticket_create(
+        title, description, state, project, labels, idempotency_key
+    )
 
 
 @mcp.tool()
 @logged_tool("ticket_update")
-async def ticket_update(ticket_id: str, title: str = "", description: str = "", state: str = "", tab_id: str = "") -> str:
+async def ticket_update(
+    ticket_id: str, title: str = "", description: str = "", state: str = "", tab_id: str = ""
+) -> str:
     """Edit a LOCAL-CREATED ticket's title/description/state/filing.
 
     Fails on a linear-pulled ticket's synced fields (title/description/state

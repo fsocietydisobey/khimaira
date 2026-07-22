@@ -145,6 +145,38 @@ def set_kg_adapter(
     return matched
 
 
+def set_virtual_kg_adapter(
+    label: str, url: str, token_env: str = "", auth_header: str = ""
+) -> None:
+    """Upsert a VIRTUAL registry entry that exists only to carry a kg_adapter.
+
+    `set_kg_adapter` deliberately refuses to create entries — it only annotates
+    projects that were actually attached. A virtual adapter (e.g. the daemon's
+    own memory-kg routes, label `khimaira-memory`) has no project/venv on disk,
+    so this helper creates a placeholder entry marked `"virtual": true` (which
+    the attach supervisor skips) and then sets the adapter block on it.
+    Idempotent — re-running updates the existing entry's adapter in place.
+    """
+    if set_kg_adapter(label, url, token_env=token_env, auth_header=auth_header):
+        return
+    data = _load()
+    projects: list = data.setdefault("projects", [])
+    projects.insert(
+        0,
+        {
+            "project_path": "",
+            "venv_path": "",
+            "attached_at": _now_iso(),
+            "label": label,
+            "virtual": True,
+        },
+    )
+    data["version"] = _VERSION
+    _save(data)
+    if not set_kg_adapter(label, url, token_env=token_env, auth_header=auth_header):
+        raise RuntimeError(f"virtual kg_adapter entry for {label!r} was created but not matched")
+
+
 def get_kg_adapter(name_or_path: str) -> dict | None:
     """Return the `kg_adapter` block for a project, or None if unset/unknown.
 
