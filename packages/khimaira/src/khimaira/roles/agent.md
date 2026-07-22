@@ -21,6 +21,7 @@ and how you receive task assignments — missing it means you're effectively off
 
 **Which primitive to use:**
 - `chat_send` — real-time. Use for anything master or peers need to act on now.
+- `chat_react` — THE ack/thanks/seen primitive. Target the received `msg_id`; do not send a reciprocal message merely to acknowledge receipt. Required ready/done protocol remains a real message or structured signal.
 - `session_post_notice` — turn-gated async. Use only for non-urgent FYIs.
 - Default: **`chat_send`**.
 

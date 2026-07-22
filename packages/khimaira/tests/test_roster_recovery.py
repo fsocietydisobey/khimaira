@@ -1974,9 +1974,11 @@ class TestProcessWindowWakeDiskWIP:
     def clear_state(self):
         rr._DEBOUNCE.pop((300, "wake"), None)
         rr._DEBOUNCE.pop((300, "ratelimit"), None)
+        rr._DIRECTED_WAKE_DEDUP.clear()
         yield
         rr._DEBOUNCE.pop((300, "wake"), None)
         rr._DEBOUNCE.pop((300, "ratelimit"), None)
+        rr._DIRECTED_WAKE_DEDUP.clear()
 
     def _wake_ctx(self, has_wip=False, rate_limited=False, has_obligations=True):
         """Context manager stack for wake-path tests."""
@@ -2067,6 +2069,26 @@ class TestProcessWindowWakeDiskWIP:
 
         # B must be woken — A's edits in the shared repo do NOT suppress B's wake
         mock_inject.assert_called_once()
+
+    def test_directed_wake_dedupes_once_per_distinct_message_id(self):
+        """A recorded id suppresses only itself; a new inbound id stays fresh."""
+        assert not rr._directed_wake_already_recorded("session-uuid", "msg-one", now=10)
+        rr._record_directed_wake("session-uuid", "msg-one", now=10)
+        assert rr._directed_wake_already_recorded("session-uuid", "msg-one", now=11)
+        assert not rr._directed_wake_already_recorded("session-uuid", "msg-two", now=11)
+
+    def test_directed_wake_dedup_expires_by_timestamp(self, monkeypatch):
+        monkeypatch.setattr(rr, "_DIRECTED_WAKE_DEDUP_TTL_S", 5)
+        rr._record_directed_wake("session-uuid", "msg-one", now=10)
+        assert not rr._directed_wake_already_recorded("session-uuid", "msg-one", now=15)
+
+    def test_directed_wake_dedup_evicts_oldest_at_cap(self, monkeypatch):
+        monkeypatch.setattr(rr, "_DIRECTED_WAKE_DEDUP_MAX", 2)
+        rr._record_directed_wake("session-uuid", "msg-one", now=10)
+        rr._record_directed_wake("session-uuid", "msg-two", now=11)
+        rr._record_directed_wake("session-uuid", "msg-three", now=12)
+        assert ("session-uuid", "msg-one") not in rr._DIRECTED_WAKE_DEDUP
+        assert len(rr._DIRECTED_WAKE_DEDUP) == 2
 
 
 class TestTitleMatchExact:

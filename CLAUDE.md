@@ -155,7 +155,8 @@ don't burn master's context on tasks an agent can do.
 | Goal | Tool | Notes |
 |---|---|---|
 | Ask a sister session, need answer | `session_log_question(target_session_id=B)` + `session_wait_for_answer` | Targeted; auto-surfaces in B's hook |
-| FYI / ack, no reply expected | `session_post_notice` | Re-surfaces up to 3 turns then auto-expires |
+| Ack / 👍 / “seen” inside an active chat | `chat_react(chat_id, target_msg_id, emoji)` | The acknowledgment primitive: visible, but creates no reply obligation or wake |
+| FYI outside an active chat, no reply expected | `session_post_notice` | Re-surfaces up to 3 turns then auto-expires |
 | **Task for the next session in this project** | `session_post_handoff(scope_project=...)` | **Directive, not informational.** Auto-surfaces on any future session's SessionStart hook. The receiving agent is expected to START on it, not wait for user confirmation. |
 | **Delegate a slice of your handoff to a specific session** | `session_invite_handoff(parent_id, me, invitee, text)` | Owner-only. Child handoff targets the named session; cwd-peers skip. Invitee gets immediate inbox notice + SessionStart-hook surface on next boot. |
 | Read what a stopped session said | `session_query_transcript` / `session_summarize_transcript` | Heuristic — no LLM call from khimaira |

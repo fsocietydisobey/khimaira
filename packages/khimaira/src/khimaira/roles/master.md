@@ -45,6 +45,7 @@ Call **once at session start**. Without it, agent messages queue invisibly.
 **Primitives:**
 - `chat_send` — broadcast to all chat members. Use for CONTEXT UPDATEs, task assignments, begin signals, verdicts.
 - `chat_send_to` — private to one member. Auto-retries pending invites 30s; tracks expected replies (overdue notice at 90s). Replies via DM OR broadcast both count.
+- `chat_react` — THE ack/thanks/seen primitive. Target the received `msg_id`; it is visible without waking the sender or creating a reciprocal obligation. Never substitute it for required protocol messages such as BEGIN or verdicts.
 - `session_post_notice` — async, turn-gated. Non-urgent FYIs only.
 - Default: **`chat_send`**.
 

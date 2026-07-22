@@ -160,6 +160,72 @@ def test_accept_then_send_then_history(chats_api_client):
     assert user_msgs[0]["body"] == "hello"
 
 
+@pytest.mark.asyncio
+async def test_react_then_history_surfaces_non_obligating_event(chats_api_client):
+    from khimaira.monitor.api import chats as api_mod
+
+    _, chats_mod = chats_api_client
+    created = chats_mod.create_room("alice", ["bob"])
+    chat_id = created["meta"]["chat_id"]
+    chats_mod.accept(chat_id, "bob")
+    message = chats_mod.send_message(chat_id, "alice", "please confirm")
+    await api_mod._register_expected_reply("alice", ["bob"], chat_id)
+    assert api_mod._EXPECTED_REPLIES
+    router = api_mod.build_router()
+    endpoint = next(
+        route.endpoint
+        for route in router.routes
+        if route.path == "/chats/{chat_id}/reactions"
+    )
+    reaction = await endpoint(
+        chat_id,
+        api_mod.ReactionReq(
+            sender_session_id="bob",
+            target_msg_id=message["id"],
+            emoji="👍",
+        ),
+        None,
+    )
+    history = chats_mod.history(chat_id, "alice")
+
+    assert reaction["kind"] == "reaction"
+    assert reaction["target_id"] == message["id"]
+    assert "to" not in reaction
+    assert any(event.get("id") == reaction["id"] for event in history)
+    assert not api_mod._EXPECTED_REPLIES
+
+
+@pytest.mark.asyncio
+async def test_react_to_missing_target_returns_404(chats_api_client):
+    import fastapi
+    from khimaira.monitor.api import chats as api_mod
+
+    _, chats_mod = chats_api_client
+    created = chats_mod.create_room("alice", ["bob"])
+    chat_id = created["meta"]["chat_id"]
+    chats_mod.accept(chat_id, "bob")
+    router = api_mod.build_router()
+    endpoint = next(
+        route.endpoint
+        for route in router.routes
+        if route.path == "/chats/{chat_id}/reactions"
+    )
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        await endpoint(
+            chat_id,
+            api_mod.ReactionReq(
+                sender_session_id="bob",
+                target_msg_id="msg-missing",
+                emoji="👍",
+            ),
+            None,
+        )
+
+    assert exc_info.value.status_code == 404
+    assert "No chat event with id='msg-missing'" in exc_info.value.detail
+
+
 def test_sse_event_resolves_sender_name_at_publish_time(chats_api_client):
     """SSE events (via _broadcast) show current name, not the stored snapshot."""
     import asyncio

@@ -5,6 +5,7 @@ Endpoints:
   POST   /api/chats/{chat_id}/invite             — invite member
   POST   /api/chats/{chat_id}/accept             — accept invite
   POST   /api/chats/{chat_id}/messages           — send a message
+  POST   /api/chats/{chat_id}/reactions          — acknowledge without reply obligation
   GET    /api/chats/{chat_id}/messages           — paginated history
   GET    /api/chats/{chat_id}                    — room metadata + members + history
   POST   /api/chats/{chat_id}/leave              — leave
@@ -1030,9 +1031,9 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                 # Lean gatekeeper owed-verdict (Option B): N DISTINCT gatekeeper
                 # ships close the gate (N=2 high-stakes/escalated else 1). A
                 # gatekeeper MEMBER owes iff the gate hasn't reached N distinct ships
-                # AND this session hasn't itself shipped — a gatekeeper that already
-                # shipped does NOT owe the 2nd ship (that's a DISTINCT session's job;
-                # distinct-session counting is the load-bearing independence property).
+                # AND this session hasn't itself voted — a gatekeeper that already
+                # shipped OR held does NOT owe another verdict. Any further vote is a
+                # DISTINCT session's job; distinct-session counting is load-bearing.
                 # This is what makes the C3 drain hook + roster wake work for gatekeeper.
                 if reviewer_role == chats.ROLE_GATEKEEPER:
                     for task in tasks.values():
@@ -1061,7 +1062,7 @@ def _get_session_obligations(session_id: str) -> list[dict]:
                             or (now - done_epoch) > _OWED_VERDICT_WINDOW_S
                         ):
                             continue
-                        if len(ships) < n and votes.get(session_id) != "ship":
+                        if len(ships) < n and session_id not in votes:
                             obligations.append(
                                 {
                                     "task_id": tid,
@@ -1534,6 +1535,12 @@ class SendReq(BaseModel):
     private: bool | None = (
         None  # v1.9.2: hide from non-recipients; None = topology default
     )
+
+
+class ReactionReq(BaseModel):
+    sender_session_id: str
+    target_msg_id: str
+    emoji: str
 
 
 class CreateTaskReq(BaseModel):
@@ -2093,6 +2100,39 @@ def build_router():
                     await asyncio.sleep(_PENDING_POLL_INTERVAL)
                     continue
                 raise fastapi.HTTPException(403, msg) from exc
+
+    @router.post("/chats/{chat_id}/reactions")
+    async def add_reaction(
+        chat_id: str,
+        req: ReactionReq,
+        _actor: "str | None" = fastapi.Depends(require_actor),
+    ) -> dict:
+        actor = _actor_or_body(
+            _actor, req.sender_session_id, f"/chats/{chat_id}/reactions"
+        )
+        try:
+            room = chats.load_room(chat_id)
+            target = next(
+                (
+                    event
+                    for event in room["messages"]
+                    if event.get("id") == req.target_msg_id
+                ),
+                None,
+            )
+            result = chats.add_reaction(
+                chat_id, actor, req.target_msg_id, req.emoji
+            )
+            # A reaction can discharge the message it acknowledges, but never
+            # registers a new expected reply of its own.
+            target_sender = (target or {}).get("sender_id")
+            if target_sender and target_sender != actor:
+                await _resolve_expected_reply(actor, [target_sender], chat_id)
+            return result
+        except ValueError as exc:
+            message = str(exc)
+            status = 404 if "No chat event with id=" in message else 403
+            raise fastapi.HTTPException(status, message) from exc
 
     # ---- Phase B: tasks ----
 

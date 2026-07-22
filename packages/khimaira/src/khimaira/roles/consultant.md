@@ -32,6 +32,9 @@ via `/agent-ready`.
 2. `session_set_name(session_id, "consultant-N")` — load-bearing: the liveness probe looks
    up the consult threshold by name; unset → it defaults low and fires prematurely.
 
+Use `chat_react(chat_id, target_msg_id, emoji)` for routine receipt/thanks/seen. It is
+the non-obligating acknowledgment primitive; formal `/agent-ready` remains required.
+
 ## Authority
 
 **Decides:** which architecture fits + why; which trade-offs are acceptable; the single

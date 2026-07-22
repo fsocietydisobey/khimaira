@@ -283,6 +283,29 @@ def send_message(
     return resp.json()
 
 
+def add_reaction(
+    chat_id: str,
+    sender_session_id: str,
+    target_msg_id: str,
+    emoji: str,
+    *,
+    base: str = DEFAULT_BASE,
+) -> dict[str, Any]:
+    """Acknowledge a chat event without sending an obligating message."""
+    resp = _request_with_retry(
+        "POST",
+        f"{base}/api/chats/{chat_id}/reactions",
+        json={
+            "sender_session_id": sender_session_id,
+            "target_msg_id": target_msg_id,
+            "emoji": emoji,
+        },
+        timeout=10.0,
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
 def create_task(
     chat_id: str,
     sender_session_id: str,

@@ -31,6 +31,10 @@ sonnet says "looks comprehensive," opus finds the path nobody tested. When assig
 `/khimaira-assign`, the assignment's budget directive is authoritative — ack via
 `/agent-ready` before reviewing.
 
+Use `chat_react(chat_id, target_msg_id, emoji)` for routine receipt/thanks/seen. It is
+the non-obligating acknowledgment primitive; formal `/agent-ready` and the structured
+verdict call remain required protocol.
+
 ## The verdict — ONE structured call, never prose
 
 After delivering your findings, record the gate decision AS A TOOL CALL:

@@ -160,6 +160,24 @@ def test_gatekeeper_shipped_does_not_self_owe(isolated_state):
     assert not _gk_owed(GK1_SID)
 
 
+def test_gatekeeper_held_does_not_self_owe(isolated_state):
+    """Normal task, GK1 rendered HOLD → GK1 does NOT still owe, even though the
+    gate correctly stays un-closed (HOLD != ship, N=1 not met). Regression test
+    for the drain-hook repost-loop bug: a gatekeeper who already voted HOLD was
+    being re-flagged as still owing a verdict on every subsequent check, causing
+    the same structured HOLD to be re-posted repeatedly."""
+    _write_chat([_gk_meta(), _done_task(), _verdict(WORK_TASK, "hold", GK1_SID)])
+    assert not _gk_owed(GK1_SID)
+
+
+def test_gatekeeper_held_gate_stays_open_for_others(isolated_state):
+    """high-stakes (N=2): GK1 held → GK1 does not owe again, but a DISTINCT GK2
+    still owes (the gate itself is not closed by a HOLD)."""
+    _write_chat([_gk_meta(), _hs_done_task(), _verdict(WORK_TASK, "hold", GK1_SID)])
+    assert not _gk_owed(GK1_SID)
+    assert _gk_owed(GK2_SID)
+
+
 def test_gatekeeper_committable_no_second_owe(isolated_state):
     """Normal task (N=1) with one ship is committable → no OTHER gatekeeper owes."""
     _write_chat([_gk_meta(), _done_task(), _verdict(WORK_TASK, "ship", GK1_SID)])

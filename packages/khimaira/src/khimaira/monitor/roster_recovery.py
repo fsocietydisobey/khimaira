@@ -79,6 +79,51 @@ _CONTEXT_WINDOW_1M = 1_000_000
 # Debounce table: (window_id, action) → last_attempt_ts
 _DEBOUNCE: dict[tuple[int, str], float] = {}
 
+# A directed message may remain structurally unanswered across many sweeps, but
+# repeatedly waking for the same inbound id is never useful. Bound and expire the
+# process-local state so long-lived daemons cannot accumulate chat history forever.
+_DIRECTED_WAKE_DEDUP_TTL_S = float(
+    os.environ.get("KHIMAIRA_DIRECTED_WAKE_DEDUP_TTL_S", "86400")
+)
+_DIRECTED_WAKE_DEDUP_MAX = int(
+    os.environ.get("KHIMAIRA_DIRECTED_WAKE_DEDUP_MAX", "4096")
+)
+_DIRECTED_WAKE_DEDUP: dict[tuple[str, str], float] = {}
+
+
+def _prune_directed_wake_dedup(now: float) -> None:
+    expired = [
+        key
+        for key, recorded_at in _DIRECTED_WAKE_DEDUP.items()
+        if now - recorded_at >= _DIRECTED_WAKE_DEDUP_TTL_S
+    ]
+    for key in expired:
+        _DIRECTED_WAKE_DEDUP.pop(key, None)
+    overflow = len(_DIRECTED_WAKE_DEDUP) - _DIRECTED_WAKE_DEDUP_MAX
+    if overflow > 0:
+        oldest = sorted(
+            _DIRECTED_WAKE_DEDUP,
+            key=lambda key: _DIRECTED_WAKE_DEDUP[key],
+        )
+        for key in oldest[:overflow]:
+            _DIRECTED_WAKE_DEDUP.pop(key, None)
+
+
+def _directed_wake_already_recorded(
+    session_id: str, message_id: str, *, now: float | None = None
+) -> bool:
+    checked_at = time.time() if now is None else now
+    _prune_directed_wake_dedup(checked_at)
+    return (session_id, message_id) in _DIRECTED_WAKE_DEDUP
+
+
+def _record_directed_wake(
+    session_id: str, message_id: str, *, now: float | None = None
+) -> None:
+    recorded_at = time.time() if now is None else now
+    _DIRECTED_WAKE_DEDUP[(session_id, message_id)] = recorded_at
+    _prune_directed_wake_dedup(recorded_at)
+
 # Escalation-dedupe table: window_id → content-hash of last-escalated HITL prompt.
 # Prevents the same unresolved prompt from flooding master's inbox every cooldown cycle.
 # Cleared when the prompt disappears (no-HITL scan cycle) so a future re-appearance
@@ -1257,10 +1302,12 @@ def _session_has_unread_inbox(session_id: str) -> bool:
         return False
 
 
-def _session_has_directed_unanswered(session_id: str) -> bool:
-    """True if a DIRECTED chat message — `to=[me]`, or `@<my-name>` in the body —
-    is newer than this session's OWN last post in that chat (addressed + not
-    replied-to since).
+def _latest_directed_unanswered_message_id(session_id: str) -> str | None:
+    """Return the newest directed message still awaiting a response or reaction.
+
+    A later own MSG retains the historical broad "replied since" behavior. An own
+    REACTION discharges only its exact target, allowing acknowledgments to close a
+    wake signal without becoming messages (and creating a reciprocal obligation).
 
     The DIRECTED wake signal (#23). It replaces the prior `_session_has_unconsumed_chat`,
     which fired on ANY peer message newer than `last_active` and so failed BOTH ways:
@@ -1275,7 +1322,7 @@ def _session_has_directed_unanswered(session_id: str) -> bool:
     undirected chatter never wakes; a directed ask stays owed across unrelated
     actions until the agent actually replies in that chat. Both ts use the daemon
     ISO clock (same clock — no mtime skew, no epsilon needed). Excludes self + SYSTEM.
-    Fail-open: False on any read error.
+    Fail-open: None on any read error.
     """
     try:
         from khimaira.monitor import chats as chats_mod
@@ -1287,7 +1334,8 @@ def _session_has_directed_unanswered(session_id: str) -> bool:
 
         chat_dir = chats_mod._chat_dir()
         if not chat_dir.exists():
-            return False
+            return None
+        latest: tuple[float, str] | None = None
         for chat_path in chat_dir.glob("chat-*.jsonl"):
             try:
                 room = chats_mod.load_room(chat_path.stem)
@@ -1295,11 +1343,16 @@ def _session_has_directed_unanswered(session_id: str) -> bool:
                 if not member or member.get("state") != chats_mod.ACCEPTED:
                     continue
                 my_name = (member.get("session_name") or "").strip()
-                msgs = [
-                    m for m in room.get("messages", []) if m.get("kind") == chats_mod.MSG
-                ]
+                events = room.get("messages", [])
+                msgs = [m for m in events if m.get("kind") == chats_mod.MSG]
                 own = [m for m in msgs if m.get("sender_id") == sid]
                 last_own = _iso_to_epoch(own[-1].get("ts")) if own else 0.0
+                reacted_targets = {
+                    event.get("target_id")
+                    for event in events
+                    if event.get("kind") == chats_mod.REACTION
+                    and event.get("sender_id") == sid
+                }
                 for m in msgs:
                     sender = m.get("sender_id")
                     if sender == sid or sender == chats_mod.SYSTEM_SENDER_ID:
@@ -1311,12 +1364,22 @@ def _session_has_directed_unanswered(session_id: str) -> bool:
                     if not directed and my_name:
                         directed = ("@" + my_name) in (m.get("body") or "")
                     if directed:
-                        return True
+                        message_id = m.get("id") or m.get("event_id")
+                        if not message_id or message_id in reacted_targets:
+                            continue
+                        candidate = (_iso_to_epoch(m.get("ts")), str(message_id))
+                        if latest is None or candidate[0] > latest[0]:
+                            latest = candidate
             except Exception:
                 continue
-        return False
+        return latest[1] if latest else None
     except Exception:
-        return False
+        return None
+
+
+def _session_has_directed_unanswered(session_id: str) -> bool:
+    """Compatibility predicate for drain and diagnostics consumers."""
+    return _latest_directed_unanswered_message_id(session_id) is not None
 
 
 # Audit instrument for #23 (idle-with-owed). Default on; KHIMAIRA_WAKE_DIAG=0 to mute.
@@ -1366,12 +1429,21 @@ def _wake_skip_diagnostic(
                 member = room["members"].get(rsid)
                 if not member or member.get("state") != chats_mod.ACCEPTED:
                     continue
-                msgs = [m for m in room.get("messages", []) if m.get("kind") == chats_mod.MSG]
+                events = room.get("messages", [])
+                msgs = [m for m in events if m.get("kind") == chats_mod.MSG]
                 own = [m for m in msgs if m.get("sender_id") == rsid]
                 last_own = _iso_to_epoch(own[-1].get("ts")) if own else 0.0
+                reacted_targets = {
+                    event.get("target_id")
+                    for event in events
+                    if event.get("kind") == chats_mod.REACTION
+                    and event.get("sender_id") == rsid
+                }
                 for m in msgs:
                     sender = m.get("sender_id")
                     if sender == rsid or sender == chats_mod.SYSTEM_SENDER_ID:
+                        continue
+                    if (m.get("id") or m.get("event_id")) in reacted_targets:
                         continue
                     if _iso_to_epoch(m.get("ts")) > last_own:
                         owed.append((chat_path.stem, m.get("sender_name") or "", m.get("to")))
@@ -2314,9 +2386,10 @@ async def _process_window(win: dict[str, Any]) -> None:
         has_unread_inbox = await asyncio.get_running_loop().run_in_executor(
             None, _session_has_unread_inbox, session_id
         )
-        has_directed_chat = await asyncio.get_running_loop().run_in_executor(
-            None, _session_has_directed_unanswered, session_id
+        directed_message_id = await asyncio.get_running_loop().run_in_executor(
+            None, _latest_directed_unanswered_message_id, session_id
         )
+        has_directed_chat = directed_message_id is not None
         if (
             not obligations
             and not has_pending_task
@@ -2339,6 +2412,28 @@ async def _process_window(win: dict[str, Any]) -> None:
                     "unread_inbox": has_unread_inbox,
                     "directed_chat": has_directed_chat,
                 },
+            )
+            return
+
+        directed_is_only_signal = (
+            has_directed_chat
+            and not obligations
+            and not has_pending_task
+            and not has_pending_invite
+            and not has_unread_inbox
+        )
+        if (
+            directed_is_only_signal
+            and directed_message_id
+            and _directed_wake_already_recorded(session_id, directed_message_id)
+        ):
+            _log.debug(
+                "roster-recovery: skip duplicate directed wake window=%d role=%s "
+                "session=%s msg=%s",
+                window_id,
+                role,
+                session_id[:8],
+                directed_message_id,
             )
             return
 
@@ -2413,6 +2508,8 @@ async def _process_window(win: dict[str, Any]) -> None:
         # must NOT retry every 60s sweep — it cools down like a successful one.
         _DEBOUNCE[action_key] = time.time()
         if submitted:
+            if directed_message_id:
+                _record_directed_wake(session_id, directed_message_id)
             _log.info(
                 "roster-recovery: wake injected to window %d role=%s session=%s",
                 window_id,

@@ -130,6 +130,54 @@ def test_create_accept_send_round_trip(isolated_chats):
     assert user_msgs[0]["body"] == "hello bob"
 
 
+def test_reaction_acknowledges_directed_message_without_reciprocal_wake(
+    isolated_chats, monkeypatch
+):
+    c = isolated_chats
+    from khimaira.monitor import roster_recovery as rr
+    from khimaira.monitor import sessions as sessions_mod
+
+    alice = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    bob = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    _make_session(sessions_mod, alice, "alice")
+    _make_session(sessions_mod, bob, "bob")
+    room = c.create_room(alice, [bob])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, bob)
+
+    wakes: list[list[tuple[str, str | None]]] = []
+    monkeypatch.setattr(c, "_auto_wake_targeted_idle", wakes.append)
+    message = c.send_message(chat_id, alice, "seen?", to=[bob])
+    assert len(wakes) == 1
+
+    reaction = c.add_reaction(chat_id, bob, message["id"], "👍")
+    assert len(wakes) == 1
+    assert reaction["kind"] == c.REACTION
+    assert reaction["target_id"] == message["id"]
+    assert reaction["emoji"] == "👍"
+    assert "to" not in reaction
+    assert "private" not in reaction
+
+    history = c.history(chat_id, alice)
+    assert reaction in history
+    assert rr._session_has_directed_unanswered(bob) is False
+    assert rr._session_has_directed_unanswered(alice) is False
+
+
+def test_reaction_rejects_nonexistent_target(isolated_chats):
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    _make_session(sessions_mod, "alice", "alice")
+    _make_session(sessions_mod, "bob", "bob")
+    room = c.create_room("alice", ["bob"])
+    chat_id = room["meta"]["chat_id"]
+    c.accept(chat_id, "bob")
+
+    with pytest.raises(ValueError, match="No chat event with id='msg-missing'"):
+        c.add_reaction(chat_id, "bob", "msg-missing", "👍")
+
+
 # ---------------------------------------------------------------------------
 # Sender gating
 # ---------------------------------------------------------------------------

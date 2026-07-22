@@ -48,6 +48,40 @@ def test_msg_from_self_skipped():
     assert _route_record(record, MY_SID) is None
 
 
+def test_reaction_from_other_session_renders():
+    record = {
+        "kind": "reaction",
+        "chat_id": "chat-1",
+        "sender_id": OTHER_SID,
+        "sender_name": "other",
+        "id": "reaction-abc",
+        "target_id": "msg-abc",
+        "emoji": "👍",
+    }
+    decision = _route_record(record, MY_SID)
+    assert decision is not None
+    content, meta = decision
+    assert content == "other reacted 👍 to msg-abc"
+    assert meta == {
+        "chat_id": "chat-1",
+        "kind": "reaction",
+        "sender": "other",
+        "target_id": "msg-abc",
+        "emoji": "👍",
+    }
+
+
+def test_reaction_from_self_skipped():
+    record = {
+        "kind": "reaction",
+        "chat_id": "chat-1",
+        "sender_id": MY_SID,
+        "target_id": "msg-abc",
+        "emoji": "✅",
+    }
+    assert _route_record(record, MY_SID) is None
+
+
 def test_pending_invite_for_me_emits():
     record = {
         "kind": "member",
@@ -305,6 +339,49 @@ def test_task_signal_skips_own_signal():
 import asyncio  # noqa: E402
 
 import pytest  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_chat_react_dispatches_target_and_emoji(monkeypatch):
+    from khimaira_chat import server
+
+    captured = {}
+
+    def fake_add_reaction(chat_id, sender_session_id, target_msg_id, emoji):
+        captured.update(
+            chat_id=chat_id,
+            sender_session_id=sender_session_id,
+            target_msg_id=target_msg_id,
+            emoji=emoji,
+        )
+        return {"kind": "reaction", **captured}
+
+    monkeypatch.setattr(server.daemon_client, "add_reaction", fake_add_reaction)
+    original_session_id = server._state.session_id
+    original_stream = server._state.write_stream
+    try:
+        server._state.session_id = None
+        server._state.write_stream = None
+        result = await server._dispatch_tool(
+            "chat_react",
+            {
+                "session_id": MY_SID,
+                "chat_id": "chat-1",
+                "target_msg_id": "msg-abc",
+                "emoji": "👍",
+            },
+        )
+    finally:
+        server._state.session_id = original_session_id
+        server._state.write_stream = original_stream
+
+    assert captured == {
+        "chat_id": "chat-1",
+        "sender_session_id": MY_SID,
+        "target_msg_id": "msg-abc",
+        "emoji": "👍",
+    }
+    assert result["kind"] == "reaction"
 
 
 @pytest.mark.asyncio

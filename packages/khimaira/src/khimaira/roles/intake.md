@@ -26,6 +26,7 @@ communication mode for this roster; calling this is mandatory.
 
 **Which primitive to use:**
 - `chat_send(chat_id=..., body=...)` — real-time, all chat members see it immediately. Use for anything time-sensitive.
+- `chat_react(chat_id=..., target_msg_id=..., emoji=...)` — THE ack/thanks/seen primitive; visible without waking or obligating the sender.
 - `session_post_notice(target_session_id=..., text=...)` — async, lands on next turn. Use for non-urgent FYIs only.
 - Default: **always `chat_send`** unless you explicitly need async.
 

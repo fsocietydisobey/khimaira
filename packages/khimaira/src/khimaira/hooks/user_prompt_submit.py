@@ -1037,7 +1037,7 @@ def _poll_missed_chat_events(session_id: str) -> str:
         # dispatch (the SSE-deaf-idle case) MUST still surface regardless of age.
         new_msgs = [
             m for m in messages
-            if m.get("kind") == "msg"
+            if m.get("kind") in {"msg", "reaction"}
             and m.get("sender_id") != session_id
             and (m.get("meta") or {}).get("event_type") != "role_directive"
             and (watermark is not None or (m.get("ts") or "") >= cutoff_iso)
@@ -1065,7 +1065,13 @@ def _poll_missed_chat_events(session_id: str) -> str:
                 ts_fmt = dt.strftime("%H:%M")
             except ValueError:
                 ts_fmt = ts_raw[:5]
-            body = (m.get("body") or "").replace("\n", " ")
+            if m.get("kind") == "reaction":
+                body = (
+                    f"reacted {m.get('emoji') or ''} to "
+                    f"{m.get('target_id') or 'unknown event'}"
+                )
+            else:
+                body = (m.get("body") or "").replace("\n", " ")
             if len(body) > 120:
                 body = body[:117] + "..."
             lines.append(f"  [{sender} → {ts_fmt}]: {body}")
@@ -1090,7 +1096,7 @@ def _channel_event_response_level(prompt: str) -> str:
              kind=task                                            → "review"
              kind=task_update, status in {in_progress, pending}   → "minimal"
              kind=invite                                         → "review"
-             kind=msg                                             → "minimal"
+             kind in {msg, reaction}                              → "minimal"
              unknown kind / no kind                               → "minimal"
         4. If multiple blocks: take highest level (review > minimal).
     """
@@ -1115,6 +1121,8 @@ def _channel_event_response_level(prompt: str) -> str:
             # in_progress/pending/unknown → stays "minimal"
         elif kind == "invite":
             level = "review"  # invites require action (chat_accept), not silence
+        elif kind == "reaction":
+            pass  # receipt/status only → stays "minimal"
         # kind=msg or absent → stays "minimal"
         if level == "review":
             break  # can't go higher

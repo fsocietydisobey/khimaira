@@ -53,6 +53,7 @@ SYSTEM_SENDER_ID = "khimaira-system"
 META = "meta"
 MEMBER = "member"
 MSG = "msg"
+REACTION = "reaction"
 TASK = "task"
 TASK_UPDATE = "task_update"
 TASK_SIGNAL = "task_signal"
@@ -790,6 +791,10 @@ def load_room(chat_id: str) -> dict[str, Any]:
                 }
             )
             members[sid] = existing
+        elif kind == REACTION:
+            # Reactions are surfaced to readers, but obligation scans remain
+            # MSG-only so an acknowledgment cannot create a reciprocal duty.
+            messages.append(line)
         elif kind in (MSG, TASK, TASK_UPDATE, TASK_SIGNAL, TASK_VERDICT):
             messages.append(line)
     return {"meta": meta, "members": members, "messages": messages}
@@ -1341,6 +1346,60 @@ def send_message(
         effective_private,
         effective_topology,
     )
+    return record
+
+
+def add_reaction(
+    chat_id: str,
+    sender_session_id: str,
+    target_msg_id: str,
+    emoji: str,
+) -> dict[str, Any]:
+    """Append a visible, non-obligating reaction to an existing chat event.
+
+    Reactions deliberately carry no ``to`` field and never call the targeted-idle
+    wake path. They are the receipt/acknowledgment primitive without reciprocal
+    message semantics.
+    """
+    sender_session_id = _resolve_or_uuid(sender_session_id, chat_id=chat_id)
+    room = load_room(chat_id)
+    canonical_sender, member = _slot_heal_member_key(room, sender_session_id)
+    if canonical_sender is None:
+        member = None
+    else:
+        sender_session_id = canonical_sender
+    if not member or member["state"] != ACCEPTED:
+        state = (member or {}).get("state", "non-member")
+        raise ValueError(
+            f"Session {sender_session_id!r} is {state!r} in {chat_id!r}; "
+            "only accepted members can react."
+        )
+    _check_not_observer(room, sender_session_id, "add reactions")
+
+    target_msg_id = target_msg_id.strip()
+    if not target_msg_id or not any(
+        event.get("id") == target_msg_id for event in room["messages"]
+    ):
+        raise ValueError(
+            f"No chat event with id={target_msg_id!r} exists in {chat_id!r}; "
+            "cannot add reaction."
+        )
+    emoji = emoji.strip()
+    if not emoji:
+        raise ValueError("emoji must be non-empty")
+
+    record = {
+        "kind": REACTION,
+        "event_id": _new_event_id(),
+        "id": "reaction-" + uuid.uuid4().hex[:12],
+        "ts": _now_iso(),
+        "chat_id": chat_id,
+        "sender_id": sender_session_id,
+        "sender_name": member.get("session_name") or sender_session_id[:8],
+        "target_id": target_msg_id,
+        "emoji": emoji,
+    }
+    _append(chat_id, record)
     return record
 
 

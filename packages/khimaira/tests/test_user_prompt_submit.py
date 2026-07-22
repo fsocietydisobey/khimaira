@@ -104,6 +104,38 @@ def test_poll_missed_chat_events_formats_correctly(hook_module):
     assert "second message" in result
 
 
+def test_poll_missed_chat_events_renders_reaction(hook_module):
+    """A reaction advances the watermark and remains visible to a polling reader."""
+    from datetime import datetime, timezone
+
+    chats_payload = {
+        "chats": [{"chat_id": CHAT_ID, "title": "test chat", "my_state": "accepted"}]
+    }
+    messages_payload = {
+        "messages": [
+            {
+                "kind": "reaction",
+                "event_id": "evt-reaction-001",
+                "sender_id": "bbbbbbbb-0000-0000-0000-000000000002",
+                "sender_name": "agent-2",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "target_id": "msg-abc",
+                "emoji": "👍",
+            }
+        ]
+    }
+
+    with patch(
+        "khimaira.hooks.user_prompt_submit.urllib.request.urlopen",
+        side_effect=_mock_urlopen([chats_payload, messages_payload]),
+    ):
+        result = hook_module._poll_missed_chat_events(SESSION_ID)
+
+    assert f"💬 MISSED CHAT EVENTS — {CHAT_ID} (1 new)" in result
+    assert "agent-2" in result
+    assert "reacted 👍 to msg-abc" in result
+
+
 def test_poll_missed_chat_events_excludes_role_directive(hook_module):
     """Regression: role_directive system messages (Claude-Code-specific
     /model + /effort slash-command guidance) must NOT surface in the

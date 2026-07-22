@@ -72,10 +72,26 @@ def _msg(
 
     return {
         "kind": chats.MSG,
+        "id": event_id.replace("evt-", "msg-"),
         "chat_id": CHAT_ID,
         "sender_id": sender_id,
         "body": body,
         "to": to,
+        "ts": datetime.fromtimestamp(ts_epoch, tz=timezone.utc).isoformat(),
+        "event_id": event_id,
+    }
+
+
+def _reaction(sender_id: str, ts_epoch: float, event_id: str, target_id: str) -> dict:
+    from datetime import datetime, timezone
+
+    return {
+        "kind": chats.REACTION,
+        "id": event_id.replace("evt-", "reaction-"),
+        "chat_id": CHAT_ID,
+        "sender_id": sender_id,
+        "target_id": target_id,
+        "emoji": "👍",
         "ts": datetime.fromtimestamp(ts_epoch, tz=timezone.utc).isoformat(),
         "event_id": event_id,
     }
@@ -141,6 +157,32 @@ def test_directed_but_answered_since_stays_quiet(isolated_state):
         ]
     )
     assert rr._session_has_directed_unanswered(MEMBER_SID) is False
+
+
+def test_directed_message_reaction_discharges_wake_without_reply(isolated_state):
+    """A reaction closes its target without manufacturing a reciprocal MSG."""
+    sessions_mod.set_status(MEMBER_SID, "idle")
+    now = time.time()
+    _write_chat(
+        [
+            _msg(PEER_SID, now - 100, "evt-1", to=[MEMBER_SID]),
+            _reaction(MEMBER_SID, now - 50, "evt-2", "msg-1"),
+        ]
+    )
+    assert rr._latest_directed_unanswered_message_id(MEMBER_SID) is None
+    assert rr._session_has_directed_unanswered(MEMBER_SID) is False
+
+
+def test_latest_directed_unanswered_returns_newest_distinct_message_id(isolated_state):
+    sessions_mod.set_status(MEMBER_SID, "idle")
+    now = time.time()
+    _write_chat(
+        [
+            _msg(PEER_SID, now - 100, "evt-1", to=[MEMBER_SID]),
+            _msg(PEER_SID, now - 50, "evt-2", to=[MEMBER_SID]),
+        ]
+    )
+    assert rr._latest_directed_unanswered_message_id(MEMBER_SID) == "msg-2"
 
 
 def test_directed_unanswered_survives_unrelated_action(isolated_state):

@@ -51,6 +51,11 @@ INSTRUCTIONS = (
     "(no chat_id arg defaults to the latest pending invite).\n"
     '- Incoming `<channel sender="..." ...>` block (no kind=invite): that\'s a chat '
     "message. Reply with `chat_send` to the same chat_id from the channel meta.\n"
+    "- For acknowledgments, thanks, seen/receipt signals, or 👍, use "
+    "`chat_react(chat_id=..., target_msg_id=..., emoji=...)`. This is THE "
+    "acknowledgment primitive: it is visible but creates no reply obligation and "
+    "does not wake another session. Do not send a reciprocal chat message merely "
+    "to acknowledge receipt.\n"
     "- The user wants to leave a note for someone who's not actively chatting: "
     "use `mcp__khimaira__session_post_notice` (durable, lands in their inbox).\n"
     "- The user wants a synchronous answer from one peer: use `mcp__khimaira__"
@@ -663,6 +668,7 @@ def _route_record(record: dict[str, Any], my_session_id: str) -> tuple[str, dict
     Routing rules:
     - kind=member, state=pending, session_id == me → invite notification
     - kind=msg, sender != me → message notification
+    - kind=reaction, sender != me → non-obligating reaction notification
     - kind=task, (assignee == me) OR (unassigned AND sender != me) → task created
     - kind=task_update, by_session_id != me → task transition (the actor
       doesn't see their own action echoed; everyone else in the chat does,
@@ -697,6 +703,23 @@ def _route_record(record: dict[str, Any], my_session_id: str) -> tuple[str, dict
             "chat_id": str(record.get("chat_id", "")),
             "sender": str(record.get("sender_name") or sender_id or ""),
             "msg_id": str(record.get("id", "")),
+        }
+        return content, meta
+
+    if kind == "reaction":
+        sender_id = record.get("sender_id")
+        if sender_id == my_session_id:
+            return None
+        sender_name = record.get("sender_name") or sender_id or ""
+        emoji = record.get("emoji", "")
+        target_id = record.get("target_id", "")
+        content = f"{sender_name} reacted {emoji} to {target_id}"
+        meta = {
+            "chat_id": str(record.get("chat_id", "")),
+            "kind": "reaction",
+            "sender": str(sender_name),
+            "target_id": str(target_id),
+            "emoji": str(emoji),
         }
         return content, meta
 
@@ -1023,6 +1046,30 @@ def _build_server() -> Server:
                         },
                     },
                     "required": ["session_id", "chat_id", "body"],
+                },
+            ),
+            types.Tool(
+                name="chat_react",
+                description=(
+                    "THE primitive for acknowledgments, thanks, seen/receipt signals, "
+                    "and emoji reactions. Reacts to an existing chat event without "
+                    "creating a reply obligation or waking another session."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "chat_id": {"type": "string"},
+                        "target_msg_id": {
+                            "type": "string",
+                            "description": "The id of the chat event being acknowledged",
+                        },
+                        "emoji": {
+                            "type": "string",
+                            "description": "Reaction marker, for example 👍 or ✅",
+                        },
+                    },
+                    "required": ["session_id", "chat_id", "target_msg_id", "emoji"],
                 },
             ),
             types.Tool(
@@ -1495,6 +1542,10 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "chat_send":
         return daemon_client.send_message(
             args["chat_id"], sid, args["body"], private=args.get("private")
+        )
+    if name == "chat_react":
+        return daemon_client.add_reaction(
+            args["chat_id"], sid, args["target_msg_id"], args["emoji"]
         )
     if name == "chat_history":
         return daemon_client.history(
