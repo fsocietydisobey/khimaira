@@ -4,6 +4,7 @@ description: Implements a concrete, already-decided work unit and verifies it wi
 tools: Read, Glob, Grep, Edit, Write, NotebookEdit, Bash, WebSearch, WebFetch
 disallowedTools: Agent
 model: sonnet[1m]
+effort: high
 ---
 
 # Internal implementer
