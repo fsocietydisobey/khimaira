@@ -13,6 +13,12 @@ from pathlib import Path
 
 import pytest
 
+# Memory safety is established before test modules import retrieval code. This
+# prevents an escaped test from reaching Qdrant even if it misses the per-test
+# path fixture below.
+os.environ["KHIMAIRA_MEMORY_AUTO_REFRESH"] = "0"
+os.environ["KHIMAIRA_MEMORY_RAG"] = "0"
+
 
 @pytest.fixture(autouse=True)
 def _suppress_desktop_notifications(monkeypatch: pytest.MonkeyPatch):
@@ -31,6 +37,30 @@ def _suppress_desktop_notifications(monkeypatch: pytest.MonkeyPatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_claude_memory_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Fail closed: no test may resolve configured production memory paths.
+
+    Any accidental call through the production wrapper inherits these scratch
+    paths and disabled automatic/Qdrant switches, including subprocesses.
+    """
+    memory_root = tmp_path / "claude-memory-safety"
+    monkeypatch.setenv(
+        "KHIMAIRA_MEMORY_KHIMAIRA_INDEX",
+        str(memory_root / "khimaira" / "MEMORY.md"),
+    )
+    monkeypatch.setenv(
+        "KHIMAIRA_MEMORY_JEEVY_INDEX",
+        str(memory_root / "jeevy" / "MEMORY.md"),
+    )
+    monkeypatch.setenv("KHIMAIRA_MEMORY_AUTO_REFRESH", "0")
+    monkeypatch.setenv("KHIMAIRA_MEMORY_RAG", "0")
+    yield
+
+
 @pytest.fixture
 def isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Re-root khimaira's state dir at a tmp_path for the test's lifetime.
@@ -46,6 +76,7 @@ def isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     # Reload so module-level constants pick up the new env var
     from khimaira.monitor import sessions as sessions_mod
+
     importlib.reload(sessions_mod)
     yield sessions_mod
     # Reload again after test so subsequent tests / non-test code
@@ -63,8 +94,8 @@ def api_client(isolated_state, monkeypatch: pytest.MonkeyPatch):
     """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-
     from khimaira.monitor.api import sessions as api_sessions
+
     importlib.reload(api_sessions)
 
     app = FastAPI()

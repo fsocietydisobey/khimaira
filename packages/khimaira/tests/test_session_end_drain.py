@@ -23,6 +23,12 @@ import pytest
 from khimaira.hooks import session_end as se
 
 
+@pytest.fixture(autouse=True)
+def _disable_memory_refresh(monkeypatch):
+    """Keep Stop-hook tests away from the developer's live memory files."""
+    monkeypatch.setattr(se, "_refresh_claude_memory", lambda cwd: None)
+
+
 @pytest.fixture
 def isolated_counter(tmp_path, monkeypatch):
     """Point the drain counter at a tmp file so tests don't touch /tmp state."""

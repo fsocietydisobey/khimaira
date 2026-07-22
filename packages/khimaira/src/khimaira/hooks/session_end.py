@@ -15,7 +15,8 @@ Stop payload contract:
 Fail-open: any exception → exit 0 silently. This hook must NEVER block
 Claude Code from exiting cleanly.
 
-Stdlib only. No third-party deps.
+The lifecycle path is stdlib-only; the optional memory refresh lazily imports the
+installed khimaira retrieval dependencies and remains fail-open if unavailable.
 """
 
 from __future__ import annotations
@@ -80,6 +81,23 @@ def _get_session_name(session_id: str) -> str:
         return name if name else session_id[:8]
     except Exception:
         return session_id[:8]
+
+
+def _refresh_claude_memory(cwd: str) -> None:
+    """Best-effort prune+reindex for the project whose Stop hook is firing."""
+    if os.environ.get("KHIMAIRA_MEMORY_AUTO_REFRESH") != "1":
+        return
+    try:
+        from khimaira.claude_memory_retrieval import (
+            canonical_project,
+            refresh_configured_memories,
+        )
+
+        project = canonical_project(detect_project(cwd))
+        if project is not None:
+            refresh_configured_memories(projects=[project])
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -287,27 +305,29 @@ def main() -> int:
     # open (still working). Fail-open.
     _stamp_turn_end(session_id)
 
-    session_name = _get_session_name(session_id)
-    domain = detect_domain(session_name)
-    if domain == "general":
-        return 0
-
-    transcript = extract_transcript(
-        session_id,
-        transcript_path=transcript_path,
-    )
-    if not transcript:
-        return 0
-
-    # Qualify domain key as <project>:<domain> to prevent cross-project pollution.
-    # Fail-open: if project detection fails, fall back to bare domain.
     try:
-        project = detect_project(cwd)
-        qualified_domain = f"{project}:{domain}" if project and project != "unknown" else domain
-    except Exception:
-        qualified_domain = domain
-
-    _mnemosyne_distill(qualified_domain, transcript, session_name)
+        session_name = _get_session_name(session_id)
+        domain = detect_domain(session_name)
+        if domain != "general":
+            transcript = extract_transcript(
+                session_id,
+                transcript_path=transcript_path,
+            )
+            if transcript:
+                # Qualify domain key as <project>:<domain> to prevent cross-project
+                # pollution. Fail-open: fall back to bare domain.
+                try:
+                    project = detect_project(cwd)
+                    qualified_domain = (
+                        f"{project}:{domain}" if project and project != "unknown" else domain
+                    )
+                except Exception:
+                    qualified_domain = domain
+                _mnemosyne_distill(qualified_domain, transcript, session_name)
+    finally:
+        # Runs after the existing Stop work for both lead and ordinary sessions.
+        # The combined operation is itself fail-open and fingerprint-gated.
+        _refresh_claude_memory(cwd)
     return 0
 
 

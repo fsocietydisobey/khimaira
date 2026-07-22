@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import io
 import json
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 import khimaira.hooks.session_end as hook_mod
+import pytest
+
+_REAL_REFRESH_CLAUDE_MEMORY = hook_mod._refresh_claude_memory
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,6 +49,12 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _disable_memory_refresh(monkeypatch: pytest.MonkeyPatch):
+    """Keep Stop-hook tests away from the developer's live memory files."""
+    monkeypatch.setattr(hook_mod, "_refresh_claude_memory", lambda cwd: None)
+
+
 def test_general_domain_does_not_post(monkeypatch: pytest.MonkeyPatch):
     """Sessions without a domain-lead pattern must not POST to mnemosyne."""
     _patch_stdin(monkeypatch, _make_payload())
@@ -68,9 +74,7 @@ def test_backend_lead_fires_post(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     _write_jsonl(jsonl, [{"role": "user", "content": "backend work"}])
     _patch_stdin(monkeypatch, _make_payload(transcript_path=str(jsonl)))
     monkeypatch.setattr(hook_mod, "_get_session_name", lambda sid: "backend-lead-1")
-    monkeypatch.setattr(
-        "khimaira.hooks.session_end.detect_project", lambda cwd: "khimaira"
-    )
+    monkeypatch.setattr("khimaira.hooks.session_end.detect_project", lambda cwd: "khimaira")
 
     captured_body: list[bytes] = []
 
@@ -139,3 +143,38 @@ def test_empty_stdin_exits_cleanly(monkeypatch: pytest.MonkeyPatch):
 
     assert result == 0
     mock_urlopen.assert_not_called()
+
+
+def test_stop_refreshes_only_the_detected_supported_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from khimaira import claude_memory_retrieval as memory
+
+    calls: list[list[str]] = []
+    monkeypatch.setenv("KHIMAIRA_MEMORY_AUTO_REFRESH", "1")
+    monkeypatch.setattr(hook_mod, "detect_project", lambda cwd: "jeevy_portal")
+    monkeypatch.setattr(
+        memory,
+        "refresh_configured_memories",
+        lambda *, projects: calls.append(projects),
+    )
+
+    # Call the real helper despite the autouse safeguard around main().
+    _REAL_REFRESH_CLAUDE_MEMORY("/repo")
+
+    assert calls == [["jeevy"]]
+
+
+def test_stop_memory_refresh_is_disabled_without_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from khimaira import claude_memory_retrieval as memory
+
+    monkeypatch.delenv("KHIMAIRA_MEMORY_AUTO_REFRESH", raising=False)
+    monkeypatch.setattr(
+        memory,
+        "refresh_configured_memories",
+        lambda **kwargs: pytest.fail("default-off Stop hook reached live wrapper"),
+    )
+
+    _REAL_REFRESH_CLAUDE_MEMORY("/repo")

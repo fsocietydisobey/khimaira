@@ -24,6 +24,7 @@ from . import attach as attach_cmd
 from . import bootstrap as bootstrap_cmd
 from . import context as context_cmd
 from . import leads as leads_cmd
+from . import memory as memory_cmd
 from . import roster as roster_cmd
 from . import sessions as sessions_cmd
 from . import (
@@ -77,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     themis_cmd.add_subparser(subparsers)
     sessions_cmd.add_subparser(subparsers)
     leads_cmd.add_subparser(subparsers)
+    memory_cmd.add_subparser(subparsers)
     roster_cmd.add_subparser(subparsers)
     context_cmd.add_subparser(subparsers)
 
