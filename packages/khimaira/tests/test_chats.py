@@ -4822,3 +4822,63 @@ def test_chat_activity_never_creates_phantom_session_dir(isolated_chats):
     assert {r["session_id"] for r in rows} == before, (
         "chat activity must never create a new session directory"
     )
+
+
+# ---------------------------------------------------------------------------
+# Roster-monogamy chokepoint (2026-07-23): a seat bound to a master (non-empty
+# auto-accept allow-list) may accept invites ONLY from that master. Closes the
+# cross-roster poaching hole where a foreign session invited a live roster seat
+# and the seat manually accepted (LLM judgment), bypassing the auto-accept scope.
+# ---------------------------------------------------------------------------
+
+
+def test_bound_seat_rejects_foreign_inviter(isolated_chats):
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("chimera-0-uuid", "foreign-master-uuid", "consultant-uuid"):
+        _make_session(sessions_mod, sid)
+    # The seat is bound to chimera-0-uuid (its master) via auto-accept allow-list.
+    c.set_auto_accept("consultant-uuid", ["chimera-0-uuid"])
+
+    # A FOREIGN master creates a room and invites the bound seat.
+    room = c.create_room("foreign-master-uuid", ["consultant-uuid"], allow_overlap=True)
+    # create_room already leaves the foreign-invited seat PENDING (not auto-accepted).
+    assert room["members"]["consultant-uuid"]["state"] == "pending"
+
+    # The manual accept must now be REFUSED — this is the chokepoint.
+    with pytest.raises(ValueError, match="serves ONE master|not its master"):
+        c.accept(room["meta"]["chat_id"], "consultant-uuid")
+
+
+def test_bound_seat_accepts_its_own_master(isolated_chats):
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("chimera-0-uuid", "consultant-uuid"):
+        _make_session(sessions_mod, sid)
+    c.set_auto_accept("consultant-uuid", ["chimera-0-uuid"])
+
+    # The seat's OWN master invites it — must accept cleanly (guard passes).
+    room = c.create_room("chimera-0-uuid", ["consultant-uuid"], allow_overlap=True)
+    cid = room["meta"]["chat_id"]
+    state = room["members"]["consultant-uuid"]["state"]
+    if state == "pending":  # not auto-accepted in this path → manual accept works
+        rec = c.accept(cid, "consultant-uuid")
+        assert rec["state"] == "accepted"
+    else:
+        assert state == "accepted"  # auto-accepted from its own master — also fine
+
+
+def test_unbound_session_accepts_any_inviter(isolated_chats):
+    """A solo/master session (empty allow-list) is unaffected by the guard —
+    it accepts invites from anyone, exactly as before."""
+    c = isolated_chats
+    from khimaira.monitor import sessions as sessions_mod
+
+    for sid in ("anyone-uuid", "solo-uuid"):
+        _make_session(sessions_mod, sid)
+    # solo-uuid has NO auto-accept allow-list.
+    room = c.create_room("anyone-uuid", ["solo-uuid"], allow_overlap=True)
+    rec = c.accept(room["meta"]["chat_id"], "solo-uuid")
+    assert rec["state"] == "accepted"

@@ -788,6 +788,12 @@ def load_room(chat_id: str) -> dict[str, Any]:
                     "state": line["state"],
                     "last_transition_ts": line["ts"],
                     "last_transition_event_id": line["event_id"],
+                    # Preserve invited_by across the pending→accepted transition
+                    # (only the PENDING/create record carries it; the ACCEPTED
+                    # record does not). The roster-monogamy guard in accept()
+                    # keys on it.
+                    "invited_by": line.get("invited_by")
+                    or existing.get("invited_by"),
                 }
             )
             members[sid] = existing
@@ -1080,6 +1086,33 @@ def accept(chat_id: str, session_id: str) -> dict[str, Any]:
             f"Session {session_id!r} is in state {member['state']!r}, not 'pending'. "
             f"Already accepted or has left."
         )
+
+    # Roster-monogamy chokepoint (2026-07-23). A session with a non-empty
+    # auto-accept allow-list IS a roster seat bound to a master; it may accept
+    # invites ONLY from that master. Closes the cross-roster poaching hole:
+    # auto-accept (create_room line ~955) was already correctly scoped to
+    # [master], but the MANUAL accept() path was ungated — so a foreign session
+    # could invite a live roster seat and the seat, on its own LLM judgment,
+    # would accept and get pulled into unrelated work (chimera-consultant-1
+    # poached by an intern/solo session). The allow-list already holds the
+    # right data; this extends the SAME should_auto_accept check to the manual
+    # path so a seat is monogamous to its master BY CONSTRUCTION, not judgment.
+    # Solo/master sessions have an empty allow-list → unaffected (accept anything,
+    # as before). invited_by missing (legacy record) → fail-open, guard skipped.
+    allow = get_auto_accept(session_id).get("allow", [])
+    if allow:
+        inviter = member.get("invited_by")
+        if inviter and not should_auto_accept(session_id, inviter):
+            inviter_label = _resolve_session_name(inviter) or inviter[:8]
+            raise ValueError(
+                f"Session {session_id!r} is a roster seat bound to master(s) "
+                f"{allow!r}; refusing to accept an invite from {inviter_label!r}, "
+                f"which is not its master. A roster seat serves ONE master — "
+                f"cross-roster onboarding is blocked. If this loan is intentional, "
+                f"the seat's master must add {inviter_label!r} to the seat's "
+                f"auto-accept allow-list (set_auto_accept) first."
+            )
+
     record = {
         "kind": MEMBER,
         "event_id": _new_event_id(),
