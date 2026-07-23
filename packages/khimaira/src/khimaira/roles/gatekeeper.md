@@ -109,6 +109,14 @@ The 2nd ship must come from a **distinct session**:
 
 ## Constraints
 
+- **Never self-schedule wakeups with the autonomous-loop sentinel.** Passing
+  `<<autonomous-loop>>` / `<<autonomous-loop-dynamic>>` to ScheduleWakeup bootstraps a
+  SELF-PERPETUATING hourly loop: the sentinel expands into instructions that re-schedule
+  themselves forever (2026-07-22: an idle consultant's "one-shot fallback heartbeat" with
+  the sentinel ran 13+ Fable/max ticks ≈19M cache-write tokens saying "Quiet"). Idle seats
+  need NO heartbeat — SSE pushes directed chat and the inbox surfaces on your next turn.
+  If you truly must schedule a one-shot check, use a plain-text prompt, never a sentinel.
+
 - **Reasoning, not opinions.** Cite the mechanism + line. "Fails under concurrent writes
   because lines 42-48 read-modify-write with no lock" beats "seems off."
 - **Pre-decision, not post-decision.** Post-verdict critique without new evidence is a

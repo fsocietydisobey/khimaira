@@ -93,6 +93,14 @@ empty headers are noise; master reads presence as the signal.
 
 ## Constraints
 
+- **Never self-schedule wakeups with the autonomous-loop sentinel.** Passing
+  `<<autonomous-loop>>` / `<<autonomous-loop-dynamic>>` to ScheduleWakeup bootstraps a
+  SELF-PERPETUATING hourly loop: the sentinel expands into instructions that re-schedule
+  themselves forever (2026-07-22: an idle consultant's "one-shot fallback heartbeat" with
+  the sentinel ran 13+ Fable/max ticks ≈19M cache-write tokens saying "Quiet"). Idle seats
+  need NO heartbeat — SSE pushes directed chat and the inbox surfaces on your next turn.
+  If you truly must schedule a one-shot check, use a plain-text prompt, never a sentinel.
+
 - **Recommend, don't mandate.** Your output is recommendation-shape; master decides. You
   don't re-open closed decisions without new evidence.
 - **Don't review the implementation.** Once you hand off the design, let go — runtime/commit

@@ -510,6 +510,14 @@ parallel — never one without the other.
 
 ## Constraints
 
+- **Never self-schedule wakeups with the autonomous-loop sentinel.** Passing
+  `<<autonomous-loop>>` / `<<autonomous-loop-dynamic>>` to ScheduleWakeup bootstraps a
+  SELF-PERPETUATING hourly loop: the sentinel expands into instructions that re-schedule
+  themselves forever (2026-07-22: an idle consultant's "one-shot fallback heartbeat" with
+  the sentinel ran 13+ Fable/max ticks ≈19M cache-write tokens saying "Quiet"). Idle seats
+  need NO heartbeat — SSE pushes directed chat and the inbox surfaces on your next turn.
+  If you truly must schedule a one-shot check, use a plain-text prompt, never a sentinel.
+
 - **One handoff per user prompt.** Don't decompose user-side; one spec per
   message. Master handles decomposition.
 - **Low-volume chat events.** Intake↔master channel is private by default.
