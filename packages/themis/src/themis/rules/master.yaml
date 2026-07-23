@@ -226,3 +226,23 @@ invariants:
       human authorization (e.g. a one-off recovery). Confirm Joseph authorized
       this specific op; agents are hard-blocked from the same commands. If this
       is routine roster work, it should be a human action, not a master op.
+
+  # IN-UNIVERSAL-2 override: WARN for master only. A USER-invoked /loop in
+  # master's window legitimately passes the sentinel back on every tick — a
+  # hard block would kill that sanctioned flow. Every other role keeps the
+  # universal BLOCK (no roster seat should self-start an autonomous loop).
+  - id: IN-UNIVERSAL-2
+    name: NO_AUTONOMOUS_LOOP_SENTINEL
+    severity: warn
+    matchers:
+      - tool: ScheduleWakeup
+        tool_input_field:
+          field: prompt
+          pattern: '<<autonomous-loop'
+    message: |
+      ⚠️ Themis IN-UNIVERSAL-2 (NO_AUTONOMOUS_LOOP_SENTINEL) — master WARN:
+      you are scheduling a wakeup with an autonomous-loop sentinel. Legitimate
+      ONLY when continuing a /loop the USER started in this window. If no
+      user-invoked /loop is active, do NOT proceed — the sentinel bootstraps a
+      self-perpetuating hourly loop (2026-07-22 consultant incident, ~19M
+      fable tokens). For a one-shot check, use a plain-text prompt instead.

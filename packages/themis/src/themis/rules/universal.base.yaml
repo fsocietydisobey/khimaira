@@ -53,3 +53,34 @@ invariants:
       ignored; this is the structural enforcement.
       (master overrides this to a WARN — IN-MASTER-10 — for human-authorized
       one-off recovery, e.g. the recovery `git stash pop` from that incident.)
+  - id: IN-UNIVERSAL-2
+    name: NO_AUTONOMOUS_LOOP_SENTINEL
+    severity: block
+    matchers:
+      # The <<autonomous-loop>> / <<autonomous-loop-dynamic>> sentinels expand
+      # at fire time into instructions whose final step is "call ScheduleWakeup
+      # again with the sentinel" — so ONE mis-parameterized call bootstraps a
+      # self-perpetuating hourly loop with no /loop invoked and no user intent.
+      - tool: ScheduleWakeup
+        tool_input_field:
+          field: prompt
+          pattern: '<<autonomous-loop'
+    message: |
+      🛑 Themis IN-UNIVERSAL-2 (NO_AUTONOMOUS_LOOP_SENTINEL): this ScheduleWakeup
+      call passes an autonomous-loop sentinel (<<autonomous-loop*>>) as the
+      prompt. That sentinel is reserved for continuing a USER-invoked /loop —
+      passing it "as a fallback heartbeat" bootstraps a SELF-PERPETUATING
+      hourly loop (each tick's instructions re-schedule the next tick, forever).
+
+      Idle roster seats need NO heartbeat: SSE pushes directed chat in real
+      time, and the inbox surfaces on your next prompted turn. If a one-shot
+      scheduled check is truly required, use a PLAIN-TEXT prompt describing the
+      single check — never a sentinel.
+
+      WHY (2026-07-22): an idle chimera consultant scheduled a "one-shot
+      fallback heartbeat" with <<autonomous-loop-dynamic>> → 13+ fable/max
+      ticks at ~61 min (just past the 1h prompt-cache TTL, full context
+      re-billed as cache writes every tick) ≈ 19M tokens to say "Quiet" —
+      62% of the day's fable burn.
+      (master overrides this to WARN — a user-invoked /loop in master's own
+      window is the one legitimate sentinel flow.)

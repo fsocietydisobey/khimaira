@@ -1222,3 +1222,49 @@ def test_agent_md_contains_execute_only_design_bounce():
     assert "bounce" in lowered, "agent.md missing the bounce-design instruction"
     assert "sonnet/medium" in lowered, "agent.md missing the execution-tier rationale"
     assert "JEEVY-651" in content, "agent.md missing the JEEVY-651 worked example"
+
+
+def test_in_universal_2_themis_rule_present():
+    """Regression guard: IN-UNIVERSAL-2 (autonomous-loop sentinel block) must be
+    defined in universal.base.yaml with a master WARN override. 2026-07-22: an
+    idle consultant passed <<autonomous-loop-dynamic>> to ScheduleWakeup as a
+    'one-shot heartbeat' — the sentinel self-perpetuates, ~19M fable tokens."""
+    universal = (THEMIS_RULES / "universal.base.yaml").read_text()
+    assert "IN-UNIVERSAL-2" in universal, "universal.base.yaml missing IN-UNIVERSAL-2"
+    assert "NO_AUTONOMOUS_LOOP_SENTINEL" in universal, "missing rule name"
+    assert "<<autonomous-loop" in universal, "missing sentinel pattern"
+
+    master = (THEMIS_RULES / "master.yaml").read_text()
+    assert "IN-UNIVERSAL-2" in master, "master.yaml missing IN-UNIVERSAL-2 WARN override"
+
+
+def test_role_docs_contain_autonomous_loop_sentinel_rule():
+    """The layer-1 role-doc text for the sentinel rule must stay present in all
+    four non-master roles (loaded at session boot; the Themis gate is the
+    structural backstop, the doc text is the pre-emption)."""
+    for role in ("consultant", "agent", "gatekeeper", "intake"):
+        content = (ROLE_DIR / f"{role}.md").read_text()
+        assert "autonomous-loop sentinel" in content, f"{role}.md missing sentinel rule"
+
+
+def test_in_universal_2_blocks_sentinel_allows_plaintext():
+    """The rule must fire on the sentinel and NOT fire on legitimate one-shot
+    plain-text wakeup prompts, per role: block for seats, warn for master."""
+    from themis.data import Severity, load_rules
+
+    for role, expected in (
+        ("consultant", Severity.BLOCK),
+        ("agent", Severity.BLOCK),
+        ("gatekeeper", Severity.BLOCK),
+        ("intake", Severity.BLOCK),
+        ("master", Severity.WARN),
+    ):
+        inv = [i for i in load_rules(role).invariants if i.id == "IN-UNIVERSAL-2"]
+        assert len(inv) == 1, f"{role}: expected exactly one IN-UNIVERSAL-2, got {len(inv)}"
+        assert inv[0].severity == expected, f"{role}: severity {inv[0].severity} != {expected}"
+        assert inv[0].tool_matches(
+            "ScheduleWakeup", {"prompt": "<<autonomous-loop-dynamic>>"}
+        ), f"{role}: sentinel not matched"
+        assert not inv[0].tool_matches(
+            "ScheduleWakeup", {"prompt": "check the CI run once and report back"}
+        ), f"{role}: false-positive on plain-text prompt"
