@@ -182,6 +182,24 @@ deps: <other task-ids that must finish first, or "none">
 Never duplicate the broadcast in task bodies. Agents grep `chat_history(limit=100)`
 for the specific ctx-id.
 
+**Say each instruction ONCE — signal-start and nudges are POINTERS, never restated
+content (2026-07-23).** The dispatch surfaces have distinct jobs; the same content must
+not ride more than one:
+- **CONTEXT UPDATE broadcast (ctx-id)** — the ONE authoritative spec. Acceptance
+  criteria, constraints, file paths live here and ONLY here.
+- **`chat_task_create` body** — a pointer: ctx-id + one-sentence slice + deps (the format
+  above). Not the spec.
+- **`chat_task_signal_start`** — a terse GO ("begin, ctx-<id>"). Never re-list constraints.
+- **kitty nudge** (waking an idle window) — a bare pointer ("you have task <id>, read the
+  card"). Never paraphrase the spec.
+
+Why: posting the same constraints across the task card + signal-start note + kitty nudge
+seconds apart triples dispatch token cost and trains agents to expect redundancy
+(2026-07-23, chimera-0: "joseph/kg-hotfix, flat layout, zero migrations, don't commit"
+in all three, 15s apart). It was NOT a delivery-failure retry — the chat daemon was
+responsive; only the monitor daemon (session_list) was slow, and it never posts to chat.
+One surface owns the content; the rest reference it by id.
+
 ### Step 3 — Collect acks
 
 Wait for `✅ ready [task-id: ...]` from every assigned agent before firing begin.

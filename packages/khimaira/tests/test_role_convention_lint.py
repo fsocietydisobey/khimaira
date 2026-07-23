@@ -1268,3 +1268,14 @@ def test_in_universal_2_blocks_sentinel_allows_plaintext():
         assert not inv[0].tool_matches(
             "ScheduleWakeup", {"prompt": "check the CI run once and report back"}
         ), f"{role}: false-positive on plain-text prompt"
+
+
+def test_master_md_contains_say_once_dispatch_discipline():
+    """Regression guard: master.md must carry the say-once dispatch rule
+    (2026-07-23 chimera-0 doubling: same content across task card + signal-start
+    + kitty nudge). Behavioral rule, role-doc + lint only — Themis layer skipped
+    because 'note duplicates card' needs fragile content-comparison to detect."""
+    content = (ROLE_DIR / "master.md").read_text()
+    assert "Say each instruction ONCE" in content, "master.md missing say-once dispatch rule"
+    assert "chat_task_signal_start" in content, "missing signal-start channel mention"
+    assert "kitty nudge" in content, "missing kitty-nudge channel mention"
