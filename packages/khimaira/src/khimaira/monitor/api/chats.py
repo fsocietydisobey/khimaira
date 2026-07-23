@@ -2039,7 +2039,11 @@ def build_router():
             _inval(req.session_id)
             return result
         except ValueError as exc:
-            raise fastapi.HTTPException(404, str(exc)) from exc
+            # Roster-monogamy refusal is a policy BLOCK (403), not a 404 —
+            # the invite exists, the seat is simply forbidden from accepting it.
+            msg = str(exc)
+            code = 403 if "serves ONE master" in msg else 404
+            raise fastapi.HTTPException(code, msg) from exc
 
     @router.post("/chats/{chat_id}/reject")
     async def reject_invite(chat_id: str, req: RejectReq) -> dict:

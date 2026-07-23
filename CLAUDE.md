@@ -119,6 +119,7 @@ the routing so the user can redirect.
 | Fuzzy requirements, consequential trade-off, bug-class enumeration | `khimaira-internal-consultant` (recommends; you decide) |
 | Concrete, already-designed change to implement + verify | `khimaira-internal-agent` (never commits) |
 | Independent review of a completed change → SHIP/HOLD | `khimaira-internal-gatekeeper` (only if it didn't shape the design) |
+| Design opinion only, no build | `/consult <question>` (one consultant subagent, no pipeline) |
 | Full design → build → verify pipeline in one shot | `/intern <task>` (Workflow; your invocation is the opt-in) |
 
 Do it yourself when the task is a one-liner, needs THIS conversation's
@@ -126,6 +127,28 @@ context, or is a tightly-coupled edit sequence where coordination costs more
 than the work. The internal roster complements the cross-session roster below
 — internal seats are ephemeral and in-session; cross-session seats persist
 and are for long-horizon parallel work.
+
+**"consultant" means the `khimaira-internal-consultant` subagent — three hard
+rules (2026-07-23 incidents):**
+
+1. **Never hand-roll a consultant.** Do NOT `Agent(subagent_type: "Plan" |
+   "general-purpose")` and call it a consultant. Those load neither the
+   consultant role definition nor its pinned tier — they run as a generic
+   architect, defeating the whole point. Use `subagent_type:
+   "khimaira-internal-consultant"` (or `/consult` / `/intern`), always.
+2. **Never pass a `model:` override on an intern spawn.** The definitions pin
+   the tier (consultant fable/max, agent sonnet/medium, gatekeeper fable/high);
+   `model: "opus"` silently defeats the fable quota-protection pin. If you think
+   a task needs a different tier, that's a Workflow `agent()` call with `effort`,
+   not an ad-hoc model override.
+3. **Never reach into the cross-session chat roster for a consult.** The
+   `chimera-*` / `griffin-*` / roster consultant SEATS are a separate PRODUCTION
+   roster serving their own master. Inviting/onboarding/`chat_task`-ing one from
+   a solo/intern session is cross-roster poaching — it hijacks live production
+   work (it happened: a solo session onboarded chimera-consultant-1, master had
+   to stop it). This is now blocked daemon-side (a roster seat only accepts
+   invites from its own master), but do not attempt it: your consultant is the
+   in-session subagent, not a roster seat.
 
 ## Cross-session coordination
 
