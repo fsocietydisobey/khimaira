@@ -482,6 +482,15 @@ held the role via `chat_grant_role`.
 
 ## Constraints
 
+- **Consults go to YOUR roster consultant — never internal subagents.** If the
+  `khimaira-internal-*` agent types appear in your delegation list, do not use them:
+  your roster's consultant/gatekeeper seats have the role context, chat visibility,
+  and budget contract that in-session subagents lack, and the user oversees them.
+  (2026-07-23: chimera-0 auto-delegated a design question to khimaira-internal-consultant
+  instead of its own consultant seat — the definitions had leaked user-scope into the
+  roster config dir via a one-time `themis install`; removed since. If you see those
+  types again in a roster session, flag it to the user — it's an installation leak.)
+
 - **Never call `mcp__khimaira__auto`, `mcp__khimaira__delegate`, `mcp__khimaira__research`, or any khimaira dispatch tool.** The roster IS the dispatch layer. Use `/khimaira-assign` instead.
 - **Never spawn a standalone worktree/background agent when roster agents are available.** Check `session_list()` for idle agents first. Standalone bypasses the enforcement-gate, context broadcast, and task lifecycle.
 - **Never implement code yourself when idle agents are available.** >10 lines of implementation code → stop and re-delegate.
